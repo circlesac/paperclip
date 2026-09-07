@@ -1,5 +1,5 @@
 diff --git a/dist/index.js b/dist/index.js
-index b80888b6d87e8ad429d18cc955c4c5048a55722a..6923ca71de57ae9ae8994d4210ef8d87f7fae996 100644
+index b80888b6d87e8ad429d18cc955c4c5048a55722a..35f533a9e2aeffe8324ff5ebda7cab3237853888 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -2154,6 +2154,7 @@ var SlackAdapter = class _SlackAdapter {
@@ -49,7 +49,169 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6923ca71de57ae9ae8994d4210ef8d87
        });
        if (response.ok) {
          this.logger.debug("Socket event forwarded successfully", {
-@@ -5636,6 +5639,7 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3900,17 +3904,17 @@ var SlackAdapter = class _SlackAdapter {
+     const { channel, threadTs: rawThreadTs } = this.decodeThreadId(threadId);
+     const threadTs = rawThreadTs || void 0;
+     try {
+-      let uploadedFileIds;
++      let uploadedFiles;
+       const files = extractFiles(message);
+       if (files.length > 0) {
+-        uploadedFileIds = await this.uploadFiles(files, channel, threadTs);
++        uploadedFiles = await this.uploadFiles(files, channel, threadTs);
+         const hasText = typeof message === "string" || typeof message === "object" && message !== null && ("raw" in message && message.raw || "markdown" in message && message.markdown || "ast" in message && message.ast);
+         const card2 = extractCard(message);
+         if (!(hasText || card2)) {
+           return {
+-            id: `file-${Date.now()}`,
++            id: uploadedFiles.messageId,
+             threadId,
+-            raw: { files, uploadedFileIds }
++            raw: { files, uploadedFileIds: uploadedFiles.fileIds }
+           };
+         }
+       }
+@@ -3946,7 +3950,7 @@ var SlackAdapter = class _SlackAdapter {
+         return {
+           id: result2.ts,
+           threadId,
+-          raw: uploadedFileIds === void 0 ? result2 : { ...result2, uploadedFileIds }
++          raw: uploadedFiles === void 0 ? result2 : { ...result2, uploadedFileIds: uploadedFiles.fileIds }
+         };
+       }
+       const payload = this.formatConverter.toSlackPayload(message);
+@@ -3971,7 +3975,7 @@ var SlackAdapter = class _SlackAdapter {
+       return {
+         id: result.ts,
+         threadId,
+-        raw: uploadedFileIds === void 0 ? result : { ...result, uploadedFileIds }
++        raw: uploadedFiles === void 0 ? result : { ...result, uploadedFileIds: uploadedFiles.fileIds }
+       };
+     } catch (error) {
+       this.handleSlackError(error);
+@@ -4205,7 +4209,9 @@ var SlackAdapter = class _SlackAdapter {
+       (result2) => result2 !== null
+     );
+     if (fileUploads.length === 0) {
+-      return [];
++      const error = new Error("Slack file upload could not prepare any files");
++      error.name = "ValidationError";
++      throw error;
+     }
+     this.logger.debug("Slack API: files.uploadV2 (batch)", {
+       fileCount: fileUploads.length,
+@@ -4219,14 +4225,106 @@ var SlackAdapter = class _SlackAdapter {
+     const result = await this._client.files.uploadV2(uploadArgs);
+     this.logger.debug("Slack API: files.uploadV2 response", { ok: result.ok });
+     const fileIds = [];
++    const completedFiles = [];
+     if (result.files?.[0]?.files) {
+-      for (const uploadedFile of result.files[0].files) {
+-        if (uploadedFile.id) {
+-          fileIds.push(uploadedFile.id);
++      for (const completion of result.files) {
++        if (Array.isArray(completion.files)) {
++          for (const uploadedFile of completion.files) {
++            completedFiles.push(uploadedFile);
++            if (uploadedFile.id) {
++              fileIds.push(uploadedFile.id);
++            }
++          }
+         }
+       }
+     }
+-    return fileIds;
++    if (fileIds.length !== fileUploads.length || new Set(fileIds).size !== fileIds.length) {
++      throw new Error(
++        "Slack file upload completed, but its message identity could not be confirmed"
++      );
++    }
++    let messageId = this.slackFileShareMessageId(
++      completedFiles,
++      channel,
++      threadTs
++    );
++    if (!messageId) {
++      let timeout;
++      try {
++        const lookup = Promise.all(
++          fileIds.map(async (file) => this._client.files.info(
++            await this.withToken({ file })
++          ))
++        );
++        const infos = await Promise.race([
++          lookup,
++          new Promise((_, reject) => {
++            timeout = setTimeout(
++              () => reject(new Error("Slack file identity lookup timed out")),
++              5e3
++            );
++            timeout.unref?.();
++          })
++        ]);
++        const infoFiles = infos.map((info) => info.file);
++        if (infoFiles.some((file, index) => !file || file.id !== fileIds[index])) {
++          throw new Error("Slack file identity lookup did not match the uploaded files");
++        }
++        messageId = this.slackFileShareMessageId(infoFiles, channel, threadTs);
++      } catch {
++        throw new Error(
++          "Slack file upload completed, but its message identity could not be confirmed"
++        );
++      } finally {
++        clearTimeout(timeout);
++      }
++    }
++    if (!messageId) {
++      throw new Error(
++        "Slack file upload completed, but its message identity could not be confirmed"
++      );
++    }
++    return { fileIds, messageId };
++  }
++  slackFileShareMessageId(files, channel, threadTs) {
++    if (!Array.isArray(files) || files.length === 0) {
++      return null;
++    }
++    const messageIdsByFile = files.map((file) => {
++      const messageIds = /* @__PURE__ */ new Set();
++      const shares = file?.shares;
++      if (!shares || typeof shares !== "object") {
++        return messageIds;
++      }
++      for (const group of Object.values(shares)) {
++        if (!group || typeof group !== "object") {
++          continue;
++        }
++        const channelShares = group[channel];
++        if (!Array.isArray(channelShares)) {
++          continue;
++        }
++        for (const share of channelShares) {
++          if (!share || typeof share !== "object" || typeof share.ts !== "string" || !/^\d+\.\d+$/.test(share.ts)) {
++            continue;
++          }
++          const shareThreadTs = typeof share.thread_ts === "string" && share.thread_ts ? share.thread_ts : void 0;
++          if (threadTs ? shareThreadTs !== threadTs : shareThreadTs !== void 0) {
++            continue;
++          }
++          messageIds.add(share.ts);
++        }
++      }
++      return messageIds;
++    });
++    if (messageIdsByFile.some((messageIds) => messageIds.size === 0)) {
++      return null;
++    }
++    const [first, ...rest] = messageIdsByFile;
++    const sharedMessageIds = [...first].filter(
++      (messageId) => rest.every((messageIds) => messageIds.has(messageId))
++    );
++    return sharedMessageIds.length === 1 ? sharedMessageIds[0] : null;
+   }
+   async editMessage(threadId, messageId, _message) {
+     const message = await this.resolveMessageMentions(_message, threadId);
+@@ -5636,6 +5734,7 @@ var SlackAdapter = class _SlackAdapter {
        method: "POST",
        headers: { "Content-Type": "application/json" },
 -      body: JSON.stringify(payload)

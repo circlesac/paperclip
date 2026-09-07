@@ -23448,6 +23448,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         .where(
           and(
             inArray(chatPublications.state, ["pending", "retry"]),
+            // Inactive endpoints must not consume the eligibility page or
+            // acquire an artificial retry deadline. When an operator resumes
+            // them, due work is immediately eligible; genuine provider retry
+            // deadlines below remain unchanged.
+            notExists(
+              db
+                .select({ id: chatEndpoints.id })
+                .from(chatEndpoints)
+                .where(
+                  and(
+                    eq(chatEndpoints.id, chatPublications.endpointId),
+                    inArray(chatEndpoints.status, ["paused", "attention"]),
+                  ),
+                ),
+            ),
             or(
               isNull(chatPublications.nextAttemptAt),
               lte(chatPublications.nextAttemptAt, now),
@@ -23611,10 +23626,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               .set({
                 state: "pending",
                 attempts: publication.attempts,
-                // Keep a blocked endpoint out of the current eligibility page.
-                // A null deadline would let the globally oldest row win every
-                // sweep and starve healthy endpoints forever.
-                nextAttemptAt: new Date(now.getTime() + 30_000),
+                // Pause can race the eligibility read. The query excludes
+                // inactive endpoints on the next pass, so retain only the
+                // original provider deadline rather than delaying Resume.
+                nextAttemptAt: publication.nextAttemptAt,
                 updatedAt: new Date(),
               })
               .where(

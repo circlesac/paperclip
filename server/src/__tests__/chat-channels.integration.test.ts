@@ -149,6 +149,7 @@ class FakeEndpointRuntime {
   }> = [];
   readonly removeReactionErrors: Error[] = [];
   readonly rehydratedAttachmentDescriptors: unknown[] = [];
+  readonly postResultIds: string[] = [];
   readonly ensuredDiscordRootThreads: Array<{
     channelId: string;
     content: string;
@@ -328,7 +329,10 @@ class FakeEndpointRuntime {
           ...(files ? { files } : {}),
         });
         this.nextPostId += 1;
-        return { id: `outbound-${this.nextPostId}`, threadId };
+        return {
+          id: this.postResultIds.shift() ?? `outbound-${this.nextPostId}`,
+          threadId,
+        };
       },
     };
   }
@@ -18479,15 +18483,36 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
-  it("backs off a paused endpoint without starving a healthy endpoint publication", async () => {
+  it("skips paused outbox heads and resumes promptly without bypassing provider backoff", async () => {
     const fixture = await seedCompany();
     const blockedFetch = fakeSlackFetch("U-BLOCKED-OUTBOX");
     const readyFetch = fakeSlackFetch("U-READY-OUTBOX");
+    let includeResumeChannel = false;
     const providerFetch = (
       input: string | URL | Request,
       init?: RequestInit,
     ) => {
       const authorization = new Headers(init?.headers).get("authorization");
+      if (
+        includeResumeChannel &&
+        String(input).startsWith("https://slack.com/api/conversations.list") &&
+        authorization === "Bearer xoxb-blocked-outbox"
+      ) {
+        return Promise.resolve(
+          Response.json({
+            ok: true,
+            channels: [
+              {
+                id: "C-PAUSED-ENDPOINT",
+                name: "paused-endpoint",
+                is_member: true,
+                is_archived: false,
+              },
+            ],
+            response_metadata: { next_cursor: "" },
+          }),
+        );
+      }
       return authorization === "Bearer xoxb-blocked-outbox"
         ? blockedFetch(input, init)
         : readyFetch(input, init);
@@ -18606,11 +18631,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     if (!blockedConversation || !readyConversation) {
       throw new Error("Expected both endpoint conversations");
     }
+    const [blockedSetup] = await db
+      .select({ setup: chatEndpoints.setup })
+      .from(chatEndpoints)
+      .where(eq(chatEndpoints.id, blockedEndpoint.id));
     await db
       .update(chatEndpoints)
-      .set({ status: "paused" })
+      .set({ setup: { ...blockedSetup.setup, step: "complete" } })
       .where(eq(chatEndpoints.id, blockedEndpoint.id));
+    await service.configure(
+      blockedEndpoint.id,
+      { action: "pause" },
+      "owner-user",
+    );
     const createdAt = new Date("2026-09-05T15:11:00.000Z");
+    const providerRetryAt = new Date(Date.now() + 60_000);
     await db.insert(chatPublications).values([
       {
         companyId: fixture.companyId,
@@ -18632,44 +18667,106 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         state: "pending",
         createdAt: new Date(createdAt.getTime() + 1),
       },
+      {
+        companyId: fixture.companyId,
+        endpointId: blockedEndpoint.id,
+        conversationId: blockedConversation.id,
+        issueId: blockedConversation.issueId,
+        idempotencyKey: `provider-backoff:${blockedEndpoint.id}`,
+        payload: { text: "Provider rate limit still applies" },
+        state: "retry",
+        attempts: 2,
+        nextAttemptAt: providerRetryAt,
+        createdAt: new Date(createdAt.getTime() + 2),
+      },
     ]);
 
-    await service.processPendingPublications(25);
+    // Even the smallest global page must skip paused work without consuming
+    // its attempt budget or imposing an artificial resume deadline.
+    try {
+      await service.processPendingPublications(1);
 
-    await expect(
-      db
-        .select({
-          idempotencyKey: chatPublications.idempotencyKey,
-          nextAttemptAt: chatPublications.nextAttemptAt,
-          state: chatPublications.state,
-        })
-        .from(chatPublications)
+      await expect(
+        db
+          .select({
+            idempotencyKey: chatPublications.idempotencyKey,
+            nextAttemptAt: chatPublications.nextAttemptAt,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(
+            inArray(chatPublications.idempotencyKey, [
+              `paused-endpoint:${blockedEndpoint.id}`,
+              `ready-endpoint:${readyEndpoint.id}`,
+            ]),
+          )
+          .orderBy(asc(chatPublications.createdAt)),
+      ).resolves.toEqual([
+        {
+          idempotencyKey: `paused-endpoint:${blockedEndpoint.id}`,
+          nextAttemptAt: null,
+          state: "pending",
+        },
+        {
+          idempotencyKey: `ready-endpoint:${readyEndpoint.id}`,
+          nextAttemptAt: null,
+          state: "published",
+        },
+      ]);
+      expect(runtime.endpoints.get(readyEndpoint.id)?.posts).toEqual([
+        {
+          text: "Healthy endpoint publication",
+          threadId: readyThread.thread.id,
+        },
+      ]);
+      includeResumeChannel = true;
+      await service.configure(
+        blockedEndpoint.id,
+        { action: "resume" },
+        "owner-user",
+      );
+      await service.processPendingPublications(1);
+      expect(runtime.endpoints.get(blockedEndpoint.id)?.posts).toEqual([
+        {
+          text: "Blocked by paused endpoint",
+          threadId: blockedThread.thread.id,
+        },
+      ]);
+      await expect(
+        db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+            nextAttemptAt: chatPublications.nextAttemptAt,
+          })
+          .from(chatPublications)
+          .where(
+            eq(
+              chatPublications.idempotencyKey,
+              `provider-backoff:${blockedEndpoint.id}`,
+            ),
+          ),
+      ).resolves.toEqual([
+        { state: "retry", attempts: 2, nextAttemptAt: providerRetryAt },
+      ]);
+    } finally {
+      // Deliberate pending fixtures must not leak into later shared-DB tests,
+      // even when a fairness or resume assertion fails.
+      await db
+        .update(chatPublications)
+        .set({ state: "cancelled", nextAttemptAt: null })
         .where(
-          inArray(chatPublications.idempotencyKey, [
-            `paused-endpoint:${blockedEndpoint.id}`,
-            `ready-endpoint:${readyEndpoint.id}`,
-          ]),
-        )
-        .orderBy(asc(chatPublications.createdAt)),
-    ).resolves.toEqual([
-      {
-        idempotencyKey: `paused-endpoint:${blockedEndpoint.id}`,
-        nextAttemptAt: expect.any(Date),
-        state: "pending",
-      },
-      {
-        idempotencyKey: `ready-endpoint:${readyEndpoint.id}`,
-        nextAttemptAt: null,
-        state: "published",
-      },
-    ]);
-    expect(runtime.endpoints.get(readyEndpoint.id)?.posts).toEqual([
-      {
-        text: "Healthy endpoint publication",
-        threadId: readyThread.thread.id,
-      },
-    ]);
-    await service.shutdown();
+          and(
+            inArray(chatPublications.idempotencyKey, [
+              `paused-endpoint:${blockedEndpoint.id}`,
+              `ready-endpoint:${readyEndpoint.id}`,
+              `provider-backoff:${blockedEndpoint.id}`,
+            ]),
+            inArray(chatPublications.state, ["pending", "retry"]),
+          ),
+        );
+      await service.shutdown();
+    }
   });
 
   it("does not let pause return while a Slack publication is still in provider transport", async () => {
@@ -28448,6 +28545,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ),
     );
 
+    const endpointRuntime = runtime.endpoints.get(endpoint.id);
+    if (!endpointRuntime) throw new Error("Expected Slack endpoint runtime");
+    endpointRuntime.postResultIds.push("1788.301", "1788.302");
     await service.processPendingPublications();
     const publications = await db
       .select()
@@ -28461,6 +28561,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }),
       expect.objectContaining({
         state: "published",
+        providerMessageId: "1788.302",
         payload: expect.objectContaining({ attachmentIds: [attachment.id] }),
       }),
     ]);
@@ -28480,6 +28581,65 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ],
       },
     ]);
+
+    const [fileMessageLink] = await db
+      .select()
+      .from(chatMessageLinks)
+      .where(
+        and(
+          eq(chatMessageLinks.endpointId, endpoint.id),
+          eq(chatMessageLinks.conversationId, conversation.id),
+          eq(chatMessageLinks.direction, "outbound"),
+          eq(chatMessageLinks.providerMessageId, "1788.302"),
+        ),
+      );
+    expect(fileMessageLink).toMatchObject({
+      commentId: response.id,
+      providerMessageId: "1788.302",
+    });
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const fileMessage = makeMessage({
+      id: "1788.302",
+      text: "",
+      mentioned: false,
+    });
+    await callbacks.onReaction({
+      endpointId: endpoint.id,
+      provider: "slack",
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "thumbs_up",
+          toJSON: () => ":thumbs_up:",
+          toString: () => ":thumbs_up:",
+        },
+        message: fileMessage,
+        messageId: fileMessage.id,
+        raw: { event_ts: "1788.400" },
+        rawEmoji: "+1",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: fileMessage.author,
+      },
+    });
+    const [reactionDelivery] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.conversationId, conversation.id),
+          eq(chatDeliveries.eventKind, "reaction_added"),
+        ),
+      );
+    expect(reactionDelivery).toMatchObject({
+      state: "processed",
+      normalizedEvent: expect.objectContaining({
+        message: { providerMessageId: "1788.302" },
+        reaction: expect.objectContaining({ emoji: "thumbs_up" }),
+      }),
+    });
   });
 
   it("hands an explicitly bound same-run image to Discord's final native file response", async () => {
@@ -31368,8 +31528,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it("acknowledges a Slack retry while one durable worker owns the unrecorded command root", async () => {
     const fixture = await seedCompany();
-    const { callbacks, endpoint, runtime, service } =
-      await configuredSlackEndpoint(fixture);
+    const scheduledWork: Array<() => void> = [];
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture, {
+        // Transport and Paperclip admission are separate durable phases.
+        // Run transport explicitly, then hold the delivery drain until reach
+        // revocation has committed instead of racing their query scheduling.
+        deferWebhookProcessing: true,
+        scheduleDeferredWork: (task) => scheduledWork.push(task),
+      });
     const command = endpoint.setup.command;
     if (!command) throw new Error("Slack endpoint did not expose its command");
     if (!callbacks.onSlashCommand) {
@@ -31430,6 +31597,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
     };
     const owner = callbacks.onSlashCommand(slashEvent);
+    await owner;
+    expect(scheduledWork).toHaveLength(1);
+    scheduledWork.shift()!();
     await vi.waitFor(() => expect(postEntered).toHaveBeenCalledTimes(1));
     await expect(
       Promise.race([
@@ -31441,9 +31611,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ),
       ]),
     ).resolves.toBe("acknowledged");
+    // The duplicate's worker must converge on the resolving action without
+    // starting a second provider root while the first request remains held.
+    expect(scheduledWork).toHaveLength(1);
+    scheduledWork.shift()!();
 
     const taskStart = await db
       .select({
+        id: chatActions.id,
         principalId: chatActions.principalId,
         status: chatActions.status,
       })
@@ -31486,23 +31661,93 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(revocationSettled).toBe(false);
+    await expect(
+      db
+        .select({ enabled: chatEndpointResources.enabled })
+        .from(chatEndpointResources)
+        .where(eq(chatEndpointResources.id, resource!.id)),
+    ).resolves.toEqual([{ enabled: true }]);
+    expect(postEntered).toHaveBeenCalledTimes(1);
     releasePost();
-    await owner;
     await revokeReach;
     expect(revocationSettled).toBe(true);
     providerRuntime.postHook = undefined;
     expect(post).not.toHaveBeenCalled();
-    await vi.waitFor(
-      async () =>
-        expect(await service.listConversations(endpoint.id)).toHaveLength(1),
-      { timeout: 2_000 },
+    await vi.waitFor(async () => {
+      const [action] = await db
+        .select({ status: chatActions.status })
+        .from(chatActions)
+        .where(eq(chatActions.id, taskStart.id));
+      expect(action?.status).toBe("processed");
+    });
+    const [stagedDelivery] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.endpointId, endpoint.id));
+    expect(stagedDelivery).toMatchObject({ state: "received" });
+    if (!stagedDelivery)
+      throw new Error("Expected the durable Slack starter receipt");
+    expect(stagedDelivery.normalizedEvent).toMatchObject({
+      admission: { origin: "provider_confirmed_action" },
+    });
+    expect(wakeup).not.toHaveBeenCalled();
+    await expect(service.listConversations(endpoint.id)).resolves.toEqual([]);
+    await expect(
+      db
+        .select({ enabled: chatEndpointResources.enabled })
+        .from(chatEndpointResources)
+        .where(eq(chatEndpointResources.id, resource!.id)),
+    ).resolves.toEqual([{ enabled: false }]);
+
+    // Expire only this receipt's reorder window, then drain after revocation.
+    // Provider acceptance is not a grant to create a Paperclip task later.
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: new Date(0) })
+      .where(eq(chatDeliveries.id, stagedDelivery.id));
+    await service.processPendingDeliveries(1, stagedDelivery.id);
+    await expect(
+      db
+        .select({
+          state: chatDeliveries.state,
+          principalId: chatDeliveries.principalId,
+          redactedError: chatDeliveries.redactedError,
+          normalizedEvent: chatDeliveries.normalizedEvent,
+        })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.id, stagedDelivery.id)),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        state: "filtered",
+        principalId: null,
+        redactedError: "Destination is not enabled in Paperclip",
+        normalizedEvent: expect.objectContaining({
+          filtering: { contentRetained: false },
+        }),
+      }),
+    ]);
+    const [filteredDelivery] = await db
+      .select({ normalizedEvent: chatDeliveries.normalizedEvent })
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, stagedDelivery.id));
+    expect(JSON.stringify(filteredDelivery?.normalizedEvent)).not.toContain(
+      slashEvent.event.text,
     );
+    await expect(service.listConversations(endpoint.id)).resolves.toEqual([]);
+    await expect(
+      db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.companyId, fixture.companyId)),
+    ).resolves.toEqual([]);
+    expect(wakeup).not.toHaveBeenCalled();
     expect(providerRuntime.posts).toEqual([
       {
         threadId: "slack:C-COMMAND-ORPHAN:",
         text: "Starting a task…",
       },
     ]);
+    await service.shutdown();
   });
 
   it("treats D-prefixed Slack status, new, and close callbacks as DM task controls even when the SDK flag is false", async () => {

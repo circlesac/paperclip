@@ -225,3 +225,69 @@ All four configured endpoints were active; all four previous internal-only
 fixtures remained unbound. These checks establish successful transport and Board
 recovery on the updated backend, not additional model qualification, a throughput
 SLA, downloaded provider-byte checksums, or native GitHub file upload support.
+
+### Retained filename receipt and resume latency finding
+
+UI commit `9763e11fc` fixes the pending-file selection issue. Its filename
+snapshots remain local to the session's existing scoped send record; they do
+not change the publication payload or authorize resending bound files. Focused
+tests passed **46/46**, mocked Board browser cases **4/4**, and UI typecheck,
+token gates, and diff-check passed.
+
+Retested live with the unchanged snapshot-11 backend and the refreshed Vite UI.
+Paused Slack, then sent `BOARD-RECEIPT-CHECK` with `board-receipt-check-note.txt`
+and `board-receipt-check-cat.png` at **19:58:15.799 UTC**. Before and after reload,
+the composer showed **Files in this send** with exactly those two names checked
+and disabled. The canonical timeline also showed the one new comment and both
+attachments. After eventual completion, a new empty draft offered only the
+unbound internal-only file, not the files already sent.
+
+The resume at **19:58:22.029** exposed a separate scheduling defect: the paused
+head had acquired a synthetic deadline of **19:58:45.898**. Text, document, and
+image eventually published at **19:58:46.193**, **19:58:46.887**, and
+**19:58:47.515**, under comment `0eae4850-b752-4f62-bd63-05ff6c27e427`. Slack
+visibly received all three, but the approximately 25-second post-resume wait is
+not acceptable transport latency. The scheduling correction and its live retest
+are separate from the successful filename-persistence result.
+
+## Subsequent scheduling and Slack identity hardening
+
+The publication selector now excludes paused/attention endpoints before applying
+its global page limit. A pause racing an already-selected row restores its
+original deadline, not a synthetic 30-second delay. Resume therefore makes due
+work eligible immediately without clearing genuine provider rate-limit or
+storage-retry deadlines. DB18 reproduced both the old delay and starvation with
+a one-row page. The revised fixture also resumes through the real configuration
+service and verifies an unrelated provider backoff remains unchanged. DB19
+exposed incomplete fixture inventory during provider revalidation; the test now
+returns its actually available channel rather than bypassing the reach check.
+
+The pinned Slack adapter now uses the uploaded file's real share timestamp for
+its exact channel/thread. Sparse upload responses use a bounded, read-only
+`files.info` lookup under the existing required `files:read` scope. Every returned
+file must match its expected uploaded ID and have one unambiguous common share
+timestamp. Missing, mismatched, timed-out, or ambiguous identities after upload
+remain `delivery_unknown`, not synthetic success or a retry that uploads again.
+An unpreparable local file fails definitively before transport. Adapter and
+bounded-hydration units passed **49/49** after the final patch; server typecheck
+passed. Applying the tracked patch to pristine 4.39.0 reproduced the installed
+adapter bytes exactly. The lockfile remains unchanged as instructed; a fresh
+frozen-lockfile install was not part of this check.
+
+DB20 passed **268/269**, including the new resume and exact Slack file-ID tests.
+Its failure was an existing slash-command test that raced provider-root
+completion against channel-access revocation and assumed a task must result.
+The recorded delivery was correctly filtered because the destination was
+disabled. The test now explicitly controls transport and admission scheduling,
+retains the duplicate-acknowledgement and lease assertions, commits revocation,
+then drains the exact receipt and requires denial with no task or wake. No
+production authorization check was relaxed to make that expectation pass.
+
+The clean combined DB21 rerun passed **269/269**. The isolated deterministic
+revocation test also passed on its own newly migrated database; server typecheck
+passed after the final test changes. Live verification of the new Slack identity
+and scheduling behavior follows separately.
+
+The separate early-reaction race remains open: a reaction arriving before the
+outbound message link commits currently has no exact lineage and is dropped.
+Resolving real Slack file IDs fixes normal post-commit matching, not that race.
