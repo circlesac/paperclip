@@ -147,6 +147,38 @@ describe("native runner file handoff", () => {
     };
   }
 
+  async function createInboundAttachmentFixture(input: {
+    storage: StorageService;
+    filename: string;
+    body: Buffer;
+    commentBody: string;
+  }) {
+    const stored = await input.storage.putFile({
+      companyId,
+      namespace: `issues/${issueId}`,
+      originalFilename: input.filename,
+      contentType: "text/plain",
+      body: input.body,
+    });
+    const comment = await issueService(db).addComment(
+      issueId,
+      input.commentBody,
+      { userId: "inbound-user" },
+    );
+    const attachment = await issueService(db).createAttachment({
+      issueId,
+      issueCommentId: comment.id,
+      provider: stored.provider,
+      objectKey: stored.objectKey,
+      contentType: stored.contentType,
+      byteSize: stored.byteSize,
+      sha256: stored.sha256,
+      originalFilename: stored.originalFilename,
+      createdByUserId: "inbound-user",
+    });
+    return { attachment, comment, stored };
+  }
+
   it("prepares one verified same-run attachment and replays without duplicates", async () => {
     const body = Buffer.from("native runner file handoff\n", "utf8");
     await mkdir(path.join(workspaceRoot, "out"), { recursive: true });
@@ -582,6 +614,166 @@ describe("native runner file handoff", () => {
       }),
     ]);
     await remoteStage.cleanup();
+  });
+
+  it("excludes an older same-issue attachment when the current wake selects a newer file", async () => {
+    const storage = createStorageService(
+      createLocalDiskStorageProvider(storageRoot),
+    );
+    const historicalBody = Buffer.from(
+      "historical decoy marker: amber-larch-17\n",
+      "utf8",
+    );
+    const currentBody = Buffer.from(
+      "current wake marker: cobalt-sparrow-42\n",
+      "utf8",
+    );
+    const historical = await createInboundAttachmentFixture({
+      storage,
+      filename: "historical.txt",
+      body: historicalBody,
+      commentBody: "An older attachment from this task.",
+    });
+    const current = await createInboundAttachmentFixture({
+      storage,
+      filename: "current.txt",
+      body: currentBody,
+      commentBody: "Inspect only the file attached to this turn.",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          paperclipWake: {
+            comments: [
+              {
+                id: current.comment.id,
+                body: "Inspect only the file attached to this turn.",
+                attachments: [
+                  {
+                    id: current.attachment.id,
+                    filename: "current.txt",
+                    contentType: "text/plain",
+                    byteSize: currentBody.length,
+                    contentPath: `/api/attachments/${current.attachment.id}/content`,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const objectReads: string[] = [];
+    const observingStorage: StorageService = {
+      ...storage,
+      getObject: async (readCompanyId, objectKey, options) => {
+        objectReads.push(objectKey);
+        return storage.getObject(readCompanyId, objectKey, options);
+      },
+    };
+    const stage = await stageNativeRunnerWakeAttachments({
+      db,
+      binding: {
+        companyId,
+        issueId,
+        runId,
+        agentId,
+        workspaceRoot,
+        executionTargetKind: "local",
+      },
+      storage: observingStorage,
+    });
+
+    expect(stage.attachments).toEqual([
+      expect.objectContaining({
+        id: current.attachment.id,
+        filename: "current.txt",
+        unavailableReason: null,
+      }),
+    ]);
+    expect(objectReads).toEqual([current.stored.objectKey]);
+    expect(objectReads).not.toContain(historical.stored.objectKey);
+    const relativePath = stage.attachments[0]?.workspaceRelativePath;
+    expect(relativePath).toBeTruthy();
+    await expect(
+      readFile(path.join(workspaceRoot, relativePath!)),
+    ).resolves.toEqual(currentBody);
+    await stage.cleanup();
+  });
+
+  it("stages no historical attachment when the current wake contains only an omission", async () => {
+    const storage = createStorageService(
+      createLocalDiskStorageProvider(storageRoot),
+    );
+    const historical = await createInboundAttachmentFixture({
+      storage,
+      filename: "omission-decoy.txt",
+      body: Buffer.from(
+        "never substitute this historical attachment\n",
+        "utf8",
+      ),
+      commentBody: "Historical file that is not part of the current wake.",
+    });
+    const currentComment = await issueService(db).addComment(
+      issueId,
+      "Inspect the current attachment if Paperclip imported it.",
+      { userId: "inbound-user" },
+    );
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          paperclipWake: {
+            comments: [
+              {
+                id: currentComment.id,
+                body: "Inspect the current attachment if Paperclip imported it.",
+                attachments: [],
+              },
+            ],
+            attachmentOmissions: [
+              {
+                commentId: currentComment.id,
+                reasons: { unsupported_type: 1 },
+              },
+            ],
+          },
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const objectReads: string[] = [];
+    const observingStorage: StorageService = {
+      ...storage,
+      getObject: async (readCompanyId, objectKey, options) => {
+        objectReads.push(objectKey);
+        return storage.getObject(readCompanyId, objectKey, options);
+      },
+    };
+    const stage = await stageNativeRunnerWakeAttachments({
+      db,
+      binding: {
+        companyId,
+        issueId,
+        runId,
+        agentId,
+        workspaceRoot,
+        executionTargetKind: "local",
+      },
+      storage: observingStorage,
+    });
+
+    expect(stage.attachments).toEqual([]);
+    expect(objectReads).toEqual([]);
+    expect(objectReads).not.toContain(historical.stored.objectKey);
+    expect(renderNativeRunnerStagedAttachmentPrompt(stage.attachments)).toBe(
+      "",
+    );
+    await stage.cleanup();
   });
 
   it("fails closed on a reminted work product and removes definite pre-commit storage failures", async () => {

@@ -320,15 +320,17 @@ export function TaskChatThreadView({
   attachments = [],
 }: TaskChatThreadViewProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
-  const retryableMarkerId = onRetryFailedRun || onTryAgainNoLiveExecutionPath
-    ? [...items]
-        .reverse()
-        .find(
-          (item) =>
-            item.kind === "marker" &&
-            item.variant === "interrupted" &&
-            item.label === "Run failed",
-        )?.id
+  const retryableMarkerId =
+    onRetryFailedRun || onTryAgainNoLiveExecutionPath
+      ? [...items]
+          .reverse()
+          .find(
+            (item) =>
+              item.kind === "marker" &&
+              item.variant === "interrupted" &&
+              (item.label === "Run failed" ||
+                item.label === "Usage limit reached"),
+          )?.id
       : undefined;
   const renderedItems = streamlined
     ? items

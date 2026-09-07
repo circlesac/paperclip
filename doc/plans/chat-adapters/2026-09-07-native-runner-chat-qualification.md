@@ -117,6 +117,32 @@ safe provider-facing capacity explanation. Model prose, tool output, raw
 provider error strings, account details, and reset URLs are not used as public
 error content. This last change is locally tested; it has not been live tested.
 
+### Post-live failure and attachment-isolation regressions
+
+A database-backed restart test reproduced a further capacity-error bug: after
+the provider terminal was committed but the controller stopped before its
+callback, replay of that exact event lost the usage-limit classification and
+scheduled another attempt. The duplicate-event observer now restores only that
+in-memory classification. It does not repeat logging, activity, or publication.
+Both first delivery and exact replay now persist `terminal_failure`, no next
+attempt or automatic wake, a board-owned capacity recovery action, and exactly
+one durable provider terminal. The test seeds the post-commit crash boundary and
+uses a simulated provider with real PostgreSQL; it is not a process-kill test or
+a new live Codex call.
+
+The task UI maps the closed native capacity code to “Usage limit reached” and
+explains when to retry, without exposing provider account details. The explicit
+retry callback remains subject to the existing server checks. The earlier live
+failure retains its original recorded error; it was not rewritten to fabricate
+post-fix UI evidence.
+
+Two additional database-backed file tests place an older decoy attachment on
+the same task. With a newer current-wake attachment, only the newer storage
+object is read and staged; with an omission-only current wake, no storage object
+is read and no file is staged. This verifies isolation, not the ability to
+retrieve or resend a historical attachment on request. That separate user
+journey remains unqualified.
+
 ## Slack callback recovery
 
 The exact `maya-e2e-paperclip` app, `A0C03GA5FPU`, still had a verified Events
@@ -267,6 +293,12 @@ by its peak concurrent staged attachment count, not by sequential turns.
   run: **552/552**. Capability inventory and generated-contract drift checks
   passed again. These are focused tests, not a claim that the workspace-wide
   test/build gate passed.
+- Post-live capacity replay, attachment-isolation, control-plane port, native
+  executor/reader, safe publication, and task UI checks: **256/256** across
+  seven focused suites. The replay test failed before the observer fix by
+  scheduling a new attempt, then passed. Server/UI TypeScript and UI token
+  gates passed. These simulated capacity cases do not replace the blocked
+  live quota-recovery retest.
 
 Broad workspace tests are not claimed green. Teams still needs the real Microsoft 365
 tenant/admin setup and has not received equivalent native live qualification.

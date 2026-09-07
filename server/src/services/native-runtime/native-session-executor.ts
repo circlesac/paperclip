@@ -4330,6 +4330,7 @@ async function executePaperclipNativeSessionWithinScope(
         // A crash can happen after the event commit but before its callback
         // finishes. Recover only idempotent durable projections here; activity,
         // publication, logging, trace, and metric effects remain committed-only.
+        providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
         const questionFallback = await materializeRuntimeQuestionFallback({
           db: input.db,
           binding: input.execution.binding,

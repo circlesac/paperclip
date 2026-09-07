@@ -984,6 +984,57 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(onRetryFailedRun).toHaveBeenCalledWith("native-failed");
   });
 
+  it("explains a native provider usage limit without exposing its error code", async () => {
+    const onRetryFailedRun = vi.fn();
+    render(
+      <TaskChatThread
+        comments={[]}
+        onAdd={async () => {}}
+        issueStatus="blocked"
+        onRetryFailedRun={onRetryFailedRun}
+        linkedRuns={[
+          {
+            runId: "native-usage-limit",
+            runtimeMode: "native",
+            status: "failed",
+            errorCode: "native_provider_usage_limit",
+            agentId: "agent-1",
+            agentName: "Runner",
+            adapterType: "paperclip_runner",
+            createdAt: "2026-08-25T18:00:00.000Z",
+            startedAt: "2026-08-25T18:00:00.000Z",
+            finishedAt: "2026-08-25T18:00:02.000Z",
+          },
+        ]}
+      />,
+    );
+
+    const marker = container.querySelector(
+      '[data-testid="task-chat-collapsible-marker"]',
+    );
+    expect(marker?.textContent).toContain("Usage limit reached");
+    expect(marker?.textContent).not.toContain("Run failed");
+    const disclosure = marker?.querySelector<HTMLButtonElement>(
+      'button[aria-expanded="false"]',
+    );
+    expect(disclosure).not.toBeNull();
+    flushSync(() => disclosure!.click());
+    const details = container.querySelector(
+      '[data-testid="task-chat-collapsible-marker-details"]',
+    );
+    expect(details?.textContent).toContain(
+      "The model provider has reached its current usage limit. Try again after the limit resets.",
+    );
+    expect(details?.textContent).not.toContain("native_provider_usage_limit");
+    const retry = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-run-failed-try-again"]',
+    );
+    expect(retry).not.toBeNull();
+    flushSync(() => retry!.click());
+    await Promise.resolve();
+    expect(onRetryFailedRun).toHaveBeenCalledWith("native-usage-limit");
+  });
+
   it("shows cancellation after native progress without offering a retry", () => {
     nativeTranscriptState.transcriptByRun.set("native-cancelled", [
       {

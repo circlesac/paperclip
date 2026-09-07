@@ -1354,13 +1354,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? "native_runner_timed_out"
             : "native_runner_process_exited");
         const label =
-          source.status === "cancelled"
-            ? "Run cancelled"
-            : source.status === "interrupted"
-              ? "Run interrupted"
-              : source.status === "timed_out"
-                ? "Run timed out"
-                : "Run failed";
+          code === "native_provider_usage_limit" && source.status === "failed"
+            ? "Usage limit reached"
+            : source.status === "cancelled"
+              ? "Run cancelled"
+              : source.status === "interrupted"
+                ? "Run interrupted"
+                : source.status === "timed_out"
+                  ? "Run timed out"
+                  : "Run failed";
         const responseBoundary = sourceHasNativeResponse
           ? "after returning a final response"
           : "before returning an answer";
@@ -1369,11 +1371,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             ? `The run was cancelled ${responseBoundary}.`
             : source.status === "interrupted"
               ? `The run was interrupted ${responseBoundary}.`
-              : code === "provider_frame_too_large"
-                ? "Provider output exceeded the safe limit."
-                : source.status === "timed_out"
-                  ? `The runner timed out ${responseBoundary} (${code}).`
-                  : `The runner stopped ${responseBoundary} (${code}).`;
+              : code === "native_provider_usage_limit" &&
+                  source.status === "failed"
+                ? "The model provider has reached its current usage limit. Try again after the limit resets."
+                : code === "provider_frame_too_large"
+                  ? "Provider output exceeded the safe limit."
+                  : source.status === "timed_out"
+                    ? `The runner timed out ${responseBoundary} (${code}).`
+                    : `The runner stopped ${responseBoundary} (${code}).`;
         const id = `${source.id}:failure`;
         const runAgent = meta?.agentId
           ? agentMap?.get(meta.agentId)

@@ -195,8 +195,15 @@ This was not a full Telegram runbook PASS. Private-chat commands, text documents
 
 - disabled-resource enforcement and linked/unlinked identity governance;
 - forged and expired real-provider actions beyond the tested one-shot native confirmation; native rendering, continuation, sibling expiry, accepted-state edit, and exact final delivery now have live evidence;
-- photos, audio, video, oversize or malformed media, and download-failure handling;
+- audio, video, oversize or malformed media, and download-failure handling;
 - flood-control retry, global token revocation, recovery, and credential rotation; and
 - the complete cleanup and evidence checklist.
 
 Telegram remains unqualified for stable release until the remaining live scenarios pass on the final release-candidate source.
+
+September 7 evidence update: real photo receipt and return now have live proof in
+[the media qualification](2026-09-07-media-live-qualification.md) and
+[the native Codex/Luna qualification](2026-09-07-native-runner-chat-qualification.md).
+The native run inspected the provider-delivered image and returned the same
+bytes as a photo. This does not qualify audio, video, failure handling, or
+reuse of an older attachment outside the current wake.
