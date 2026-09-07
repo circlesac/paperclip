@@ -107,3 +107,54 @@ An independent code audit also found outbound file hydration lacks a bounded
 storage read and persisted SHA-256 verification. That is failure-injection work,
 not a corruption observed in these successful live sends. Fixes and supporting
 tests are being handled separately; none is qualified by the preceding baseline.
+
+## Follow-up implementation and deterministic verification
+
+The outbound reader now checks the persisted SHA-256 and exact byte length,
+bounds storage acquisition and streaming to ten seconds each, and destroys a
+stream returned after timeout. Task/comment scope and metadata validation run
+before storage access. Invalid metadata fails definitively; storage/query/read
+failures remain safe pre-provider retries under the existing five-attempt limit.
+An accepted provider send with an uncertain durable result still becomes
+`delivery_unknown`, never an automatic retry.
+
+The Board composer now uses a scoped read-only batch-status endpoint. It waits
+for every text/file part, observes explicit Activity resolution, and refreshes
+both UUID and canonical-identifier task caches. Its exact submitted payload,
+selected files, and idempotency key are stored before POST in session-scoped
+browser storage. Reload resumes a known anchor through GET only; a lost response
+restores a locked draft with an explicit same-key **Retry safely** action.
+Storage failure before submission prevents an untracked send. State and late
+responses are isolated by company, task, endpoint, and conversation. This is
+reload/navigation continuity within that browser session, not a cross-device
+draft synchronization claim.
+
+Verification before restarting the live server:
+
+- Fresh PostgreSQL integration: **269/269**, database
+  `chat_adapters_test_20260907_latency_17` (78.12 seconds).
+- Focused UI/API/OpenAPI/draft tests: **43/43**; separate hydration/API/OpenAPI
+  subset: **17/17**, including four bounded-read/integrity unit cases.
+- Five-provider browser file plus Board regressions: **9/9**; clean final Board
+  subset after scope hardening: **4/4** (39.9 seconds).
+- Shared/server/UI typechecks, UI token gates, and diff checks passed.
+- The lockfile was unchanged; no broad workspace-test pass is claimed.
+
+The previous DB14 run passed 268 cases before the final pretransport guard
+expansion. DB15 exposed metadata validation being masked by missing storage;
+the guard ordering was corrected, not the expected security result weakened.
+That run also exposed leaked retry work in a projection-only test fixture. The
+fixture now retires its exact staged publication and shuts down its service;
+new hydration tests shut down in `finally`. DB16 passed the new cases but found
+a timing assumption in a GitHub lease test: a nonblocking HTTP response can
+precede the worker claim. The test now waits for the same required `processing`
+state while the lease is held. DB17 is the clean combined result above.
+
+An early full browser run overlapped development hot reload and missed one
+success toast; the final clean runs supersede it. The initial red browser test
+also established that the old component made zero status GETs for eight seconds
+and kept the completed send disabled.
+
+Live retesting on the updated backend remains separate from these deterministic
+results. A further code audit found synthetic Slack file-share message IDs;
+reaction matching on uploaded Slack files is not yet qualified.

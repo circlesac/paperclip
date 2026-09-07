@@ -61,6 +61,26 @@ describe("chatEndpointsApi", () => {
     );
   });
 
+  it("reads a stable publication batch anchor without posting", async () => {
+    const status = {
+      publication: { id: "file-part", state: "pending", attempts: 0 },
+      total: 2,
+      published: 1,
+    };
+    mockApi.get.mockResolvedValue(status);
+    await expect(
+      chatEndpointsApi.getPublicationBatchStatus(
+        "endpoint-1",
+        "conversation-1",
+        "text-part",
+      ),
+    ).resolves.toEqual(status);
+    expect(mockApi.get).toHaveBeenCalledWith(
+      "/chat-endpoints/endpoint-1/conversations/conversation-1/publications/text-part/status",
+    );
+    expect(mockApi.post).not.toHaveBeenCalled();
+  });
+
   it("sends only explicitly selected attachment ids with a board message", async () => {
     mockApi.post.mockResolvedValue({
       id: "publication-file",

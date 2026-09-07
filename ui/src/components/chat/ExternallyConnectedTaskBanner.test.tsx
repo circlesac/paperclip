@@ -7,10 +7,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ExternallyConnectedTaskBanner } from "./ExternallyConnectedTaskBanner";
+import { boardSendDraftKey, readBoardSendDraft } from "./board-send-draft";
 
 const mockChatEndpointsApi = vi.hoisted(() => ({
   getIssueBinding: vi.fn(),
   publishBoardMessage: vi.fn(),
+  getPublicationBatchStatus: vi.fn(),
 }));
 const pushToastMock = vi.hoisted(() => vi.fn());
 
@@ -78,7 +80,10 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
   let container: HTMLDivElement;
   let root: Root;
 
-  async function renderBanner(attachments: IssueAttachment[] = []) {
+  async function renderBanner(
+    attachments: IssueAttachment[] = [],
+    issueCacheRefs?: string[],
+  ) {
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
@@ -89,11 +94,13 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
             attachments={attachments}
             companyId="company-1"
             issueId="issue-1"
+            issueCacheRefs={issueCacheRefs}
           />
         </QueryClientProvider>,
       );
     });
     await flushReact();
+    return queryClient;
   }
 
   async function composeAndSubmit(value = "Visible board update") {
@@ -112,6 +119,10 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
+    mockChatEndpointsApi.getPublicationBatchStatus.mockImplementation(
+      () => new Promise(() => {}),
+    );
     mockChatEndpointsApi.getIssueBinding.mockResolvedValue({
       endpointId: "endpoint-1",
       provider: "slack",
@@ -130,6 +141,7 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
   afterEach(() => {
     flushSync(() => root.unmount());
     container.remove();
+    vi.restoreAllMocks();
   });
 
   it("only reports success and clears the draft after confirmed publication", async () => {
@@ -179,7 +191,8 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       createdByUserId: null,
       createdAt: new Date(),
       updatedAt: new Date(),
-      contentPath: "/api/attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/content",
+      contentPath:
+        "/api/attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/content",
     } satisfies IssueAttachment;
     await renderBanner([
       attachment,
@@ -215,6 +228,83 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       expect.any(String),
       [attachment.id],
     );
+  });
+
+  it("refreshes a retained send and clears it only after every batch part is published", async () => {
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValue({
+      id: "text-part",
+      state: "streaming",
+      attempts: 1,
+    });
+    mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+      publication: { id: "file-part", state: "pending", attempts: 0 },
+      total: 2,
+      published: 1,
+    });
+    const queryClient = await renderBanner();
+    await composeAndSubmit();
+    await flushReact();
+    expect(mockChatEndpointsApi.getPublicationBatchStatus).toHaveBeenCalledWith(
+      "endpoint-1",
+      "conversation-1",
+      "text-part",
+    );
+    expect(container.querySelector("textarea")?.value).toBe(
+      "Visible board update",
+    );
+    expect(container.textContent).toContain("Queued for channel");
+    mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+      publication: { id: "file-part", state: "published", attempts: 1 },
+      total: 2,
+      published: 2,
+    });
+    await queryClient.invalidateQueries({
+      queryKey: ["chat-publication-batch"],
+    });
+    await flushReact();
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
+    expect(
+      mockChatEndpointsApi.getPublicationBatchStatus.mock.calls.every(
+        (call) => call[2] === "text-part",
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a draft across status read errors and invalidates canonical task aliases", async () => {
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValue({
+      id: "text-part",
+      state: "streaming",
+      attempts: 1,
+    });
+    mockChatEndpointsApi.getPublicationBatchStatus.mockRejectedValue(
+      new Error("Status temporarily unavailable"),
+    );
+    const queryClient = await renderBanner([], ["issue-1", "CHA-2"]);
+    const invalidated = vi.spyOn(queryClient, "invalidateQueries");
+    await composeAndSubmit();
+    await flushReact();
+    expect(container.textContent).toContain(
+      "Delivery status could not be refreshed",
+    );
+    expect(container.querySelector("textarea")?.value).toBe(
+      "Visible board update",
+    );
+    expect(container.querySelector("textarea")?.disabled).toBe(true);
+    expect(invalidated).toHaveBeenCalledWith({
+      queryKey: ["issues", "comments", "CHA-2"],
+    });
+    mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+      publication: { id: "file-part", state: "published", attempts: 1 },
+      total: 2,
+      published: 1,
+    });
+    await queryClient.invalidateQueries({
+      queryKey: ["chat-publication-batch"],
+    });
+    await flushReact();
+    expect(container.querySelector("textarea")?.disabled).toBe(true);
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
   });
 
   it("explains GitHub's link-only file boundary before publication", async () => {
@@ -352,5 +442,151 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       "Visible board update",
     );
     expect(container.querySelector("textarea")?.disabled).toBe(false);
+  });
+
+  it("restores a pending batch after reload without another POST", async () => {
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValue({
+      id: "original-anchor",
+      state: "streaming",
+      attempts: 1,
+    });
+    await renderBanner();
+    await composeAndSubmit("Reload-safe board send");
+    flushSync(() => root.unmount());
+    root = createRoot(container);
+    await renderBanner();
+    expect(container.querySelector("textarea")?.value).toBe(
+      "Reload-safe board send",
+    );
+    expect(container.querySelector("textarea")?.disabled).toBe(true);
+    expect(
+      mockChatEndpointsApi.getPublicationBatchStatus,
+    ).toHaveBeenLastCalledWith(
+      "endpoint-1",
+      "conversation-1",
+      "original-anchor",
+    );
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores an unconfirmed payload after reload and only explicitly retries the same identity", async () => {
+    mockChatEndpointsApi.publishBoardMessage.mockRejectedValueOnce(
+      new Error("Response lost"),
+    );
+    await renderBanner();
+    await composeAndSubmit("Exact request survives reload");
+    const firstCall = mockChatEndpointsApi.publishBoardMessage.mock.calls[0];
+    flushSync(() => root.unmount());
+    root = createRoot(container);
+    await renderBanner();
+    expect(container.querySelector("textarea")?.value).toBe(
+      "Exact request survives reload",
+    );
+    expect(container.querySelector("textarea")?.disabled).toBe(true);
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
+    expect(
+      mockChatEndpointsApi.getPublicationBatchStatus,
+    ).not.toHaveBeenCalled();
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValueOnce({
+      id: "confirmed",
+      state: "published",
+      attempts: 1,
+    });
+    await act(() => findButton(container, "Retry safely").click());
+    await flushReact();
+    expect(mockChatEndpointsApi.publishBoardMessage.mock.calls[1]).toEqual(
+      firstCall,
+    );
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it("does not send when browser storage cannot preserve the request identity", async () => {
+    await renderBanner();
+    vi.spyOn(
+      Object.getPrototypeOf(sessionStorage),
+      "setItem",
+    ).mockImplementation(() => {
+      throw new Error("Storage full");
+    });
+    await composeAndSubmit();
+    expect(mockChatEndpointsApi.publishBoardMessage).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("No update was sent");
+  });
+
+  it("isolates an in-flight send and its late response when the binding scope changes", async () => {
+    let finishOldSend!: (value: unknown) => void;
+    mockChatEndpointsApi.publishBoardMessage.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishOldSend = resolve;
+        }),
+    );
+    const queryClient = await renderBanner();
+    await composeAndSubmit("Original conversation only");
+    const originalCall = mockChatEndpointsApi.publishBoardMessage.mock.calls[0];
+    queryClient.setQueryData(["issue-chat-binding", "company-1", "issue-1"], {
+      endpointId: "endpoint-2",
+      conversationId: "conversation-2",
+      provider: "slack",
+      externalLabel: "#second",
+      assignedAgentLocked: true,
+    });
+    await flushReact();
+    await act(() => findButton(container, "Send to channel").click());
+    expect(container.querySelector("textarea")?.value).toBe("");
+    const sendButtons = [...container.querySelectorAll("button")].filter(
+      (button) => button.textContent?.trim() === "Send to channel",
+    );
+    expect(sendButtons.at(-1)?.disabled).toBe(true);
+    finishOldSend({ id: "old-anchor", state: "streaming", attempts: 1 });
+    await flushReact();
+    expect(container.querySelector("textarea")?.value).toBe("");
+    expect(
+      mockChatEndpointsApi.getPublicationBatchStatus,
+    ).not.toHaveBeenCalledWith("endpoint-2", "conversation-2", "old-anchor");
+    expect(
+      readBoardSendDraft(
+        boardSendDraftKey(
+          "company-1",
+          "issue-1",
+          "endpoint-1",
+          "conversation-1",
+        ),
+      ),
+    ).toMatchObject({
+      body: "Original conversation only",
+      idempotencyKey: originalCall[3],
+      publication: { id: "old-anchor" },
+    });
+    expect(
+      readBoardSendDraft(
+        boardSendDraftKey(
+          "company-1",
+          "issue-1",
+          "endpoint-2",
+          "conversation-2",
+        ),
+      ),
+    ).toBeNull();
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValueOnce({
+      id: "new-anchor",
+      state: "published",
+      attempts: 1,
+    });
+    await act(() =>
+      setTextareaValue(
+        container.querySelector("textarea")!,
+        "New conversation only",
+      ),
+    );
+    await act(() => sendButtons.at(-1)?.click());
+    await flushReact();
+    expect(
+      mockChatEndpointsApi.publishBoardMessage.mock.calls[1]?.slice(0, 3),
+    ).toEqual(["endpoint-2", "conversation-2", "New conversation only"]);
+    expect(
+      mockChatEndpointsApi.publishBoardMessage.mock.calls[1]?.[3],
+    ).not.toBe(originalCall[3]);
   });
 });

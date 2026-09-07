@@ -1727,3 +1727,230 @@ test.describe.serial("native chat adapter UI", () => {
     });
   }
 });
+
+test.describe("Board send delivery refresh", () => {
+  for (const outcome of [
+    "published",
+    "failed",
+    "delivery_unknown",
+    "response_lost",
+  ] as const) {
+    test(`tracks the whole file batch across reload and ${outcome} without a new send identity`, async ({
+      page,
+      request,
+    }) => {
+      const seed = await seedCompanyAndAgent(request);
+      const issue = await json<{ id: string; identifier: string }>(
+        await request.post(`/api/companies/${seed.companyId}/issues`, {
+          data: { title: "Board delivery refresh", status: "backlog" },
+        }),
+        "create board-send task",
+      );
+      const endpointId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const conversationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const publicationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      const attachmentId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+      const statusPath = `/api/chat-endpoints/${endpointId}/conversations/${conversationId}/publications/${publicationId}/status`;
+      let sends = 0;
+      const submittedPayloads: Record<string, unknown>[] = [];
+      let reads = 0;
+      let canonicalAttachmentReadsAfterSend = 0;
+      let canonicalCommentReadsAfterSend = 0;
+      let status = "streaming";
+      await page.route(`**/api/issues/${issue.id}/chat-binding`, (route) =>
+        fulfill(route, {
+          endpointId,
+          conversationId,
+          provider: "slack",
+          externalLabel: "#board-send-test",
+          assignedAgentLocked: true,
+        }),
+      );
+      await page.route(
+        new RegExp(
+          `/api/issues/(${issue.id}|${issue.identifier})/comments(?:\\?|$)`,
+        ),
+        async (route) => {
+          if (
+            sends &&
+            route.request().url().includes(`/issues/${issue.identifier}/`)
+          )
+            canonicalCommentReadsAfterSend += 1;
+          await fulfill(
+            route,
+            sends
+              ? [
+                  {
+                    id: publicationId,
+                    companyId: seed.companyId,
+                    issueId: issue.id,
+                    authorAgentId: null,
+                    authorUserId: "local-board",
+                    authorType: "user",
+                    body: "Board batch must finish all files.",
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                  },
+                ]
+              : [],
+          );
+        },
+      );
+      await page.route(
+        new RegExp(
+          `/api/issues/(${issue.id}|${issue.identifier})/attachments$`,
+        ),
+        async (route) => {
+          if (
+            sends &&
+            route.request().url().includes(`/issues/${issue.identifier}/`)
+          )
+            canonicalAttachmentReadsAfterSend += 1;
+          await fulfill(route, [
+            {
+              id: attachmentId,
+              companyId: seed.companyId,
+              issueId: issue.id,
+              issueCommentId: sends ? publicationId : null,
+              assetId: attachmentId,
+              provider: "local_disk",
+              objectKey: "board-send-test.txt",
+              contentType: "text/plain",
+              byteSize: 12,
+              sha256: "a".repeat(64),
+              originalFilename: "board-send-test.txt",
+              createdByAgentId: null,
+              createdByUserId: "local-board",
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              contentPath: `/api/attachments/${attachmentId}/content`,
+            },
+          ]);
+        },
+      );
+      await page.route(
+        `**/api/chat-endpoints/${endpointId}/conversations/${conversationId}/publications`,
+        async (route) => {
+          expect(route.request().method()).toBe("POST");
+          expect(bodyOf(route).attachmentIds).toEqual([attachmentId]);
+          sends += 1;
+          submittedPayloads.push(bodyOf(route));
+          if (outcome === "response_lost" && sends === 1) {
+            await route.abort("failed");
+            return;
+          }
+          await fulfill(
+            route,
+            { id: publicationId, state: "streaming", attempts: 1 },
+            201,
+          );
+        },
+      );
+      await page.route(`**${statusPath}`, async (route) => {
+        expect(route.request().method()).toBe("GET");
+        reads += 1;
+        await fulfill(route, {
+          publication: {
+            id: status === "streaming" ? publicationId : attachmentId,
+            state: status,
+            attempts: 1,
+          },
+          total: 2,
+          published: status === "published" ? 2 : 1,
+        });
+      });
+      await page.goto(`/${seed.prefix}/issues/${issue.identifier}`);
+      await page
+        .getByRole("button", { name: "Send to channel", exact: true })
+        .click();
+      await page
+        .getByRole("textbox", { name: "Board update", exact: true })
+        .fill("Board batch must finish all files.");
+      await page.getByRole("checkbox", { name: "board-send-test.txt" }).check();
+      await page
+        .getByRole("button", { name: "Send to channel", exact: true })
+        .last()
+        .click();
+      if (outcome === "response_lost") {
+        await expect(
+          page.getByText("Delivery result not confirmed", { exact: true }),
+        ).toBeVisible();
+        await page.reload();
+        await expect(
+          page.getByRole("textbox", { name: "Board update", exact: true }),
+        ).toBeDisabled();
+        expect(sends).toBe(1);
+        expect(reads).toBe(0);
+        await page
+          .getByRole("button", { name: "Retry safely", exact: true })
+          .click();
+        await expect.poll(() => submittedPayloads.length).toBe(2);
+        expect(submittedPayloads[1]).toEqual(submittedPayloads[0]);
+      } else {
+        await expect(
+          page.getByText("Publishing to channel", { exact: true }).first(),
+        ).toBeVisible();
+        // The canonical task view must refresh its comment/files before any reload.
+        await expect
+          .poll(() => canonicalCommentReadsAfterSend)
+          .toBeGreaterThan(0);
+        await expect
+          .poll(() => canonicalAttachmentReadsAfterSend)
+          .toBeGreaterThan(0);
+        const readsBeforeReload = reads;
+        await page.reload();
+        await expect
+          .poll(() => reads, { timeout: 8_000 })
+          .toBeGreaterThan(readsBeforeReload);
+        expect(sends).toBe(1);
+      }
+      await expect.poll(() => reads, { timeout: 8_000 }).toBeGreaterThan(0);
+      await expect(
+        page.getByRole("textbox", { name: "Board update", exact: true }),
+      ).toHaveValue("Board batch must finish all files.");
+      await expect(
+        page.getByRole("textbox", { name: "Board update", exact: true }),
+      ).toBeDisabled();
+      status = outcome === "response_lost" ? "published" : outcome;
+      if (status === "published") {
+        await expect(
+          page.getByRole("textbox", { name: "Board update", exact: true }),
+        ).toHaveCount(0, { timeout: 8_000 });
+        await expect(
+          page.getByText("Sent to channel", { exact: true }),
+        ).toBeVisible();
+      } else {
+        await expect(
+          page.getByText(
+            outcome === "failed"
+              ? "Channel delivery failed"
+              : "Delivery not confirmed",
+            { exact: true },
+          ),
+        ).toBeVisible({ timeout: 8_000 });
+        await expect(
+          page.getByRole("textbox", { name: "Board update", exact: true }),
+        ).toHaveValue("Board batch must finish all files.");
+        await expect(
+          page
+            .getByRole("button", { name: "Send to channel", exact: true })
+            .last(),
+        ).toBeDisabled();
+        await expect(
+          page.getByRole("link", { name: "Open Activity", exact: true }),
+        ).toBeVisible();
+        // An explicit resolution elsewhere may complete the batch; this surface only reads it.
+        status = "published";
+        await expect(
+          page.getByRole("textbox", { name: "Board update", exact: true }),
+        ).toHaveCount(0, { timeout: 8_000 });
+      }
+      expect(sends).toBe(outcome === "response_lost" ? 2 : 1);
+      expect(canonicalCommentReadsAfterSend).toBeGreaterThan(0);
+      expect(canonicalAttachmentReadsAfterSend).toBeGreaterThan(0);
+      await expect(
+        page.getByText("Board batch must finish all files.", { exact: true }),
+      ).toBeVisible();
+    });
+  }
+});

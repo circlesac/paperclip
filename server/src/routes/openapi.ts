@@ -1420,6 +1420,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/chat-endpoints/{endpointId}/publications/{publicationId}/resolve",
   "POST /api/chat-endpoints/{endpointId}/actions/{actionId}/resolve",
   "POST /api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications",
+  "GET /api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications/{publicationId}/status",
   "GET /api/issues/{issueId}/chat-binding",
 ]);
 
@@ -2380,6 +2381,45 @@ registry.registerPath({
   request: { params: z.object({ issueId: z.string().uuid() }) },
   responses: {
     200: r.ok(externalChannelBindingResponseSchema.nullable()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications/{publicationId}/status",
+  tags: ["chat-channels"],
+  summary: "Read authoritative delivery status for a Board publication batch",
+  description:
+    "Returns the first blocking text/file part, or the final published part only when every part is published. This read-only endpoint never retries or sends provider messages. The original publication ID remains a stable batch anchor.",
+  request: {
+    params: z.object({
+      endpointId: z.string().uuid(),
+      conversationId: z.string().uuid(),
+      publicationId: z.string().uuid(),
+    }),
+  },
+  responses: {
+    200: r.ok(
+      z
+        .object({
+          publication: chatPublicationResponseSchema.pick({
+            id: true,
+            state: true,
+            providerUrl: true,
+            attempts: true,
+            redactedError: true,
+            nextAttemptAt: true,
+            publishedAt: true,
+          }),
+          total: z.number().int().positive(),
+          published: z.number().int().nonnegative(),
+        })
+        .strict(),
+    ),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,

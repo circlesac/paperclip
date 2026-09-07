@@ -5418,21 +5418,28 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(elapsedMs).toBeLessThan(500);
     expect(providerRuntime.webhookRequest).toBeNull();
     expect(deferred).toHaveLength(0);
-    await expect(
-      db
-        .select()
-        .from(chatActions)
-        .where(
-          and(
-            eq(chatActions.endpointId, endpoint.id),
-            eq(
-              chatActions.providerActionId,
-              "github_webhook_ingress:github-authentication-lane-budget",
-            ),
-          ),
-        )
-        .then((rows) => rows[0]),
-    ).resolves.toMatchObject({ status: "processing" });
+    // The HTTP response budget can expire before the asynchronous worker has
+    // claimed the durable receipt. Wait for its claim while the lease is held.
+    await vi.waitFor(
+      async () => {
+        await expect(
+          db
+            .select()
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.endpointId, endpoint.id),
+                eq(
+                  chatActions.providerActionId,
+                  "github_webhook_ingress:github-authentication-lane-budget",
+                ),
+              ),
+            )
+            .then((rows) => rows[0]),
+        ).resolves.toMatchObject({ status: "processing" });
+      },
+      { timeout: 2_000 },
+    );
 
     await db
       .delete(chatEndpointLeases)
@@ -16085,8 +16092,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .then((rows) => rows.find((row) => row.status === "succeeded"));
       expect(firstRun).toBeDefined();
       const firstAdapterInput = execute.mock.calls[0]?.[0] as
-        | { context?: { paperclipWake?: unknown } }
-        | undefined;
+        { context?: { paperclipWake?: unknown } } | undefined;
       expect(
         isPaperclipExternalChatTurn(firstAdapterInput?.context?.paperclipWake),
       ).toBe(true);
@@ -16228,10 +16234,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           issueId: conversation!.issueId,
           contextSnapshot: {
             ...trustedWakeContext,
-            wakeCommentIds: [
-              firstInboundLink!.commentId!,
-              internalComment!.id,
-            ],
+            wakeCommentIds: [firstInboundLink!.commentId!, internalComment!.id],
           },
         }),
       ).resolves.toBeNull();
@@ -16294,8 +16297,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const secondRun = succeededRuns.find((row) => row.id !== firstRun!.id);
       expect(secondRun).toBeDefined();
       const secondAdapterInput = execute.mock.calls[1]?.[0] as
-        | { context?: { paperclipWake?: unknown } }
-        | undefined;
+        { context?: { paperclipWake?: unknown } } | undefined;
       expect(
         isPaperclipExternalChatTurn(secondAdapterInput?.context?.paperclipWake),
       ).toBe(true);
@@ -20328,8 +20330,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .where(eq(chatDeliveries.endpointId, endpoint.id));
     expect(delivery).toMatchObject({
       state: "processed",
-      redactedError:
-        "1 external attachment was omitted (unsupported type: 1)",
+      redactedError: "1 external attachment was omitted (unsupported type: 1)",
     });
     expect(wakeup).toHaveBeenCalledTimes(1);
     expect(wakeup.mock.calls[0]?.[1]?.contextSnapshot).toMatchObject({
@@ -21614,7 +21615,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       conversationId: conversation.id,
       issueId: conversation.issueId,
       idempotencyKey: `run:${ambiguousRunId}:working:${endpoint.id}`,
-      payload: { text: "Working on another attachment…", progressState: "working" },
+      payload: {
+        text: "Working on another attachment…",
+        progressState: "working",
+      },
       state: "published",
       providerMessageId: "working-message-ambiguous-attachment",
       createdAt: ambiguousCreatedAt,
@@ -21652,10 +21656,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .orderBy(
           sql`(${chatPublications.payload}->'transportPart'->>'index')::int`,
         ),
-    ).resolves.toEqual([
-      { state: "published" },
-      { state: "delivery_unknown" },
-    ]);
+    ).resolves.toEqual([{ state: "published" }, { state: "delivery_unknown" }]);
     await expect(
       db
         .select({ id: chatPublications.id })
@@ -27017,9 +27018,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.test(endpoint.id, "owner-user");
     const [conversation] = await service.listConversations(endpoint.id);
     if (!conversation) throw new Error("Expected Slack file conversation");
-    const png = Buffer.from([
-      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-    ]);
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     const stored = await storage.storage.putFile({
       companyId: fixture.companyId,
       namespace: `issues/${conversation.issueId}`,
@@ -27498,6 +27497,119 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
   });
 
+  it("reads the entire publication batch without side effects and rejects foreign bindings", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    const channel = makeThread({
+      channelId: "C-BATCH-STATUS",
+      id: "slack:C-BATCH-STATUS:4410.1",
+      name: "batch-status",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: "4410.1",
+        text: "@maya status test",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    const comment = await issueService(db).addComment(
+      conversation.issueId,
+      "Batch status fixture",
+      { userId: "owner-user" },
+    );
+    const [textPart, filePart] = await db
+      .insert(chatPublications)
+      .values([
+        {
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          commentId: comment.id,
+          idempotencyKey: "status-text",
+          state: "published",
+          payload: { text: "Batch status fixture" },
+          providerMessageId: "status-provider-id",
+        },
+        {
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          commentId: comment.id,
+          idempotencyKey: "status-file",
+          state: "pending",
+          payload: { text: "File fixture" },
+        },
+      ])
+      .returning();
+    const app = routesApp(db, fixture.companyId, service);
+    const path = `/api/chat-endpoints/${endpoint.id}/conversations/${conversation.id}/publications/${textPart.id}/status`;
+    const initialPosts = runtime.endpoints.get(endpoint.id)?.posts.length;
+    const initialWakes = wakeup.mock.calls.length;
+    for (const state of [
+      "pending",
+      "streaming",
+      "retry",
+      "failed",
+      "delivery_unknown",
+      "cancelled",
+      "published",
+    ] as const) {
+      await db
+        .update(chatPublications)
+        .set({ state })
+        .where(eq(chatPublications.id, filePart.id));
+      const response = await request(app).get(path).expect(200);
+      expect(response.body).toMatchObject({
+        total: 2,
+        published: state === "published" ? 2 : 1,
+        publication: { state },
+      });
+      if (state !== "published")
+        expect(response.body.publication.id).toBe(filePart.id);
+      expect(Object.keys(response.body.publication).sort()).toEqual([
+        "attempts",
+        "id",
+        "nextAttemptAt",
+        "providerUrl",
+        "publishedAt",
+        "redactedError",
+        "state",
+      ]);
+    }
+    expect(runtime.endpoints.get(endpoint.id)?.posts.length).toBe(initialPosts);
+    expect(wakeup.mock.calls.length).toBe(initialWakes);
+    await request(app)
+      .get(path.replace(conversation.id, randomUUID()))
+      .expect(404);
+    await request(app).get(path.replace(textPart.id, randomUUID())).expect(404);
+    await request(app)
+      .get(path.replace(textPart.id, "invalid-publication"))
+      .expect(400);
+    const foreign = await seedCompany();
+    const foreignEndpoint = await service.create(
+      foreign.companyId,
+      { provider: "slack", assignedAgentId: foreign.assignedAgentId },
+      "owner-user",
+    );
+    await request(app)
+      .get(path.replace(endpoint.id, foreignEndpoint.id))
+      .expect(404);
+    await request(routesApp(db, foreign.companyId, service))
+      .get(path)
+      .expect(404);
+  });
+
   it("publishes only explicitly selected board attachments and stays idempotent across retries", async () => {
     const fixture = await seedCompany();
     const storage = createStorageService();
@@ -27659,6 +27771,313 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       { id: blocked.id, state: "delivery_unknown" },
       { id: expect.any(String), state: "pending" },
     ]);
+  });
+
+  it("retries pre-transport attachment integrity failures without blocking another conversation", async () => {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture, {
+        storage: storage.storage,
+      });
+    try {
+      const damagedChannel = makeThread({
+        channelId: "C-BOARD-DAMAGED-FILE",
+        id: "slack:C-BOARD-DAMAGED-FILE:4400.2",
+        name: "board-damaged-file",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: damagedChannel.thread,
+        message: makeMessage({
+          id: "4400.2",
+          text: "@maya start the damaged-file task",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id);
+      await service.test(endpoint.id, "owner-user");
+      await db.insert(chatEndpointResources).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        type: "channel",
+        providerResourceId: "C-BOARD-HEALTHY-FILE",
+        label: "board-healthy-file",
+        availability: "available",
+        enabled: true,
+      });
+      const healthyChannel = makeThread({
+        channelId: "C-BOARD-HEALTHY-FILE",
+        id: "slack:C-BOARD-HEALTHY-FILE:4400.3",
+        name: "board-healthy-file",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: healthyChannel.thread,
+        message: makeMessage({
+          id: "4400.3",
+          text: "@maya start the healthy-file task",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+
+      const conversations = await service.listConversations(endpoint.id);
+      const damagedConversation = conversations.find(
+        (conversation) =>
+          conversation.externalThreadId === damagedChannel.thread.id,
+      );
+      const healthyConversation = conversations.find(
+        (conversation) =>
+          conversation.externalThreadId === healthyChannel.thread.id,
+      );
+      if (!damagedConversation || !healthyConversation) {
+        throw new Error("Expected both board attachment conversations");
+      }
+      const damagedBody = Buffer.from("registered outbound evidence", "utf8");
+      const healthyBody = Buffer.from("healthy outbound evidence", "utf8");
+      const damagedStored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${damagedConversation.issueId}`,
+        originalFilename: "damaged.txt",
+        contentType: "text/plain",
+        body: damagedBody,
+      });
+      const healthyStored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${healthyConversation.issueId}`,
+        originalFilename: "healthy.txt",
+        contentType: "text/plain",
+        body: healthyBody,
+      });
+      const damagedAttachment = await issueService(db).createAttachment({
+        issueId: damagedConversation.issueId,
+        provider: damagedStored.provider,
+        objectKey: damagedStored.objectKey,
+        contentType: damagedStored.contentType,
+        byteSize: damagedStored.byteSize,
+        sha256: damagedStored.sha256,
+        originalFilename: damagedStored.originalFilename,
+        createdByUserId: "owner-user",
+      });
+      const healthyAttachment = await issueService(db).createAttachment({
+        issueId: healthyConversation.issueId,
+        provider: healthyStored.provider,
+        objectKey: healthyStored.objectKey,
+        contentType: healthyStored.contentType,
+        byteSize: healthyStored.byteSize,
+        sha256: healthyStored.sha256,
+        originalFilename: healthyStored.originalFilename,
+        createdByUserId: "owner-user",
+      });
+      const damagedReplacement = Buffer.from(damagedBody);
+      damagedReplacement[0] ^= 0xff;
+      storage.objects.set(damagedStored.objectKey, damagedReplacement);
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!providerRuntime) throw new Error("Expected Slack provider runtime");
+      providerRuntime.posts.length = 0;
+
+      const damagedPublication = await service.publishBoardMessage(
+        endpoint.id,
+        damagedConversation.id,
+        "Damaged attachment send",
+        "board-damaged-file-send",
+        "owner-user",
+        [damagedAttachment.id],
+      );
+
+      expect(damagedPublication).toMatchObject({
+        attempts: 1,
+        state: "retry",
+        nextAttemptAt: expect.any(Date),
+        redactedError:
+          "Chat publication attachment integrity changed after registration",
+      });
+      expect(providerRuntime.posts).toEqual([
+        {
+          threadId: damagedChannel.thread.id,
+          text: "Damaged attachment send",
+        },
+      ]);
+
+      const healthyPublication = await service.publishBoardMessage(
+        endpoint.id,
+        healthyConversation.id,
+        "Healthy attachment send",
+        "board-healthy-file-send",
+        "owner-user",
+        [healthyAttachment.id],
+      );
+      expect(healthyPublication).toMatchObject({
+        attempts: 1,
+        state: "published",
+      });
+      expect(providerRuntime.posts).toEqual([
+        {
+          threadId: damagedChannel.thread.id,
+          text: "Damaged attachment send",
+        },
+        {
+          threadId: healthyChannel.thread.id,
+          text: "Healthy attachment send",
+        },
+        {
+          threadId: healthyChannel.thread.id,
+          text: "",
+          files: [
+            expect.objectContaining({
+              data: healthyBody,
+              filename: "healthy.txt",
+              mimeType: "text/plain",
+            }),
+          ],
+        },
+      ]);
+
+      storage.objects.set(damagedStored.objectKey, damagedBody);
+      await db
+        .update(chatPublications)
+        .set({ nextAttemptAt: new Date(0) })
+        .where(eq(chatPublications.id, damagedPublication.id));
+      await service.processPendingPublications();
+      await service.processPendingPublications();
+
+      await expect(
+        db
+          .select({
+            attempts: chatPublications.attempts,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, damagedPublication.id)),
+      ).resolves.toEqual([{ attempts: 2, state: "published" }]);
+      expect(
+        providerRuntime.posts.filter(
+          (post) =>
+            post.files?.[0] && post.threadId === damagedChannel.thread.id,
+        ),
+      ).toEqual([
+        {
+          threadId: damagedChannel.thread.id,
+          text: "",
+          files: [
+            expect.objectContaining({
+              data: damagedBody,
+              filename: "damaged.txt",
+              mimeType: "text/plain",
+            }),
+          ],
+        },
+      ]);
+    } finally {
+      await service.shutdown();
+    }
+  });
+
+  it("keeps missing attachment storage retryable but fails invalid metadata before provider transport", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture);
+    try {
+      const channel = makeThread({
+        channelId: "C-BOARD-MISSING-STORAGE",
+        id: "slack:C-BOARD-MISSING-STORAGE:4400.4",
+        name: "board-missing-storage",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: channel.thread,
+        message: makeMessage({
+          id: "4400.4",
+          text: "@maya start the missing-storage task",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await service.listConversations(endpoint.id);
+      if (!conversation)
+        throw new Error("Expected board attachment conversation");
+      const body = Buffer.from("missing storage evidence", "utf8");
+      const attachment = await issueService(db).createAttachment({
+        issueId: conversation.issueId,
+        provider: "local_disk",
+        objectKey: "issues/missing-storage-evidence.txt",
+        contentType: "text/plain",
+        byteSize: body.byteLength,
+        sha256: createHash("sha256").update(body).digest("hex"),
+        originalFilename: "missing-storage-evidence.txt",
+        createdByUserId: "owner-user",
+      });
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!providerRuntime) throw new Error("Expected Slack provider runtime");
+      providerRuntime.posts.length = 0;
+
+      const retrying = await service.publishBoardMessage(
+        endpoint.id,
+        conversation.id,
+        "Missing storage attachment send",
+        "board-missing-storage-send",
+        "owner-user",
+        [attachment.id],
+      );
+
+      expect(retrying).toMatchObject({
+        attempts: 1,
+        state: "retry",
+        nextAttemptAt: expect.any(Date),
+        redactedError: "Attachment storage is unavailable for chat publication",
+      });
+      expect(providerRuntime.posts).toEqual([
+        {
+          threadId: channel.thread.id,
+          text: "Missing storage attachment send",
+        },
+      ]);
+
+      const [attachmentRow] = await db
+        .select({ assetId: issueAttachments.assetId })
+        .from(issueAttachments)
+        .where(eq(issueAttachments.id, attachment.id));
+      if (!attachmentRow) throw new Error("Expected attachment metadata");
+      await db
+        .update(assets)
+        .set({ contentType: "application/x-executable" })
+        .where(eq(assets.id, attachmentRow.assetId));
+      await db
+        .update(chatPublications)
+        .set({ nextAttemptAt: new Date(0) })
+        .where(eq(chatPublications.id, retrying.id));
+      await service.processPendingPublications();
+
+      await expect(
+        db
+          .select({
+            attempts: chatPublications.attempts,
+            redactedError: chatPublications.redactedError,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, retrying.id)),
+      ).resolves.toEqual([
+        {
+          attempts: 2,
+          redactedError:
+            "Chat publication attachment is invalid or outside its authorized task comment",
+          state: "failed",
+        },
+      ]);
+      expect(providerRuntime.posts.every((post) => !post.files?.length)).toBe(
+        true,
+      );
+    } finally {
+      await service.shutdown();
+    }
   });
 
   it("scopes board-send idempotency to one external conversation", async () => {
@@ -28654,7 +29073,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           issueCommentId: issueAttachments.issueCommentId,
         })
         .from(issueAttachments)
-        .where(inArray(issueAttachments.id, attachments.map((item) => item.id)))
+        .where(
+          inArray(
+            issueAttachments.id,
+            attachments.map((item) => item.id),
+          ),
+        )
         .then((rows) => ({
           bound: rows.filter((row) => row.issueCommentId !== null).length,
           rejected: rows.find((row) => row.id === rejectedAttachment.id),
@@ -28746,8 +29170,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           typeof attachmentId === "string",
       );
     });
-    expect(publications.every((publication) => publication.state === "published"))
-      .toBe(true);
+    expect(
+      publications.every((publication) => publication.state === "published"),
+    ).toBe(true);
     expect(publishedAttachmentIds).toHaveLength(20);
     expect(new Set(publishedAttachmentIds).size).toBe(20);
     expect(publishedAttachmentIds).toEqual(
@@ -29069,6 +29494,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         state: "pending",
       }),
     ]);
+    // This projection-only fixture intentionally has no object-store bytes.
+    // Retire its staged work so another test's global worker cannot retry it.
+    await db
+      .update(chatPublications)
+      .set({ state: "cancelled", nextAttemptAt: null })
+      .where(
+        and(
+          eq(chatPublications.endpointId, endpoint.id),
+          eq(
+            chatPublications.idempotencyKey,
+            `attachment:${chatAttachment.id}:${endpoint.id}`,
+          ),
+        ),
+      );
+    await service.shutdown();
   });
 
   it("holds ambiguous provider sends for an audited duplicate-risk resolution without reordering", async () => {

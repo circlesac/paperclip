@@ -329,6 +329,8 @@ Run these assertions within each platform-specific procedure.
 4. Add `PUBLIC-<run-id>` with **Send to channel** selected.
 5. Confirm it appears once in the bound provider conversation with delivered status in Paperclip.
 6. Inspect provider output for chain-of-thought, raw tool arguments, credentials, internal logs, hidden comments, or private artifact URLs.
+7. From the canonical task-identifier URL, send a Board update with a selected file and image. Confirm the new comment and attachment bindings appear without reloading. For a delayed send, keep the composer mounted: it must track the entire batch, not declare success after the text alone publishes.
+8. Reload or navigate away and back while that send is pending. The exact draft and delivery identity must remain locked; status checks must not send another provider message. If the original response was lost, **Retry safely** must explicitly reuse the original text, selected files, and request identity. A failed or unconfirmed part keeps the draft until Activity resolves it; no automatic replay is allowed.
 
 **Pass:** only safe milestones/final output and explicit board publication leave Paperclip. No internal material is exposed.
 

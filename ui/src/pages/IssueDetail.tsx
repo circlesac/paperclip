@@ -7266,9 +7266,11 @@ export function IssueDetail() {
         {taskChatShellEnabled ? null : ancestorsNav}
 
         <ExternallyConnectedTaskBanner
+          key={issue.id}
           attachments={attachments ?? []}
           companyId={issue.companyId}
           issueId={issue.id}
+          issueCacheRefs={issueCacheRefs}
         />
 
         {issue.hiddenAt && (

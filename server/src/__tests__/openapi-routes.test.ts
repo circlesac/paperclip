@@ -402,6 +402,10 @@ describe("openapi routes", () => {
         "/api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications",
       ],
       ["get", "/api/issues/{issueId}/chat-binding"],
+      [
+        "get",
+        "/api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications/{publicationId}/status",
+      ],
     ] as const;
 
     for (const [method, routePath] of operations) {

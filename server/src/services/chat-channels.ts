@@ -63,6 +63,7 @@ import type {
   ChatEndpoint,
   ChatEndpointSetupState,
   ChatProvider,
+  ChatPublicationBatchStatus,
   ConfigureChatEndpointInput,
   CreateChatEndpointInput,
   ExternalChannelBindingSummary,
@@ -85,7 +86,13 @@ import {
 } from "../attachment-types.js";
 import { isUniqueViolation } from "../db-errors.js";
 import { parseChatWebhookPublicBaseUrl } from "../chat-webhook-public-url.js";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import {
+  badRequest,
+  conflict,
+  forbidden,
+  notFound,
+  unprocessable,
+} from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { redactSensitiveText } from "../redaction.js";
 import type { StorageService } from "../storage/types.js";
@@ -2307,6 +2314,163 @@ export function createChatSdkStatePersistence(db: Db): ChatSdkStatePersistence {
         .returning({ id: chatSdkState.id });
       return deleted.length === 1;
     },
+  };
+}
+
+const OUTBOUND_ATTACHMENT_STORAGE_TIMEOUT_MS = 10_000;
+
+class OutboundAttachmentHydrationError extends Error {
+  readonly code = "CHAT_ATTACHMENT_HYDRATION_FAILED";
+
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "OutboundAttachmentHydrationError";
+  }
+}
+
+class OutboundAttachmentValidationError extends Error {
+  readonly code = "CHAT_ATTACHMENT_VALIDATION_FAILED";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "OutboundAttachmentValidationError";
+  }
+}
+
+function isOutboundAttachmentHydrationError(
+  error: unknown,
+): error is OutboundAttachmentHydrationError {
+  return error instanceof OutboundAttachmentHydrationError;
+}
+
+function isOutboundAttachmentValidationError(
+  error: unknown,
+): error is OutboundAttachmentValidationError {
+  return error instanceof OutboundAttachmentValidationError;
+}
+
+/**
+ * Read one already-authorized attachment before any provider transport starts.
+ * The database digest, rather than mutable object-store metadata, is the
+ * integrity boundary. Both acquisition and streaming are bounded so a stuck
+ * storage backend cannot hold the publication lane indefinitely.
+ */
+export async function hydrateOutboundAttachment(input: {
+  storage: StorageService;
+  companyId: string;
+  objectKey: string;
+  byteSize: number;
+  sha256: string;
+  filename: string;
+  mimeType: string;
+  timeoutMs?: number;
+}): Promise<FileUpload> {
+  const timeoutMs =
+    typeof input.timeoutMs === "number" &&
+    Number.isFinite(input.timeoutMs) &&
+    input.timeoutMs > 0
+      ? input.timeoutMs
+      : OUTBOUND_ATTACHMENT_STORAGE_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(input.byteSize) ||
+    input.byteSize <= 0 ||
+    input.byteSize > MAX_ATTACHMENT_BYTES ||
+    !/^[0-9a-f]{64}$/iu.test(input.sha256)
+  ) {
+    throw new OutboundAttachmentHydrationError(
+      "Chat publication attachment metadata is invalid",
+    );
+  }
+  const acquisitionTimeoutError = new OutboundAttachmentHydrationError(
+    "Chat publication attachment storage read timed out",
+  );
+  let acquisitionTimedOut = false;
+  let rejectAcquisition!: (error: Error) => void;
+  const acquisitionTimeout = new Promise<never>((_resolve, reject) => {
+    rejectAcquisition = reject;
+  });
+  const acquisitionTimer = setTimeout(() => {
+    acquisitionTimedOut = true;
+    rejectAcquisition(acquisitionTimeoutError);
+  }, timeoutMs);
+  acquisitionTimer.unref?.();
+  const objectPromise = Promise.resolve()
+    .then(() => input.storage.getObject(input.companyId, input.objectKey))
+    .then((object) => {
+      if (acquisitionTimedOut) object.stream.destroy();
+      return object;
+    })
+    .catch((error) => {
+      throw isOutboundAttachmentHydrationError(error)
+        ? error
+        : new OutboundAttachmentHydrationError(
+            "Chat publication attachment storage read failed",
+            error,
+          );
+    });
+  let object: Awaited<ReturnType<StorageService["getObject"]>>;
+  try {
+    object = await Promise.race([objectPromise, acquisitionTimeout]);
+  } finally {
+    clearTimeout(acquisitionTimer);
+  }
+
+  if (
+    object.contentLength !== undefined &&
+    object.contentLength !== input.byteSize
+  ) {
+    object.stream.destroy();
+    throw new OutboundAttachmentHydrationError(
+      "Chat publication attachment size changed after registration",
+    );
+  }
+
+  const streamTimeoutError = new OutboundAttachmentHydrationError(
+    "Chat publication attachment storage read timed out",
+  );
+  const streamTimer = setTimeout(() => {
+    object.stream.destroy(streamTimeoutError);
+  }, timeoutMs);
+  streamTimer.unref?.();
+  const chunks: Buffer[] = [];
+  const digest = createHash("sha256");
+  let bytes = 0;
+  try {
+    for await (const chunk of object.stream) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > input.byteSize || bytes > MAX_ATTACHMENT_BYTES) {
+        object.stream.destroy();
+        throw new OutboundAttachmentHydrationError(
+          "Chat publication attachment exceeded its streaming byte limit",
+        );
+      }
+      digest.update(buffer);
+      chunks.push(buffer);
+    }
+  } catch (error) {
+    throw isOutboundAttachmentHydrationError(error)
+      ? error
+      : new OutboundAttachmentHydrationError(
+          "Chat publication attachment storage read failed",
+          error,
+        );
+  } finally {
+    clearTimeout(streamTimer);
+  }
+
+  const actualDigest = digest.digest("hex");
+  if (bytes !== input.byteSize || actualDigest !== input.sha256.toLowerCase()) {
+    if (!object.stream.destroyed) object.stream.destroy();
+    throw new OutboundAttachmentHydrationError(
+      "Chat publication attachment integrity changed after registration",
+    );
+  }
+
+  return {
+    data: Buffer.concat(chunks, bytes),
+    filename: input.filename,
+    mimeType: input.mimeType,
   };
 }
 
@@ -17241,7 +17405,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               // Record only an authenticated, content-free admission decision.
               // Do not make operators infer a working callback from silence,
               // or retain the comment/actor/thread from a disabled repository.
-              const providerEventId = `github:filtered_ingress:${createHash("sha256")
+              const providerEventId = `github:filtered_ingress:${createHash(
+                "sha256",
+              )
                 .update(providerDeliveryId)
                 .digest("hex")}`;
               const eventKind =
@@ -20882,6 +21048,69 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
+  async function getPublicationBatchStatus(
+    endpointId: string,
+    conversationId: string,
+    publicationId: string,
+  ): Promise<ChatPublicationBatchStatus> {
+    if (![endpointId, conversationId, publicationId].every(isUuidLike)) {
+      throw badRequest(
+        "Valid endpoint, conversation, and publication IDs are required",
+      );
+    }
+    const anchor = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.id, publicationId),
+          eq(chatPublications.endpointId, endpointId),
+          eq(chatPublications.conversationId, conversationId),
+        ),
+      )
+      .then((rows) => rows[0]);
+    if (!anchor) throw notFound("Chat publication not found");
+    // An explicit Board send and every durable text/file transport part share
+    // its comment. Read all parts without Activity's history limit; never
+    // advance the worker or replay a provider side effect from this GET.
+    const batch = anchor.commentId
+      ? await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.companyId, anchor.companyId),
+              eq(chatPublications.endpointId, endpointId),
+              eq(chatPublications.conversationId, conversationId),
+              eq(chatPublications.commentId, anchor.commentId),
+            ),
+          )
+          .orderBy(
+            asc(chatPublications.createdAt),
+            asc(publicationTransportOrderKey(chatPublications)),
+          )
+      : [anchor];
+    const current =
+      batch.find((candidate) => candidate.state !== "published") ??
+      batch.at(-1);
+    if (!current) throw notFound("Chat publication not found");
+    return {
+      publication: {
+        id: current.id,
+        state:
+          current.state as ChatPublicationBatchStatus["publication"]["state"],
+        providerUrl: current.providerUrl,
+        attempts: current.attempts,
+        redactedError: current.redactedError,
+        nextAttemptAt: current.nextAttemptAt?.toISOString() ?? null,
+        publishedAt: current.publishedAt?.toISOString() ?? null,
+      },
+      total: batch.length,
+      published: batch.filter((candidate) => candidate.state === "published")
+        .length,
+    };
+  }
+
   async function publishComment(
     endpointId: string,
     conversationId: string,
@@ -21137,75 +21366,78 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     payload: SafeChatPublicationPayload,
   ): Promise<FileUpload[]> {
     if (!payload.attachmentIds?.length) return [];
-    if (!options.storage)
-      throw new Error("Attachment storage is unavailable for chat publication");
-    const rows = await db
-      .select({
-        id: issueAttachments.id,
-        issueId: issueAttachments.issueId,
-        issueCommentId: issueAttachments.issueCommentId,
-        objectKey: assets.objectKey,
-        contentType: assets.contentType,
-        byteSize: assets.byteSize,
-        originalFilename: assets.originalFilename,
-      })
-      .from(issueAttachments)
-      .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
-      .where(
-        and(
-          eq(issueAttachments.companyId, publication.companyId),
-          eq(issueAttachments.issueId, publication.issueId),
-          inArray(issueAttachments.id, payload.attachmentIds),
-        ),
-      );
-    const byId = new Map(rows.map((row) => [row.id, row]));
-    const files: FileUpload[] = [];
-    for (const attachmentId of payload.attachmentIds) {
-      const row = byId.get(attachmentId);
-      if (
-        !row ||
-        (publication.commentId &&
-          row.issueCommentId !== publication.commentId) ||
-        row.byteSize <= 0 ||
-        row.byteSize > MAX_ATTACHMENT_BYTES ||
-        !isAllowedContentType(row.contentType)
-      )
-        throw new Error(
-          "Chat publication attachment is outside its authorized task comment",
+    try {
+      const rows = await db
+        .select({
+          id: issueAttachments.id,
+          issueId: issueAttachments.issueId,
+          issueCommentId: issueAttachments.issueCommentId,
+          objectKey: assets.objectKey,
+          contentType: assets.contentType,
+          byteSize: assets.byteSize,
+          sha256: assets.sha256,
+          originalFilename: assets.originalFilename,
+        })
+        .from(issueAttachments)
+        .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
+        .where(
+          and(
+            eq(issueAttachments.companyId, publication.companyId),
+            eq(issueAttachments.issueId, publication.issueId),
+            inArray(issueAttachments.id, payload.attachmentIds),
+          ),
         );
-      const object = await options.storage.getObject(
-        publication.companyId,
-        row.objectKey,
-      );
-      if (
-        object.contentLength !== undefined &&
-        object.contentLength > MAX_ATTACHMENT_BYTES
-      )
-        throw new Error(
-          "Chat publication attachment exceeds the configured size limit",
-        );
-      const chunks: Buffer[] = [];
-      let bytes = 0;
-      for await (const chunk of object.stream) {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        bytes += buffer.length;
-        if (bytes > MAX_ATTACHMENT_BYTES)
-          throw new Error(
-            "Chat publication attachment exceeded its streaming byte limit",
+      const byId = new Map(rows.map((row) => [row.id, row]));
+      const orderedRows = payload.attachmentIds.map((attachmentId) => {
+        const row = byId.get(attachmentId);
+        if (
+          !row ||
+          (publication.commentId &&
+            row.issueCommentId !== publication.commentId) ||
+          row.byteSize <= 0 ||
+          row.byteSize > MAX_ATTACHMENT_BYTES ||
+          !row.objectKey.trim() ||
+          !/^[0-9a-f]{64}$/iu.test(row.sha256) ||
+          !isAllowedContentType(row.contentType)
+        )
+          throw new OutboundAttachmentValidationError(
+            "Chat publication attachment is invalid or outside its authorized task comment",
           );
-        chunks.push(buffer);
-      }
-      if (bytes !== row.byteSize)
-        throw new Error(
-          "Chat publication attachment size changed after registration",
-        );
-      files.push({
-        data: Buffer.concat(chunks, bytes),
-        filename: row.originalFilename ?? `attachment-${attachmentId}`,
-        mimeType: row.contentType,
+        return row;
       });
+      // Authorization and persisted metadata must fail definitively even when
+      // storage is unavailable; do not mask an invalid file as a transient outage.
+      if (!options.storage)
+        throw new OutboundAttachmentHydrationError(
+          "Attachment storage is unavailable for chat publication",
+        );
+      const files: FileUpload[] = [];
+      for (const row of orderedRows) {
+        files.push(
+          await hydrateOutboundAttachment({
+            storage: options.storage,
+            companyId: publication.companyId,
+            objectKey: row.objectKey,
+            byteSize: row.byteSize,
+            sha256: row.sha256,
+            filename: row.originalFilename ?? `attachment-${row.id}`,
+            mimeType: row.contentType,
+          }),
+        );
+      }
+      return files;
+    } catch (error) {
+      if (
+        isOutboundAttachmentHydrationError(error) ||
+        isOutboundAttachmentValidationError(error)
+      ) {
+        throw error;
+      }
+      throw new OutboundAttachmentHydrationError(
+        "Chat publication attachment preparation failed",
+        error,
+      );
     }
-    return files;
   }
 
   function telegramAttachmentForUpload(file: FileUpload): Attachment {
@@ -21459,7 +21691,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       );
       if (
         attachmentFailureFence &&
-        (attachmentFailureFence.generation !== input.runtimeContext.generation ||
+        (attachmentFailureFence.generation !==
+          input.runtimeContext.generation ||
           attachmentFailureFence.credentialFingerprint !==
             input.runtimeContext.credentialFingerprint)
       ) {
@@ -22196,7 +22429,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           reason:
             "Provider accepted the publication, but Paperclip could not confirm its durable result",
         }
-      : classifyChatPublicationError(error, attempts);
+      : isOutboundAttachmentValidationError(error)
+        ? {
+            kind: "failed" as const,
+            reason: error.message,
+          }
+        : isOutboundAttachmentHydrationError(error)
+          ? {
+              kind: "retry" as const,
+              retryAfterMs: Math.min(
+                60_000,
+                2 ** Math.max(0, attempts) * 1_000,
+              ),
+              reason: error.message,
+            }
+          : classifyChatPublicationError(error, attempts);
     const failure = redactSensitiveText(disposition.reason).slice(
       0,
       MAX_ERROR_TEXT,
@@ -22403,7 +22650,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               payload: projectSafeChatPublication({
                 classification: "external",
                 source: "safe_milestone",
-                text: taskUrl ? `${noticeText} Open task: ${taskUrl}` : noticeText,
+                text: taskUrl
+                  ? `${noticeText} Open task: ${taskUrl}`
+                  : noticeText,
               }),
               state: "pending",
             })
@@ -23791,6 +24040,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     resolveAction,
     resolvePublication,
     publishComment,
+    getPublicationBatchStatus,
     publishBoardMessage,
     reconcileProviderRuntimes,
     processPendingPublications,

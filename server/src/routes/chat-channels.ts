@@ -10,6 +10,7 @@ import {
   confirmChatIdentityLinkSchema,
   createChatEndpointSchema,
   createChatIdentityLinkIntentSchema,
+  isUuidLike,
   publishChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   resolveChatActionSchema,
@@ -347,6 +348,31 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
             req.body.attachmentIds,
           ),
         );
+    },
+  );
+
+  router.get(
+    "/chat-endpoints/:endpointId/conversations/:conversationId/publications/:publicationId/status",
+    async (req, res) => {
+      if (
+        ![
+          endpointId(req),
+          req.params.conversationId,
+          req.params.publicationId,
+        ].every((id) => typeof id === "string" && isUuidLike(id))
+      ) {
+        throw badRequest(
+          "Valid endpoint, conversation, and publication IDs are required",
+        );
+      }
+      if (!(await assertEndpointAccess(req, res, service))) return;
+      res.json(
+        await service.getPublicationBatchStatus(
+          endpointId(req),
+          req.params.conversationId as string,
+          req.params.publicationId as string,
+        ),
+      );
     },
   );
 

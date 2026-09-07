@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, Paperclip, Radio } from "lucide-react";
 import type {
@@ -9,6 +9,7 @@ import {
   chatEndpointsApi,
   type ChatProvider,
   type ChatPublicationSummary,
+  type ExternalChannelBindingSummary,
 } from "@/api/chatEndpoints";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -16,6 +17,13 @@ import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/context/ToastContext";
 import { Link } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
+import {
+  boardSendDraftKey,
+  clearBoardSendDraft,
+  readBoardSendDraft,
+  writeBoardSendDraft,
+  type RetainedBoardSend,
+} from "./board-send-draft";
 
 const providerNames: Record<ChatProvider, string> = {
   slack: "Slack",
@@ -64,7 +72,7 @@ const publicationFeedback: Record<ChatPublicationState, PublicationFeedback> = {
   },
   cancelled: {
     title: "Channel delivery cancelled",
-    body: "Nothing was confirmed as published. Your draft is kept if you want to start a new send.",
+    body: "Your draft is kept. Some parts may already have been published; check Activity before starting a new send.",
     tone: "info",
   },
 };
@@ -78,16 +86,37 @@ export function useIssueChatBinding(companyId: string, issueId: string) {
   return { binding: query.data ?? null, isLoading: query.isLoading };
 }
 
-export function ExternallyConnectedTaskBanner({
-  attachments = [],
-  companyId,
-  issueId,
-}: {
+type ConnectedTaskProps = {
   attachments?: IssueAttachment[];
   companyId: string;
   issueId: string;
-}) {
-  const { binding } = useIssueChatBinding(companyId, issueId);
+  issueCacheRefs?: string[];
+};
+
+export function ExternallyConnectedTaskBanner(props: ConnectedTaskProps) {
+  const { binding } = useIssueChatBinding(props.companyId, props.issueId);
+  if (!binding) return null;
+  return (
+    <ConnectedTaskComposer
+      key={boardSendDraftKey(
+        props.companyId,
+        props.issueId,
+        binding.endpointId,
+        binding.conversationId,
+      )}
+      {...props}
+      binding={binding}
+    />
+  );
+}
+
+function ConnectedTaskComposer({
+  attachments = [],
+  companyId,
+  issueId,
+  issueCacheRefs,
+  binding,
+}: ConnectedTaskProps & { binding: ExternalChannelBindingSummary }) {
   const { pushToast } = useToast();
   const queryClient = useQueryClient();
   const [composing, setComposing] = useState(false);
@@ -99,43 +128,155 @@ export function ExternallyConnectedTaskBanner({
     null,
   );
   const idempotencyKey = useRef<string | null>(null);
+  const retainedSend = useRef<RetainedBoardSend | null>(null);
+  const retainedScopeKey = useRef<string | null>(null);
+  const [unconfirmedRequest, setUnconfirmedRequest] = useState(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const storageKey = binding
+    ? boardSendDraftKey(
+        companyId,
+        issueId,
+        binding.endpointId,
+        binding.conversationId,
+      )
+    : null;
+  const loadedStorageKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!storageKey || loadedStorageKey.current === storageKey) return;
+    loadedStorageKey.current = storageKey;
+    try {
+      const saved = readBoardSendDraft(storageKey);
+      retainedScopeKey.current = storageKey;
+      retainedSend.current = saved;
+      idempotencyKey.current = saved?.idempotencyKey ?? null;
+      setBody(saved?.body ?? "");
+      setSelectedAttachmentIds(saved?.attachmentIds ?? []);
+      setPublication(saved?.publication ?? null);
+      setUnconfirmedRequest(Boolean(saved && !saved.publication));
+      setComposing(Boolean(saved));
+      setStorageError(null);
+    } catch {
+      setStorageError(
+        "Saved delivery identity could not be read. Check Activity and restore browser storage before starting another send.",
+      );
+      setComposing(true);
+    }
+  }, [storageKey]);
+  const deliveryScopeReady = Boolean(
+    storageKey &&
+    loadedStorageKey.current === storageKey &&
+    retainedScopeKey.current === storageKey,
+  );
+  const invalidateTask = useCallback(() => {
+    for (const ref of new Set([issueId, ...(issueCacheRefs ?? [])])) {
+      for (const queryKey of [
+        queryKeys.issues.comments(ref),
+        queryKeys.issues.attachments(ref),
+        queryKeys.issues.detail(ref),
+        queryKeys.issues.activity(ref),
+      ]) {
+        void queryClient.invalidateQueries({ queryKey });
+      }
+    }
+  }, [issueId, issueCacheRefs, queryClient]);
+  const finishPublication = useCallback(() => {
+    if (storageKey) {
+      try {
+        clearBoardSendDraft(storageKey);
+      } catch {
+        /* The retained anchor remains safe to recheck after reload. */
+      }
+    }
+    retainedSend.current = null;
+    setUnconfirmedRequest(false);
+    setPublication(null);
+    idempotencyKey.current = null;
+    setBody("");
+    setSelectedAttachmentIds([]);
+    setComposing(false);
+    invalidateTask();
+    pushToast(publicationFeedback.published);
+  }, [invalidateTask, pushToast, storageKey]);
+  // Keep the first returned ID as the anchor. A batch's blocking row may
+  // change as text and files finish; no read is allowed to submit another send.
+  const publicationStatus = useQuery({
+    queryKey: [
+      "chat-publication-batch",
+      companyId,
+      binding?.endpointId,
+      binding?.conversationId,
+      publication?.id,
+    ],
+    queryFn: () =>
+      chatEndpointsApi.getPublicationBatchStatus(
+        binding!.endpointId,
+        binding!.conversationId,
+        publication!.id,
+      ),
+    enabled: deliveryScopeReady && Boolean(publication),
+    staleTime: 0,
+    refetchInterval: 2_000,
+    refetchIntervalInBackground: false,
+    retry: false,
+  });
+  useEffect(() => {
+    const batch = publicationStatus.data;
+    if (
+      publication &&
+      batch &&
+      batch.total > 0 &&
+      batch.published === batch.total &&
+      batch.publication.state === "published"
+    ) {
+      finishPublication();
+    }
+  }, [publication, publicationStatus.data, finishPublication]);
   const publish = useMutation({
     mutationFn: (input: {
       attachmentIds: string[];
       body: string;
       idempotencyKey: string;
+      endpointId: string;
+      conversationId: string;
     }) =>
       chatEndpointsApi.publishBoardMessage(
-        binding!.endpointId,
-        binding!.conversationId,
+        input.endpointId,
+        input.conversationId,
         input.body,
         input.idempotencyKey,
         input.attachmentIds,
       ),
     onSuccess: (result) => {
-      void Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId) }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.attachments(issueId) }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.issues.detail(issueId) }),
-      ]);
+      invalidateTask();
       const feedback = publicationFeedback[result.state];
       setPublication(result.state === "published" ? null : result);
       if (result.state === "published") {
-        idempotencyKey.current = null;
-        setBody("");
-        setSelectedAttachmentIds([]);
-        setComposing(false);
+        finishPublication();
+        return;
+      }
+      setUnconfirmedRequest(false);
+      if (storageKey && retainedSend.current) {
+        retainedSend.current = {
+          ...retainedSend.current,
+          publication: {
+            id: result.id,
+            state: result.state,
+            attempts: result.attempts,
+          },
+        };
+        try {
+          writeBoardSendDraft(storageKey, retainedSend.current);
+        } catch {
+          // The pre-POST payload/key is already persisted. It remains a safe,
+          // explicit same-request retry when the publication ID cannot be saved.
+        }
       }
       pushToast({
         ...feedback,
-        ...(result.state === "published"
-          ? {}
-          : {
-              action: {
-                label: "View activity",
-                href: `/apps/chat/${binding!.endpointId}/activity`,
-              },
-            }),
+        action: {
+          label: "View activity",
+          href: `/apps/chat/${binding!.endpointId}/activity`,
+        },
       });
     },
     onError: (error) =>
@@ -148,12 +289,12 @@ export function ExternallyConnectedTaskBanner({
         tone: "error",
       }),
   });
-  if (!binding) return null;
   const selectableAttachments = attachments.filter(
     (attachment) => attachment.issueCommentId === null,
   );
-  const currentFeedback = publication
-    ? publicationFeedback[publication.state]
+  const currentPublication = publicationStatus.data?.publication ?? publication;
+  const currentFeedback = currentPublication
+    ? publicationFeedback[currentPublication.state]
     : null;
   const activityPath = `/apps/chat/${binding.endpointId}/activity`;
   return (
@@ -200,7 +341,13 @@ export function ExternallyConnectedTaskBanner({
           <Textarea
             id="external-board-update"
             value={body}
-            disabled={Boolean(publication) || publish.isError}
+            disabled={
+              Boolean(publication) ||
+              publish.isError ||
+              unconfirmedRequest ||
+              Boolean(storageError) ||
+              !deliveryScopeReady
+            }
             onChange={(event) => {
               setBody(event.target.value);
               idempotencyKey.current = null;
@@ -211,7 +358,13 @@ export function ExternallyConnectedTaskBanner({
           {selectableAttachments.length > 0 && (
             <fieldset
               className="space-y-2 rounded-md border border-border bg-background p-3"
-              disabled={Boolean(publication) || publish.isError}
+              disabled={
+                Boolean(publication) ||
+                publish.isError ||
+                unconfirmedRequest ||
+                Boolean(storageError) ||
+                !deliveryScopeReady
+              }
             >
               <legend className="px-1 text-xs font-medium">
                 Include task files
@@ -250,7 +403,12 @@ export function ExternallyConnectedTaskBanner({
               </div>
             </fieldset>
           )}
-          {publish.isError && !publication && (
+          {storageError && (
+            <p role="alert" className="text-xs text-destructive">
+              {storageError}
+            </p>
+          )}
+          {(publish.isError || unconfirmedRequest) && !publication && (
             <div
               role="alert"
               className="space-y-1 rounded-md border border-border bg-background p-3 text-xs"
@@ -269,11 +427,11 @@ export function ExternallyConnectedTaskBanner({
               </Link>
             </div>
           )}
-          {publication && currentFeedback && (
+          {publication && currentPublication && currentFeedback && (
             <div
               role={
-                publication.state === "failed" ||
-                publication.state === "delivery_unknown"
+                currentPublication.state === "failed" ||
+                currentPublication.state === "delivery_unknown"
                   ? "alert"
                   : "status"
               }
@@ -281,9 +439,21 @@ export function ExternallyConnectedTaskBanner({
             >
               <p className="font-medium">{currentFeedback.title}</p>
               <p className="text-muted-foreground">{currentFeedback.body}</p>
-              {publication.redactedError && (
+              {publicationStatus.data && (
                 <p className="text-muted-foreground">
-                  Provider detail: {publication.redactedError}
+                  {publicationStatus.data.published} of{" "}
+                  {publicationStatus.data.total} parts published.
+                </p>
+              )}
+              {publicationStatus.isError && (
+                <p role="alert" className="text-muted-foreground">
+                  Delivery status could not be refreshed. Your draft is kept;
+                  Paperclip will check again without sending another update.
+                </p>
+              )}
+              {currentPublication.redactedError && (
+                <p className="text-muted-foreground">
+                  Provider detail: {currentPublication.redactedError}
                 </p>
               )}
               <Link
@@ -292,12 +462,24 @@ export function ExternallyConnectedTaskBanner({
               >
                 Open Activity
               </Link>
-              {publication.state === "cancelled" && (
+              {currentPublication.state === "cancelled" && (
                 <Button
                   className="ml-3"
                   size="sm"
                   variant="ghost"
                   onClick={() => {
+                    if (storageKey) {
+                      try {
+                        clearBoardSendDraft(storageKey);
+                      } catch {
+                        setStorageError(
+                          "Saved delivery identity could not be cleared. Restore browser storage before starting another send.",
+                        );
+                        return;
+                      }
+                    }
+                    retainedSend.current = null;
+                    setUnconfirmedRequest(false);
                     setPublication(null);
                     setSelectedAttachmentIds([]);
                     idempotencyKey.current = null;
@@ -316,20 +498,47 @@ export function ExternallyConnectedTaskBanner({
             <Button
               size="sm"
               disabled={
-                !body.trim() || publish.isPending || Boolean(publication)
+                !body.trim() ||
+                publish.isPending ||
+                Boolean(publication) ||
+                Boolean(storageError) ||
+                !deliveryScopeReady
               }
               onClick={() => {
+                if (
+                  !storageKey ||
+                  loadedStorageKey.current !== storageKey ||
+                  retainedScopeKey.current !== storageKey
+                )
+                  return;
                 idempotencyKey.current ??= crypto.randomUUID();
-                publish.mutate({
+                const input = retainedSend.current ?? {
                   attachmentIds: selectedAttachmentIds,
                   body: body.trim(),
                   idempotencyKey: idempotencyKey.current,
+                  publication: null,
+                };
+                try {
+                  if (!storageKey) throw new Error("Missing delivery scope");
+                  writeBoardSendDraft(storageKey, input);
+                } catch {
+                  setStorageError(
+                    "Browser storage could not preserve this delivery identity. No update was sent. Restore browser storage, then reload to try again.",
+                  );
+                  return;
+                }
+                retainedSend.current = input;
+                setUnconfirmedRequest(true);
+                publish.mutate({
+                  ...input,
+                  endpointId: binding.endpointId,
+                  conversationId: binding.conversationId,
                 });
               }}
             >
               {publish.isPending
                 ? "Sending…"
-                : publish.isError
+                : publish.isError || unconfirmedRequest
                   ? "Retry safely"
                   : "Send to channel"}
             </Button>

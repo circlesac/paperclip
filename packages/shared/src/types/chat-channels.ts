@@ -349,6 +349,23 @@ export interface ChatPublication {
   publishedAt?: string | null;
 }
 
+export interface ChatPublicationSummary {
+  id: string;
+  state: ChatPublicationState;
+  providerUrl?: string | null;
+  attempts: number;
+  redactedError?: string | null;
+  nextAttemptAt?: string | null;
+  publishedAt?: string | null;
+}
+
+export interface ChatPublicationBatchStatus {
+  /** First blocking part, or the final part when the entire batch is published. */
+  publication: ChatPublicationSummary;
+  total: number;
+  published: number;
+}
+
 export interface ChatActivityItem {
   id: string;
   kind: "delivery" | "publication" | "action" | "health" | "repair";
