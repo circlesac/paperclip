@@ -76,7 +76,33 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
 +	};
 +}
  //#endregion
-@@ -3959,7 +3959,24 @@ var AcpClient = class {
+@@ -3716,20 +3716,23 @@ function resolveClientInfo(devinAcp) {
+ 		version: process.env.ACPX_DEVIN_WINDSURF_VERSION ?? DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION
+ 	};
+ }
+ function resolveClientCapabilities(params) {
+ 	const baseCapabilities = {
+ 		fs: {
+ 			readTextFile: true,
+ 			writeTextFile: true
+ 		},
+ 		terminal: params.terminal
+ 	};
+-	if (!params.devinAcp) return baseCapabilities;
++	const typedSessionFailureMeta = {
++		jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } }
++	};
++	if (!params.devinAcp) return { ...baseCapabilities, _meta: typedSessionFailureMeta };
+ 	return {
+ 		...baseCapabilities,
+-		_meta: DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META
++		_meta: { ...typedSessionFailureMeta, ...DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META }
+ 	};
+ }
+ function isDevinRequestDiagnosticsMethod(method) {
+ 	return method === "_cognition.ai/request_diagnostics";
+ }
+@@ -3959,7 +3962,24 @@ var AcpClient = class {
 -		this.attachAgentLifecycleObservers(child);
 +		this.attachAgentLifecycleObservers(child);
 +		if (this.options.onAgentSpawn) {
@@ -102,7 +128,7 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -3994,7 +4011,7 @@ var AcpClient = class {
+@@ -3994,7 +4014,7 @@ var AcpClient = class {
  			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
@@ -111,6 +137,47 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  		};
  	}
  	logAgentLaunch(plan) {
+@@ -6087,16 +6110,40 @@ async function closeConnectedSession(options) {
+ }
+ //#endregion
+ //#region src/runtime/engine/prompt-turn.ts
+ const SESSION_REPLY_IDLE_MS = 1e3;
+ const SESSION_REPLY_DRAIN_TIMEOUT_MS = 5e3;
++const TYPED_SESSION_FAILURE_CATEGORIES = /* @__PURE__ */ new Set([
++	"connection",
++	"access",
++	"limit",
++	"service",
++	"request",
++	"unknown"
++]);
++function typedTerminalSessionFailureCategory(response) {
++	if (response === null || typeof response !== "object" || Array.isArray(response)) return null;
++	const meta = response._meta;
++	if (meta === null || typeof meta !== "object" || Array.isArray(meta)) return null;
++	const jetbrains = meta.jetbrains;
++	if (jetbrains === null || typeof jetbrains !== "object" || Array.isArray(jetbrains)) return null;
++	const air = jetbrains.air;
++	if (air === null || typeof air !== "object" || Array.isArray(air)) return null;
++	if (!Number.isInteger(air.version) || air.version < 1) return null;
++	const failure = air.sessionFailure;
++	if (failure === null || typeof failure !== "object" || Array.isArray(failure) || failure.severity !== "error") return null;
++	return typeof failure.category === "string" && TYPED_SESSION_FAILURE_CATEGORIES.has(failure.category) ? failure.category : "unknown";
++}
+ async function runPromptTurn(params) {
+ 	try {
+ 		const promptPromise = params.client.prompt(params.sessionId, params.prompt);
+ 		await params.onPromptStarted?.();
+ 		const response = await withTimeout(promptPromise, params.timeoutMs);
+ 		await params.client.waitForSessionUpdatesIdle?.({
+ 			idleMs: SESSION_REPLY_IDLE_MS,
+ 			timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS
+ 		}).catch(() => {});
++		const terminalFailureCategory = typedTerminalSessionFailureCategory(response);
++		if (terminalFailureCategory !== null)
++			throw new Error(`ACP agent reported a terminal ${terminalFailureCategory} failure.`);
+ 		recordPromptResponseUsage(params.conversation, response.usage, params.promptMessageId);
+ 		return {
 diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
 index ccdbe5b032521518022223733049b8b38793473b..3d4e04231e78efeecd8540735b08e1e43547ff2d 100644
 --- a/dist/runtime.d.ts
