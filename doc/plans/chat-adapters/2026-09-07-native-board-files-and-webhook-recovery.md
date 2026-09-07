@@ -504,3 +504,33 @@ instruction not to edit or commit `pnpm-lock.yaml` remains in force. No patch,
 override, or dependency was removed to make the check appear green. Release
 qualification needs a reconciled lockfile and a clean frozen-install retest
 after that constraint is resolved; the active local server is unaffected.
+
+## Upstream reconciliation remains open
+
+A fresh fetch on September 7 found `origin/master` at `d8b958053`, four commits
+ahead of this branch's merge base `f6a211479`. In addition to the lock refresh,
+upstream adds guarded Runner API fallback, responsible-person GitHub execution
+identity, and recent-task ordering. The tested checkpoint `9007e4111` does not
+contain those changes.
+
+A non-worktree `git merge-tree` diagnostic confirmed conflicts in migration
+metadata 0240–0245 and the journal, the OpenAPI route test, issue routes, and
+native runner tool authority. Automatically merged heartbeat/executor paths
+still require semantic verification; a textual auto-merge is not proof that
+native chat authority and continuation behavior remain correct. No merge,
+rebase, migration rewrite, or lockfile update was applied to the live worktree.
+The existing live database must retain its applied migration history during
+that future reconciliation. Current-source release qualification cannot be
+claimed against the newer upstream revision until this work and its tests are
+complete.
+
+Independent review identified the concrete merged checks: retain both the
+chat-specific native tool/attachment authority and upstream's guarded API
+fallback; carry identity-context fields through the rewritten issue handlers;
+test fresh and already-migrated databases; and verify broker-bound resumed
+turns with different linked actors. Guest messages are currently quarantined,
+and higher-trust runs omit their bodies and attachments. Upstream identity
+initialization skips authorless comments and may inherit a continuation actor,
+so guest-root and linked-A/guest/linked-B scenarios need explicit combined
+identity/credential tests. This is an unverified integration boundary, not
+evidence that credentials leaked in the tested branch.
