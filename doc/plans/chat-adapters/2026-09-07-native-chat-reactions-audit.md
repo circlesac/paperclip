@@ -134,5 +134,46 @@ The lockfile was not changed. The only newly fetched upstream commit,
 `392ab26b1`, changes that file alone and was not applied under the explicit
 instruction to leave it untouched.
 
+## Final live retest on the reaction fix
+
+Commit `dde176bbc` was pushed and the isolated server restarted after verifying
+zero active runs. Snapshot 10 started at **19:18:20.078 UTC**, with loaded server
+version `2026.831.0+396.git.dde176bbc`; startup recovery reached ready and the
+Discord Gateway connected. Existing recovery-blocked history was not edited.
+
+The same signed-in browser repeated two thumbs-up add/remove cycles on each
+original test message. Every event below was processed once with a null error.
+
+| Provider | Event    | Browser action UTC | Received → processed UTC    | Delivery ID                            |
+| -------- | -------- | ------------------ | --------------------------- | -------------------------------------- |
+| Discord  | Add 1    | 19:18:51.109       | 19:18:51.537 → 19:18:51.539 | `324d147a-6ace-44fe-9952-529a02bfaced` |
+| Discord  | Remove 1 | 19:18:56.075       | 19:18:56.336 → 19:18:56.338 | `d98047bd-9efb-48b4-98b5-ed79f2aea964` |
+| Discord  | Add 2    | 19:19:10.424       | 19:19:10.661 → 19:19:10.663 | `71185c1a-bf33-4b75-87d9-9ba530c417e1` |
+| Discord  | Remove 2 | 19:19:15.631       | 19:19:15.826 → 19:19:15.829 | `8e45ba6c-94f7-40cb-b4f3-d62a681fcfc7` |
+| Telegram | Add 1    | 19:19:31.957       | 19:19:33.065 → 19:19:33.067 | `5e1a4207-cbb0-49ff-87c7-c400f2cde12c` |
+| Telegram | Remove 1 | 19:19:52.642       | 19:19:52.854 → 19:19:52.856 | `e3494e32-9841-4f6e-894b-d1d65ac26eb0` |
+| Telegram | Add 2    | 19:20:15.526       | 19:20:15.711 → 19:20:15.714 | `e41b4e64-750d-4ae0-a59d-66f37edba765` |
+| Telegram | Remove 2 | 19:20:33.120       | 19:20:33.386 → 19:20:33.387 | `267118ca-5d62-4c57-8856-eeaf55f6400b` |
+
+Discord's second pair appeared in its already-open Activity view by
+**19:19:21.917**, without reload/navigation. Telegram's first pair appeared
+after navigating from the catalog into Activity; no automatic-refresh claim is
+made for that first pair. With that view kept open, its second addition was
+visible at **19:20:28.587** and removal at **19:20:40.938**. Both providers'
+latest rows were visually inspected. All four Telegram receipts belong to
+completed generation 5, not the newer active generation 6.
+
+Between **19:18:41.974** and **19:20:57.941 UTC**, counts stayed **86 Maya runs,
+17 tasks, 216 comments, 200 publications**. All test thumbs-up reactions were
+removed; existing bot reactions stayed intact. Slack, GitHub, Discord, and
+Telegram endpoints remained active. These specific functional and Activity
+freshness retests pass and supersede the failed reaction baselines above.
+Replay/startup-buffer behavior has deterministic coverage, not an injected
+live Gateway outage qualification.
+
+The Maya agent was rechecked as `paperclip_runner` → `codex` → `gpt-5.6-luna`.
+The current Codex usage tool still reports the general weekly limit exhausted;
+no reset, billing change, or model-starting prompt was attempted in this batch.
+
 The broader provider release gate remains open, including live native model
 stress/recovery and Teams tenant/admin qualification.
