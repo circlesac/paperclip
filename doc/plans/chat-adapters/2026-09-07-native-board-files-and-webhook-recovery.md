@@ -333,3 +333,50 @@ produce a safe uncertain-delivery result. Focused adapter and hydration tests
 passed **51/51**; the first typecheck caught a generic mock typing error in the
 new late-token test. The corrected test and server typecheck pass. Live qualification of
 this polling change is recorded below rather than inferred from those tests.
+
+## Snapshot 13: real file identities and file reactions pass
+
+Loaded `2026.831.0+403.git.dddcf0d93` at **20:21:08.692 UTC**, with startup
+recovery ready and Discord Gateway connected. Rechecked the existing document
+in Slack, including its correct fixture text, then used Activity's **Mark
+delivered** at **20:21:31.363**. It retained one upload attempt; no retry or
+provider-ID backfill was performed. Its missing automatic lineage remains an
+explicit limitation of manual resolution, not a successful identity test.
+
+The previously pending image then published once, automatically, at
+**20:21:36.719**, with real Slack ID `1788812496.261909` and a matching outbound
+message link. Slack showed the cat image in the intended thread. The mounted
+Board composer closed automatically after the batch completed. A new draft
+offered the new unbound note and the internal-only fixture, not already sent
+files.
+
+Sent `SLACK-FILE-ID-RECHECK` from the Board at **20:21:55.713**, selecting only
+`slack-upload-id-recheck-note.txt`. Text and document published in one attempt
+each under canonical comment `f1118339-a6e2-40f5-b4e6-b67fe3883e1f`. The document
+publication `e7517c83-15b2-4928-964b-422d1b64e8d1` completed at
+**20:21:56.890**, with native ID `1788812516.721189` and a matching outbound link.
+Slack visibly rendered the correct `cobalt otter 47` content. No manual
+resolution or duplicate send was needed, and the Board draft cleared again.
+
+Added and removed the operator's thumbs-up on that exact document, then on the
+new image, through Slack's message controls. All four receipts processed once,
+without error, and the Activity tab refreshed to show them:
+
+| File | Event | Received UTC | Processed UTC | Exact native message ID |
+| --- | --- | --- | --- | --- |
+| Note | added | 20:22:38.257 | 20:22:38.262 | `1788812516.721189` |
+| Note | removed | 20:22:56.917 | 20:22:56.921 | `1788812516.721189` |
+| Image | added | 20:23:24.762 | 20:23:24.768 | `1788812496.261909` |
+| Image | removed | 20:23:27.958 | 20:23:27.962 | `1788812496.261909` |
+
+Both test reactions were removed; existing reactions were untouched. Maya's
+run counts remained 78 succeeded / 8 failed, with no running or queued run.
+An unrelated automatic productivity-review task, CHA-18, appeared during this
+window; it has no chat conversation and must not be attributed to these
+reactions. All four configured endpoints remained active.
+
+Functional result: fresh Slack document/image delivery, exact outbound lineage,
+post-commit file reactions, and automatic Board draft completion passed live.
+The one-shot failure did require operator recovery; the corrected fresh-send
+journey did not. This does not qualify the still-open reaction-before-link race,
+native model generation under exhausted quota, or Microsoft Teams.
