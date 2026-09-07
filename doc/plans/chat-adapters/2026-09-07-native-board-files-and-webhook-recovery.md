@@ -380,3 +380,20 @@ post-commit file reactions, and automatic Board draft completion passed live.
 The one-shot failure did require operator recovery; the corrected fresh-send
 journey did not. This does not qualify the still-open reaction-before-link race,
 native model generation under exhausted quota, or Microsoft Teams.
+
+### Manual confirmation is not a recovered provider receipt
+
+Read-only review confirmed that `mark_delivered` intentionally records the
+operator's confirmation without inventing an external ID. Exact reactions or
+later message replacement cannot use a link that does not exist. The current
+adapter discards its known uploaded file IDs when bounded share lookup expires,
+so old uncertain/manual-confirmed rows cannot safely be matched later by
+filename, text, or time-window searches.
+
+A future recovery path would need a durable internal partial receipt from the
+original attempt: the exact server-observed file IDs, publication/attempt, bot
+identity, and intended channel/thread. It could then repeat only scoped,
+read-only metadata lookups under current authorization, require the same unique
+share match, and transactionally bind the identity without another upload or
+repeating manual-completion side effects. That path is not implemented or
+claimed in this qualification.

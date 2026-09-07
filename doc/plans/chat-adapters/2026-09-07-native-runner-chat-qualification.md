@@ -192,6 +192,12 @@ chunking presents already-selected safe prose; it is not token-live Runner
 reasoning. Any richer external activity would require a separate closed,
 sanitized projection, not reuse of the Board transcript objects.
 
+A separate native execution-input, question-bridge, file-handoff, and
+same-conversation attachment-reuse recheck passed **20/20** across four files
+after the Slack polling change. Its disabled-runner eligibility error was an
+isolated test-fixture gate, not a failure of the active live instance. These
+contract/DB checks do not substitute for new model-driven live turns.
+
 The new runner does not have the legacy operational skill or a general
 Paperclip API key. Consequently, the previous shell-helper file instructions
 were not a valid native-runner qualification. Native runs now receive a scoped
