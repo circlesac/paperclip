@@ -1825,6 +1825,25 @@ test.describe("Board send delivery refresh", () => {
               updatedAt: new Date().toISOString(),
               contentPath: `/api/attachments/${attachmentId}/content`,
             },
+            {
+              id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+              companyId: seed.companyId,
+              issueId: issue.id,
+              issueCommentId: null,
+              assetId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+              provider: "local_disk",
+              objectKey: "internal-only.txt",
+              contentType: "text/plain",
+              byteSize: 8,
+              sha256: "b".repeat(64),
+              originalFilename: "internal-only.txt",
+              createdByAgentId: null,
+              createdByUserId: "local-board",
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              contentPath:
+                "/api/attachments/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee/content",
+            },
           ]);
         },
       );
@@ -1871,6 +1890,23 @@ test.describe("Board send delivery refresh", () => {
         .getByRole("button", { name: "Send to channel", exact: true })
         .last()
         .click();
+      const expectRetainedFiles = async () => {
+        const files = page.getByRole("group", {
+          name: "Files in this send",
+          exact: true,
+        });
+        await expect(files).toBeVisible();
+        await expect(files.getByRole("checkbox")).toHaveCount(1);
+        await expect(
+          files.getByRole("checkbox", { name: "board-send-test.txt" }),
+        ).toBeChecked();
+        await expect(
+          files.getByRole("checkbox", { name: "board-send-test.txt" }),
+        ).toBeDisabled();
+        await expect(
+          files.getByText("internal-only.txt", { exact: true }),
+        ).toHaveCount(0);
+      };
       if (outcome === "response_lost") {
         await expect(
           page.getByText("Delivery result not confirmed", { exact: true }),
@@ -1879,6 +1915,7 @@ test.describe("Board send delivery refresh", () => {
         await expect(
           page.getByRole("textbox", { name: "Board update", exact: true }),
         ).toBeDisabled();
+        await expectRetainedFiles();
         expect(sends).toBe(1);
         expect(reads).toBe(0);
         await page
@@ -1897,6 +1934,7 @@ test.describe("Board send delivery refresh", () => {
         await expect
           .poll(() => canonicalAttachmentReadsAfterSend)
           .toBeGreaterThan(0);
+        await expectRetainedFiles();
         const readsBeforeReload = reads;
         await page.reload();
         await expect
@@ -1905,6 +1943,7 @@ test.describe("Board send delivery refresh", () => {
         expect(sends).toBe(1);
       }
       await expect.poll(() => reads, { timeout: 8_000 }).toBeGreaterThan(0);
+      await expectRetainedFiles();
       await expect(
         page.getByRole("textbox", { name: "Board update", exact: true }),
       ).toHaveValue("Board batch must finish all files.");
@@ -1951,6 +1990,23 @@ test.describe("Board send delivery refresh", () => {
       await expect(
         page.getByText("Board batch must finish all files.", { exact: true }),
       ).toBeVisible();
+      await page
+        .getByRole("button", { name: "Send to channel", exact: true })
+        .click();
+      const newFiles = page.getByRole("group", {
+        name: "Include task files",
+        exact: true,
+      });
+      await expect(
+        newFiles.getByRole("checkbox", { name: "board-send-test.txt" }),
+      ).toHaveCount(0);
+      await expect(
+        newFiles.getByRole("checkbox", { name: "internal-only.txt" }),
+      ).not.toBeChecked();
+      await expect(
+        newFiles.getByRole("checkbox", { name: "internal-only.txt" }),
+      ).toBeEnabled();
+      expect(sends).toBe(outcome === "response_lost" ? 2 : 1);
     });
   }
 });

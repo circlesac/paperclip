@@ -83,10 +83,13 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
   async function renderBanner(
     attachments: IssueAttachment[] = [],
     issueCacheRefs?: string[],
+    existingQueryClient?: QueryClient,
   ) {
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
+    const queryClient =
+      existingQueryClient ??
+      new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
     flushSync(() => {
       root.render(
         <QueryClientProvider client={queryClient}>
@@ -229,6 +232,109 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       [attachment.id],
     );
   });
+
+  it.each(["published", "cancelled"] as const)(
+    "keeps exact selected file names and checks through binding/reload, then excludes them from a new %s draft",
+    async (finalState) => {
+      const attachment = {
+        id: "file-selected",
+        companyId: "company-1",
+        issueId: "issue-1",
+        issueCommentId: null,
+        assetId: "asset-selected",
+        provider: "local_disk",
+        objectKey: "selected.txt",
+        contentType: "text/plain",
+        byteSize: 12,
+        sha256: "a".repeat(64),
+        originalFilename: "selected.txt",
+        createdByAgentId: null,
+        createdByUserId: "board",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        contentPath: "/api/attachments/file-selected/content",
+      } satisfies IssueAttachment;
+      const internalOnly = {
+        ...attachment,
+        id: "file-internal",
+        originalFilename: "internal-only.txt",
+      };
+      mockChatEndpointsApi.publishBoardMessage.mockResolvedValue({
+        id: "original-anchor",
+        state: "streaming",
+        attempts: 1,
+      });
+      mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+        publication: { id: "file-part", state: "pending", attempts: 0 },
+        total: 2,
+        published: 1,
+      });
+      const queryClient = await renderBanner([attachment, internalOnly]);
+      await act(() => findButton(container, "Send to channel").click());
+      await act(() =>
+        (
+          container.querySelector(
+            'button[role="checkbox"]',
+          ) as HTMLButtonElement
+        ).click(),
+      );
+      await act(() =>
+        setTextareaValue(container.querySelector("textarea")!, "Exact files"),
+      );
+      await act(() =>
+        [...container.querySelectorAll("button")]
+          .filter((button) => button.textContent?.trim() === "Send to channel")
+          .at(-1)
+          ?.click(),
+      );
+      await flushReact();
+      const bound = { ...attachment, issueCommentId: "board-comment" };
+      await renderBanner([bound, internalOnly], undefined, queryClient);
+      const assertRetainedFiles = () => {
+        expect(container.textContent).toContain("Files in this send");
+        expect(container.textContent).toContain("selected.txt");
+        expect(container.textContent).not.toContain("internal-only.txt");
+        const checks = container.querySelectorAll('button[role="checkbox"]');
+        expect(checks.length).toBe(1);
+        expect(checks[0]?.getAttribute("aria-checked")).toBe("true");
+        expect((checks[0] as HTMLButtonElement).disabled).toBe(true);
+      };
+      assertRetainedFiles();
+      // Reload with attachment metadata still loading must retain saved names.
+      flushSync(() => root.unmount());
+      root = createRoot(container);
+      const restoredClient = await renderBanner([]);
+      assertRetainedFiles();
+      await renderBanner([bound, internalOnly], undefined, restoredClient);
+      assertRetainedFiles();
+      mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+        publication: { id: "file-part", state: finalState, attempts: 1 },
+        total: 2,
+        published: finalState === "published" ? 2 : 1,
+      });
+      await restoredClient.invalidateQueries({
+        queryKey: ["chat-publication-batch"],
+      });
+      await flushReact();
+      await act(() =>
+        findButton(
+          container,
+          finalState === "published" ? "Send to channel" : "Start a new send",
+        ).click(),
+      );
+      expect(container.textContent).not.toContain("selected.txt");
+      expect(container.textContent).toContain("internal-only.txt");
+      const newCheck = container.querySelector(
+        'button[role="checkbox"]',
+      ) as HTMLButtonElement;
+      expect(newCheck.getAttribute("aria-checked")).toBe("false");
+      expect(newCheck.disabled).toBe(false);
+      expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
+      expect(
+        mockChatEndpointsApi.publishBoardMessage.mock.calls[0]?.[4],
+      ).toEqual([attachment.id]);
+    },
+  );
 
   it("refreshes a retained send and clears it only after every batch part is published", async () => {
     mockChatEndpointsApi.publishBoardMessage.mockResolvedValue({

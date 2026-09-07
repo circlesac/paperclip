@@ -289,9 +289,21 @@ function ConnectedTaskComposer({
         tone: "error",
       }),
   });
-  const selectableAttachments = attachments.filter(
-    (attachment) => attachment.issueCommentId === null,
-  );
+  const showingRetainedFiles = Boolean(retainedSend.current);
+  // Comment binding removes files from new-send eligibility, not from the
+  // immutable receipt for the current send. Saved names survive reload while
+  // task metadata is loading (or a selected attachment has since been removed).
+  const visibleAttachments = retainedSend.current
+    ? retainedSend.current.attachmentIds.map((id) => ({
+        id,
+        originalFilename:
+          retainedSend.current?.attachmentNames?.find((file) => file.id === id)
+            ?.name ??
+          attachments.find((attachment) => attachment.id === id)
+            ?.originalFilename ??
+          "Selected task file (details unavailable)",
+      }))
+    : attachments.filter((attachment) => attachment.issueCommentId === null);
   const currentPublication = publicationStatus.data?.publication ?? publication;
   const currentFeedback = currentPublication
     ? publicationFeedback[currentPublication.state]
@@ -355,10 +367,11 @@ function ConnectedTaskComposer({
             }}
             placeholder="Write only what should be visible in the provider conversation."
           />
-          {selectableAttachments.length > 0 && (
+          {visibleAttachments.length > 0 && (
             <fieldset
               className="space-y-2 rounded-md border border-border bg-background p-3"
               disabled={
+                showingRetainedFiles ||
                 Boolean(publication) ||
                 publish.isError ||
                 unconfirmedRequest ||
@@ -367,15 +380,19 @@ function ConnectedTaskComposer({
               }
             >
               <legend className="px-1 text-xs font-medium">
-                Include task files
+                {showingRetainedFiles
+                  ? "Files in this send"
+                  : "Include task files"}
               </legend>
               <p className="text-xs text-muted-foreground">
                 {binding.provider === "github"
                   ? "GitHub Apps cannot upload file bytes in comments. Checked files stay on the Paperclip task; GitHub receives an authenticated task link when this Board has a public URL, or a private-task notice otherwise."
-                  : "Only checked files will be published to the external conversation."}
+                  : showingRetainedFiles
+                    ? "These are the files selected for this send. Selection is locked until delivery is resolved."
+                    : "Only checked files will be published to the external conversation."}
               </p>
               <div className="space-y-2">
-                {selectableAttachments.map((attachment) => {
+                {visibleAttachments.map((attachment) => {
                   const label =
                     attachment.originalFilename ?? "Unnamed attachment";
                   return (
@@ -384,6 +401,7 @@ function ConnectedTaskComposer({
                       key={attachment.id}
                     >
                       <Checkbox
+                        disabled={showingRetainedFiles}
                         checked={selectedAttachmentIds.includes(attachment.id)}
                         onCheckedChange={(checked) => {
                           setSelectedAttachmentIds((current) =>
@@ -514,6 +532,12 @@ function ConnectedTaskComposer({
                 idempotencyKey.current ??= crypto.randomUUID();
                 const input = retainedSend.current ?? {
                   attachmentIds: selectedAttachmentIds,
+                  attachmentNames: selectedAttachmentIds.map((id) => ({
+                    id,
+                    name:
+                      attachments.find((attachment) => attachment.id === id)
+                        ?.originalFilename ?? "Unnamed attachment",
+                  })),
                   body: body.trim(),
                   idempotencyKey: idempotencyKey.current,
                   publication: null,

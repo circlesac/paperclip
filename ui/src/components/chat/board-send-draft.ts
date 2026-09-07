@@ -6,6 +6,7 @@ import {
 export interface RetainedBoardSend {
   body: string;
   attachmentIds: string[];
+  attachmentNames?: { id: string; name: string }[];
   idempotencyKey: string;
   publication: Pick<ChatPublicationSummary, "id" | "state" | "attempts"> | null;
 }
@@ -35,6 +36,18 @@ export function readBoardSendDraft(key: string): RetainedBoardSend | null {
     !Array.isArray(value.attachmentIds) ||
     value.attachmentIds.length > 20 ||
     !value.attachmentIds.every((id) => typeof id === "string") ||
+    (value.attachmentNames !== undefined &&
+      (!Array.isArray(value.attachmentNames) ||
+        value.attachmentNames.length !== value.attachmentIds.length ||
+        new Set(value.attachmentNames.map((file) => file?.id)).size !==
+          value.attachmentNames.length ||
+        !value.attachmentNames.every(
+          (file) =>
+            file &&
+            typeof file.id === "string" &&
+            value.attachmentIds!.includes(file.id) &&
+            typeof file.name === "string",
+        ))) ||
     (value.publication !== null &&
       (!value.publication ||
         typeof value.publication.id !== "string" ||

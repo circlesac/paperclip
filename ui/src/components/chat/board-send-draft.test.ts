@@ -37,6 +37,34 @@ describe("session-scoped Board send identity", () => {
       "Saved channel delivery identity",
     );
   });
+  it("preserves selected filename snapshots but rejects names outside the exact send", () => {
+    const draft = {
+      body: "Intended external update",
+      attachmentIds: ["file-1"],
+      attachmentNames: [{ id: "file-1", name: "selected-image.png" }],
+      idempotencyKey: "stable-request-key-1",
+      publication: null,
+    };
+    writeBoardSendDraft("named", draft);
+    expect(readBoardSendDraft("named")).toEqual(draft);
+    for (const attachmentNames of [
+      [],
+      [{ id: "other-file", name: "internal-only.txt" }],
+      [{ id: "file-1", name: 123 }],
+      [
+        { id: "file-1", name: "selected-image.png" },
+        { id: "file-1", name: "duplicate.png" },
+      ],
+    ]) {
+      sessionStorage.setItem(
+        "named",
+        JSON.stringify({ ...draft, attachmentNames }),
+      );
+      expect(() => readBoardSendDraft("named")).toThrow(
+        "Saved channel delivery identity",
+      );
+    }
+  });
   it("surfaces storage write failures before a caller performs its send", () => {
     vi.spyOn(
       Object.getPrototypeOf(sessionStorage),
