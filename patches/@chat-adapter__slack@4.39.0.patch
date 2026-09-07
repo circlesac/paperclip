@@ -49,7 +49,7 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
        });
        if (response.ok) {
          this.logger.debug("Socket event forwarded successfully", {
-@@ -3900,17 +3904,17 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3900,17 +3904,22 @@ var SlackAdapter = class _SlackAdapter {
      const { channel, threadTs: rawThreadTs } = this.decodeThreadId(threadId);
      const threadTs = rawThreadTs || void 0;
      try {
@@ -58,7 +58,12 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
        const files = extractFiles(message);
        if (files.length > 0) {
 -        uploadedFileIds = await this.uploadFiles(files, channel, threadTs);
-+        uploadedFiles = await this.uploadFiles(files, channel, threadTs);
++        uploadedFiles = await this.uploadFiles(
++          files,
++          channel,
++          threadTs,
++          this.paperclipFileUploadReceiptContext?.getStore?.()
++        );
          const hasText = typeof message === "string" || typeof message === "object" && message !== null && ("raw" in message && message.raw || "markdown" in message && message.markdown || "ast" in message && message.ast);
          const card2 = extractCard(message);
          if (!(hasText || card2)) {
@@ -89,6 +94,15 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
        };
      } catch (error) {
        this.handleSlackError(error);
+@@ -4190,7 +4194,7 @@ var SlackAdapter = class _SlackAdapter {
+    * Upload files to Slack and share them to a channel.
+    * Returns the file IDs of uploaded files.
+    */
+-  async uploadFiles(files, channel, threadTs) {
++  async uploadFiles(files, channel, threadTs, onFileUploadAccepted) {
+     const bufferResults = await Promise.all(
+       files.map(async (file) => {
+         try {
 @@ -4205,7 +4209,9 @@ var SlackAdapter = class _SlackAdapter {
        (result2) => result2 !== null
      );
@@ -100,7 +114,7 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
      }
      this.logger.debug("Slack API: files.uploadV2 (batch)", {
        fileCount: fileUploads.length,
-@@ -4219,14 +4225,127 @@ var SlackAdapter = class _SlackAdapter {
+@@ -4219,14 +4225,157 @@ var SlackAdapter = class _SlackAdapter {
      const result = await this._client.files.uploadV2(uploadArgs);
      this.logger.debug("Slack API: files.uploadV2 response", { ok: result.ok });
      const fileIds = [];
@@ -121,10 +135,18 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
        }
      }
 -    return fileIds;
-+    if (fileIds.length !== fileUploads.length || new Set(fileIds).size !== fileIds.length) {
++    if (fileIds.length !== fileUploads.length || new Set(fileIds).size !== fileIds.length || fileIds.some((fileId) => typeof fileId !== "string" || !/^F[A-Z0-9]{1,254}$/.test(fileId))) {
 +      throw new Error(
 +        "Slack file upload completed, but its message identity could not be confirmed"
 +      );
++    }
++    if (typeof onFileUploadAccepted === "function") {
++      await onFileUploadAccepted({
++        version: 1,
++        fileIds: [...fileIds],
++        channelId: channel,
++        threadTs: threadTs ?? null
++      });
 +    }
 +    let messageId = this.slackFileShareMessageId(
 +      completedFiles,
@@ -132,55 +154,12 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
 +      threadTs
 +    );
 +    if (!messageId) {
-+      const deadline = Date.now() + 5e3;
-+      const retryDelays = [100, 250, 500, 1e3];
-+      let lookupAttempt = 0;
-+      while (!messageId && Date.now() < deadline) {
-+        let timeout;
-+        try {
-+          const lookup = Promise.all(
-+            fileIds.map(async (file) => {
-+              const args = await this.withToken({ file });
-+              if (Date.now() >= deadline) {
-+                throw new Error("Slack file identity lookup timed out");
-+              }
-+              return this._client.files.info(args);
-+            })
-+          );
-+          const infos = await Promise.race([
-+            lookup,
-+            new Promise((_, reject) => {
-+              timeout = setTimeout(
-+                () => reject(new Error("Slack file identity lookup timed out")),
-+                Math.max(1, deadline - Date.now())
-+              );
-+              timeout.unref?.();
-+            })
-+          ]);
-+          const infoFiles = infos.map((info) => info.file);
-+          if (infoFiles.some((file, index) => !file || file.id !== fileIds[index])) {
-+            throw new Error("Slack file identity lookup did not match the uploaded files");
-+          }
-+          messageId = this.slackFileShareMessageId(infoFiles, channel, threadTs);
-+        } catch {
-+          throw new Error(
-+            "Slack file upload completed, but its message identity could not be confirmed"
-+          );
-+        } finally {
-+          clearTimeout(timeout);
-+        }
-+        if (messageId) break;
-+        const remaining = deadline - Date.now();
-+        if (remaining <= 0) break;
-+        const delay = Math.min(
-+          retryDelays[Math.min(lookupAttempt, retryDelays.length - 1)],
-+          remaining
++      try {
++        messageId = await this.paperclipResolveFileUploadMessageId(fileIds, channel, threadTs);
++      } catch {
++        throw new Error(
++          "Slack file upload completed, but its message identity could not be confirmed"
 +        );
-+        lookupAttempt += 1;
-+        await new Promise((resolve) => {
-+          const retryTimer = setTimeout(resolve, delay);
-+          retryTimer.unref?.();
-+        });
 +      }
 +    }
 +    if (!messageId) {
@@ -189,6 +168,71 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
 +      );
 +    }
 +    return { fileIds, messageId };
++  }
++  async paperclipResolveFileUploadReceipt(fileIds, threadId) {
++    if (!Array.isArray(fileIds) || fileIds.length === 0 || fileIds.length > 20 || new Set(fileIds).size !== fileIds.length || fileIds.some((fileId) => typeof fileId !== "string" || !/^F[A-Z0-9]{1,254}$/.test(fileId))) {
++      const error = new Error("Slack file upload receipt is invalid");
++      error.name = "ValidationError";
++      throw error;
++    }
++    const { channel, threadTs: rawThreadTs } = this.decodeThreadId(threadId);
++    try {
++      return await this.paperclipResolveFileUploadMessageId(fileIds, channel, rawThreadTs || void 0);
++    } catch (error) {
++      this.handleSlackError(error);
++    }
++  }
++  async paperclipResolveFileUploadMessageId(fileIds, channel, threadTs) {
++    const deadline = Date.now() + 5e3;
++    const retryDelays = [100, 250, 500, 1e3];
++    let lookupAttempt = 0;
++    while (Date.now() < deadline) {
++      let timeout;
++      let messageId = null;
++      try {
++        const lookup = Promise.all(
++          fileIds.map(async (file) => {
++            const args = await this.withToken({ file });
++            if (Date.now() >= deadline) {
++              throw new Error("Slack file identity lookup timed out");
++            }
++            return this._client.files.info(args);
++          })
++        );
++        const infos = await Promise.race([
++          lookup,
++          new Promise((_, reject) => {
++            timeout = setTimeout(
++              () => reject(new Error("Slack file identity lookup timed out")),
++              Math.max(1, deadline - Date.now())
++            );
++            timeout.unref?.();
++          })
++        ]);
++        const infoFiles = infos.map((info) => info.file);
++        if (infoFiles.some((file, index) => !file || file.id !== fileIds[index])) {
++          const error = new Error("Slack file identity lookup did not match the uploaded files");
++          error.name = "ValidationError";
++          throw error;
++        }
++        messageId = this.slackFileShareMessageId(infoFiles, channel, threadTs);
++      } finally {
++        clearTimeout(timeout);
++      }
++      if (messageId) return messageId;
++      const remaining = deadline - Date.now();
++      if (remaining <= 0) break;
++      const delay = Math.min(
++        retryDelays[Math.min(lookupAttempt, retryDelays.length - 1)],
++        remaining
++      );
++      lookupAttempt += 1;
++      await new Promise((resolve) => {
++        const retryTimer = setTimeout(resolve, delay);
++        retryTimer.unref?.();
++      });
++    }
++    return null;
 +  }
 +  slackFileShareMessageId(files, channel, threadTs) {
 +    if (!Array.isArray(files) || files.length === 0) {

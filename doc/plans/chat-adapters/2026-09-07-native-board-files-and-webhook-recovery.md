@@ -207,11 +207,11 @@ then selected them through each canonical task's actual Send composer. Markers
 were `BOARD-NEW-BACKEND-{PROVIDER}`. Unrelated and internal-only files stayed
 unchecked. No agent reply was requested.
 
-| Provider | Board click UTC | All three parts published UTC | Canonical comment |
-| --- | --- | --- | --- |
-| Discord | 19:54:40.669 | 19:54:46.478 | `0cbe837f-b48c-42dc-b36f-f2bc7c901ec2` |
-| Telegram | 19:55:11.630 | 19:55:14.991 | `57639d0a-4c3e-4b2b-80c8-e36c5311fdc6` |
-| GitHub | 19:55:36.324 | 19:55:38.967 | `0b206e5a-4171-4fb8-b8af-773ad612f419` |
+| Provider | Board click UTC | All three parts published UTC | Canonical comment                      |
+| -------- | --------------- | ----------------------------- | -------------------------------------- |
+| Discord  | 19:54:40.669    | 19:54:46.478                  | `0cbe837f-b48c-42dc-b36f-f2bc7c901ec2` |
+| Telegram | 19:55:11.630    | 19:55:14.991                  | `57639d0a-4c3e-4b2b-80c8-e36c5311fdc6` |
+| GitHub   | 19:55:36.324    | 19:55:38.967                  | `0b206e5a-4171-4fb8-b8af-773ad612f419` |
 
 All nine rows were published with real provider message IDs and null errors.
 Discord visibly rendered the text preview and cat; Telegram rendered its 128-byte
@@ -362,12 +362,12 @@ Added and removed the operator's thumbs-up on that exact document, then on the
 new image, through Slack's message controls. All four receipts processed once,
 without error, and the Activity tab refreshed to show them:
 
-| File | Event | Received UTC | Processed UTC | Exact native message ID |
-| --- | --- | --- | --- | --- |
-| Note | added | 20:22:38.257 | 20:22:38.262 | `1788812516.721189` |
-| Note | removed | 20:22:56.917 | 20:22:56.921 | `1788812516.721189` |
-| Image | added | 20:23:24.762 | 20:23:24.768 | `1788812496.261909` |
-| Image | removed | 20:23:27.958 | 20:23:27.962 | `1788812496.261909` |
+| File  | Event   | Received UTC | Processed UTC | Exact native message ID |
+| ----- | ------- | ------------ | ------------- | ----------------------- |
+| Note  | added   | 20:22:38.257 | 20:22:38.262  | `1788812516.721189`     |
+| Note  | removed | 20:22:56.917 | 20:22:56.921  | `1788812516.721189`     |
+| Image | added   | 20:23:24.762 | 20:23:24.768  | `1788812496.261909`     |
+| Image | removed | 20:23:27.958 | 20:23:27.962  | `1788812496.261909`     |
 
 Both test reactions were removed; existing reactions were untouched. Maya's
 run counts remained 78 succeeded / 8 failed, with no running or queued run.
@@ -534,3 +534,88 @@ initialization skips authorless comments and may inherit a continuation actor,
 so guest-root and linked-A/guest/linked-B scenarios need explicit combined
 identity/credential tests. This is an unverified integration boundary, not
 evidence that credentials leaked in the tested branch.
+
+## Slack accepted-upload receipt recovery
+
+The bounded share lookup still had a process-interruption gap: after Slack
+accepted a file, Paperclip could lose the returned file IDs before confirming
+the share's real message timestamp. The follow-up records those exact IDs in
+a private, attempt-bound `slack_file_upload_receipt` action immediately after
+the successful upload response, before the eventual-consistency lookup. It
+uses a per-call asynchronous context around ordinary `Thread.post`, preserving
+the SDK's sent-message, typing, and history behavior.
+
+An independent recovery lane performs only metadata reads for the saved file
+IDs. It does not re-upload files, guess timestamps from filenames, or create
+another model turn. Settlement requires the exact publication attempt,
+endpoint bot/runtime/credential identity, conversation, channel/thread, and
+current destination reach. It is endpoint-authorized bookkeeping for bytes
+already accepted, not a newly authorized external-user send; file publications
+have no original-principal anchor, and this change does not claim to add one.
+Task controls and interactive cards are excluded. Historical attachment reuse
+continues to authorize its own requesting principal separately.
+
+An exact receipt can settle an unconfirmed publication automatically. After
+an operator explicitly marks that same attempt delivered, recovery may only
+enrich the missing provider identity/link; it must not repeat completion
+effects or alter the confirmed timestamp. Retry/cancel/new-attempt changes
+invalidate the old receipt. A conflicting existing message binding remains
+unconfirmed. Receipts are omitted from normal endpoint Activity and publication
+payloads. Older uploads without a durable receipt cannot be reconstructed by
+this change.
+
+Independent review caught two worker races before qualification: stale
+selection could bypass a newly scheduled backoff, and held endpoints could
+monopolize the bounded selection page. Claims now recheck eligibility and
+attempts under the row lock; held endpoints and same-attempt streaming work
+are excluded before the page limit.
+
+The first real PostgreSQL run caught an additional timestamp-precision defect:
+a server-default `updated_at` had microseconds, but the decoded JavaScript
+timestamp used for equality had only milliseconds. The receipt remained
+`received` and recovery returned zero. This is a production claim-path defect,
+not a flaky timing assertion. Claims now use the already-locked row; malformed
+or removed-endpoint receipts use a precision-safe state and semantic JSONB
+comparison, with SQL null distinguished from JSONB null. The manual-confirmation
+case also exposed untyped `jsonb_build_object` parameters; explicit casts fix
+the PostgreSQL error before any deployment.
+
+Supporting verification so far:
+
+- All pinned-provider adapter and reconciliation-coordinator tests passed
+  **59/59**. Coverage includes reverse-order concurrent upload callbacks,
+  callback failure without a second upload, strict accepted-ID validation,
+  preserved SDK sent-message methods, independent reconciliation, and joined
+  shutdown for both successful and failed receipt lookups.
+- The frozen tracked patch applied cleanly to pristine Slack adapter 4.39.0.
+  Its output exactly matches the installed module, SHA-256
+  `094eafb219f99546c5189a28e6c25b228034cc6a589edca63ed09a09d7ca42ea`.
+  The lockfile was not modified; this is patch reproducibility, not a passed
+  frozen workspace installation.
+- Fresh databases `chat_adapters_test_20260907_slack_receipt_01` and `_02`
+  exposed the timestamp and manual-confirmation SQL defects. After fixes,
+  `_03` passed both expanded database cases, including duplicate receipt
+  capture, a 25-row paused backlog, exact-message conflict, cancellation, and
+  identity-only manual-confirmation enrichment.
+- Fresh `_04` passed **4/4** focused cases, adding two workers demonstrably
+  preselected behind a held credential lease, and channel reach revoked during
+  a held metadata lookup. Only one competing lookup ran, its new retry deadline
+  remained intact, and revoked reach produced neither a provider link nor a
+  second upload. The final malformed-row SQL-null variant landed afterward
+  and was included in the final full-suite gate below.
+- The first full receipt suite passed 278/282. Its fake Slack transport wrongly
+  invoked upload acceptance before a definite-rejection hook, leaving a receipt
+  that also disrupted two later tests. The fixture now separates pre-acceptance
+  rejection from post-acceptance ambiguity; production acceptance handling was
+  not weakened. An unrelated Discord Gateway renewal also consumed a global
+  one-shot database fault intended for the Slack lifecycle test. That fault is
+  now bound to the exact lifecycle transaction's uncommitted terminal row,
+  proving rollback of both its comment and terminal state. Fresh `_05` passed
+  all **6/6** affected cases, including the final null-result receipt variant.
+- Final fresh database
+  `chat_adapters_test_20260907_slack_receipt_full_02` passed **282/282** in
+  63.91 seconds (58.15 seconds of tests). Server TypeScript passed after the
+  final code and fixture changes. These are simulated-provider tests with
+  real PostgreSQL, not new live-provider or process-kill qualification. The
+  earlier frozen-install, upstream, browser-input, model-capacity, and Teams
+  gates remain open; this is not a whole-product readiness sign-off.

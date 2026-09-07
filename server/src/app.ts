@@ -256,7 +256,11 @@ export function shouldEnablePrivateHostnameGuard(opts: {
 }
 
 type ChatReconciliationLane =
-  "provider runtimes" | "deliveries" | "publications" | "Slack session status";
+  | "provider runtimes"
+  | "deliveries"
+  | "publications"
+  | "Slack file receipts"
+  | "Slack session status";
 
 /**
  * Provider recovery can wait on slow external I/O. Keep each existing durable
@@ -267,6 +271,7 @@ export function createChatReconciliationCoordinator(input: {
   reconcileProviderRuntimes: () => Promise<unknown>;
   processPendingDeliveries: () => Promise<unknown>;
   flushPublications: () => Promise<unknown>;
+  processPendingSlackFileUploadReceipts: () => Promise<unknown>;
   processPendingSlackSessionSyncs: () => Promise<unknown>;
   onError: (lane: ChatReconciliationLane, error: unknown) => void;
 }) {
@@ -290,6 +295,7 @@ export function createChatReconciliationCoordinator(input: {
       start("provider runtimes", input.reconcileProviderRuntimes);
       start("deliveries", input.processPendingDeliveries);
       start("publications", input.flushPublications);
+      start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
       start("Slack session status", input.processPendingSlackSessionSyncs);
     },
     async drain() {
@@ -1061,6 +1067,8 @@ export async function createApp(
     reconcileProviderRuntimes: () => chatChannels.reconcileProviderRuntimes(),
     processPendingDeliveries: () => chatChannels.processPendingDeliveries(),
     flushPublications: () => flushChatPublications(),
+    processPendingSlackFileUploadReceipts: () =>
+      chatChannels.processPendingSlackFileUploadReceipts(),
     processPendingSlackSessionSyncs: () =>
       chatChannels.processPendingSlackSessionSyncs(),
     onError: (lane, err) => {

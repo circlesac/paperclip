@@ -150,6 +150,16 @@ class FakeEndpointRuntime {
   readonly removeReactionErrors: Error[] = [];
   readonly rehydratedAttachmentDescriptors: unknown[] = [];
   readonly postResultIds: string[] = [];
+  readonly slackFileReceiptLookups: Array<{
+    fileIds: string[];
+    threadId: string;
+  }> = [];
+  readonly slackFileReceiptResultIds: Array<string | null> = [];
+  slackFileReceiptCaptureRepeats = 1;
+  slackFilePublicationAttempts = 0;
+  slackFilePostAcceptanceError: Error | null = null;
+  slackFilePostAcceptanceHook: (() => Promise<void>) | undefined;
+  slackFileReceiptHook: (() => Promise<void>) | undefined;
   readonly ensuredDiscordRootThreads: Array<{
     channelId: string;
     content: string;
@@ -192,6 +202,61 @@ class FakeEndpointRuntime {
 
   async recordMicrosoftTeamsRoute(threadId: string, serviceUrl: unknown) {
     this.recordedMicrosoftTeamsRoutes.push({ threadId, serviceUrl });
+  }
+
+  async postSlackFilePublication(
+    threadId: string,
+    message: unknown,
+    onUploadAccepted: (receipt: {
+      version: 1;
+      channelId: string;
+      fileIds: string[];
+      threadTs: string | null;
+    }) => Promise<void>,
+  ) {
+    this.slackFilePublicationAttempts += 1;
+    await this.postHook?.();
+    if (this.postError) throw this.postError;
+    const parts = threadId.split(":");
+    const files =
+      message &&
+      typeof message === "object" &&
+      "files" in message &&
+      Array.isArray((message as { files?: unknown }).files)
+        ? (message as { files: unknown[] }).files
+        : [];
+    for (
+      let attempt = 0;
+      attempt < this.slackFileReceiptCaptureRepeats;
+      attempt += 1
+    ) {
+      await onUploadAccepted({
+        version: 1,
+        channelId: parts[1] ?? "",
+        fileIds: files.map((_, index) => `FTEST${index + 1}`),
+        threadTs: parts[2] || null,
+      });
+    }
+    await this.slackFilePostAcceptanceHook?.();
+    if (this.slackFilePostAcceptanceError) {
+      throw this.slackFilePostAcceptanceError;
+    }
+    const postHook = this.postHook;
+    this.postHook = undefined;
+    try {
+      return await this.thread(threadId).post(message);
+    } finally {
+      this.postHook = postHook;
+    }
+  }
+
+  async resolveSlackFileUploadReceipt(threadId: string, fileIds: string[]) {
+    this.slackFileReceiptLookups.push({
+      fileIds: [...fileIds],
+      threadId,
+    });
+    await this.slackFileReceiptHook?.();
+    return this.slackFileReceiptResultIds.shift() ?? null;
   }
 
   acceptsProviderScope(raw: unknown) {
@@ -1297,6 +1362,103 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     if (!callbacks)
       throw new Error("Fake runtime did not receive endpoint callbacks");
     return { ...context, endpoint, callbacks };
+  }
+
+  async function acceptedUnknownSlackFileReceipt(label: string) {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const configured = await configuredSlackEndpoint(fixture, {
+      storage: storage.storage,
+    });
+    const { callbacks, endpoint, runtime, service } = configured;
+    const channel = makeThread({
+      channelId: `C-RECEIPT-${label.toUpperCase()}`,
+      id: `slack:C-RECEIPT-${label.toUpperCase()}:${Date.now()}.1`,
+      name: `receipt-${label}`,
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: `${Date.now()}.1`,
+        text: "@maya start a receipt authorization test",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Slack receipt conversation");
+    const comment = await issueService(db).addComment(
+      conversation.issueId,
+      "Accepted Slack authorization fixture",
+      { userId: "owner-user" },
+    );
+    const stored = await storage.storage.putFile({
+      companyId: fixture.companyId,
+      namespace: `issues/${conversation.issueId}`,
+      originalFilename: `${label}.txt`,
+      contentType: "text/plain",
+      body: Buffer.from(`accepted ${label}`, "utf8"),
+    });
+    const attachment = await issueService(db).createAttachment({
+      issueId: conversation.issueId,
+      issueCommentId: comment.id,
+      provider: stored.provider,
+      objectKey: stored.objectKey,
+      contentType: stored.contentType,
+      byteSize: stored.byteSize,
+      sha256: stored.sha256,
+      originalFilename: stored.originalFilename,
+      createdByUserId: "owner-user",
+    });
+    const [publication] = await db
+      .insert(chatPublications)
+      .values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        issueId: conversation.issueId,
+        commentId: comment.id,
+        idempotencyKey: `slack-file-receipt-${label}:${randomUUID()}`,
+        payload: { text: "", attachmentIds: [attachment.id] },
+        state: "pending",
+      })
+      .returning();
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack provider runtime");
+    providerRuntime.slackFilePostAcceptanceError = new Error(
+      "connection closed after Slack accepted the upload",
+    );
+    await service.processPendingPublications();
+    providerRuntime.slackFilePostAcceptanceError = null;
+    const [receipt] = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.endpointId, endpoint.id),
+          eq(chatActions.kind, "slack_file_upload_receipt"),
+          eq(
+            chatActions.providerActionId,
+            `slack-file-receipt:${publication!.id}:1`,
+          ),
+        ),
+      );
+    if (!publication || !receipt) {
+      throw new Error("Expected accepted Slack receipt fixture");
+    }
+    return {
+      ...configured,
+      channel,
+      conversation,
+      fixture,
+      providerRuntime,
+      publication,
+      receipt,
+    };
   }
 
   async function configuredTeamsEndpoint(
@@ -27874,6 +28036,666 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
   });
 
+  it("recovers an accepted Slack file receipt without uploading twice or exposing provider identifiers", async () => {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture, { storage: storage.storage });
+    try {
+      const channel = makeThread({
+        channelId: "C-SLACK-RECEIPT",
+        id: "slack:C-SLACK-RECEIPT:4400.15",
+        name: "slack-file-receipt",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: channel.thread,
+        message: makeMessage({
+          id: "4400.15",
+          text: "@maya start a receipt repair test",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await service.listConversations(endpoint.id);
+      if (!conversation) throw new Error("Expected Slack receipt conversation");
+      const comment = await issueService(db).addComment(
+        conversation.issueId,
+        "Accepted Slack file fixture",
+        { userId: "owner-user" },
+      );
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${conversation.issueId}`,
+        originalFilename: "accepted-once.txt",
+        contentType: "text/plain",
+        body: Buffer.from("accepted exactly once", "utf8"),
+      });
+      const attachment = await issueService(db).createAttachment({
+        issueId: conversation.issueId,
+        issueCommentId: comment.id,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByUserId: "owner-user",
+      });
+      const [publication] = await db
+        .insert(chatPublications)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          commentId: comment.id,
+          idempotencyKey: `slack-file-receipt:${randomUUID()}`,
+          payload: { text: "", attachmentIds: [attachment.id] },
+          state: "pending",
+        })
+        .returning();
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!providerRuntime) throw new Error("Expected Slack provider runtime");
+      providerRuntime.posts.length = 0;
+      providerRuntime.slackFileReceiptCaptureRepeats = 2;
+      providerRuntime.slackFilePostAcceptanceError = new Error(
+        "connection closed after Slack accepted the upload",
+      );
+
+      await expect(service.processPendingPublications()).resolves.toBe(1);
+      expect(providerRuntime.slackFilePublicationAttempts).toBe(1);
+      await expect(
+        db
+          .select({
+            attempts: chatPublications.attempts,
+            providerMessageId: chatPublications.providerMessageId,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication!.id)),
+      ).resolves.toEqual([
+        { attempts: 1, providerMessageId: null, state: "delivery_unknown" },
+      ]);
+      const [receipt] = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.kind, "slack_file_upload_receipt"),
+            eq(
+              chatActions.providerActionId,
+              `slack-file-receipt:${publication!.id}:1`,
+            ),
+          ),
+        );
+      expect(receipt).toMatchObject({
+        status: "received",
+        payload: expect.objectContaining({
+          fileIds: ["FTEST1"],
+          publicationAttempt: 1,
+          publicationId: publication!.id,
+        }),
+      });
+      expect(
+        JSON.stringify(await service.listActivity(endpoint.id)),
+      ).not.toContain("FTEST1");
+      expect(
+        JSON.stringify(await service.listActivity(endpoint.id)),
+      ).not.toContain("credentialFingerprint");
+      // Legacy/default-timestamp receipts can retain PostgreSQL microseconds
+      // that JavaScript Date cannot round-trip. Row ownership must come from
+      // the locked status, not a lossy timestamp equality check.
+      await db
+        .update(chatActions)
+        .set({
+          updatedAt: sql`${chatActions.updatedAt} + interval '0.000123 seconds'`,
+        })
+        .where(eq(chatActions.id, receipt!.id));
+      const heldEndpoint = await service.create(
+        fixture.companyId,
+        {
+          provider: "slack",
+          assignedAgentId: fixture.assignedAgentId,
+          name: "Paused receipt backlog",
+        },
+        "owner-user",
+      );
+      await db
+        .update(chatEndpoints)
+        .set({ status: "paused", updatedAt: new Date() })
+        .where(eq(chatEndpoints.id, heldEndpoint.id));
+      await db.insert(chatActions).values(
+        Array.from({ length: 25 }, (_, index) => ({
+          companyId: fixture.companyId,
+          endpointId: heldEndpoint.id,
+          kind: "slack_file_upload_receipt",
+          providerActionId: `paused-slack-file-receipt:${index}:${randomUUID()}`,
+          payload: {},
+          status: "received" as const,
+          result: { code: "slack_file_upload_identity_pending", attempts: 0 },
+          createdAt: new Date(Date.now() - 60_000),
+          updatedAt: new Date(Date.now() - 60_000),
+        })),
+      );
+
+      providerRuntime.slackFilePostAcceptanceError = null;
+      providerRuntime.slackFileReceiptResultIds.push("1788.990001");
+      await expect(
+        service.processPendingSlackFileUploadReceipts(1),
+      ).resolves.toBe(1);
+      expect(providerRuntime.slackFilePublicationAttempts).toBe(1);
+      expect(providerRuntime.slackFileReceiptLookups).toEqual([
+        {
+          fileIds: ["FTEST1"],
+          threadId: channel.thread.id,
+        },
+      ]);
+      await expect(
+        db
+          .select({
+            providerMessageId: chatPublications.providerMessageId,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication!.id)),
+      ).resolves.toEqual([
+        { providerMessageId: "1788.990001", state: "published" },
+      ]);
+      await expect(
+        db
+          .select({
+            providerMessageId: chatMessageLinks.providerMessageId,
+            publicationId: chatMessageLinks.publicationId,
+          })
+          .from(chatMessageLinks)
+          .where(eq(chatMessageLinks.publicationId, publication!.id)),
+      ).resolves.toEqual([
+        {
+          providerMessageId: "1788.990001",
+          publicationId: publication!.id,
+        },
+      ]);
+      await expect(
+        db
+          .select({ status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, receipt!.id)),
+      ).resolves.toEqual([{ status: "processed" }]);
+      await expect(
+        service.processPendingSlackFileUploadReceipts(),
+      ).resolves.toBe(0);
+      expect(providerRuntime.slackFileReceiptLookups).toHaveLength(1);
+
+      // Operator confirmation is a state-only assertion. The later receipt
+      // lookup may add the exact Slack identity, but must not replay bytes or
+      // rewrite the operator's published timestamp.
+      await db
+        .delete(chatMessageLinks)
+        .where(eq(chatMessageLinks.publicationId, publication!.id));
+      await db
+        .update(chatPublications)
+        .set({
+          state: "delivery_unknown",
+          providerMessageId: null,
+          publishedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(chatPublications.id, publication!.id));
+      await db
+        .update(chatActions)
+        .set({
+          status: "received",
+          result: { code: "slack_file_upload_identity_pending", attempts: 1 },
+          updatedAt: new Date(),
+        })
+        .where(eq(chatActions.id, receipt!.id));
+      const [conflictingPublication] = await db
+        .insert(chatPublications)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          commentId: comment.id,
+          idempotencyKey: `existing-slack-message:${randomUUID()}`,
+          payload: { text: "Existing provider message" },
+          state: "published",
+          providerMessageId: "1788.990003",
+          publishedAt: new Date(),
+        })
+        .returning();
+      await db.insert(chatMessageLinks).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        publicationId: conflictingPublication!.id,
+        commentId: comment.id,
+        providerMessageId: "1788.990003",
+        direction: "outbound",
+      });
+      providerRuntime.slackFileReceiptResultIds.push("1788.990003");
+      await expect(
+        service.processPendingSlackFileUploadReceipts(1),
+      ).resolves.toBe(1);
+      await expect(
+        db
+          .select({ result: chatActions.result, status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, receipt!.id)),
+      ).resolves.toEqual([
+        {
+          result: expect.objectContaining({
+            code: "slack_file_upload_receipt_message_conflict",
+            retryable: false,
+          }),
+          status: "failed",
+        },
+      ]);
+      await db
+        .update(chatActions)
+        .set({
+          status: "received",
+          result: { code: "slack_file_upload_identity_pending", attempts: 1 },
+          updatedAt: new Date(),
+        })
+        .where(eq(chatActions.id, receipt!.id));
+      await service.resolvePublication(
+        endpoint.id,
+        publication!.id,
+        "mark_delivered",
+        "owner-user",
+      );
+      const operatorPublishedAt = await db
+        .select({ publishedAt: chatPublications.publishedAt })
+        .from(chatPublications)
+        .where(eq(chatPublications.id, publication!.id))
+        .then((rows) => rows[0]!.publishedAt);
+      providerRuntime.slackFileReceiptResultIds.push("1788.990002");
+      await expect(
+        service.processPendingSlackFileUploadReceipts(1),
+      ).resolves.toBe(1);
+      expect(providerRuntime.slackFilePublicationAttempts).toBe(1);
+      await expect(
+        db
+          .select({
+            providerMessageId: chatPublications.providerMessageId,
+            publishedAt: chatPublications.publishedAt,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication!.id)),
+      ).resolves.toEqual([
+        {
+          providerMessageId: "1788.990002",
+          publishedAt: operatorPublishedAt,
+          state: "published",
+        },
+      ]);
+
+      await db
+        .delete(chatMessageLinks)
+        .where(eq(chatMessageLinks.publicationId, publication!.id));
+      await db
+        .update(chatPublications)
+        .set({
+          state: "delivery_unknown",
+          providerMessageId: null,
+          publishedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(chatPublications.id, publication!.id));
+      await db
+        .update(chatActions)
+        .set({
+          status: "received",
+          result: { code: "slack_file_upload_identity_pending", attempts: 2 },
+          updatedAt: new Date(),
+        })
+        .where(eq(chatActions.id, receipt!.id));
+      await service.resolvePublication(
+        endpoint.id,
+        publication!.id,
+        "cancel",
+        "owner-user",
+      );
+      await expect(
+        db
+          .select({ status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, receipt!.id)),
+      ).resolves.toEqual([{ status: "cancelled" }]);
+      await expect(
+        service.processPendingSlackFileUploadReceipts(1),
+      ).resolves.toBe(0);
+    } finally {
+      await service.shutdown();
+    }
+  });
+
+  it("defers Slack file receipt recovery while the original post owns the same attempt", async () => {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture, { storage: storage.storage });
+    let releasePost!: () => void;
+    const postReleased = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    let postEntered!: () => void;
+    const postBlocked = new Promise<void>((resolve) => {
+      postEntered = resolve;
+    });
+    try {
+      const channel = makeThread({
+        channelId: "C-SLACK-RECEIPT-STREAMING",
+        id: "slack:C-SLACK-RECEIPT-STREAMING:4400.16",
+        name: "slack-file-receipt-streaming",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: channel.thread,
+        message: makeMessage({
+          id: "4400.16",
+          text: "@maya start a streaming receipt test",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await service.listConversations(endpoint.id);
+      if (!conversation) throw new Error("Expected streaming conversation");
+      const comment = await issueService(db).addComment(
+        conversation.issueId,
+        "Streaming Slack file fixture",
+        { userId: "owner-user" },
+      );
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${conversation.issueId}`,
+        originalFilename: "streaming-once.txt",
+        contentType: "text/plain",
+        body: Buffer.from("still owned by original post", "utf8"),
+      });
+      const attachment = await issueService(db).createAttachment({
+        issueId: conversation.issueId,
+        issueCommentId: comment.id,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByUserId: "owner-user",
+      });
+      const [publication] = await db
+        .insert(chatPublications)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          commentId: comment.id,
+          idempotencyKey: `slack-file-receipt-streaming:${randomUUID()}`,
+          payload: { text: "", attachmentIds: [attachment.id] },
+          state: "pending",
+        })
+        .returning();
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!providerRuntime) throw new Error("Expected Slack provider runtime");
+      providerRuntime.slackFilePostAcceptanceHook = async () => {
+        postEntered();
+        await postReleased;
+      };
+      const originalWorker = service.processPendingPublications();
+      await postBlocked;
+
+      await expect(
+        service.processPendingSlackFileUploadReceipts(),
+      ).resolves.toBe(0);
+      expect(providerRuntime.slackFileReceiptLookups).toHaveLength(0);
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication!.id)),
+      ).resolves.toEqual([{ state: "streaming" }]);
+
+      releasePost();
+      await originalWorker;
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication!.id)),
+      ).resolves.toEqual([{ state: "published" }]);
+      await expect(
+        db
+          .select({ status: chatActions.status })
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.kind, "slack_file_upload_receipt"),
+              eq(
+                chatActions.providerActionId,
+                `slack-file-receipt:${publication!.id}:1`,
+              ),
+            ),
+          ),
+      ).resolves.toEqual([{ status: "processed" }]);
+    } finally {
+      releasePost();
+      await service.shutdown();
+    }
+  });
+
+  it("rechecks a Slack file receipt after a competing worker changes its retry deadline", async () => {
+    const { endpoint, fixture, providerRuntime, receipt, service } =
+      await acceptedUnknownSlackFileReceipt("stale-worker");
+    try {
+      const [malformed] = await db
+        .insert(chatActions)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          kind: "slack_file_upload_receipt",
+          providerActionId: `malformed-slack-file-receipt:${randomUUID()}`,
+          payload: {},
+          status: "received",
+          result: null,
+          createdAt: new Date(Date.now() - 60_000),
+          updatedAt: new Date(Date.now() - 60_000),
+        })
+        .returning();
+      await db
+        .update(chatActions)
+        .set({
+          updatedAt: sql`${chatActions.updatedAt} + interval '0.000123 seconds'`,
+        })
+        .where(eq(chatActions.id, malformed!.id));
+      await expect(
+        service.processPendingSlackFileUploadReceipts(1),
+      ).resolves.toBe(0);
+      await expect(
+        db
+          .select({ result: chatActions.result, status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, malformed!.id)),
+      ).resolves.toEqual([
+        {
+          result: {
+            code: "slack_file_upload_receipt_payload_invalid",
+            retryable: false,
+          },
+          status: "failed",
+        },
+      ]);
+      expect(providerRuntime.slackFileReceiptLookups).toHaveLength(0);
+      const blockerToken = `test-blocker-${randomUUID()}`;
+      await db.insert(chatEndpointLeases).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        leaseKey: "credentials",
+        token: blockerToken,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      const attemptedWorkerTokens = new Set<string>();
+      const originalInsert = db.insert.bind(db);
+      const insertSpy = vi.spyOn(db, "insert").mockImplementation((table) => {
+        const builder = originalInsert(table);
+        if (table === chatEndpointLeases) {
+          const originalValues = builder.values.bind(builder);
+          builder.values = ((values: {
+            endpointId?: string;
+            leaseKey?: string;
+            token?: string;
+          }) => {
+            if (
+              values.endpointId === endpoint.id &&
+              values.leaseKey === "credentials" &&
+              values.token &&
+              values.token !== blockerToken
+            ) {
+              attemptedWorkerTokens.add(values.token);
+            }
+            return originalValues(values);
+          }) as typeof builder.values;
+        }
+        return builder;
+      });
+      const workers = [
+        service.processPendingSlackFileUploadReceipts(1),
+        service.processPendingSlackFileUploadReceipts(1),
+      ];
+      let outcomes: number[] = [];
+      try {
+        await expect.poll(() => attemptedWorkerTokens.size).toBe(2);
+      } finally {
+        await db
+          .delete(chatEndpointLeases)
+          .where(
+            and(
+              eq(chatEndpointLeases.endpointId, endpoint.id),
+              eq(chatEndpointLeases.leaseKey, "credentials"),
+              eq(chatEndpointLeases.token, blockerToken),
+            ),
+          );
+        try {
+          outcomes = await Promise.all(workers);
+        } finally {
+          insertSpy.mockRestore();
+        }
+      }
+      expect(outcomes.reduce((sum, value) => sum + value, 0)).toBe(1);
+      expect(providerRuntime.slackFileReceiptLookups).toHaveLength(1);
+      await expect(
+        db
+          .select({ result: chatActions.result, status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, receipt.id)),
+      ).resolves.toEqual([
+        {
+          result: expect.objectContaining({
+            attempts: 1,
+            code: "slack_file_upload_identity_pending",
+            retryable: true,
+            retryAt: expect.any(String),
+          }),
+          status: "failed",
+        },
+      ]);
+      expect(providerRuntime.slackFilePublicationAttempts).toBe(1);
+    } finally {
+      await service.shutdown();
+    }
+  });
+
+  it("rejects a recovered Slack file identity when destination reach changes during lookup", async () => {
+    const {
+      conversation,
+      endpoint,
+      providerRuntime,
+      publication,
+      receipt,
+      service,
+    } = await acceptedUnknownSlackFileReceipt("revoked-reach");
+    let releaseLookup!: () => void;
+    const lookupReleased = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    let lookupEntered!: () => void;
+    const lookupBlocked = new Promise<void>((resolve) => {
+      lookupEntered = resolve;
+    });
+    try {
+      providerRuntime.slackFileReceiptResultIds.push("1788.991001");
+      providerRuntime.slackFileReceiptHook = async () => {
+        lookupEntered();
+        await lookupReleased;
+      };
+      const recovery = service.processPendingSlackFileUploadReceipts(1);
+      await lookupBlocked;
+      if (!conversation.resourceId) {
+        throw new Error("Expected Slack channel resource");
+      }
+      await db
+        .update(chatEndpointResources)
+        .set({ enabled: false, updatedAt: new Date() })
+        .where(
+          and(
+            eq(chatEndpointResources.id, conversation.resourceId),
+            eq(chatEndpointResources.endpointId, endpoint.id),
+          ),
+        );
+      releaseLookup();
+      await expect(recovery).resolves.toBe(1);
+
+      await expect(
+        db
+          .select({
+            providerMessageId: chatPublications.providerMessageId,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).resolves.toEqual([
+        { providerMessageId: null, state: "delivery_unknown" },
+      ]);
+      await expect(
+        db
+          .select({ result: chatActions.result, status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, receipt.id)),
+      ).resolves.toEqual([
+        {
+          result: {
+            attempts: 1,
+            code: "slack_file_upload_receipt_authorization_changed",
+          },
+          status: "cancelled",
+        },
+      ]);
+      await expect(
+        db
+          .select({ id: chatMessageLinks.id })
+          .from(chatMessageLinks)
+          .where(eq(chatMessageLinks.publicationId, publication.id)),
+      ).resolves.toHaveLength(0);
+      expect(providerRuntime.slackFilePublicationAttempts).toBe(1);
+      expect(providerRuntime.slackFileReceiptLookups).toHaveLength(1);
+    } finally {
+      releaseLookup();
+      await service.shutdown();
+    }
+  });
+
   it("retries pre-transport attachment integrity failures without blocking another conversation", async () => {
     const fixture = await seedCompany();
     const storage = createStorageService();
@@ -33792,8 +34614,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
     // The row becomes processed inside the mutation transaction, just before
     // the conversation drain releases its endpoint/thread lease. Synchronize
-    // on that lease boundary so the one-shot transaction fault below belongs
-    // to this lifecycle attempt instead of racing the prior background drain.
+    // on that lease boundary before injecting the exact lifecycle commit fault.
     await vi.waitFor(async () => {
       await expect(
         db
@@ -33839,11 +34660,43 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .update(chatDeliveries)
       .set({ nextAttemptAt: new Date(0) })
       .where(eq(chatDeliveries.id, lifecycle.id));
-    const transaction = vi
-      .spyOn(db, "transaction")
-      .mockRejectedValueOnce(new Error("injected lifecycle comment failure"));
-    await first.service.processPendingDeliveries(25, lifecycle.id);
-    transaction.mockRestore();
+    const originalTransaction = db.transaction.bind(db);
+    let injectedLifecycleFailure = false;
+    const transaction = vi.spyOn(db, "transaction").mockImplementation((async (
+      ...args: Parameters<typeof originalTransaction>
+    ) => {
+      const [callback, config] = args;
+      return originalTransaction(async (tx) => {
+        const result = await callback(tx);
+        if (!injectedLifecycleFailure) {
+          const [committedLifecycle] = await tx
+            .select({ id: chatDeliveries.id })
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.id, lifecycle.id),
+                eq(chatDeliveries.endpointId, first.endpoint.id),
+                eq(chatDeliveries.state, "processed"),
+                eq(chatDeliveries.attempts, 1),
+              ),
+            );
+          if (committedLifecycle) {
+            // Only this transaction can see its uncommitted terminal row.
+            // Roll back both its comment and terminal update; unrelated
+            // Gateway renewals must never consume the injected failure.
+            injectedLifecycleFailure = true;
+            throw new Error("injected lifecycle comment failure");
+          }
+        }
+        return result;
+      }, config);
+    }) as typeof db.transaction);
+    try {
+      await first.service.processPendingDeliveries(25, lifecycle.id);
+    } finally {
+      transaction.mockRestore();
+    }
+    expect(injectedLifecycleFailure).toBe(true);
     await expect(
       db
         .select({

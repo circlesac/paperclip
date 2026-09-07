@@ -941,12 +941,10 @@ describe("Chat SDK published adapter integration", () => {
           ok: true,
           files: [
             {
-              id: "F-PAPERCLIP",
+              id: "FPAPERCLIP",
               shares: {
                 public: {
-                  "C-PAPERCLIP": [
-                    { thread_ts: "1788.300", ts: "1788.302" },
-                  ],
+                  "C-PAPERCLIP": [{ thread_ts: "1788.300", ts: "1788.302" }],
                 },
               },
             },
@@ -1019,23 +1017,21 @@ describe("Chat SDK published adapter integration", () => {
     });
     const uploadV2 = vi.fn(async () => ({
       ok: true,
-      files: [{ ok: true, files: [{ id: "F-SPARSE" }] }],
+      files: [{ ok: true, files: [{ id: "FSPARSE" }] }],
     }));
     const fileInfo = vi
       .fn()
       .mockResolvedValueOnce({
         ok: true,
-        file: { id: "F-SPARSE", shares: {} },
+        file: { id: "FSPARSE", shares: {} },
       })
       .mockResolvedValueOnce({
         ok: true,
         file: {
-          id: "F-SPARSE",
+          id: "FSPARSE",
           shares: {
             private: {
-              "D-PAPERCLIP": [
-                { thread_ts: "1788.400", ts: "1788.401" },
-              ],
+              "D-PAPERCLIP": [{ thread_ts: "1788.400", ts: "1788.401" }],
             },
           },
         },
@@ -1079,11 +1075,377 @@ describe("Chat SDK published adapter integration", () => {
       expect(uploadV2).toHaveBeenCalledOnce();
       expect(fileInfo).toHaveBeenCalledTimes(2);
       expect(fileInfo).toHaveBeenCalledWith(
-        expect.objectContaining({ file: "F-SPARSE" }),
+        expect.objectContaining({ file: "FSPARSE" }),
       );
       expect(postMessage).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
+      await runtime.shutdown();
+    }
+  });
+
+  it("records accepted Slack file IDs before the share lookup and preserves Thread.post", async () => {
+    const runtime = createChatSdkEndpointRuntime({
+      callbacks: { onMessage() {} },
+      companyId: "company-slack-file-receipt",
+      endpointId: "endpoint-slack-file-receipt",
+      logger: "silent",
+      persistence,
+      providerConfig: {
+        provider: "slack",
+        userName: "paperclip-agent",
+        credentials: {
+          botToken: "xoxb-test",
+          botUserId: "U-PAPERCLIP-BOT",
+          signingSecret: "secret",
+        },
+      },
+    });
+    const uploadV2 = vi.fn(async () => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "FRECEIPT1" }] }],
+    }));
+    const fileInfo = vi.fn(async () => ({
+      ok: true,
+      file: {
+        id: "FRECEIPT1",
+        shares: {
+          public: {
+            "C-PAPERCLIP": [{ thread_ts: "1788.410", ts: "1788.411" }],
+          },
+        },
+      },
+    }));
+    const postMessage = vi.fn();
+    let releaseReceipt!: () => void;
+    const receiptReleased = new Promise<void>((resolve) => {
+      releaseReceipt = resolve;
+    });
+    let receiptEntered!: () => void;
+    const receiptAccepted = new Promise<void>((resolve) => {
+      receiptEntered = resolve;
+    });
+    const onUploadAccepted = vi.fn(async () => {
+      receiptEntered();
+      await receiptReleased;
+    });
+    try {
+      await runtime.initialize();
+      const adapter = runtime.getProviderAdapter() as unknown as {
+        _client: {
+          chat: { postMessage: typeof postMessage };
+          files: {
+            info: typeof fileInfo;
+            uploadV2: typeof uploadV2;
+          };
+        };
+      };
+      adapter._client.files.uploadV2 = uploadV2;
+      adapter._client.files.info = fileInfo;
+      adapter._client.chat.postMessage = postMessage;
+      const sentPromise = runtime.postSlackFilePublication(
+        "slack:C-PAPERCLIP:1788.410",
+        {
+          files: [
+            {
+              data: Buffer.from("safe artifact"),
+              filename: "result.txt",
+              mimeType: "text/plain",
+            },
+          ],
+          markdown: "",
+        },
+        onUploadAccepted,
+      );
+      await receiptAccepted;
+      expect(onUploadAccepted).toHaveBeenCalledWith({
+        version: 1,
+        channelId: "C-PAPERCLIP",
+        fileIds: ["FRECEIPT1"],
+        threadTs: "1788.410",
+      });
+      expect(fileInfo).not.toHaveBeenCalled();
+      releaseReceipt();
+      await expect(sentPromise).resolves.toMatchObject({
+        id: "1788.411",
+        threadId: "slack:C-PAPERCLIP:1788.410",
+        edit: expect.any(Function),
+        addReaction: expect.any(Function),
+        toJSON: expect.any(Function),
+      });
+      expect(uploadV2).toHaveBeenCalledOnce();
+      expect(fileInfo).toHaveBeenCalledOnce();
+      expect(postMessage).not.toHaveBeenCalled();
+    } finally {
+      releaseReceipt();
+      await runtime.shutdown();
+    }
+  });
+
+  it("isolates concurrent Slack upload receipt callbacks and restores the ordinary post context", async () => {
+    const runtime = createChatSdkEndpointRuntime({
+      callbacks: { onMessage() {} },
+      companyId: "company-slack-file-concurrent",
+      endpointId: "endpoint-slack-file-concurrent",
+      logger: "silent",
+      persistence,
+      providerConfig: {
+        provider: "slack",
+        userName: "paperclip-agent",
+        credentials: {
+          botToken: "xoxb-test",
+          botUserId: "U-PAPERCLIP-BOT",
+          signingSecret: "secret",
+        },
+      },
+    });
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondReleased = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const uploadV2 = vi.fn(async (args: { thread_ts?: string }) => {
+      const first = args.thread_ts === "1788.430";
+      const second = args.thread_ts === "1788.440";
+      if (first) await firstReleased;
+      if (second) await secondReleased;
+      return {
+        ok: true,
+        files: [
+          {
+            ok: true,
+            files: [
+              {
+                id: first ? "FFIRST" : second ? "FSECOND" : "FORDINARY",
+                shares: {
+                  public: {
+                    "C-PAPERCLIP": [
+                      {
+                        thread_ts: args.thread_ts,
+                        ts: first
+                          ? "1788.431"
+                          : second
+                            ? "1788.441"
+                            : "1788.451",
+                      },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      };
+    });
+    const fileInfo = vi.fn();
+    const postMessage = vi.fn();
+    const firstCallback = vi.fn(async () => undefined);
+    const secondCallback = vi.fn(async () => undefined);
+    const message = {
+      files: [
+        {
+          data: Buffer.from("safe artifact"),
+          filename: "result.txt",
+          mimeType: "text/plain",
+        },
+      ],
+      markdown: "",
+    };
+    const pending: Array<Promise<{ id: string }>> = [];
+    try {
+      await runtime.initialize();
+      const adapter = runtime.getProviderAdapter() as unknown as {
+        _client: {
+          chat: { postMessage: typeof postMessage };
+          files: { info: typeof fileInfo; uploadV2: typeof uploadV2 };
+        };
+      };
+      adapter._client.files.uploadV2 = uploadV2;
+      adapter._client.files.info = fileInfo;
+      adapter._client.chat.postMessage = postMessage;
+      const first = runtime.postSlackFilePublication(
+        "slack:C-PAPERCLIP:1788.430",
+        message,
+        firstCallback,
+      );
+      const second = runtime.postSlackFilePublication(
+        "slack:C-PAPERCLIP:1788.440",
+        message,
+        secondCallback,
+      );
+      pending.push(first, second);
+      await vi.waitFor(() => expect(uploadV2).toHaveBeenCalledTimes(2));
+
+      // Complete in reverse order while both asynchronous contexts are live.
+      releaseSecond();
+      await expect(second).resolves.toMatchObject({ id: "1788.441" });
+      expect(firstCallback).not.toHaveBeenCalled();
+      expect(secondCallback).toHaveBeenCalledExactlyOnceWith({
+        version: 1,
+        channelId: "C-PAPERCLIP",
+        threadTs: "1788.440",
+        fileIds: ["FSECOND"],
+      });
+      releaseFirst();
+      await expect(first).resolves.toMatchObject({ id: "1788.431" });
+      expect(firstCallback).toHaveBeenCalledExactlyOnceWith({
+        version: 1,
+        channelId: "C-PAPERCLIP",
+        threadTs: "1788.430",
+        fileIds: ["FFIRST"],
+      });
+
+      await expect(
+        runtime.thread("slack:C-PAPERCLIP:1788.450").post(message),
+      ).resolves.toMatchObject({ id: "1788.451" });
+      expect(firstCallback).toHaveBeenCalledOnce();
+      expect(secondCallback).toHaveBeenCalledOnce();
+      expect(uploadV2).toHaveBeenCalledTimes(3);
+      expect(fileInfo).not.toHaveBeenCalled();
+      expect(postMessage).not.toHaveBeenCalled();
+    } finally {
+      releaseFirst();
+      releaseSecond();
+      await Promise.allSettled(pending);
+      await runtime.shutdown();
+    }
+  });
+
+  it.each(["receipt write", "malformed accepted ID"])(
+    "does not repeat a Slack upload or look up shares after a failed %s",
+    async (failure) => {
+      const runtime = createChatSdkEndpointRuntime({
+        callbacks: { onMessage() {} },
+        companyId: "company-slack-file-callback-failure",
+        endpointId: "endpoint-slack-file-callback-failure",
+        logger: "silent",
+        persistence,
+        providerConfig: {
+          provider: "slack",
+          userName: "paperclip-agent",
+          credentials: {
+            botToken: "xoxb-test",
+            botUserId: "U-PAPERCLIP-BOT",
+            signingSecret: "secret",
+          },
+        },
+      });
+      const uploadV2 = vi.fn(async () => ({
+        ok: true,
+        files: [
+          {
+            ok: true,
+            files: [
+              {
+                id:
+                  failure === "receipt write" ? "FACCEPTED" : "invalid-file-id",
+              },
+            ],
+          },
+        ],
+      }));
+      const fileInfo = vi.fn();
+      const postMessage = vi.fn();
+      const onUploadAccepted = vi.fn(async () => {
+        throw new Error("receipt persistence failed");
+      });
+      try {
+        await runtime.initialize();
+        const adapter = runtime.getProviderAdapter() as unknown as {
+          _client: {
+            chat: { postMessage: typeof postMessage };
+            files: { info: typeof fileInfo; uploadV2: typeof uploadV2 };
+          };
+        };
+        adapter._client.files.uploadV2 = uploadV2;
+        adapter._client.files.info = fileInfo;
+        adapter._client.chat.postMessage = postMessage;
+        await expect(
+          runtime.postSlackFilePublication(
+            "slack:C-PAPERCLIP:1788.460",
+            {
+              files: [
+                {
+                  data: Buffer.from("safe artifact"),
+                  filename: "result.txt",
+                  mimeType: "text/plain",
+                },
+              ],
+              markdown: "",
+            },
+            onUploadAccepted,
+          ),
+        ).rejects.toThrow();
+        expect(uploadV2).toHaveBeenCalledOnce();
+        expect(onUploadAccepted).toHaveBeenCalledTimes(
+          failure === "receipt write" ? 1 : 0,
+        );
+        expect(fileInfo).not.toHaveBeenCalled();
+        expect(postMessage).not.toHaveBeenCalled();
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
+
+  it("resolves a captured Slack file receipt with metadata reads only", async () => {
+    const runtime = createChatSdkEndpointRuntime({
+      callbacks: { onMessage() {} },
+      companyId: "company-slack-file-recovery",
+      endpointId: "endpoint-slack-file-recovery",
+      logger: "silent",
+      persistence,
+      providerConfig: {
+        provider: "slack",
+        userName: "paperclip-agent",
+        credentials: {
+          botToken: "xoxb-test",
+          botUserId: "U-PAPERCLIP-BOT",
+          signingSecret: "secret",
+        },
+      },
+    });
+    const uploadV2 = vi.fn();
+    const fileInfo = vi.fn(async () => ({
+      ok: true,
+      file: {
+        id: "FRECOVERY1",
+        shares: {
+          public: {
+            "C-PAPERCLIP": [{ thread_ts: "1788.420", ts: "1788.421" }],
+          },
+        },
+      },
+    }));
+    try {
+      await runtime.initialize();
+      const adapter = runtime.getProviderAdapter() as unknown as {
+        _client: {
+          files: {
+            info: typeof fileInfo;
+            uploadV2: typeof uploadV2;
+          };
+        };
+      };
+      adapter._client.files.uploadV2 = uploadV2;
+      adapter._client.files.info = fileInfo;
+      await expect(
+        runtime.resolveSlackFileUploadReceipt("slack:C-PAPERCLIP:1788.420", [
+          "FRECOVERY1",
+        ]),
+      ).resolves.toBe("1788.421");
+      expect(fileInfo).toHaveBeenCalledOnce();
+      expect(uploadV2).not.toHaveBeenCalled();
+      await expect(
+        runtime.resolveSlackFileUploadReceipt("slack:C-PAPERCLIP:1788.420", [
+          "not-a-slack-file-id",
+        ]),
+      ).rejects.toMatchObject({ name: "ValidationError" });
+      expect(fileInfo).toHaveBeenCalledOnce();
+    } finally {
       await runtime.shutdown();
     }
   });
@@ -1107,12 +1469,12 @@ describe("Chat SDK published adapter integration", () => {
     });
     const uploadV2 = vi.fn(async () => ({
       ok: true,
-      files: [{ ok: true, files: [{ id: "F-AMBIGUOUS" }] }],
+      files: [{ ok: true, files: [{ id: "FAMBIGUOUS" }] }],
     }));
     const fileInfo = vi.fn(async () => ({
       ok: true,
       file: {
-        id: "F-AMBIGUOUS",
+        id: "FAMBIGUOUS",
         shares: {
           public: {
             "C-OTHER": [{ ts: "1788.501" }],
@@ -1188,7 +1550,7 @@ describe("Chat SDK published adapter integration", () => {
     });
     const uploadV2 = vi.fn(async () => ({
       ok: true,
-      files: [{ ok: true, files: [{ id: "F-TIMEOUT" }] }],
+      files: [{ ok: true, files: [{ id: "FTIMEOUT" }] }],
     }));
     const fileInfo = vi.fn(() => new Promise<never>(() => undefined));
     const postMessage = vi.fn();
@@ -1259,7 +1621,7 @@ describe("Chat SDK published adapter integration", () => {
     });
     const uploadV2 = vi.fn(async () => ({
       ok: true,
-      files: [{ ok: true, files: [{ id: "F-LATE-TOKEN" }] }],
+      files: [{ ok: true, files: [{ id: "FLATETOKEN" }] }],
     }));
     const fileInfo = vi.fn();
     const postMessage = vi.fn();
@@ -1328,7 +1690,7 @@ describe("Chat SDK published adapter integration", () => {
       infoResult: {
         ok: true,
         file: {
-          id: "F-OTHER",
+          id: "FOTHER",
           shares: {
             public: {
               "C-PAPERCLIP": [{ thread_ts: "1788.600", ts: "1788.601" }],
@@ -1358,7 +1720,7 @@ describe("Chat SDK published adapter integration", () => {
       });
       const uploadV2 = vi.fn(async () => ({
         ok: true,
-        files: [{ ok: true, files: [{ id: "F-EXPECTED" }] }],
+        files: [{ ok: true, files: [{ id: "FEXPECTED" }] }],
       }));
       const fileInfo = vi.fn(async () => infoResult);
       const postMessage = vi.fn();
@@ -1375,7 +1737,11 @@ describe("Chat SDK published adapter integration", () => {
           postMessage(
             threadId: string,
             message: {
-              files: Array<{ data: Buffer; filename: string; mimeType: string }>;
+              files: Array<{
+                data: Buffer;
+                filename: string;
+                mimeType: string;
+              }>;
               markdown: string;
             },
           ): Promise<{ id: string }>;

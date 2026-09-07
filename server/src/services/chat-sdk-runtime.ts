@@ -492,6 +492,32 @@ export class DiscordAdapterCompatibilityError extends Error {
   }
 }
 
+export class SlackAdapterCompatibilityError extends Error {
+  readonly code = "CHAT_ADAPTER_COMPATIBILITY_ERROR";
+
+  constructor(detail: string) {
+    super(`The pinned Slack adapter is incompatible: ${detail}`);
+    this.name = "SlackAdapterCompatibilityError";
+  }
+}
+
+export interface SlackFileUploadAcceptedReceipt {
+  version: 1;
+  channelId: string;
+  fileIds: string[];
+  threadTs: string | null;
+}
+
+interface SlackAdapterInternals {
+  paperclipFileUploadReceiptContext?: AsyncLocalStorage<
+    (receipt: SlackFileUploadAcceptedReceipt) => Promise<void>
+  >;
+  paperclipResolveFileUploadReceipt?: (
+    fileIds: string[],
+    threadId: string,
+  ) => Promise<string | null>;
+}
+
 interface DiscordAdapterInternals {
   ensureRootThread?: unknown;
   paperclipCompatibilityRevision?: unknown;
@@ -915,7 +941,13 @@ function createProviderAdapter(
           timeout: SLACK_WEB_API_TIMEOUT_MS,
         },
       };
-      return createSlackAdapter(adapterConfig);
+      const adapter = createSlackAdapter(adapterConfig);
+      (
+        adapter as unknown as SlackAdapterInternals
+      ).paperclipFileUploadReceiptContext = new AsyncLocalStorage<
+        (receipt: SlackFileUploadAcceptedReceipt) => Promise<void>
+      >();
+      return adapter;
     }
     case "github": {
       // GitHub's API identifies an App actor as `<slug>[bot]`, while people
@@ -1665,6 +1697,62 @@ export class ChatSdkEndpointRuntime {
 
   thread(threadId: string): Thread {
     return this.chat.thread(threadId);
+  }
+
+  /**
+   * Post one Slack file-only publication while durably recording the accepted
+   * upload IDs before the adapter performs its eventually-consistent share
+   * lookup. This specialized receipt scope is deliberately unavailable for
+   * cards, edits, and ordinary text sends; the send still uses Thread.post.
+   */
+  async postSlackFilePublication(
+    threadId: string,
+    message: Parameters<Thread["post"]>[0],
+    onUploadAccepted: (
+      receipt: SlackFileUploadAcceptedReceipt,
+    ) => Promise<void>,
+  ): Promise<{ id: string }> {
+    if (this.provider !== "slack") {
+      throw new SlackAdapterCompatibilityError(
+        "file publication receipt capture was called for a non-Slack endpoint",
+      );
+    }
+    const slack = this.adapter as unknown as SlackAdapterInternals;
+    if (
+      !slack.paperclipFileUploadReceiptContext ||
+      typeof slack.paperclipResolveFileUploadReceipt !== "function"
+    ) {
+      throw new SlackAdapterCompatibilityError(
+        "file publication receipt capture is unavailable",
+      );
+    }
+    return await slack.paperclipFileUploadReceiptContext.run(
+      onUploadAccepted,
+      async () => await this.chat.thread(threadId).post(message),
+    );
+  }
+
+  /** Resolve a previously accepted Slack upload using metadata reads only. */
+  async resolveSlackFileUploadReceipt(
+    threadId: string,
+    fileIds: string[],
+  ): Promise<string | null> {
+    if (this.provider !== "slack") {
+      throw new SlackAdapterCompatibilityError(
+        "file publication receipt lookup was called for a non-Slack endpoint",
+      );
+    }
+    const slack = this.adapter as unknown as SlackAdapterInternals;
+    if (typeof slack.paperclipResolveFileUploadReceipt !== "function") {
+      throw new SlackAdapterCompatibilityError(
+        "file publication receipt lookup is unavailable",
+      );
+    }
+    return await slack.paperclipResolveFileUploadReceipt.call(
+      this.adapter,
+      fileIds,
+      threadId,
+    );
   }
 
   /**
