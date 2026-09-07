@@ -63,6 +63,19 @@ describe("chat run milestone projection", () => {
     );
   });
 
+  it("explains an allowlisted native provider capacity failure without exposing provider details", () => {
+    expect(
+      safeMilestoneText({
+        agentName: "Maya",
+        errorCode: "native_provider_usage_limit",
+        milestone: "failed",
+        issueId: "issue-1",
+      }),
+    ).toBe(
+      "Maya couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying. Open the task in Paperclip for details.",
+    );
+  });
+
   it("confirms an explicit Slack Stop without claiming an unexpected failure", () => {
     expect(
       safeMilestoneText({

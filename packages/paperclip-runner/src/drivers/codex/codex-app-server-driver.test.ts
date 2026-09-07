@@ -2311,6 +2311,56 @@ describe("Codex app-server Codex driver", () => {
     await session.close({ reason: "test complete" });
   });
 
+  it("exposes only explicit file handoff across fresh and resumed direct chat", async () => {
+    const first = new FakeCodexTransport();
+    const second = new FakeCodexTransport();
+    const registerDeliverable = {
+      name: "register_deliverable",
+      description: "Prepare one requested file.",
+      inputSchema: { type: "object", properties: {} },
+    };
+    const readCurrentWakeComments = {
+      name: "read_current_wake_comments",
+      description: "Read only comments bound into the current wake.",
+      inputSchema: { type: "object", properties: {} },
+    };
+    const driver = makeDriver([first, second], {
+      conversationMode: "direct",
+      dynamicTools: [
+        registerDeliverable,
+        readCurrentWakeComments,
+        {
+          name: "report_progress",
+          description: "Must remain unavailable in direct chat.",
+          inputSchema: { type: "object", properties: {} },
+        },
+      ],
+    });
+    const original = await driver.openSession({
+      runId: "run-direct-file",
+      normalizedSessionId: "normalized-direct-file",
+      workingDirectory: TEST_WORKING_DIRECTORY,
+    });
+    await original.startTurn({
+      message: { role: "user", text: "Please return one file." },
+    });
+    const snapshot = await original.snapshot();
+    await original.close({ reason: "transport lost" });
+
+    expect(
+      first.calls.find((call) => call.method === "thread/start")?.params
+        .dynamicTools,
+    ).toEqual([registerDeliverable, readCurrentWakeComments]);
+
+    const recovery = await driver.recoverSession?.(snapshot);
+    expect(recovery).toMatchObject({ recovered: true });
+    expect(
+      second.calls.find((call) => call.method === "thread/resume")?.params
+        .dynamicTools,
+    ).toEqual([registerDeliverable, readCurrentWakeComments]);
+    await recovery?.session?.close({ reason: "test complete" });
+  });
+
   it("lets an answer claimed before expiry win the terminal-event race", async () => {
     const transport = new FakeCodexTransport();
     let releaseResolution!: () => void;

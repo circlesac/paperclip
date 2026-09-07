@@ -106,6 +106,13 @@ describe("buildPaperclipTaskMarkdown", () => {
       expect(markdown).toContain("installed skill location, not the task workspace");
       expect(markdown).toContain("Do not search for a separate provider tool connection");
       expect(markdown).toContain("do not claim provider delivery merely because binding succeeded");
+      expect(markdown).toContain(
+        "one helper command per file into as few tool calls as practical",
+      );
+      expect(markdown).toContain("do not manually bind the same file again");
+      expect(markdown).toContain(
+        "Retry or investigate only a failed or ambiguous step",
+      );
     },
   );
 
@@ -119,7 +126,45 @@ describe("buildPaperclipTaskMarkdown", () => {
       },
     });
     expect(markdown).not.toContain("External chat file delivery:");
+    expect(markdown).not.toContain("External chat turn efficiency:");
   });
+
+  it.each(["slack", "discord", "telegram", "microsoft-teams", "github"])(
+    "directs native %s files through scoped tools without legacy credentials",
+    (externalChatProvider) => {
+      const markdown = buildPaperclipTaskMarkdown({
+        issue: {
+          id: "native-files",
+          title: "Inspect and share requested files",
+          workMode: "standard",
+          description: null,
+        },
+        externalChatProvider,
+        nativeRunner: true,
+        wakeComments: [{
+          id: "native-file-comment",
+          body: "Inspect this image, then send the requested file.",
+          attachments: [{
+            id: "native-attachment",
+            filename: "image.png",
+            contentType: "image/png",
+            byteSize: 2048,
+            contentPath: "/api/attachments/native-attachment/content",
+          }],
+        }],
+      });
+      expect(markdown).toContain("`register_deliverable`");
+      expect(markdown).toContain("workspace-relative `contentRef`");
+      expect(markdown).toContain("does not confirm provider delivery");
+      expect(markdown).toContain("Register only the requested files");
+      expect(markdown).toContain("workspace-relative staged attachment descriptors");
+      expect(markdown).toContain("clearly state that you could not inspect it");
+      expect(markdown).toContain('"id":"native-attachment"');
+      expect(markdown).not.toContain("paperclip-upload-artifact.sh");
+      expect(markdown).not.toContain("PAPERCLIP_API_KEY");
+      expect(markdown).not.toContain("/api/attachments/");
+    },
+  );
 
   it("does not imply that GitHub chat grants attachment or repository-tool access", () => {
     const markdown = buildPaperclipTaskMarkdown({

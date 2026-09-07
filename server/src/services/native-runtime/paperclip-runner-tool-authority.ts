@@ -18,11 +18,20 @@ import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
+import type { StorageService } from "../../storage/types.js";
+import { prepareNativeRunnerFileHandoff } from "./native-runner-file-handoff.js";
+import { MAX_ATTACHMENT_BYTES } from "../../attachment-types.js";
+import {
+  READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION,
+  READ_CURRENT_WAKE_COMMENTS_TOOL_NAME,
+  readCurrentWakeComments,
+  type CurrentWakeCommentsBinding,
+} from "./current-wake-comments.js";
 
 const IMPLEMENTED_OPERATIONS = new Set([
   "get_task_context", "get_task_history", "search_tasks", "report_progress",
   "request_human_input",
-  "create_task", "set_dependencies",
+  "create_task", "set_dependencies", "register_deliverable",
   "list_documents", "read_document", "list_document_revisions", "write_document",
   "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
 ]);
@@ -34,6 +43,10 @@ type Binding = {
   agentId: string;
   normalizedSessionId?: string;
   workMode?: "standard" | "planning" | "ask";
+  workspaceRoot?: string;
+  executionTargetKind?: "local" | "remote";
+  storage?: StorageService;
+  currentWakeComments?: CurrentWakeCommentsBinding;
   enqueueWakeup?: (agentId: string, options: {
     source: "assignment";
     triggerDetail: "system";
@@ -72,28 +85,86 @@ export class PaperclipRunnerToolAuthority {
 
   definitions(): Array<Record<string, unknown>> {
     const workMode = this.binding.workMode ?? "standard";
-    return CAPABILITY_SEMANTIC_TOOL_CATALOG
-      .filter((descriptor) =>
-        IMPLEMENTED_OPERATIONS.has(descriptor.operationId)
-        && descriptor.allowedModes.includes(workMode)
-      )
-      .map((descriptor) => ({
+    const definitions: Array<Record<string, unknown>> =
+      CAPABILITY_SEMANTIC_TOOL_CATALOG.filter(
+        (descriptor) =>
+          IMPLEMENTED_OPERATIONS.has(descriptor.operationId) &&
+          descriptor.allowedModes.includes(workMode) &&
+          (descriptor.operationId !== "register_deliverable" ||
+            (Boolean(this.binding.workspaceRoot) &&
+              (this.binding.executionTargetKind ?? "local") === "local")),
+      ).map((descriptor) => ({
         name: descriptor.operationId,
-        description: descriptor.description,
-        inputSchema: descriptor.inputSchema,
+        description:
+          descriptor.operationId === "register_deliverable"
+            ? "Prepare one verified workspace file for Paperclip's final task or external-chat response. This records the attachment, work product, and explicit same-run selection; it does not confirm provider delivery."
+            : descriptor.description,
+        inputSchema:
+          descriptor.operationId === "register_deliverable"
+            ? {
+                ...descriptor.inputSchema,
+                properties: {
+                  ...descriptor.inputSchema.properties,
+                  filename: {
+                    ...(descriptor.inputSchema.properties?.filename ?? {}),
+                    description:
+                      "Basename for the prepared attachment. Directory components are rejected.",
+                  },
+                  byteSize: {
+                    ...(descriptor.inputSchema.properties?.byteSize ?? {}),
+                    minimum: 1,
+                    maximum: MAX_ATTACHMENT_BYTES,
+                  },
+                  contentRef: {
+                    ...(descriptor.inputSchema.properties?.contentRef ?? {}),
+                    description:
+                      "Workspace-relative source path. Absolute paths, URLs, traversal, and symlinks are rejected.",
+                  },
+                },
+              }
+            : descriptor.inputSchema,
       }));
+    // Keep the provider session's direct tool catalog stable across ordinary
+    // and truncated external-chat turns. Execution still fails closed unless
+    // this exact run carries a server-verified current-wake binding.
+    definitions.push(READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION);
+    return definitions;
   }
 
-  async execute(call: { tool: string; callId: string; arguments: unknown }): Promise<unknown> {
-    if (!IMPLEMENTED_OPERATIONS.has(call.tool)) throw new Error("paperclip_runner_tool_not_advertised");
+  async execute(call: {
+    tool: string;
+    callId: string;
+    arguments: unknown;
+  }): Promise<unknown> {
+    if (
+      !IMPLEMENTED_OPERATIONS.has(call.tool) &&
+      call.tool !== READ_CURRENT_WAKE_COMMENTS_TOOL_NAME
+    ) {
+      throw new Error("paperclip_runner_tool_not_advertised");
+    }
     const context = await this.#boundContext();
-    const descriptor = CAPABILITY_SEMANTIC_TOOL_CATALOG.find((candidate) => candidate.operationId === call.tool);
-    if (!descriptor || !descriptor.allowedModes.includes(
-      context.issue.workMode as "standard" | "planning" | "ask",
-    )) {
+    const input = record(call.arguments);
+    if (call.tool === READ_CURRENT_WAKE_COMMENTS_TOOL_NAME) {
+      if (!this.binding.currentWakeComments) {
+        throw new Error("paperclip_runner_tool_not_advertised");
+      }
+      return readCurrentWakeComments(
+        this.db,
+        this.binding.currentWakeComments,
+        input,
+      );
+    }
+    const descriptor = CAPABILITY_SEMANTIC_TOOL_CATALOG.find(
+      (candidate) => candidate.operationId === call.tool,
+    );
+    if (
+      !descriptor ||
+      !descriptor.allowedModes.includes(
+        context.issue.workMode as "standard" | "planning" | "ask",
+      )
+    ) {
       throw new Error("paperclip_runner_tool_mode_denied");
     }
-    const input = record(call.arguments);
     switch (call.tool) {
       case "get_task_context": return {
         company: { id: this.binding.companyId },
@@ -171,6 +242,7 @@ export class PaperclipRunnerToolAuthority {
       case "request_human_input": return this.#requestHumanInput(input);
       case "create_task": return this.#createTask(input);
       case "set_dependencies": return this.#setDependencies(input);
+      case "register_deliverable": return this.#registerDeliverable(input);
       default: throw new Error("paperclip_runner_tool_not_bound");
     }
   }
@@ -457,6 +529,81 @@ export class PaperclipRunnerToolAuthority {
     });
   }
 
+  async #registerDeliverable(input: Record<string, unknown>): Promise<unknown> {
+    const idempotencyKey = requiredString(input.idempotencyKey);
+    const workspaceRoot = this.binding.workspaceRoot?.trim();
+    if (!workspaceRoot) {
+      throw new Error("paperclip_runner_file_handoff_workspace_unavailable");
+    }
+    let publication:
+      Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
+    let rollbackDefinitePreCommitFailure: (() => Promise<void>) | null = null;
+    const result = await this.#withMutationReceipt(
+      "register_deliverable",
+      idempotencyKey,
+      input,
+      async (tx, context) => {
+        const prepared = await prepareNativeRunnerFileHandoff({
+          db: tx,
+          binding: {
+            companyId: this.binding.companyId,
+            issueId: this.binding.issueId,
+            runId: this.binding.runId,
+            agentId: this.binding.agentId,
+            workspaceRoot,
+            executionTargetKind: this.binding.executionTargetKind ?? "local",
+          },
+          deliverable: {
+            filename: typeof input.filename === "string" ? input.filename : "",
+            contentType:
+              typeof input.contentType === "string" ? input.contentType : "",
+            byteSize:
+              typeof input.byteSize === "number" ? input.byteSize : Number.NaN,
+            sha256: typeof input.sha256 === "string" ? input.sha256 : "",
+            contentRef:
+              typeof input.contentRef === "string" ? input.contentRef : "",
+            title: typeof input.title === "string" ? input.title : "",
+          },
+          storage: this.binding.storage,
+        });
+        rollbackDefinitePreCommitFailure =
+          prepared.rollbackDefinitePreCommitFailure;
+        if (prepared.result.disposition === "applied") {
+          const activity = await persistActivity(tx, {
+            companyId: this.binding.companyId,
+            actorType: "agent",
+            actorId: this.binding.agentId,
+            agentId: this.binding.agentId,
+            runId: this.binding.runId,
+            issueId: this.binding.issueId,
+            action: "issue.attachment_added",
+            entityType: "issue",
+            entityId: this.binding.issueId,
+            details: {
+              attachmentId: prepared.result.entityRefs[0],
+              workProductId: prepared.result.entityRefs[1],
+              commentId: prepared.result.entityRefs[2],
+              identifier: context.issue.identifier,
+              issueTitle: context.issue.title,
+              source: "paperclip_runner_protocol",
+            },
+          });
+          publication = activity.publication;
+        }
+        return prepared.result;
+      },
+      {
+        onDefinitePreCommitFailure: async () => {
+          const rollback = rollbackDefinitePreCommitFailure;
+          rollbackDefinitePreCommitFailure = null;
+          await rollback?.();
+        },
+      },
+    );
+    if (publication) publishActivity(publication);
+    return result;
+  }
+
   async #acceptedPlan(contextSnapshot: unknown): Promise<{
     documentId: string;
     revisionId: string;
@@ -520,32 +667,55 @@ export class PaperclipRunnerToolAuthority {
     operationId: string,
     idempotencyKey: string,
     input: Record<string, unknown>,
-    effect: (tx: Db, context: {
-      run: typeof heartbeatRuns.$inferSelect;
-      issue: typeof issues.$inferSelect;
-      actor: typeof agents.$inferSelect;
-    }) => Promise<unknown>,
+    effect: (
+      tx: Db,
+      context: {
+        run: typeof heartbeatRuns.$inferSelect;
+        issue: typeof issues.$inferSelect;
+        actor: typeof agents.$inferSelect;
+      },
+    ) => Promise<unknown>,
+    options: {
+      onDefinitePreCommitFailure?: () => Promise<void>;
+    } = {},
   ): Promise<unknown> {
     return this.db.transaction(async (tx) => {
-      const context = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
-      const resultJson = record(context.run.resultJson);
-      const receipts = record(resultJson.semanticToolReceipts);
-      const prior = receipts[idempotencyKey] as ToolReceipt | undefined;
-      if (prior !== undefined) {
-        if (prior.operationId !== operationId || canonicalJson(prior.input) !== canonicalJson(input)) {
-          throw new Error("paperclip_runner_tool_idempotency_conflict");
+      try {
+        const context = await this.#lockAuthorizedMutationContext(
+          tx as unknown as Db,
+        );
+        const resultJson = record(context.run.resultJson);
+        const receipts = record(resultJson.semanticToolReceipts);
+        const prior = receipts[idempotencyKey] as ToolReceipt | undefined;
+        if (prior !== undefined) {
+          if (
+            prior.operationId !== operationId ||
+            canonicalJson(prior.input) !== canonicalJson(input)
+          ) {
+            throw new Error("paperclip_runner_tool_idempotency_conflict");
+          }
+          return prior.result;
         }
-        return prior.result;
+        const result = JSON.parse(
+          JSON.stringify(await effect(tx as unknown as Db, context)),
+        ) as unknown;
+        receipts[idempotencyKey] = {
+          operationId,
+          input,
+          result,
+        } satisfies ToolReceipt;
+        await tx
+          .update(heartbeatRuns)
+          .set({
+            resultJson: { ...resultJson, semanticToolReceipts: receipts },
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, this.binding.runId));
+        return result;
+      } catch (error) {
+        await options.onDefinitePreCommitFailure?.().catch(() => undefined);
+        throw error;
       }
-      const result = JSON.parse(JSON.stringify(
-        await effect(tx as unknown as Db, context),
-      )) as unknown;
-      receipts[idempotencyKey] = { operationId, input, result } satisfies ToolReceipt;
-      await tx.update(heartbeatRuns).set({
-        resultJson: { ...resultJson, semanticToolReceipts: receipts },
-        updatedAt: new Date(),
-      }).where(eq(heartbeatRuns.id, this.binding.runId));
-      return result;
     });
   }
 

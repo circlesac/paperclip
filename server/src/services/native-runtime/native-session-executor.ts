@@ -69,6 +69,15 @@ import {
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
+import {
+  assertCurrentWakeCommentsRead,
+  resolveCurrentWakeCommentsBinding,
+} from "./current-wake-comments.js";
+import {
+  renderNativeRunnerStagedAttachmentPrompt,
+  stageNativeRunnerWakeAttachments,
+} from "./native-runner-file-handoff.js";
+import { nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -1847,7 +1856,10 @@ function loadRunnerdDurableBinding(execution: NativeExecutionInput): {
   };
 }
 
-function nativeSessionConfigDigest(execution: NativeExecutionInput): string {
+function nativeSessionConfigDigest(
+  execution: NativeExecutionInput,
+  executionTargetKind: "local" | "remote" = "local",
+): string {
   const executionLocation = {
     executionKind: "local_process",
     workspaceId: execution.binding.executionWorkspaceId,
@@ -1868,6 +1880,12 @@ function nativeSessionConfigDigest(execution: NativeExecutionInput): string {
           "runtimeContext" in execution
             ? execution.runtimeContext.aggregateDigest
             : null,
+        // Provider threads retain their tool declarations across resume. Bump
+        // this revision whenever the server-authorized native tool surface
+        // changes so an older thread is rotated instead of falsely resuming
+        // without newly required tools.
+        nativeToolContractFingerprint:
+          nativeToolContractFingerprintForTarget(executionTargetKind),
       }),
     )
     .digest("hex")}`;
@@ -1887,7 +1905,10 @@ function hasIdleWarmNativeSessionOwner(input: {
   return (
     entry.companyId === input.execution.binding.companyId &&
     entry.environmentId === environmentId &&
-    entry.configDigest === nativeSessionConfigDigest(input.execution)
+    entry.configDigest === nativeSessionConfigDigest(
+      input.execution,
+      input.runnerExecutionTarget?.kind ?? "local",
+    )
   );
 }
 
@@ -2567,6 +2588,17 @@ async function releaseWarmNativeSession(
   entry.idleTimer.unref();
 }
 
+/** Classify only a committed provider terminal, never model prose or tool output. */
+export function nativeProviderUsageLimitFromEvent(
+  event: Pick<PrpEvent, "sourceKind" | "eventType" | "payload">,
+): boolean {
+  const payload = record(event.payload);
+  return event.sourceKind === "runner"
+    && event.eventType === "turn.failed"
+    && payload.status === "failed"
+    && record(payload.error).codexErrorInfo === "usageLimitExceeded";
+}
+
 export function nativeSessionFailureDisposition(
   attempt: number,
   now = new Date(),
@@ -2574,7 +2606,10 @@ export function nativeSessionFailureDisposition(
 ) {
   const permanentFailure =
     sourceFailureCode === "native_event_replay_conflict" ||
-    sourceFailureCode === "runner_remote_provider_artifact_incompatible";
+    sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
+    sourceFailureCode === "native_current_wake_comments_unread" ||
+    sourceFailureCode === "native_current_wake_comments_changed_after_read" ||
+    sourceFailureCode === "native_provider_usage_limit";
   const exhausted = permanentFailure || attempt >= 3;
   return {
     phase: exhausted
@@ -2613,6 +2648,7 @@ export function nativeSessionRecoveryProjection(input: {
 export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
+  | "native_provider_usage_limit"
   | "runner_remote_provider_artifact_incompatible"
   | "provider_process_exited"
   | "provider_stdout_closed"
@@ -2627,6 +2663,8 @@ export function nativeSessionFailureSourceCode(
   | "native_runner_process_exited"
   | "planning_mode_unsupported"
   | "native_event_replay_conflict"
+  | "native_current_wake_comments_unread"
+  | "native_current_wake_comments_changed_after_read"
   | "native_session_interrupted" {
   const message = error instanceof Error ? error.message : String(error);
   if (/runner_remote_provider_artifact_incompatible/i.test(message)) {
@@ -2676,6 +2714,12 @@ export function nativeSessionFailureSourceCode(
   }
   if (/native_event_replay_conflict/i.test(message)) {
     return "native_event_replay_conflict";
+  }
+  if (/native_current_wake_comments_changed_after_read/i.test(message)) {
+    return "native_current_wake_comments_changed_after_read";
+  }
+  if (/native_current_wake_comments_unread/i.test(message)) {
+    return "native_current_wake_comments_unread";
   }
   return "native_session_interrupted";
 }
@@ -3663,22 +3707,85 @@ export async function executePaperclipNativeSession(input: {
   if (!input.useRunnerd) {
     return executePaperclipNativeSessionWithinScope(input);
   }
-  const sessionScopeId = nativeSessionScopeKey(input.execution);
-  if (executingRunnerdSessionScopes.has(sessionScopeId)) {
-    throw new Error("native_session_supervisor_busy");
-  }
-  executingRunnerdSessionScopes.set(
-    sessionScopeId,
-    input.execution.binding.runId,
-  );
+  let preparedInput: typeof input = input;
+  let cleanupStagedAttachments: () => Promise<void> = async () => undefined;
+  let sessionScopeId: string | null = null;
+  let ownsSessionScope = false;
+  let executionFailure: unknown;
   try {
-    return await executePaperclipNativeSessionWithinScope(input);
+    // The session scope is unaffected by appending server-staged attachment
+    // descriptors. Claim it before any workspace scrub/write so a duplicate
+    // execution cannot truncate or replace the active turn's staging inode.
+    sessionScopeId = nativeSessionScopeKey(input.execution);
+    if (executingRunnerdSessionScopes.has(sessionScopeId)) {
+      throw new Error("native_session_supervisor_busy");
+    }
+    executingRunnerdSessionScopes.set(
+      sessionScopeId,
+      input.execution.binding.runId,
+    );
+    ownsSessionScope = true;
+
+    const targetKind = input.runnerExecutionTarget?.kind ?? "local";
+    const attachmentStage = await stageNativeRunnerWakeAttachments({
+      db: input.db,
+      binding: {
+        companyId: input.execution.binding.companyId,
+        issueId: input.execution.binding.issueId,
+        runId: input.execution.binding.runId,
+        agentId: input.execution.binding.agentId,
+        workspaceRoot: input.execution.workspace.cwd,
+        executionTargetKind: targetKind,
+      },
+    });
+    cleanupStagedAttachments = attachmentStage.cleanup;
+    const stagedPrompt = renderNativeRunnerStagedAttachmentPrompt(
+      attachmentStage.attachments,
+    );
+    if (stagedPrompt) {
+      preparedInput = {
+        ...input,
+        execution: parseNativeExecutionInput({
+          ...input.execution,
+          task: {
+            ...input.execution.task,
+            prompt: `${input.execution.task.prompt}\n\n${stagedPrompt}`,
+          },
+        }),
+      };
+    }
+    return await executePaperclipNativeSessionWithinScope(preparedInput);
+  } catch (error) {
+    executionFailure = error;
+    throw error;
   } finally {
     if (
+      ownsSessionScope &&
+      sessionScopeId !== null &&
       executingRunnerdSessionScopes.get(sessionScopeId) ===
-      input.execution.binding.runId
+        input.execution.binding.runId
     ) {
       executingRunnerdSessionScopes.delete(sessionScopeId);
+    }
+    try {
+      await cleanupStagedAttachments();
+    } catch (cleanupError) {
+      // Cleanup is a confidentiality incident, but it occurs after the native
+      // provider may already have completed the turn. Reclassifying that turn
+      // as failed could replay provider side effects. Emit a private runtime
+      // health event while preserving the provider result/error disposition.
+      await input
+        .onEvent?.({
+          eventType: "native.attachment_staging_cleanup_failed",
+          level: "error",
+          message: "Native inbound attachment staging cleanup failed.",
+          payload: {
+            runId: input.execution.binding.runId,
+            issueId: input.execution.binding.issueId,
+            executionAlreadyFailed: executionFailure !== undefined,
+          },
+        })
+        .catch(() => undefined);
     }
   }
 }
@@ -4010,6 +4117,7 @@ async function executePaperclipNativeSessionWithinScope(
   let turnSubmittedAtMs: number | null = null;
   let turnStartedAtMs: number | null = null;
   let firstAgentEventRecorded = false;
+  let providerUsageLimitObserved = false;
   let turnCompletedAtMs: number | null = null;
   let runnerSessionStartupScope: NativeRunSpanScope | null = null;
   let agentTurnScope: NativeRunSpanScope | null = null;
@@ -4032,6 +4140,7 @@ async function executePaperclipNativeSessionWithinScope(
     },
     {
       onCommittedEvent: async (event) => {
+        providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
         const eventAtMs = Date.parse(event.emittedAt);
         const milestoneAtMs = Number.isFinite(eventAtMs)
           ? eventAtMs
@@ -4257,7 +4366,10 @@ async function executePaperclipNativeSessionWithinScope(
       : null;
   const warmConfigDigest =
     lifecyclePolicy.mode === "warm"
-      ? nativeSessionConfigDigest(input.execution)
+      ? nativeSessionConfigDigest(
+          input.execution,
+          input.runnerExecutionTarget?.kind ?? "local",
+        )
       : null;
   const warmSessionOwnerToken = Symbol(
     `native-warm-session:${input.execution.binding.runId}`,
@@ -4358,6 +4470,11 @@ async function executePaperclipNativeSessionWithinScope(
     controller,
   });
   try {
+    const expectedCurrentWakeComments =
+      await resolveCurrentWakeCommentsBinding(
+        input.db,
+        input.execution.binding,
+      );
     const runnerdBackend =
       input.useRunnerd && input.backend === undefined
         ? await createRunnerdBackend({
@@ -4533,6 +4650,17 @@ async function executePaperclipNativeSessionWithinScope(
       },
       { parentName: "task.run" },
     );
+    if (native.terminal.runTerminalState === "succeeded") {
+      // A truncated, verified external-chat wake cannot settle from the
+      // provider's partial inline prompt. The run-scoped reader records a
+      // durable complete-page receipt; this fence revalidates that exact
+      // current snapshot before any native finalization can become authoritative.
+      await assertCurrentWakeCommentsRead(
+        input.db,
+        input.execution.binding,
+        expectedCurrentWakeComments,
+      );
+    }
     await leaseRenewal.stop();
     await trace.record({
       name: "native.result.finalize",
@@ -4596,7 +4724,9 @@ async function executePaperclipNativeSessionWithinScope(
       throw error;
     }
     const now = new Date();
-    const sourceFailureCode = nativeSessionFailureSourceCode(error);
+    const sourceFailureCode = providerUsageLimitObserved
+      ? ("native_provider_usage_limit" as const)
+      : nativeSessionFailureSourceCode(error);
     const recoveryEvidence = await nativeProviderRecoveryEvidence({
       db: input.db,
       runId: input.execution.binding.runId,
@@ -4656,7 +4786,9 @@ async function executePaperclipNativeSessionWithinScope(
                 ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
                 : integrityFailure
                   ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
-                  : exhausted
+                  : sourceFailureCode === "native_provider_usage_limit"
+                    ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
+                    : exhausted
                     ? "Inspect the persisted native session after its bounded resume budget was exhausted."
                     : recoveryEvidence.recoveryMode === "bootstrap_retry"
                       ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
@@ -4767,7 +4899,9 @@ async function executePaperclipNativeSessionWithinScope(
             ? "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session."
             : integrityFailure
               ? "Inspect the persisted runner event collision and explicitly repair or replace the run; automatic retries are disabled."
-              : exhausted
+              : sourceFailureCode === "native_provider_usage_limit"
+                ? "Restore model provider usage capacity, then explicitly retry the task; automatic retries are stopped."
+                : exhausted
                 ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
                 : recoveryEvidence.recoveryMode === "bootstrap_retry"
                   ? "Retry bootstrap on the same run without manufacturing a provider checkpoint."
@@ -6151,6 +6285,10 @@ async function createRunnerdBackendWithinSessionClaim(
   sessionScopeId: string,
 ): Promise<NativeSessionBackend> {
   const target = input.runnerExecutionTarget ?? { kind: "local" as const };
+  const currentWakeComments = await resolveCurrentWakeCommentsBinding(
+    input.db,
+    input.execution.binding,
+  );
   const authority = new PaperclipRunnerToolAuthority(input.db, {
     companyId: input.execution.binding.companyId,
     issueId: input.execution.binding.issueId,
@@ -6158,6 +6296,9 @@ async function createRunnerdBackendWithinSessionClaim(
     agentId: input.execution.binding.agentId,
     normalizedSessionId: nativeSessionKey(input.execution),
     workMode: input.execution.task.workMode,
+    workspaceRoot: input.execution.workspace.cwd,
+    executionTargetKind: target.kind,
+    currentWakeComments: currentWakeComments ?? undefined,
     enqueueWakeup: input.enqueueWakeup,
   });
   const authorityEpoch = new SessionToolAuthorityEpoch(

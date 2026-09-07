@@ -54,6 +54,7 @@ import {
   toolConnections,
 } from "@paperclipai/db";
 import type { ChatProvider } from "@paperclipai/shared";
+import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-utils";
 import type { Attachment, Author, Message, Thread } from "chat";
 import { errorHandler } from "../middleware/index.js";
 import {
@@ -83,6 +84,14 @@ import {
   enqueueChatRunMilestones,
   resolveChatRunPresentationAuthorizationReason,
 } from "../services/chat-run-publications.js";
+import {
+  heartbeatService,
+  resolveExternalChatWakeProvider,
+} from "../services/heartbeat.js";
+import {
+  registerServerAdapter,
+  unregisterServerAdapter,
+} from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import {
@@ -5288,6 +5297,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         githubWebhookResponseBudgetMs: 25,
         scheduleDeferredWork: (task) => deferred.push(task),
       });
+    // The setup helper intentionally uses setImmediate until setup completes,
+    // while this test replaces later work with a captured queue. Let those
+    // setup-era callbacks join the runtime singleflight before measuring the
+    // cold request so their replacement is not attributed to this webhook.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await service.reconcileProviderRuntimes();
     deferred.length = 0;
     await runtime.removeEndpoint(endpoint.id);
     const replacementsBeforeRequest = runtime.replaceCount;
@@ -5312,7 +5327,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
     expect(response.status).toBe(202);
     expect(elapsedMs).toBeLessThan(500);
-    expect(runtime.replaceCount).toBe(replacementsBeforeRequest + 1);
+    // The durable response budget is intentionally independent of cold
+    // runtime startup. Under a loaded event loop the 202 can win the budget
+    // race before the background processor reaches replaceEndpoint, so wait
+    // for the explicit initialization boundary instead of assuming same-tick
+    // scheduling.
+    await vi.waitFor(() => {
+      expect(runtime.replaceCount).toBe(replacementsBeforeRequest + 1);
+    });
     expect(deferred).toHaveLength(0);
     await expect(
       db
@@ -15836,6 +15858,374 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(JSON.stringify(posts)).not.toContain("Acknowledged");
   });
 
+  it("materializes direct external-chat finals once and accepts the next turn without agent bookkeeping writes", async () => {
+    const fixture = await seedCompany();
+    const adapterType = `chat-shortcut-test-${randomUUID()}`;
+    const directFinals = ["SHORTCUT-FIRST", "SHORTCUT-SECOND"];
+    const execute = vi.fn(async (_input: unknown) => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary: directFinals[execute.mock.calls.length - 1]!,
+      provider: "test",
+      model: "test-model",
+    }));
+    registerServerAdapter({
+      type: adapterType,
+      supportsLocalAgentJwt: false,
+      execute,
+      testEnvironment: async () => ({
+        adapterType,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
+
+    const heartbeat = heartbeatService(db);
+    try {
+      await db
+        .update(companies)
+        .set({ defaultResponsibleUserId: "owner-user" })
+        .where(eq(companies.id, fixture.companyId));
+      await db
+        .update(agents)
+        .set({
+          adapterType,
+          runtimeConfig: {
+            heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+          },
+        })
+        .where(eq(agents.id, fixture.assignedAgentId));
+
+      const { callbacks, endpoint, runtime, service } =
+        await configuredSlackEndpoint(fixture, {
+          wakeup: heartbeat.wakeup,
+        });
+      const configuredEndpoint = await service.get(endpoint.id);
+      const [principal] = await db
+        .insert(chatExternalPrincipals)
+        .values({
+          companyId: fixture.companyId,
+          provider: "slack",
+          providerAccountId: configuredEndpoint.providerAccountId!,
+          externalId: "U-SHORTCUT-LINKED",
+          kind: "user",
+          displayName: "Linked Chat User",
+        })
+        .returning();
+      await db.insert(chatIdentityLinks).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        principalId: principal!.id,
+        paperclipUserId: "owner-user",
+        status: "linked",
+        confirmedAt: new Date(),
+      });
+
+      const channel = makeThread({
+        channelId: "C-SHORTCUT",
+        id: "slack:C-SHORTCUT:shortcut-root",
+        name: "shortcut",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: channel.thread,
+        message: makeMessage({
+          id: "shortcut-root",
+          text: "@maya answer the first self-contained question",
+          mentioned: true,
+          userId: "U-SHORTCUT-LINKED",
+        }),
+        trigger: "mention",
+      });
+      await heartbeat.drainActiveRunExecutions();
+
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.endpointId, endpoint.id),
+            eq(chatConversations.externalThreadId, channel.thread.id),
+          ),
+        );
+      expect(conversation).toBeDefined();
+      const firstRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, fixture.companyId),
+            eq(heartbeatRuns.agentId, fixture.assignedAgentId),
+          ),
+        )
+        .then((rows) => rows.find((row) => row.status === "succeeded"));
+      expect(firstRun).toBeDefined();
+      const firstAdapterInput = execute.mock.calls[0]?.[0] as
+        | { context?: { paperclipWake?: unknown } }
+        | undefined;
+      expect(
+        isPaperclipExternalChatTurn(firstAdapterInput?.context?.paperclipWake),
+      ).toBe(true);
+      const [firstInboundLink] = await db
+        .select({ commentId: chatMessageLinks.commentId })
+        .from(chatMessageLinks)
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, endpoint.id),
+            eq(chatMessageLinks.providerMessageId, "shortcut-root"),
+            eq(chatMessageLinks.direction, "inbound"),
+          ),
+        );
+      const trustedWakeContext = {
+        source: "chat:slack",
+        wakeCommentIds: [firstInboundLink!.commentId!],
+        paperclipHarnessCheckedOut: true,
+      };
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: trustedWakeContext,
+        }),
+      ).resolves.toBe("slack");
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: {
+            ...trustedWakeContext,
+            source: "chat:slack:recovery",
+          },
+        }),
+      ).resolves.toBe("slack");
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: {
+            ...trustedWakeContext,
+            source: "chat:slack:recovery:unexpected",
+          },
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.replacementAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: trustedWakeContext,
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: {
+            ...trustedWakeContext,
+            source: "automation",
+          },
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: randomUUID(),
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: trustedWakeContext,
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: randomUUID(),
+          contextSnapshot: trustedWakeContext,
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: {
+            ...trustedWakeContext,
+            paperclipHarnessCheckedOut: false,
+          },
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: {
+            ...trustedWakeContext,
+            source: "chat:discord",
+          },
+        }),
+      ).resolves.toBeNull();
+
+      const [internalComment] = await db
+        .insert(issueComments)
+        .values({
+          companyId: fixture.companyId,
+          issueId: conversation!.issueId,
+          authorType: "user",
+          authorUserId: "owner-user",
+          body: "Internal board note, not external chat input.",
+        })
+        .returning();
+      await db.insert(chatMessageLinks).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation!.id,
+        commentId: internalComment!.id,
+        providerMessageId: "shortcut-outbound-only",
+        direction: "outbound",
+      });
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: {
+            ...trustedWakeContext,
+            wakeCommentIds: [
+              firstInboundLink!.commentId!,
+              internalComment!.id,
+            ],
+          },
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        resolveExternalChatWakeProvider({
+          db,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation!.issueId,
+          contextSnapshot: {
+            ...trustedWakeContext,
+            wakeCommentIds: [internalComment!.id],
+          },
+        }),
+      ).resolves.toBeNull();
+      const firstFinal = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.createdByRunId, firstRun!.id));
+      expect(firstFinal).toHaveLength(1);
+      expect(firstFinal[0]).toMatchObject({
+        issueId: conversation!.issueId,
+        body: "SHORTCUT-FIRST",
+        metadata: expect.objectContaining({
+          authorizationReason: "allow_chat_run_presentation",
+        }),
+      });
+      await expect(
+        db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, firstFinal[0]!.id)),
+      ).resolves.toHaveLength(1);
+      await service.processPendingPublications(1_000);
+
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: channel.thread,
+        message: makeMessage({
+          id: "shortcut-followup",
+          text: "answer the second self-contained question",
+          userId: "U-SHORTCUT-LINKED",
+        }),
+        trigger: "subscribed_message",
+      });
+      await heartbeat.drainActiveRunExecutions();
+
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, fixture.companyId),
+            eq(heartbeatRuns.agentId, fixture.assignedAgentId),
+          ),
+        );
+      const succeededRuns = runs.filter((row) => row.status === "succeeded");
+      expect(succeededRuns).toHaveLength(2);
+      const secondRun = succeededRuns.find((row) => row.id !== firstRun!.id);
+      expect(secondRun).toBeDefined();
+      const secondAdapterInput = execute.mock.calls[1]?.[0] as
+        | { context?: { paperclipWake?: unknown } }
+        | undefined;
+      expect(
+        isPaperclipExternalChatTurn(secondAdapterInput?.context?.paperclipWake),
+      ).toBe(true);
+      const secondFinal = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.createdByRunId, secondRun!.id));
+      expect(secondFinal).toHaveLength(1);
+      expect(secondFinal[0]).toMatchObject({
+        issueId: conversation!.issueId,
+        body: "SHORTCUT-SECOND",
+        metadata: expect.objectContaining({
+          authorizationReason: "allow_chat_run_presentation",
+        }),
+      });
+      await service.processPendingPublications(1_000);
+
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(
+        (runtime.endpoints.get(endpoint.id)?.posts ?? []).filter(
+          (post) =>
+            post.threadId === channel.thread.id &&
+            directFinals.includes(post.text),
+        ),
+      ).toEqual([
+        expect.objectContaining({ text: "SHORTCUT-FIRST" }),
+        expect.objectContaining({ text: "SHORTCUT-SECOND" }),
+      ]);
+      const providerFacingComments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, conversation!.issueId),
+            eq(issueComments.authorType, "agent"),
+          ),
+        );
+      expect(providerFacingComments).toHaveLength(2);
+      expect(providerFacingComments).toEqual(
+        expect.arrayContaining([
+          { body: "SHORTCUT-FIRST" },
+          { body: "SHORTCUT-SECOND" },
+        ]),
+      );
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      unregisterServerAdapter(adapterType);
+    }
+  });
+
   it("coalesces one GitHub run's progress and final response into one provider comment", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service } =
@@ -19751,6 +20141,107 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(streamed?.chunks?.join("")).toBe(publication.payload.text);
     expect(streamed?.text).toBe(publicParagraph);
     expect(JSON.stringify(streamed)).not.toContain("private chain of thought");
+  });
+
+  it("imports every Discord upload when text files include MIME parameters", async () => {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, service, wakeup } =
+      await configuredDiscordEndpoint(fixture, { storage: storage.storage });
+    const textBody = Buffer.from("multi-file Discord text", "utf8");
+    const imageBody = Buffer.from("multi-file Discord image", "utf8");
+    const textFetch = vi.fn(async () => textBody);
+    const imageFetch = vi.fn(async () => imageBody);
+    const rejectedFetch = vi.fn(async () => Buffer.from("not imported"));
+    const rootMessageId = "555555555555555596";
+    const channel = makeThread({
+      channelId: "333333333333333329",
+      id: `discord:1457808928258658549:333333333333333329:${rootMessageId}`,
+      name: "discord-multi-upload",
+    });
+
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message: makeMessage({
+        attachments: [
+          {
+            type: "file",
+            name: "native-inbound.txt",
+            mimeType: "text/plain; charset=utf-8",
+            size: textBody.length,
+            fetchData: textFetch,
+            fetchMetadata: { testRecoveryKey: "discord-multi-text" },
+          } as Attachment,
+          {
+            type: "image",
+            name: "native-inbound.png",
+            mimeType: "image/png",
+            size: imageBody.length,
+            fetchData: imageFetch,
+            fetchMetadata: { testRecoveryKey: "discord-multi-image" },
+          } as Attachment,
+          {
+            type: "file",
+            name: "unsupported.exe",
+            mimeType: "application/x-msdownload",
+            size: 12,
+            fetchData: rejectedFetch,
+          } as Attachment,
+        ],
+        id: rootMessageId,
+        mentioned: true,
+        text: "@maya inspect both files",
+      }),
+      trigger: "mention",
+    });
+
+    expect(textFetch).toHaveBeenCalledTimes(1);
+    expect(imageFetch).toHaveBeenCalledTimes(1);
+    expect(rejectedFetch).not.toHaveBeenCalled();
+    expect(storage.putFile).toHaveBeenCalledTimes(2);
+    const [delivery] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.endpointId, endpoint.id));
+    expect(delivery).toMatchObject({
+      state: "processed",
+      redactedError:
+        "1 external attachment was omitted (unsupported type: 1)",
+    });
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup.mock.calls[0]?.[1]?.contextSnapshot).toMatchObject({
+      externalAttachmentOmissions: [
+        {
+          commentId: expect.any(String),
+          reasons: { unsupported_type: 1 },
+        },
+      ],
+    });
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Discord upload conversation");
+    await expect(
+      db
+        .select({
+          contentType: assets.contentType,
+          originalFilename: assets.originalFilename,
+        })
+        .from(issueAttachments)
+        .innerJoin(assets, eq(assets.id, issueAttachments.assetId))
+        .where(eq(issueAttachments.issueId, conversation.issueId))
+        .orderBy(asc(assets.originalFilename)),
+    ).resolves.toEqual([
+      {
+        contentType: "image/png",
+        originalFilename: "native-inbound.png",
+      },
+      {
+        contentType: "text/plain",
+        originalFilename: "native-inbound.txt",
+      },
+    ]);
   });
 
   it("durably audits a rejected Discord Gateway action before surfacing transport rejection", async () => {
@@ -29468,7 +29959,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it("recovers a provider-confirmed Slack starter after restart but rechecks revoked reach", async () => {
     const fixture = await seedCompany();
-    const { endpoint, runtime, service, wakeup } =
+    const { callbacks, endpoint, runtime, service, wakeup } =
       await configuredSlackEndpoint(fixture, {
         // Keep the synthetic inbound delivery queued so the test can discard
         // every process-local callback object before a replacement service
@@ -29505,6 +29996,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         isBot: false,
       })
       .returning();
+    const providerMessageId = randomUUID();
+    const syntheticMessageId = randomUUID();
+    const confirmedThreadId = `slack:C-QUEUED-STARTER:${providerMessageId}`;
     const [action] = await db
       .insert(chatActions)
       .values({
@@ -29517,21 +30011,62 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           version: 1,
           channelId: "C-QUEUED-STARTER",
           command: configured.setup.command,
-          syntheticMessageId: randomUUID(),
+          syntheticMessageId,
           taskText: "recover this safely queued slash task",
         },
-        status: "queued",
+        status: "provider_confirmed",
+        result: {
+          attemptCount: 1,
+          authorizedUserId: null,
+          providerMessageId,
+          threadId: confirmedThreadId,
+        },
       })
       .returning();
 
-    await service.processPendingDeliveries(1_000);
+    // Seed the exact crash boundary deterministically: Slack has confirmed the
+    // starter and Paperclip has durably normalized it, but no delivery drain
+    // has begun. A global reconciliation sweep intentionally runs action and
+    // delivery lanes concurrently, so using it to create this fixture made
+    // the pre-shutdown assertion depend on query scheduling under load.
+    const endpointRuntime = runtime.endpoints.get(endpoint.id);
+    if (!endpointRuntime) throw new Error("Slack runtime was unavailable");
+    await callbacks.onMessage({
+      endpointId: endpoint.id,
+      provider: "slack",
+      thread: endpointRuntime.thread(confirmedThreadId),
+      message: makeMessage({
+        id: syntheticMessageId,
+        text: "recover this safely queued slash task",
+        userId: "U-QUEUED-STARTER",
+      }),
+      trigger: "mention",
+    });
+    const [normalizedStarter] = await db
+      .select({
+        id: chatDeliveries.id,
+        normalizedEvent: chatDeliveries.normalizedEvent,
+      })
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.endpointId, endpoint.id));
+    if (!normalizedStarter) {
+      throw new Error("Expected normalized Slack starter delivery");
+    }
+    await db
+      .update(chatDeliveries)
+      .set({
+        normalizedEvent: {
+          ...(normalizedStarter.normalizedEvent as Record<string, unknown>),
+          admission: { origin: "provider_confirmed_action" },
+          acknowledgement: { receiptReactionSupported: false },
+        },
+      })
+      .where(eq(chatDeliveries.id, normalizedStarter.id));
 
-    expect(runtime.endpoints.get(endpoint.id)?.posts).toEqual([
-      {
-        threadId: "slack:C-QUEUED-STARTER:",
-        text: "Starting a task…",
-      },
-    ]);
+    expect(action).toMatchObject({
+      status: "provider_confirmed",
+      result: { providerMessageId, threadId: confirmedThreadId },
+    });
     const [stagedDelivery] = await db
       .select({
         normalizedEvent: chatDeliveries.normalizedEvent,

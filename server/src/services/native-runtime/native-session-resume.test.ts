@@ -1,8 +1,12 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import {
+  buildNativeExecutionWithCheckpoint,
+  NATIVE_TOOL_CONTRACT_FINGERPRINT,
   isUnusedLegacyNativeRetryReplacement,
+  nativeToolContractFingerprintForTarget,
   rebindNativeSessionCheckpoint,
 } from "./native-session-resume.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -14,14 +18,48 @@ const previousRunId = "40000000-0000-4000-8000-000000000004";
 const currentRunId = "50000000-0000-4000-8000-000000000005";
 const normalizedSessionId = "60000000-0000-4000-8000-000000000006";
 
-function execution(runId: string, cwd = "/workspace") {
+const CONDITIONAL_READER_TOOL_CONTRACT_FINGERPRINT = `sha256:${createHash(
+  "sha256",
+)
+  .update(
+    JSON.stringify({
+      schema: "paperclip.native-tool-contract.v1",
+      tools: [
+        { name: "register_deliverable", version: 1 },
+        {
+          name: "read_current_wake_comments",
+          semanticContract: "paperclip.server-current-wake-comments.v1",
+          version: 1,
+        },
+      ],
+    }),
+  )
+  .digest("hex")}`;
+
+function execution(
+  runId: string,
+  cwd = "/workspace",
+  workMode = "standard",
+  workspace: {
+    id?: string;
+    repoUrl?: string | null;
+    repoRef?: string | null;
+    branchName?: string | null;
+  } = {},
+) {
   return buildNativeExecutionInput({
     companyId,
     runId,
-    issue: { id: issueId, identifier: "DOT-2", title: "Test", description: null, workMode: "standard" },
+    issue: { id: issueId, identifier: "DOT-2", title: "Test", description: null, workMode },
     taskPrompt: "Only the current turn",
     agentId,
-    workspace: { id: runId, cwd, repoUrl: null, repoRef: null, branchName: null },
+    workspace: {
+      id: workspace.id ?? runId,
+      cwd,
+      repoUrl: workspace.repoUrl ?? null,
+      repoRef: workspace.repoRef ?? null,
+      branchName: workspace.branchName ?? null,
+    },
     normalizedSessionId,
     provider: "codex",
     completionContract: {
@@ -69,6 +107,7 @@ function previousRun(overrides: Record<string, unknown> = {}) {
     agentId,
     nativeSessionId: normalizedSessionId,
     runnerProfileJson: {
+      nativeToolContractFingerprint: NATIVE_TOOL_CONTRACT_FINGERPRINT,
       nativeExecutionInput: execution(previousRunId),
       sessionCheckpoint: {
         backendKind: "runner",
@@ -90,6 +129,156 @@ function previousRun(overrides: Record<string, unknown> = {}) {
 }
 
 describe("rebindNativeSessionCheckpoint", () => {
+  it("does not resume across a work-mode tool-surface change", () => {
+    expect(rebindNativeSessionCheckpoint({
+      previousRun: previousRun(),
+      currentExecution: execution(currentRunId, "/workspace", "ask"),
+    })).toBeNull();
+  });
+  it.each(["External chat message received", "issue_comment_added"])(
+    "rebuilds full task context when a %s checkpoint is corrupt",
+    (reason) => {
+      const calls: boolean[] = [];
+      const result = buildNativeExecutionWithCheckpoint({
+        previousRun: previousRun({ sessionCheckpoint: {} }),
+        normalizedSessionId,
+        buildExecution: (options) => {
+          calls.push(options.resumedSession);
+          return buildNativeExecutionInput({
+            companyId,
+            runId: currentRunId,
+            issue: {
+              id: issueId,
+              identifier: "DOT-2",
+              title: "Current task",
+              description: "Full task instructions",
+              workMode: "standard",
+            },
+            taskPrompt: options.resumedSession
+              ? "Compact context"
+              : "Full task instructions",
+            wakePayload: {
+              reason,
+              issue: {
+                id: issueId,
+                title: "Current task",
+                workMode: "standard",
+              },
+            },
+            resumedSession: options.resumedSession,
+            agentId,
+            workspace: {
+              id: currentRunId,
+              cwd: "/workspace",
+              repoUrl: null,
+              repoRef: null,
+              branchName: null,
+            },
+            normalizedSessionId: options.normalizedSessionId,
+            provider: "codex",
+            completionContract: execution(currentRunId).completionContract,
+            runtimeContext: nativeRuntimeContextFixture(),
+          });
+        },
+      });
+      expect(calls).toEqual([true, false]);
+      expect(result.checkpoint).toBeNull();
+      expect(result.execution.session.normalizedSessionId).not.toBe(
+        normalizedSessionId,
+      );
+      expect(result.execution.task.prompt).toContain("Full task instructions");
+      expect(result.execution.task.prompt).not.toContain(
+        "Paperclip Resume Delta",
+      );
+      expect(result.execution.task.prompt).not.toContain("Compact context");
+    },
+  );
+
+  it("keeps a valid checkpoint and does not rebuild the resumed task", () => {
+    const calls: boolean[] = [];
+    const result = buildNativeExecutionWithCheckpoint({
+      previousRun: previousRun(),
+      normalizedSessionId,
+      buildExecution: (options) => {
+        calls.push(options.resumedSession);
+        return execution(currentRunId);
+      },
+    });
+    expect(calls).toEqual([true]);
+    expect(result.checkpoint?.sessionId).toBe("provider-thread-123");
+    expect(result.execution.session.normalizedSessionId).toBe(
+      normalizedSessionId,
+    );
+  });
+
+  it("rebuilds full context when the persisted provider tool contract is stale", () => {
+    const calls: boolean[] = [];
+    const result = buildNativeExecutionWithCheckpoint({
+      previousRun: previousRun({
+        nativeToolContractFingerprint: "sha256:stale",
+      }),
+      normalizedSessionId,
+      buildExecution: (options) => {
+        calls.push(options.resumedSession);
+        const current = execution(currentRunId);
+        return {
+          ...current,
+          session: {
+            ...current.session,
+            normalizedSessionId: options.normalizedSessionId,
+          },
+          task: {
+            ...current.task,
+            prompt: options.resumedSession
+              ? "Paperclip Resume Delta"
+              : "Full task instructions",
+          },
+        };
+      },
+    });
+
+    expect(calls).toEqual([true, false]);
+    expect(result.checkpoint).toBeNull();
+    expect(result.execution.task.prompt).toBe("Full task instructions");
+    expect(result.normalizedSessionId).not.toBe(normalizedSessionId);
+  });
+
+  it("rotates a provider thread created while the current-wake reader was conditionally advertised", () => {
+    expect(CONDITIONAL_READER_TOOL_CONTRACT_FINGERPRINT).not.toBe(
+      NATIVE_TOOL_CONTRACT_FINGERPRINT,
+    );
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: previousRun({
+          nativeToolContractFingerprint:
+            CONDITIONAL_READER_TOOL_CONTRACT_FINGERPRINT,
+        }),
+        currentExecution: execution(currentRunId),
+      }),
+    ).toBeNull();
+  });
+
+  it("binds the provider tool catalog to the local or remote execution target", () => {
+    const remoteFingerprint = nativeToolContractFingerprintForTarget("remote");
+    expect(remoteFingerprint).not.toBe(NATIVE_TOOL_CONTRACT_FINGERPRINT);
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: previousRun(),
+        currentExecution: execution(currentRunId),
+        executionTargetKind: "remote",
+      }),
+    ).toBeNull();
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: previousRun({
+          nativeToolContractFingerprint: remoteFingerprint,
+        }),
+        currentExecution: execution(currentRunId),
+        executionTargetKind: "remote",
+      }),
+    ).not.toBeNull();
+  });
+
   it("permits legacy retry rebinding only before the replacement acquired authority", () => {
     const source = {
       runtimeMode: "native",
@@ -188,6 +377,97 @@ describe("rebindNativeSessionCheckpoint", () => {
     })).toBeNull();
   });
 
+  it("requires the exact managed execution-workspace identity", () => {
+    const managedWorkspaceId =
+      "90000000-0000-4000-8000-000000000009";
+    const source = previousRun({
+      nativeExecutionInput: execution(
+        previousRunId,
+        "/shared-workspace",
+        "standard",
+        { id: managedWorkspaceId },
+      ),
+    });
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: source,
+        currentExecution: execution(
+          currentRunId,
+          "/shared-workspace",
+          "standard",
+          { id: managedWorkspaceId },
+        ),
+      }),
+    ).not.toBeNull();
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: source,
+        currentExecution: execution(
+          currentRunId,
+          "/shared-workspace",
+          "standard",
+          { id: "a0000000-0000-4000-8000-00000000000a" },
+        ),
+      }),
+    ).toBeNull();
+  });
+
+  it("permits per-run projectless placeholders only for an identical workspace descriptor", () => {
+    const source = previousRun({
+      nativeExecutionInput: execution(
+        previousRunId,
+        "/projectless",
+        "standard",
+        {
+          repoUrl: "https://example.test/repo.git",
+          repoRef: "refs/heads/main",
+          branchName: "main",
+        },
+      ),
+    });
+    const matching = execution(
+      currentRunId,
+      "/projectless",
+      "standard",
+      {
+        repoUrl: "https://example.test/repo.git",
+        repoRef: "refs/heads/main",
+        branchName: "main",
+      },
+    );
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: source,
+        currentExecution: matching,
+      }),
+    ).not.toBeNull();
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: source,
+        currentExecution: {
+          ...matching,
+          workspace: { ...matching.workspace, repoRef: "refs/heads/next" },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: source,
+        currentExecution: execution(
+          currentRunId,
+          "/projectless",
+          "standard",
+          {
+            id: "b0000000-0000-4000-8000-00000000000b",
+            repoUrl: "https://example.test/repo.git",
+            repoRef: "refs/heads/main",
+            branchName: "main",
+          },
+        ),
+      }),
+    ).toBeNull();
+  });
+
   it("rotates when assigned context changes but permits a fresh run-scoped MCP binding", () => {
     const reboundCredential = execution(currentRunId);
     reboundCredential.runtimeContext.mcp.bindingId = "native-mcp:fresh-run";
@@ -239,6 +519,106 @@ describe("rebindNativeSessionCheckpoint", () => {
 });
 
 describe("buildNativeExecutionInput wake projection", () => {
+  it("uses a neutral turn title for authenticated external-chat follow-ups", () => {
+    const staleRootTitle = "Reply with exactly STALE-ROOT-MARKER";
+    const input = buildNativeExecutionInput({
+      companyId,
+      runId: currentRunId,
+      issue: {
+        id: issueId,
+        identifier: "CHAT-4",
+        title: staleRootTitle,
+        description: "Started from Telegram.",
+        workMode: "standard",
+      },
+      taskPrompt: [
+        "Paperclip task context:",
+        `- Title: ${JSON.stringify(staleRootTitle)}`,
+        "Latest wake comment:",
+        "```text",
+        "Quick question: what is 55 + 8?",
+        "```",
+      ].join("\n"),
+      wakePayload: {
+        reason: "External chat message received",
+        externalChatProvider: "telegram",
+        checkedOutByHarness: true,
+        issue: {
+          id: issueId,
+          identifier: "CHAT-4",
+          title: staleRootTitle,
+          description: "Started from Telegram.",
+          descriptionTruncated: false,
+          status: "in_progress",
+          workMode: "standard",
+        },
+        commentWindow: {
+          requestedCount: 1,
+          includedCount: 1,
+          missingCount: 0,
+        },
+        commentIds: ["comment-current"],
+        latestCommentId: "comment-current",
+        comments: [
+          {
+            id: "comment-current",
+            issueId,
+            body: "Quick question: what is 55 + 8?",
+            bodyTruncated: false,
+            authorType: "user",
+          },
+        ],
+        fallbackFetchNeeded: false,
+      },
+      agentId,
+      workspace: {
+        id: currentRunId,
+        cwd: "/workspace",
+        repoUrl: null,
+        repoRef: null,
+        branchName: null,
+      },
+      normalizedSessionId,
+      provider: "codex",
+      completionContract: {
+        id: "70000000-0000-4000-8000-000000000007",
+        sha256: `sha256:${"a".repeat(64)}`,
+        schemaVersion: "paperclip.run-result.v1",
+        contract: {
+          revision: "2",
+          objective: "Respond to the latest comment",
+          criteria: [
+            {
+              id: "objective",
+              requirement: "Quick question: what is 55 + 8?",
+            },
+          ],
+        },
+      },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+
+    expect(input.task.title).toBe("External chat follow-up");
+    expect(input.task.description).toBeNull();
+    expect(input.task.prompt).toContain(staleRootTitle);
+    expect(input.task.prompt).toContain("Quick question: what is 55 + 8?");
+    expect(input.completionContract.contract).toMatchObject({
+      objective: "Respond to the latest comment",
+      criteria: [
+        {
+          id: "objective",
+          requirement: "Quick question: what is 55 + 8?",
+        },
+      ],
+    });
+  });
+
+  it("preserves the canonical task title outside the authenticated chat shortcut", () => {
+    const input = execution(currentRunId);
+
+    expect(input.task.title).toBe("Test");
+  });
+
   it("writes native v4 and pins every provider's complete effective configuration", () => {
     const common = {
       companyId,

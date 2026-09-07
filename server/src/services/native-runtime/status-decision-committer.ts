@@ -272,6 +272,7 @@ async function enqueueWake(input: {
         ...(input.contextSnapshot ?? {}),
         wakeReason: input.reason,
         source: "native_status_decision",
+        statusDecisionSource: "native_status_decision",
       },
     },
     requestedByActorType: "system",

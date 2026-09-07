@@ -135,6 +135,15 @@ describe("normalizeContentType", () => {
     expect(normalizeContentType(" Application/Zip ")).toBe("application/zip");
   });
 
+  it("normalizes provider Content-Type header parameters to the MIME essence", () => {
+    expect(normalizeContentType(" Text/Plain ; charset=utf-8 ")).toBe(
+      "text/plain",
+    );
+    expect(normalizeContentType("image/svg+xml; charset=utf-8")).toBe(
+      "image/svg+xml",
+    );
+  });
+
   it("falls back to octet-stream when the type is missing", () => {
     expect(normalizeContentType(undefined)).toBe("application/octet-stream");
     expect(normalizeContentType("")).toBe("application/octet-stream");

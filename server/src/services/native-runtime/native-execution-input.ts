@@ -13,7 +13,10 @@ import {
   parseNativeExecutionInput,
   resolveQualifiedAcpxProfile,
 } from "../../vendor/paperclip-runner/index.js";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import {
+  isPaperclipExternalChatContractTurn,
+  renderPaperclipWakePrompt,
+} from "@paperclipai/adapter-utils/server-utils";
 
 /** Closed constructor: callers cannot spread legacy context or environment data. */
 export function buildNativeExecutionInput(input: {
@@ -90,7 +93,11 @@ export function buildNativeExecutionInput(input: {
   const wakePrompt = renderPaperclipWakePrompt(input.wakePayload, {
     resumedSession: input.resumedSession === true,
     suppressIssueDescription: input.taskPrompt.trim().length > 0,
+    nativeWakeReaderAvailable: true,
   });
+  const externalChatTurn = isPaperclipExternalChatContractTurn(
+    input.wakePayload,
+  );
   const taskPrompt = [wakePrompt, input.taskPrompt.trim()]
     .filter((section) => section.length > 0)
     .join("\n\n");
@@ -107,8 +114,14 @@ export function buildNativeExecutionInput(input: {
     },
     task: {
       identifier: input.issue.identifier ?? input.issue.id,
-      title: input.issue.title,
-      description: input.issue.description,
+      // The issue title is durable background context and may itself contain an
+      // exact-output instruction from the thread's first message. Repeating it
+      // as the native turn title can override a newer provider message in small
+      // models. Keep the canonical title and description in task.prompt as
+      // explicitly labeled background, but give authenticated external-chat
+      // turns neutral structured fields.
+      title: externalChatTurn ? "External chat follow-up" : input.issue.title,
+      description: externalChatTurn ? null : input.issue.description,
       prompt: taskPrompt,
       workMode: input.issue.workMode,
     },

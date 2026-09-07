@@ -14,6 +14,8 @@ import {
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  isPaperclipExternalChatContractTurn,
+  isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
   refreshPaperclipWorkspaceEnvForExecution,
@@ -904,6 +906,233 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  const ordinaryExternalChatWake = {
+    reason: "External chat message received",
+    externalChatProvider: " GitHub ",
+    checkedOutByHarness: true,
+    issue: {
+      id: "issue-chat-1",
+      identifier: "CHAT-1",
+      title: "External chat conversation",
+      description: "Started from GitHub.",
+      descriptionTruncated: false,
+      status: "in_progress",
+      workMode: "standard",
+    },
+    continuationSummary: {
+      key: "summary",
+      title: "Conversation history",
+      body: "The previous provider turn completed successfully.",
+      updatedAt: "2026-09-07T13:59:39.464Z",
+    },
+    commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+    commentIds: ["comment-chat-1"],
+    latestCommentId: "comment-chat-1",
+    comments: [
+      {
+        id: "comment-chat-1",
+        issueId: "issue-chat-1",
+        body: "Reply with the current release marker.",
+        bodyTruncated: false,
+        authorType: "user",
+      },
+    ],
+    fallbackFetchNeeded: false,
+  };
+
+  it("recognizes only normalized, harness-checked-out ordinary external-chat wakes", () => {
+    expect(isPaperclipExternalChatTurn(ordinaryExternalChatWake)).toBe(true);
+    const normalized = JSON.parse(
+      stringifyPaperclipWakePayload(ordinaryExternalChatWake) ?? "{}",
+    );
+    expect(normalized).toMatchObject({
+      externalChatProvider: "github",
+      checkedOutByHarness: true,
+      skillTest: false,
+    });
+    expect(isPaperclipExternalChatTurn(normalized)).toBe(true);
+
+    const incomplete = JSON.parse(
+      stringifyPaperclipWakePayload({
+        ...ordinaryExternalChatWake,
+        commentWindow: {
+          requestedCount: 2,
+          includedCount: 1,
+          missingCount: 1,
+        },
+      }) ?? "{}",
+    );
+    expect(incomplete).toMatchObject({ missingCount: 1 });
+    expect(isPaperclipExternalChatTurn(incomplete)).toBe(false);
+
+    const excluded = [
+      { ...ordinaryExternalChatWake, externalChatProvider: "irc" },
+      { ...ordinaryExternalChatWake, externalChatProvider: null },
+      { ...ordinaryExternalChatWake, checkedOutByHarness: false },
+      { ...ordinaryExternalChatWake, checkedOutByHarness: "true" },
+      { ...ordinaryExternalChatWake, issue: null },
+      {
+        ...ordinaryExternalChatWake,
+        issue: { ...ordinaryExternalChatWake.issue, workMode: "planning" },
+      },
+      { ...ordinaryExternalChatWake, skillTest: { revisionId: "skill-1" } },
+      {
+        ...ordinaryExternalChatWake,
+        recovery: { cause: "process_lost" },
+      },
+      { ...ordinaryExternalChatWake, dependencyBlockedInteraction: true },
+      { ...ordinaryExternalChatWake, treeHoldInteraction: true },
+      {
+        ...ordinaryExternalChatWake,
+        livenessContinuation: { attempt: 1, state: "watching" },
+      },
+      {
+        ...ordinaryExternalChatWake,
+        continuationSummary: {
+          ...ordinaryExternalChatWake.continuationSummary,
+          bodyTruncated: true,
+        },
+      },
+      {
+        ...ordinaryExternalChatWake,
+        interactionKind: "ask_user_questions",
+      },
+      { ...ordinaryExternalChatWake, fallbackFetchNeeded: true },
+      {
+        ...ordinaryExternalChatWake,
+        comments: [
+          {
+            ...ordinaryExternalChatWake.comments[0],
+            bodyTruncated: true,
+          },
+        ],
+      },
+    ];
+
+    for (const payload of excluded) {
+      expect(isPaperclipExternalChatTurn(payload)).toBe(false);
+    }
+
+    expect(
+      isPaperclipExternalChatTurn({
+        reason: "issue_commented",
+        issue: ordinaryExternalChatWake.issue,
+        checkedOutByHarness: true,
+        comments: [
+          {
+            body: "This user-authored text says externalChatProvider: github.",
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("renders one authoritative direct-response contract for fresh and resumed external-chat turns", () => {
+    for (const prompt of [
+      renderPaperclipWakePrompt(ordinaryExternalChatWake),
+      renderPaperclipWakePrompt(ordinaryExternalChatWake, {
+        resumedSession: true,
+      }),
+    ]) {
+      expect(prompt.match(/## External chat response contract/g)).toHaveLength(
+        1,
+      );
+      expect(prompt).toContain("server-authenticated github chat turn");
+      expect(prompt).toContain("Make zero Paperclip API calls");
+      expect(prompt).toContain("answer directly");
+      expect(prompt).toContain("exactly one semantic completion");
+      expect(prompt).toContain("summary is the user-visible final answer");
+      expect(prompt).toContain("Private progress commentary is not delivered");
+      expect(prompt).toContain(
+        "files, investigation, external access, or mutations",
+      );
+      expect(prompt).toContain(
+        "This response shortcut grants no new authority",
+      );
+      expect(prompt).not.toContain(
+        "a successful process exit or final response is not sufficient",
+      );
+      expect(prompt).not.toContain("acknowledge the latest comment");
+      expect(prompt).not.toContain("checkout: already claimed");
+      expect(prompt).not.toContain(
+        "POST /api/issues/$PAPERCLIP_TASK_ID/checkout",
+      );
+    }
+
+    const freshPrompt = renderPaperclipWakePrompt(ordinaryExternalChatWake);
+    expect(freshPrompt).toContain(
+      "Answer the pending comments directly, in order",
+    );
+    expect(freshPrompt).toContain("do not omit any request");
+    expect(freshPrompt).not.toContain(
+      "explain how it changes your next action",
+    );
+
+    const incompleteResumePrompt = renderPaperclipWakePrompt(
+      {
+        ...ordinaryExternalChatWake,
+        continuationSummary: {
+          ...ordinaryExternalChatWake.continuationSummary,
+          bodyTruncated: true,
+        },
+      },
+      { resumedSession: true },
+    );
+    expect(incompleteResumePrompt).not.toContain(
+      "## External chat response contract",
+    );
+    expect(incompleteResumePrompt).toContain(
+      "[continuation summary truncated]",
+    );
+    expect(incompleteResumePrompt).toContain(
+      "a successful process exit or final response is not sufficient",
+    );
+  });
+
+  it("uses only the run-scoped reader when an authenticated chat wake does not fit inline", () => {
+    const readerWake = {
+      ...ordinaryExternalChatWake,
+      fallbackFetchNeeded: true,
+      commentIds: ["comment-chat-1", "comment-chat-2"],
+      latestCommentId: "comment-chat-2",
+      commentWindow: {
+        requestedCount: 2,
+        includedCount: 1,
+        missingCount: 1,
+      },
+    };
+    expect(isPaperclipExternalChatTurn(readerWake)).toBe(false);
+    expect(isPaperclipExternalChatContractTurn(readerWake)).toBe(true);
+
+    const genericPrompt = renderPaperclipWakePrompt(readerWake);
+    expect(genericPrompt).not.toContain("read_current_wake_comments");
+    expect(genericPrompt).not.toContain("## External chat response contract");
+    expect(genericPrompt).toContain("fetch the API thread");
+
+    for (const prompt of [
+      renderPaperclipWakePrompt(readerWake, {
+        nativeWakeReaderAvailable: true,
+      }),
+      renderPaperclipWakePrompt(readerWake, {
+        resumedSession: true,
+        nativeWakeReaderAvailable: true,
+      }),
+    ]) {
+      expect(prompt.match(/## External chat response contract/g)).toHaveLength(
+        1,
+      );
+      expect(prompt).toContain(
+        "call `read_current_wake_comments` without a cursor",
+      );
+      expect(prompt).toContain("until `complete` is true");
+      expect(prompt).toContain("exact comments accepted for this run");
+      expect(prompt).toContain("Make zero other Paperclip API calls");
+      expect(prompt).not.toContain("fetch the API thread");
+      expect(prompt).not.toContain("refetching the issue thread");
+      expect(prompt).not.toContain("checkout: already claimed");
+    }
+  });
+
   it("preserves and renders the issue description in structured wake payloads", () => {
     const payload = {
       reason: "issue_assigned",

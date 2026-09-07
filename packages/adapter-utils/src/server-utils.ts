@@ -221,6 +221,7 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "- For plan approval, update the plan document first, then create request_confirmation targeting the latest plan revision with idempotencyKey confirmation:{issueId}:plan:{revisionId}. Wait for acceptance before creating implementation subtasks, and create a fresh confirmation after superseding board/user comments if approval is still needed.",
   "- If blocked, mark the issue blocked and name the unblock owner and action.",
   "- Respect budget, pause/cancel, approval gates, and company boundaries.",
+  "- When the server-authenticated wake payload includes an External chat response contract, that narrower contract replaces the generic Paperclip comment, status, checkout, and final-disposition steps above for that turn. Follow the external-chat contract exactly; it does not relax any permission, approval, execution-policy, containment, budget, pause/cancel, or company boundary.",
   "",
   CONNECTION_INTENT_AGENT_GUIDANCE,
 ].join("\n");
@@ -760,11 +761,16 @@ type PaperclipWakeRecovery = {
   routingFallbackReason: string | null;
 };
 
+export type PaperclipExternalChatProvider =
+  "slack" | "github" | "discord" | "microsoft-teams" | "telegram";
+
 type PaperclipWakePayload = {
   reason: string | null;
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
+  externalChatProvider: PaperclipExternalChatProvider | null;
+  skillTest: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
   simplifiedEnglishInteractions: boolean;
@@ -1600,6 +1606,26 @@ function markdownFencedText(value: string): string {
   return `${fence}text\n${value}\n${fence}`;
 }
 
+const PAPERCLIP_EXTERNAL_CHAT_PROVIDERS =
+  new Set<PaperclipExternalChatProvider>([
+    "slack",
+    "github",
+    "discord",
+    "microsoft-teams",
+    "telegram",
+  ]);
+
+function normalizePaperclipExternalChatProvider(
+  value: unknown,
+): PaperclipExternalChatProvider | null {
+  const provider = asString(value, "").trim().toLowerCase();
+  return PAPERCLIP_EXTERNAL_CHAT_PROVIDERS.has(
+    provider as PaperclipExternalChatProvider,
+  )
+    ? (provider as PaperclipExternalChatProvider)
+    : null;
+}
+
 export function normalizePaperclipWakePayload(
   value: unknown,
 ): PaperclipWakePayload | null {
@@ -1609,7 +1635,12 @@ export function normalizePaperclipWakePayload(
         .map((entry) => normalizePaperclipWakeComment(entry))
         .filter((entry): entry is PaperclipWakeComment => Boolean(entry))
     : [];
-  const commentWindow = parseObject(payload.commentWindow);
+  const nestedCommentWindow = parseObject(payload.commentWindow);
+  // `stringifyPaperclipWakePayload` emits the normalized counters at the top
+  // level. Accept that shape too so normalization and the external-chat guard
+  // remain fail-closed after an env/JSON round trip.
+  const commentWindow =
+    Object.keys(nestedCommentWindow).length > 0 ? nestedCommentWindow : payload;
   const commentIds = Array.isArray(payload.commentIds)
     ? payload.commentIds
         .filter(
@@ -1697,6 +1728,11 @@ export function normalizePaperclipWakePayload(
     payload.executionWorkspace,
   );
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
+  const issue = normalizePaperclipWakeIssue(payload.issue);
+  const skillTest =
+    issue?.workMode === "skill_test" ||
+    payload.skillTest === true ||
+    Object.keys(parseObject(payload.skillTest)).length > 0;
   if (
     comments.length === 0 &&
     commentIds.length === 0 &&
@@ -1716,7 +1752,7 @@ export function normalizePaperclipWakePayload(
     !executionWorkspace &&
     !agentMessage &&
     !recovery &&
-    !normalizePaperclipWakeIssue(payload.issue)
+    !issue
   ) {
     return null;
   }
@@ -1724,8 +1760,12 @@ export function normalizePaperclipWakePayload(
   return {
     reason: asString(payload.reason, "").trim() || null,
     recovery,
-    issue: normalizePaperclipWakeIssue(payload.issue),
+    issue,
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
+    externalChatProvider: normalizePaperclipExternalChatProvider(
+      payload.externalChatProvider,
+    ),
+    skillTest,
     simplifiedEnglishInteractions: asBoolean(
       payload.simplifiedEnglishInteractions,
       false,
@@ -1806,6 +1846,113 @@ export function isPaperclipRecoveryWakePayload(value: unknown): boolean {
   );
 }
 
+const PAPERCLIP_EXTERNAL_CHAT_WAKE_REASONS = new Set([
+  "External chat message received",
+  "issue_assigned",
+  "issue_commented",
+]);
+
+function hasNormalizedPaperclipExternalChatContext(
+  normalized: PaperclipWakePayload | null,
+): normalized is PaperclipWakePayload & {
+  externalChatProvider: PaperclipExternalChatProvider;
+} {
+  if (
+    !normalized?.externalChatProvider ||
+    !normalized.checkedOutByHarness ||
+    !normalized.issue?.id ||
+    !PAPERCLIP_EXTERNAL_CHAT_WAKE_REASONS.has(normalized.reason ?? "")
+  ) {
+    return false;
+  }
+
+  if (
+    normalized.issue.workMode !== "standard" &&
+    normalized.issue.workMode !== "ask"
+  ) {
+    return false;
+  }
+
+  return !(
+    normalized.recovery ||
+    normalized.dependencyBlockedInteraction ||
+    normalized.treeHoldInteraction ||
+    normalized.activeTreeHold ||
+    normalized.unresolvedBlockerIssueIds.length > 0 ||
+    normalized.unresolvedBlockerSummaries.length > 0 ||
+    normalized.executionStage ||
+    normalized.continuationSummary?.bodyTruncated ||
+    normalized.planReviewContext ||
+    normalized.documentReviewContext ||
+    normalized.livenessContinuation ||
+    normalized.taskWatchdog ||
+    normalized.skillTest ||
+    normalized.interactionKind ||
+    normalized.interactionStatus ||
+    normalized.externalInteractionContinuation ||
+    normalized.checkboxSelection ||
+    normalized.questionResponse ||
+    normalized.agentMessage ||
+    normalized.annotationDeltas.length > 0 ||
+    normalized.childIssueSummaries.length > 0 ||
+    normalized.childIssueSummaryTruncated ||
+    normalized.issue.descriptionTruncated
+  );
+}
+
+function isNormalizedPaperclipExternalChatTurn(
+  normalized: PaperclipWakePayload | null,
+): normalized is PaperclipWakePayload & {
+  externalChatProvider: PaperclipExternalChatProvider;
+} {
+  return Boolean(
+    hasNormalizedPaperclipExternalChatContext(normalized) &&
+    !normalized.comments.some((comment) => comment.bodyTruncated) &&
+    normalized.missingCount === 0 &&
+    !normalized.truncated &&
+    !normalized.fallbackFetchNeeded,
+  );
+}
+
+function isNormalizedPaperclipExternalChatReaderTurn(
+  normalized: PaperclipWakePayload | null,
+): normalized is PaperclipWakePayload & {
+  externalChatProvider: PaperclipExternalChatProvider;
+} {
+  return Boolean(
+    hasNormalizedPaperclipExternalChatContext(normalized) &&
+    normalized.fallbackFetchNeeded &&
+    normalized.commentIds.length > 0 &&
+    normalized.latestCommentId === normalized.commentIds.at(-1) &&
+    normalized.requestedCount === normalized.commentIds.length,
+  );
+}
+
+/**
+ * Returns true only for an ordinary external-chat task wake that the trusted
+ * Paperclip harness has already authenticated, bound to a concrete issue, and
+ * checked out for this run. Provider-like text elsewhere in the payload cannot
+ * opt a turn into this contract.
+ */
+export function isPaperclipExternalChatTurn(value: unknown): boolean {
+  return isNormalizedPaperclipExternalChatTurn(
+    normalizePaperclipWakePayload(value),
+  );
+}
+
+/**
+ * Returns true for either an inline-complete external-chat turn or the exact
+ * overflow shape that a native runner can satisfy through its closed reader.
+ * Callers must not assume the reader exists outside the native-runner lane.
+ */
+export function isPaperclipExternalChatContractTurn(value: unknown): boolean {
+  const normalized = normalizePaperclipWakePayload(value);
+  return Boolean(
+    isNormalizedPaperclipExternalChatTurn(normalized) ||
+      isNormalizedPaperclipExternalChatReaderTurn(normalized),
+  );
+}
+
 export function readPaperclipIssueWorkModeFromContext(
   value: unknown,
 ): string | null {
@@ -1864,6 +2011,7 @@ export function renderPaperclipWakePrompt(
   options: {
     resumedSession?: boolean;
     includeExecutionContract?: boolean;
+    nativeWakeReaderAvailable?: boolean;
     // Set by adapters whose prompt already carries the task-context markdown
     // (the authoritative, uncapped brief) so the description is not delivered
     // twice in one prompt.
@@ -1873,6 +2021,11 @@ export function renderPaperclipWakePrompt(
   const normalized = normalizePaperclipWakePayload(value);
   if (!normalized) return "";
   const resumedSession = options.resumedSession === true;
+  const externalChatTurn = isNormalizedPaperclipExternalChatTurn(normalized);
+  const externalChatReaderTurn =
+    options.nativeWakeReaderAvailable === true &&
+    isNormalizedPaperclipExternalChatReaderTurn(normalized);
+  const externalChatContract = externalChatTurn || externalChatReaderTurn;
   // The heartbeat prompt template already carries the execution contract on
   // fresh sessions; only resume deltas (which replace the template) and
   // template-less adapters need the wake-payload copy.
@@ -1946,25 +2099,44 @@ export function renderPaperclipWakePrompt(
     }
   };
 
-  const executionContractLines = recoveryScoped
+  const executionContractLines = externalChatContract
     ? [
-        "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
-        `Cause-specific instruction: ${recoveryInstruction}`,
-        ...(recovery?.cause === "successful_run_missing_state" ||
-        recovery?.cause === "successful_run_missing_issue_disposition"
-          ? []
+        "## External chat response contract",
+        "",
+        `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip already authorized and bound the provider message, assigned this immutable agent, and checked out the issue for this run.`,
+        ...(externalChatReaderTurn
+          ? [
+              "The inline comment batch is incomplete. Before answering, call `read_current_wake_comments` without a cursor, then pass each returned `nextCursor` until `complete` is true. That closed reader exposes only the exact comments accepted for this run. Attachment entries marked `metadata_only` are not readable bytes; state that limitation instead of inferring their contents.",
+              "After the complete read, answer every accepted comment in order. Make zero other Paperclip API calls: do not fetch broader task history, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
+            ]
           : [
-              "Record the outcome in the resolve call's `resolutionNote`. Any comment you post on the source issue must be ≤3 lines (cause → what you did → hand-back). No headings, no run-by-run narrative.",
+              "For a self-contained text request, answer directly from the supplied task and wake context. Make zero Paperclip API calls: do not refetch the issue, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
             ]),
-        `Fallback preference order: (1) send back to ${originalAssigneeLabel} with a retry instruction; (2) fix the runtime/adapter/workspace problem, then send it back; (3) reassign to another agent with the right specialty; (4) convert to an explicit manual-review state for the board.`,
+        "The harness owns task state and persists your final assistant response. If the runtime offers a semantic completion operation, emit exactly one semantic completion and do not duplicate that response in a Paperclip comment or status update.",
+        "The semantic completion summary is the user-visible final answer. Include every requested answer, exact value, description, and file-delivery limitation there; a statement that you read, checked, or prepared something is not a substitute. Private progress commentary is not delivered as the final answer.",
+        "When the request genuinely requires files, investigation, external access, or mutations, use the appropriate tools and complete every required permission, approval, execution-policy, containment, budget, pause/cancel, and company-boundary check. This response shortcut grants no new authority.",
+        "Keep the final response concise and provider-facing. Do not narrate Paperclip workflow, checkout, status, or completion bookkeeping.",
         "",
       ]
-    : includeExecutionContract
+    : recoveryScoped
       ? [
-          "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Immediately before returning, verify that Paperclip records one of those dispositions; a successful process exit or final response is not sufficient. If no valid disposition is recorded, record it now and do not end the run. After 2 consecutive failures of the same control-plane write, stop retrying it for the rest of the heartbeat, continue useful work, report the failure in the final response, and rely on the adapter/runtime status channel as the sanctioned fallback. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
+          "Recovery contract: your job is to RECOVER this task, not to do the work. Do not produce the deliverable yourself.",
+          `Cause-specific instruction: ${recoveryInstruction}`,
+          ...(recovery?.cause === "successful_run_missing_state" ||
+          recovery?.cause === "successful_run_missing_issue_disposition"
+            ? []
+            : [
+                "Record the outcome in the resolve call's `resolutionNote`. Any comment you post on the source issue must be ≤3 lines (cause → what you did → hand-back). No headings, no run-by-run narrative.",
+              ]),
+          `Fallback preference order: (1) send back to ${originalAssigneeLabel} with a retry instruction; (2) fix the runtime/adapter/workspace problem, then send it back; (3) reassign to another agent with the right specialty; (4) convert to an explicit manual-review state for the board.`,
           "",
         ]
-      : [];
+      : includeExecutionContract
+        ? [
+            "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Immediately before returning, verify that Paperclip records one of those dispositions; a successful process exit or final response is not sufficient. If no valid disposition is recorded, record it now and do not end the run. After 2 consecutive failures of the same control-plane write, stop retrying it for the rest of the heartbeat, continue useful work, report the failure in the final response, and rely on the adapter/runtime status channel as the sanctioned fallback. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
+            "",
+          ]
+        : [];
   const wakeSummaryLines = [
     `- reason: ${normalized.reason ?? "unknown"}`,
     `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
@@ -2014,7 +2186,11 @@ export function renderPaperclipWakePrompt(
         "You are resuming an existing Paperclip session.",
         "This heartbeat is scoped to the issue below. Do not switch to another issue until you have handled this wake.",
         "Focus on the new wake delta below and continue the current task without restating the full heartbeat boilerplate.",
-        "Fetch the API thread only when `fallbackFetchNeeded` is true or you need broader history than this batch.",
+        ...(externalChatContract
+          ? ["Use the supplied task and wake context before considering tools."]
+          : [
+              "Fetch the API thread only when `fallbackFetchNeeded` is true or you need broader history than this batch.",
+            ]),
         "",
         ...externalInteractionContinuationLines,
         ...executionContractLines,
@@ -2026,12 +2202,21 @@ export function renderPaperclipWakePrompt(
         "Treat this wake payload as the highest-priority change for the current heartbeat.",
         "This heartbeat is scoped to the issue below. Do not switch to another issue until you have handled this wake.",
         ...(hasWakeCommentBatch
-          ? [
-              "Before generic repo exploration or boilerplate heartbeat updates, acknowledge the latest comment and explain how it changes your next action.",
-            ]
+          ? externalChatContract
+            ? [
+                externalChatReaderTurn
+                  ? "Read the complete bound comment batch before answering it in order; do not omit any request or preface the answer with an acknowledgment or a description of your next action."
+                  : "Answer the pending comments directly, in order. You may combine the reply, but do not omit any request or preface the answer with an acknowledgment or a description of your next action.",
+              ]
+            : [
+                "Before generic repo exploration or boilerplate heartbeat updates, acknowledge the latest comment and explain how it changes your next action.",
+              ]
           : []),
-        "Use this inline wake data first before refetching the issue thread.",
-        ...(hasWakeCommentBatch || normalized.fallbackFetchNeeded
+        externalChatContract
+          ? "Use the supplied task and wake context before considering tools."
+          : "Use this inline wake data first before refetching the issue thread.",
+        ...(!externalChatContract &&
+        (hasWakeCommentBatch || normalized.fallbackFetchNeeded)
           ? [
               "Only fetch the API thread when `fallbackFetchNeeded` is true or you need broader history than this batch.",
             ]
@@ -2132,7 +2317,7 @@ export function renderPaperclipWakePrompt(
       );
     }
   }
-  if (normalized.checkedOutByHarness) {
+  if (normalized.checkedOutByHarness && !externalChatContract) {
     lines.push("- checkout: already claimed by the harness for this run");
   }
   if (!resumedSession && normalized.executionWorkspace?.branchName) {
@@ -2541,7 +2726,7 @@ export function renderPaperclipWakePrompt(
     }
   }
 
-  if (normalized.checkedOutByHarness) {
+  if (normalized.checkedOutByHarness && !externalChatContract) {
     lines.push(
       "",
       "The harness already checked out this issue for the current run.",

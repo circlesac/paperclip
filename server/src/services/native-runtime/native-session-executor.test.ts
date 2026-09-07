@@ -121,6 +121,20 @@ const state = vi.hoisted(() => ({
     },
   })),
   publishActivity: vi.fn(),
+  stageNativeRunnerWakeAttachments: vi.fn(
+    async (): Promise<{
+      attachments: Array<Record<string, unknown>>;
+      cleanup: () => Promise<void>;
+    }> => ({
+      attachments: [],
+      cleanup: vi.fn(async () => undefined),
+    }),
+  ),
+  renderNativeRunnerStagedAttachmentPrompt: vi.fn(() => ""),
+  resolveCurrentWakeCommentsBinding: vi.fn(
+    async (): Promise<Record<string, unknown> | null> => null,
+  ),
+  assertCurrentWakeCommentsRead: vi.fn(async () => undefined),
   resolveRunnerBinary: vi.fn(() => "/tmp/paperclip-runnerd"),
   release: null as null | (() => void),
 }));
@@ -153,6 +167,17 @@ vi.mock("./paperclip-runner-tool-authority.js", () => ({
   },
 }));
 
+vi.mock("./native-runner-file-handoff.js", () => ({
+  stageNativeRunnerWakeAttachments: state.stageNativeRunnerWakeAttachments,
+  renderNativeRunnerStagedAttachmentPrompt:
+    state.renderNativeRunnerStagedAttachmentPrompt,
+}));
+
+vi.mock("./current-wake-comments.js", () => ({
+  resolveCurrentWakeCommentsBinding: state.resolveCurrentWakeCommentsBinding,
+  assertCurrentWakeCommentsRead: state.assertCurrentWakeCommentsRead,
+}));
+
 vi.mock("../activity-log.js", () => ({
   persistActivity: state.persistActivity,
   publishActivity: state.publishActivity,
@@ -176,6 +201,7 @@ import {
   NativeSessionSteeringError,
   assertRemoteRunnerBuildMetadata,
   nativeSessionFailureDisposition,
+  nativeProviderUsageLimitFromEvent,
   nativeSessionFailureSourceCode,
   nativeSessionRecoveryProjection,
   nativeGovernedWaitResult,
@@ -204,6 +230,11 @@ import {
   verifyNativeHarnessBackup,
   shouldRestoreNativeHarnessBackupIntoSandbox,
 } from "./native-session-executor.js";
+
+beforeEach(() => {
+  state.resolveCurrentWakeCommentsBinding.mockReset().mockResolvedValue(null);
+  state.assertCurrentWakeCommentsRead.mockReset().mockResolvedValue(undefined);
+});
 
 describe("remote runner process supervision", () => {
   it("detaches runnerd from the provider RPC and monitors its durable identity", async () => {
@@ -3712,6 +3743,16 @@ describe("native session bounded recovery", () => {
         ),
       ),
     ).toBe("runner_remote_provider_artifact_incompatible");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error("native_current_wake_comments_unread"),
+      ),
+    ).toBe("native_current_wake_comments_unread");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error("native_current_wake_comments_changed_after_read"),
+      ),
+    ).toBe("native_current_wake_comments_changed_after_read");
   });
 
   it("retries the same run twice and stops at the third failed attempt", () => {
@@ -3747,6 +3788,60 @@ describe("native session bounded recovery", () => {
     ).toEqual({
       phase: "terminal_failure",
       failureCode: "runner_remote_provider_artifact_incompatible",
+      nextAttemptAt: null,
+    });
+    expect(
+      nativeSessionFailureDisposition(
+        1,
+        now,
+        "native_current_wake_comments_unread",
+      ),
+    ).toEqual({
+      phase: "terminal_failure",
+      failureCode: "native_current_wake_comments_unread",
+      nextAttemptAt: null,
+    });
+    expect(
+      nativeSessionFailureDisposition(
+        1,
+        now,
+        "native_current_wake_comments_changed_after_read",
+      ),
+    ).toEqual({
+      phase: "terminal_failure",
+      failureCode: "native_current_wake_comments_changed_after_read",
+      nextAttemptAt: null,
+    });
+  });
+
+  it("stops retries only for an authenticated provider usage-limit terminal", () => {
+    const event = {
+      sourceKind: "runner" as const,
+      eventType: "turn.failed" as const,
+      payload: {
+        status: "failed",
+        error: {
+          codexErrorInfo: "usageLimitExceeded",
+          message: "Private provider account details",
+        },
+      },
+    };
+    expect(nativeProviderUsageLimitFromEvent(event)).toBe(true);
+    expect(nativeProviderUsageLimitFromEvent({
+      ...event, eventType: "item.completed",
+    })).toBe(false);
+    expect(nativeProviderUsageLimitFromEvent({
+      ...event, sourceKind: "control_plane",
+    })).toBe(false);
+    expect(nativeProviderUsageLimitFromEvent({
+      ...event,
+      payload: { status: "failed", error: { message: "usageLimitExceeded" } },
+    })).toBe(false);
+    expect(nativeSessionFailureDisposition(
+      1, new Date(), "native_provider_usage_limit",
+    )).toEqual({
+      phase: "terminal_failure",
+      failureCode: "native_provider_usage_limit",
       nextAttemptAt: null,
     });
   });
@@ -3786,6 +3881,43 @@ describe("native session bounded recovery", () => {
 });
 
 describe("native process ownership", () => {
+  it("checks the complete wake-comment receipt before finalizing a successful provider turn", async () => {
+    const expectedBinding = {
+      schema: "paperclip.current-wake-comments-binding.v1",
+      companyId: execution.binding.companyId,
+      issueId: execution.binding.issueId,
+      runId: execution.binding.runId,
+      agentId: execution.binding.agentId,
+      provider: "slack",
+      commentIds: ["comment-current-wake-1"],
+      attachmentOmissions: [],
+      bindingDigest: "current-wake-binding-digest",
+    };
+    state.resolveCurrentWakeCommentsBinding.mockResolvedValue(expectedBinding);
+    state.execute.mockReset().mockResolvedValue({
+      result: { summary: "must not become authoritative" },
+      terminal: { runTerminalState: "succeeded" },
+      turnId: "turn-current-wake-unread",
+      normalizedSessionId: "session-current-wake-unread",
+      providerSessionId: null,
+      driverKind: "test",
+      driverVersion: "1",
+      nativeEventCount: 1,
+      highestContiguousSourceSeq: 1,
+      usage: null,
+    });
+    await executePaperclipNativeSession({
+      db: leaseDb(),
+      execution,
+      runnerInstanceId: "runner-current-wake-receipt",
+    });
+    expect(state.assertCurrentWakeCommentsRead).toHaveBeenCalledWith(
+      expect.anything(),
+      execution.binding,
+      expectedBinding,
+    );
+  });
+
   it("forwards the app-server PID and process group through the production backend seam", async () => {
     const processMetadata = {
       pid: 42_001,
@@ -3937,6 +4069,72 @@ describe("runnerd provider runtime wiring", () => {
       process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
     }
     await rm(isolatedStateDirectory, { recursive: true, force: true });
+  });
+
+  it("stages from the authenticated run snapshot and cleans up after the provider turn", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    state.stageNativeRunnerWakeAttachments.mockResolvedValueOnce({
+      attachments: [
+        {
+          id: "00000000-0000-4000-8000-000000009201",
+          filename: "inbound.txt",
+          contentType: "text/plain",
+          byteSize: 12,
+          workspaceRelativePath:
+            ".paperclip-inbound/run/00000000-0000-4000-8000-000000009202",
+          unavailableReason: null,
+        },
+      ],
+      cleanup,
+    });
+    state.renderNativeRunnerStagedAttachmentPrompt.mockReturnValueOnce(
+      "Paperclip native attachment access: staged.",
+    );
+    state.execute.mockReset().mockResolvedValueOnce({
+      result: { summary: "completed" },
+      terminal: { runTerminalState: "succeeded" },
+      turnId: "turn-attachment-cleanup",
+      normalizedSessionId: "session-attachment-cleanup",
+      providerSessionId: null,
+      driverKind: "test",
+      driverVersion: "1",
+      nativeEventCount: 1,
+      highestContiguousSourceSeq: 1,
+      usage: null,
+    });
+    const stagedExecution = {
+      ...execution,
+      binding: {
+        ...execution.binding,
+        runId: "run-runnerd-attachment-cleanup",
+      },
+      task: {
+        ...execution.task,
+        prompt: "Inspect the current user input.",
+      },
+    } as NativeExecutionInputV1;
+
+    await expect(
+      executePaperclipNativeSession({
+        db: leaseDb(stagedExecution),
+        execution: stagedExecution,
+        runnerInstanceId: "runner-attachment-cleanup",
+        useRunnerd: true,
+      }),
+    ).resolves.toBeDefined();
+
+    expect(state.stageNativeRunnerWakeAttachments).toHaveBeenCalledWith(
+      expect.objectContaining({
+        binding: expect.objectContaining({
+          companyId: stagedExecution.binding.companyId,
+          issueId: stagedExecution.binding.issueId,
+          runId: stagedExecution.binding.runId,
+          agentId: stagedExecution.binding.agentId,
+          executionTargetKind: "local",
+        }),
+      }),
+    );
+    expect(cleanup).toHaveBeenCalledTimes(1);
   });
 
   it("passes the run checkpoint active turn into restart recovery", async () => {

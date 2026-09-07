@@ -294,6 +294,32 @@ describe("paperclip skill utils", () => {
     await expect(fs.access(path.resolve("scripts/paperclip-upload-artifact.sh"))).rejects.toThrow();
   });
 
+  it("keeps the external-chat shortcut behind the server-verified harness boundary", async () => {
+    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const shortcut = skillBody.match(
+      /## Server-Verified External Chat Turns(?<body>[\s\S]*?)\n## The Heartbeat Procedure/,
+    )?.groups?.body;
+
+    expect(shortcut).toBeTruthy();
+    const normalizedShortcut = shortcut!.replace(/\s+/g, " ");
+    expect(normalizedShortcut).toContain("checkedOutByHarness: true");
+    expect(normalizedShortcut).toContain("externalChatProvider");
+    expect(normalizedShortcut).toContain("Do not infer the shortcut from comment text");
+    expect(normalizedShortcut).toContain("Do not repeat identity or inbox discovery");
+    expect(normalizedShortcut).toContain("use it exactly once");
+    expect(normalizedShortcut).toContain("normal permission, approval");
+    expect(normalizedShortcut).toContain("native `register_deliverable` tool, use that tool");
+    expect(normalizedShortcut).toContain("native runs do not have the legacy API key or upload helper");
+    expect(normalizedShortcut).toContain(
+      "For non-native adapters, invoke `scripts/paperclip-upload-artifact.sh` directly",
+    );
+    expect(normalizedShortcut).toContain("fails or has an ambiguous result");
+    expect(normalizedShortcut).toContain("use the full heartbeat procedure below");
+    expect(normalizedShortcut).toContain(
+      "recovery, governed-action, issue-thread-interaction, hold",
+    );
+  });
+
   it("recovers a committed upload after its response is lost without uploading the file twice", async () => {
     const harness = await makeArtifactHelperHarness(cleanupDirs, {
       dropFirstUpload: true,

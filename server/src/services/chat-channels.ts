@@ -9419,6 +9419,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             rebound.authorUserId ?? activeDelivery.principalId,
           taskKey: rebound.issueIdentifier,
           wakeCommentId: inboundCommentId,
+          attachmentOmissionReasons: attachmentResult.omissionReasons,
           rethrowOnError: true,
         });
         // Subscription is part of the durable acceptance boundary. If it
@@ -10336,6 +10337,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         requestedByActorId: actorUserId ?? principalResolution.principal.id,
         taskKey: issue.identifier,
         wakeCommentId: comment.id,
+        attachmentOmissionReasons: attachmentResult.omissionReasons,
         rethrowOnError: true,
       });
       // Do not discard a subscription failure after marking the delivery
