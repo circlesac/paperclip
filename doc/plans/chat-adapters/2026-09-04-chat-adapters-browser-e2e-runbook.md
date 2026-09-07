@@ -61,6 +61,13 @@ complete final-source qualification of every provider and feature.
 
 The dated provider result documents are the evidence ledger. This snapshot is navigation, not proof and not a substitute for rerunning every blocking case on one final SHA.
 
+The Telegram snapshot above predates the subsequent URL-changing reconnect
+retest: the [Telegram result](./2026-09-05-telegram-live-qualification-result.md)
+records real queued updates 75/76 preserved and processed once. The separate
+[2026-09-07 recovery and Board-file audit](./2026-09-07-native-board-files-and-webhook-recovery.md)
+records a stable-ingress reaction outage and explicit file sends, including
+remaining Board feedback defects. Neither upgrades the whole provider matrix.
+
 The account-less Cloudflare quick tunnels used during development are defect-finding infrastructure only. Their expiry caused real callback loss and configuration drift in the Slack and Telegram exercises. They do not qualify production ingress; release deployment requires a durable HTTPS origin, preserved instance key material, and provider callback health that is checked as one configuration set.
 
 The four blocking outcomes are:
