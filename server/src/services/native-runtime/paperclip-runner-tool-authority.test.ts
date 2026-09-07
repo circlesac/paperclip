@@ -87,7 +87,7 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId,
       runId,
     });
-    expect(authority.definitions()).toHaveLength(17);
+    expect(authority.definitions()).toHaveLength(19);
     expect(authority.definitions().map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
         "get_task_context",
@@ -107,6 +107,8 @@ describe("PaperclipRunnerToolAuthority", () => {
         "get_approval",
         "get_approval_context",
         READ_CURRENT_WAKE_COMMENTS_TOOL_NAME,
+        "list_chat_attachments",
+        "reuse_chat_attachment",
       ]),
     );
     const context = await authority.execute({
@@ -126,6 +128,13 @@ describe("PaperclipRunnerToolAuthority", () => {
         arguments: {},
       }),
     ).rejects.toThrow("paperclip_runner_tool_not_advertised");
+    await expect(
+      authority.execute({
+        tool: "list_chat_attachments",
+        callId: "historical-list-without-chat-binding",
+        arguments: {},
+      }),
+    ).rejects.toThrow("paperclip_runner_chat_attachment_binding_denied");
     await expect(
       authority.execute({
         tool: READ_CURRENT_WAKE_COMMENTS_TOOL_NAME,

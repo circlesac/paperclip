@@ -2324,11 +2324,23 @@ describe("Codex app-server Codex driver", () => {
       description: "Read only comments bound into the current wake.",
       inputSchema: { type: "object", properties: {} },
     };
+    const listChatAttachments = {
+      name: "list_chat_attachments",
+      description: "List same-conversation attachment metadata.",
+      inputSchema: { type: "object", properties: {} },
+    };
+    const reuseChatAttachment = {
+      name: "reuse_chat_attachment",
+      description: "Prepare one same-conversation attachment again.",
+      inputSchema: { type: "object", properties: {} },
+    };
     const driver = makeDriver([first, second], {
       conversationMode: "direct",
       dynamicTools: [
         registerDeliverable,
         readCurrentWakeComments,
+        listChatAttachments,
+        reuseChatAttachment,
         {
           name: "report_progress",
           description: "Must remain unavailable in direct chat.",
@@ -2350,14 +2362,24 @@ describe("Codex app-server Codex driver", () => {
     expect(
       first.calls.find((call) => call.method === "thread/start")?.params
         .dynamicTools,
-    ).toEqual([registerDeliverable, readCurrentWakeComments]);
+    ).toEqual([
+      registerDeliverable,
+      readCurrentWakeComments,
+      listChatAttachments,
+      reuseChatAttachment,
+    ]);
 
     const recovery = await driver.recoverSession?.(snapshot);
     expect(recovery).toMatchObject({ recovered: true });
     expect(
       second.calls.find((call) => call.method === "thread/resume")?.params
         .dynamicTools,
-    ).toEqual([registerDeliverable, readCurrentWakeComments]);
+    ).toEqual([
+      registerDeliverable,
+      readCurrentWakeComments,
+      listChatAttachments,
+      reuseChatAttachment,
+    ]);
     await recovery?.session?.close({ reason: "test complete" });
   });
 

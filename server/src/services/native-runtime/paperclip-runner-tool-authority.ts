@@ -27,6 +27,16 @@ import {
   readCurrentWakeComments,
   type CurrentWakeCommentsBinding,
 } from "./current-wake-comments.js";
+import {
+  authorizeChatAttachmentReuse,
+  LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION,
+  LIST_CHAT_ATTACHMENTS_TOOL_NAME,
+  listAuthorizedChatAttachments,
+  prepareReusedChatAttachment,
+  REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION,
+  REUSE_CHAT_ATTACHMENT_TOOL_NAME,
+  type ChatAttachmentReuseSource,
+} from "./chat-attachment-reuse.js";
 
 const IMPLEMENTED_OPERATIONS = new Set([
   "get_task_context", "get_task_history", "search_tasks", "report_progress",
@@ -128,6 +138,8 @@ export class PaperclipRunnerToolAuthority {
     // and truncated external-chat turns. Execution still fails closed unless
     // this exact run carries a server-verified current-wake binding.
     definitions.push(READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION);
+    definitions.push(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION);
+    definitions.push(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION);
     return definitions;
   }
 
@@ -138,7 +150,9 @@ export class PaperclipRunnerToolAuthority {
   }): Promise<unknown> {
     if (
       !IMPLEMENTED_OPERATIONS.has(call.tool) &&
-      call.tool !== READ_CURRENT_WAKE_COMMENTS_TOOL_NAME
+      call.tool !== READ_CURRENT_WAKE_COMMENTS_TOOL_NAME &&
+      call.tool !== LIST_CHAT_ATTACHMENTS_TOOL_NAME &&
+      call.tool !== REUSE_CHAT_ATTACHMENT_TOOL_NAME
     ) {
       throw new Error("paperclip_runner_tool_not_advertised");
     }
@@ -153,6 +167,24 @@ export class PaperclipRunnerToolAuthority {
         this.binding.currentWakeComments,
         input,
       );
+    }
+    if (call.tool === LIST_CHAT_ATTACHMENTS_TOOL_NAME) {
+      return listAuthorizedChatAttachments({
+        db: this.db,
+        binding: this.binding,
+        sourceCommentId:
+          input.sourceCommentId === null || input.sourceCommentId === undefined
+            ? null
+            : requiredUuid(input.sourceCommentId),
+        limit: boundedLimit(input.limit, 20, 50),
+        cursor:
+          input.cursor === null || input.cursor === undefined
+            ? null
+            : requiredString(input.cursor),
+      });
+    }
+    if (call.tool === REUSE_CHAT_ATTACHMENT_TOOL_NAME) {
+      return this.#reuseChatAttachment(input);
     }
     const descriptor = CAPABILITY_SEMANTIC_TOOL_CATALOG.find(
       (candidate) => candidate.operationId === call.tool,
@@ -604,6 +636,101 @@ export class PaperclipRunnerToolAuthority {
     return result;
   }
 
+  async #reuseChatAttachment(input: Record<string, unknown>): Promise<unknown> {
+    const idempotencyKey = requiredString(input.idempotencyKey);
+    if (idempotencyKey.length > 200) {
+      throw new Error("paperclip_runner_tool_input_invalid");
+    }
+    const sourceCommentId = requiredUuid(input.sourceCommentId);
+    const attachmentId = requiredUuid(input.attachmentId);
+    const title = requiredString(input.title);
+    if (title.length > 500) throw new Error("paperclip_runner_tool_input_invalid");
+    let source: ChatAttachmentReuseSource | null = null;
+    let publication:
+      Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
+    let rollbackDefinitePreCommitFailure: (() => Promise<void>) | null = null;
+    const authorize = async (tx: Db, contextSnapshot: unknown) => {
+      source = await authorizeChatAttachmentReuse({
+        db: tx,
+        binding: this.binding,
+        contextSnapshot,
+        sourceCommentId,
+        attachmentId,
+      });
+    };
+    const result = await this.#withMutationReceipt(
+      REUSE_CHAT_ATTACHMENT_TOOL_NAME,
+      idempotencyKey,
+      input,
+      async (tx, context) => {
+        if (context.issue.workMode === "ask") {
+          throw new Error("paperclip_runner_tool_mode_denied");
+        }
+        await authorize(tx, context.run.contextSnapshot);
+        const resultJson = record(context.run.resultJson);
+        for (const receipt of Object.values(record(resultJson.semanticToolReceipts))) {
+          const candidate = receipt as ToolReceipt | undefined;
+          if (candidate?.operationId !== REUSE_CHAT_ATTACHMENT_TOOL_NAME) continue;
+          const priorInput = record(candidate.input);
+          if (
+            priorInput.sourceCommentId === sourceCommentId &&
+            priorInput.attachmentId === attachmentId
+          ) {
+            return { ...record(candidate.result), disposition: "duplicate" };
+          }
+        }
+        const prepared = await prepareReusedChatAttachment({
+          db: tx,
+          binding: this.binding,
+          source: source!,
+          title,
+          storage: this.binding.storage,
+        });
+        rollbackDefinitePreCommitFailure =
+          prepared.rollbackDefinitePreCommitFailure;
+        const activity = await persistActivity(tx, {
+          companyId: this.binding.companyId,
+          actorType: "agent",
+          actorId: this.binding.agentId,
+          agentId: this.binding.agentId,
+          runId: this.binding.runId,
+          issueId: this.binding.issueId,
+          action: "issue.attachment_added",
+          entityType: "issue",
+          entityId: this.binding.issueId,
+          details: {
+            attachmentId: prepared.result.prepared.attachmentId,
+            workProductId: prepared.result.prepared.workProductId,
+            commentId: prepared.result.prepared.commentId,
+            identifier: context.issue.identifier,
+            issueTitle: context.issue.title,
+            source: "paperclip_runner_chat_attachment_reuse",
+            sourceCommentId,
+            sourceAttachmentId: attachmentId,
+            sourceSha256: source!.sha256,
+          },
+        });
+        publication = activity.publication;
+        return prepared.result;
+      },
+      {
+        beforeReceiptReplay: async (tx, context) => {
+          if (context.issue.workMode === "ask") {
+            throw new Error("paperclip_runner_tool_mode_denied");
+          }
+          await authorize(tx, context.run.contextSnapshot);
+        },
+        onDefinitePreCommitFailure: async () => {
+          const rollback = rollbackDefinitePreCommitFailure;
+          rollbackDefinitePreCommitFailure = null;
+          await rollback?.();
+        },
+      },
+    );
+    if (publication) publishActivity(publication);
+    return result;
+  }
+
   async #acceptedPlan(contextSnapshot: unknown): Promise<{
     documentId: string;
     revisionId: string;
@@ -677,6 +804,14 @@ export class PaperclipRunnerToolAuthority {
     ) => Promise<unknown>,
     options: {
       onDefinitePreCommitFailure?: () => Promise<void>;
+      beforeReceiptReplay?: (
+        tx: Db,
+        context: {
+          run: typeof heartbeatRuns.$inferSelect;
+          issue: typeof issues.$inferSelect;
+          actor: typeof agents.$inferSelect;
+        },
+      ) => Promise<void>;
     } = {},
   ): Promise<unknown> {
     return this.db.transaction(async (tx) => {
@@ -694,6 +829,7 @@ export class PaperclipRunnerToolAuthority {
           ) {
             throw new Error("paperclip_runner_tool_idempotency_conflict");
           }
+          await options.beforeReceiptReplay?.(tx as unknown as Db, context);
           return prior.result;
         }
         const result = JSON.parse(
@@ -879,10 +1015,18 @@ function nullableProviderId(value: unknown): string | null {
   return normalized === "null" || normalized === "undefined" ? null : normalized;
 }
 
-function boundedLimit(value: unknown): number {
+function requiredUuid(value: unknown): string {
+  const normalized = requiredString(value);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(normalized)) {
+    throw new Error("paperclip_runner_tool_input_invalid");
+  }
+  return normalized;
+}
+
+function boundedLimit(value: unknown, fallback = 50, maximum = 100): number {
   return typeof value === "number" && Number.isInteger(value)
-    ? Math.max(1, Math.min(value, 100))
-    : 50;
+    ? Math.max(1, Math.min(value, maximum))
+    : fallback;
 }
 
 function redactedActor(actor: {

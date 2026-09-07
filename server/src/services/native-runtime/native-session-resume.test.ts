@@ -36,6 +36,29 @@ const CONDITIONAL_READER_TOOL_CONTRACT_FINGERPRINT = `sha256:${createHash(
   )
   .digest("hex")}`;
 
+const PRE_CHAT_ATTACHMENT_REUSE_TOOL_CONTRACT_FINGERPRINT = `sha256:${createHash(
+  "sha256",
+)
+  .update(
+    JSON.stringify({
+      schema: "paperclip.native-tool-contract.v2",
+      executionTargetKind: "local",
+      advertisementPolicy: {
+        readCurrentWakeComments: "always_advertised_binding_gated.v1",
+        registerDeliverable: "local_workspace_only.v1",
+      },
+      tools: [
+        { name: "register_deliverable", version: 1 },
+        {
+          name: "read_current_wake_comments",
+          semanticContract: "paperclip.server-current-wake-comments.v1",
+          version: 1,
+        },
+      ],
+    }),
+  )
+  .digest("hex")}`;
+
 function execution(
   runId: string,
   cwd = "/workspace",
@@ -252,6 +275,21 @@ describe("rebindNativeSessionCheckpoint", () => {
         previousRun: previousRun({
           nativeToolContractFingerprint:
             CONDITIONAL_READER_TOOL_CONTRACT_FINGERPRINT,
+        }),
+        currentExecution: execution(currentRunId),
+      }),
+    ).toBeNull();
+  });
+
+  it("rotates a provider thread that predates same-conversation attachment reuse", () => {
+    expect(PRE_CHAT_ATTACHMENT_REUSE_TOOL_CONTRACT_FINGERPRINT).not.toBe(
+      NATIVE_TOOL_CONTRACT_FINGERPRINT,
+    );
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: previousRun({
+          nativeToolContractFingerprint:
+            PRE_CHAT_ATTACHMENT_REUSE_TOOL_CONTRACT_FINGERPRINT,
         }),
         currentExecution: execution(currentRunId),
       }),

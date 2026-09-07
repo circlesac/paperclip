@@ -155,8 +155,13 @@ describe("buildPaperclipTaskMarkdown", () => {
       });
       expect(markdown).toContain("`register_deliverable`");
       expect(markdown).toContain("workspace-relative `contentRef`");
-      expect(markdown).toContain("does not confirm provider delivery");
-      expect(markdown).toContain("Register only the requested files");
+      expect(markdown).toContain("do not confirm provider delivery");
+      expect(markdown).toContain("Register or reuse only the requested files");
+      expect(markdown).toContain("`list_chat_attachments`");
+      expect(markdown).toContain("`reuse_chat_attachment`");
+      expect(markdown).toContain(
+        "never substitute an earlier file for unavailable current-turn input",
+      );
       expect(markdown).toContain("workspace-relative staged attachment descriptors");
       expect(markdown).toContain("clearly state that you could not inspect it");
       expect(markdown).toContain('"id":"native-attachment"');

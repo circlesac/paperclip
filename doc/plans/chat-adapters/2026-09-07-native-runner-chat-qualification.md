@@ -306,3 +306,42 @@ GitHub App file-byte uploads remain an explicitly disclosed private-task
 fallback. Provider quota recovery, the final long/burst reader changes, and
 historical attachments outside the current wake still require live qualification;
 this document is not a production-readiness sign-off for all providers/features.
+
+## Same-conversation file resend follow-up
+
+Code review after the native live file tests found a real capability gap:
+current-wake staging safely omitted older files, but native direct chat had no
+bounded way to resend an earlier attachment. The follow-up adds
+`list_chat_attachments` (paged metadata only) and `reuse_chat_attachment`
+(exact-byte server-side copy into a new current-run attachment and final-response
+selection). It does not expose storage locations, reopen general task tools, or
+permit an older file to substitute for unavailable current-turn input.
+
+Both operations verify the current native run, immutable endpoint agent,
+conversation, destination reach, principal membership, and exact admitted
+inbound or confirmed published file lineage. Reuse repeats authorization on
+idempotent replay, rejects ask-mode mutation, and records source/new IDs and
+SHA-256 in receipts and Activity. Deleted or provider-edited/deleted source
+messages are ineligible. The byte handoff also works for remote native targets
+without returning a local path. The native tool-contract fingerprint advances
+to v3 so old provider sessions cannot silently retain the pre-resend tool set.
+
+Supporting verification after review fixes:
+
+- Reuse/authority/resume suites: **35/35**; the three DB cases cover byte
+  identity, duplicate suppression, receipt preservation, equal-timestamp
+  pagination, exact-pair lineage, and access/source revocation.
+- Codex driver fresh/resumed direct-mode tool filtering: **65/65**.
+- Executor, file handoff, current-wake reader, and capacity regression:
+  **156/156**.
+- Native chat prompt context tests: **29/29**.
+- Server TypeScript and full runner build passed, including generated
+  protocol/capability/semantic drift checks, workflow traceability, Rust binary,
+  and replay golden checks. The lockfile was unchanged.
+
+These are local simulated/DB tests. New live model-driven historical-file resend,
+long/burst reader, and quota-recovery qualification remain blocked by the actual
+Codex `usageLimitExceeded` response. Historical-file resend is not historical
+file inspection: this tool intentionally returns no earlier file bytes to the
+model. Teams and GitHub's private-task attachment fallback retain the limits
+described above.
