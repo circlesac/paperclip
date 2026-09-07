@@ -176,6 +176,16 @@ Post-merge verification:
 - Workspace typecheck and workspace build: passed on the final merged sources.
 - Deterministic provider browser flows: **5/5** on another fresh database.
 - UI token gates and `git diff --check`: passed.
+- Native-session and adapter-registry tests: **158/158**.
+
+Runtime reproducibility caveat: these live Maya retakes used the retained ACP
+installation resolving Codex 0.148.0 with the Sol fixture model. The merged
+manifest now requests 0.153.4, also installed as the global CLI. The local
+dependency tree was not re-resolved during handoff, because doing so without the
+CI-owned lockfile would also refresh ranged transitive dependencies and change
+the just-qualified environment. Neither the lockfile nor Maya's model/engine
+was modified. The next normal dependency refresh must requalify the current
+runtime; these results do not establish that 0.153.4 ACP combination.
 
 The broad workspace run was stopped after fixture/mock failures and does not
 have a passing final summary. It also overlapped upstream reconciliation, so it
