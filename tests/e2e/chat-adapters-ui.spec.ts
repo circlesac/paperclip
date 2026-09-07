@@ -319,6 +319,8 @@ type ChatMock = {
   revokedPrincipalId: string | null;
   lifecycleActions: string[];
   replayedDelivery: boolean;
+  liveActivitySummary: string | null;
+  conversationState: "active" | "waiting";
   removed: boolean;
   setStatus: (status: string) => void;
   setGitHubWebhookVerified: () => void;
@@ -351,6 +353,8 @@ async function installChatControlPlaneMock(
     revokedPrincipalId: null,
     lifecycleActions: [],
     replayedDelivery: false,
+    liveActivitySummary: null,
+    conversationState: "active",
     removed: false,
     setStatus: (status) => {
       endpoint.status = status;
@@ -452,9 +456,7 @@ async function installChatControlPlaneMock(
       endpoint.setup.webhookSecretConfigured = true;
       endpoint.setup.step = "provider_setup";
       endpoint.setup.webhookVerifiedAt =
-        state.githubSetupSecretRequests === 1
-          ? new Date().toISOString()
-          : null;
+        state.githubSetupSecretRequests === 1 ? new Date().toISOString() : null;
       if (state.githubSetupSecretRequests > 1) {
         state.failNextGitHubEndpointRead = true;
       }
@@ -487,8 +489,9 @@ async function installChatControlPlaneMock(
           (body.credentials ?? {}) as Record<string, string>,
         ).sort();
         if (provider.provider === "github") {
-          const privateKey = ((body.credentials ?? {}) as Record<string, string>)
-            .privateKey;
+          const privateKey = (
+            (body.credentials ?? {}) as Record<string, string>
+          ).privateKey;
           state.githubPrivateKeyMatchedFile =
             state.githubPrivateKeyMatchedFile === true ||
             privateKey === GITHUB_PRIVATE_KEY_FIXTURE;
@@ -655,7 +658,7 @@ async function installChatControlPlaneMock(
             externalLabel: provider.resourceLabel,
             externalUrl: provider.externalUrl,
             isDirectMessage: provider.provider === "telegram",
-            state: "active",
+            state: state.conversationState,
             lastPublicationStatus: "published",
             createdAt: endpoint.createdAt,
             updatedAt: endpoint.updatedAt,
@@ -671,6 +674,18 @@ async function installChatControlPlaneMock(
     ) {
       await fulfill(route, {
         items: [
+          ...(state.liveActivitySummary
+            ? [
+                {
+                  id: `live-reaction-${provider.provider}`,
+                  kind: "delivery",
+                  status: "processed",
+                  summary: state.liveActivitySummary,
+                  createdAt: endpoint.createdAt,
+                  replayable: false,
+                },
+              ]
+            : []),
           {
             id: `delivery-${provider.provider}`,
             kind: "delivery",
@@ -765,8 +780,9 @@ async function fillProviderSetup(page: Page, provider: ProviderCase) {
     await expect(page.locator("body")).not.toContainText("paperclip-test.pem");
     await page.getByRole("button", { name: provider.setupButton }).click();
     await expect(page.getByRole("alert")).toContainText("Connection failed");
-    await page.getByLabel("Private key (PEM)").evaluate(
-      (element, privateKey) => {
+    await page
+      .getByLabel("Private key (PEM)")
+      .evaluate((element, privateKey) => {
         const clipboardData = new DataTransfer();
         clipboardData.setData("text/plain", privateKey);
         element.dispatchEvent(
@@ -776,9 +792,7 @@ async function fillProviderSetup(page: Page, provider: ProviderCase) {
             clipboardData,
           }),
         );
-      },
-      GITHUB_PRIVATE_KEY_PASTE_FIXTURE,
-    );
+      }, GITHUB_PRIVATE_KEY_PASTE_FIXTURE);
     await expect(page.locator("textarea#github-private-key")).toHaveCount(0);
     await expect(page.locator("body")).not.toContainText(
       GITHUB_PRIVATE_KEY_PASTE_FIXTURE,
@@ -1526,6 +1540,10 @@ test.describe.serial("native chat adapter UI", () => {
         "href",
         new RegExp(`/${seed.prefix}/issues/issue-${provider.provider}$`),
       );
+      mock.conversationState = "waiting";
+      await expect(page.getByText("waiting", { exact: true })).toBeVisible({
+        timeout: 8_000,
+      });
 
       await page.getByRole("tab", { name: "Activity" }).click();
       await expect(
@@ -1560,6 +1578,22 @@ test.describe.serial("native chat adapter UI", () => {
       await expect(page.getByText("xoxb-e2e-redacted")).toHaveCount(0);
       await expect(page.getByText("teams-client-secret")).toHaveCount(0);
       await expect(page.getByText("github-webhook-secret")).toHaveCount(0);
+
+      // A provider callback does not cause a Board mutation. Keep this tab
+      // mounted and focused: neither navigation nor Replay may refresh it.
+      mock.liveActivitySummary = `${provider.name} reaction removed while viewing Activity`;
+      mock.setStatus("paused");
+      await expect(
+        page.getByText(mock.liveActivitySummary, { exact: true }),
+      ).toBeVisible({ timeout: 8_000 });
+      await expect(
+        page.getByRole("button", { name: "Resume", exact: true }),
+      ).toBeVisible({ timeout: 8_000 });
+      mock.setStatus("active");
+      await expect(
+        page.getByRole("button", { name: "Pause", exact: true }),
+      ).toBeVisible({ timeout: 8_000 });
+
       await page.getByRole("button", { name: "Replay" }).click();
       await expect.poll(() => mock.replayedDelivery).toBe(true);
 

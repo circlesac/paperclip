@@ -97,6 +97,13 @@ const activityKindLabels: Record<ChatActivityItem["kind"], string> = {
 };
 
 const replayableFailureStates = new Set(["failed"]);
+// Provider callbacks do not necessarily emit a Board activity event. Refresh
+// only mounted operational views, and stop polling when the browser is hidden.
+const liveChatQueryOptions = {
+  staleTime: 0,
+  refetchInterval: 5_000,
+  refetchIntervalInBackground: false,
+} as const;
 
 export function isReplayEligible(item: ChatActivityItem): boolean {
   if (!item.replayable || !replayableFailureStates.has(item.status)) {
@@ -140,6 +147,11 @@ export function ChatEndpointDetail() {
     queryKey: queryKeys.chatEndpoints.detail(endpointId),
     queryFn: () => chatEndpointsApi.get(endpointId),
     enabled: Boolean(endpointId && activeTab),
+    ...liveChatQueryOptions,
+    refetchInterval:
+      activeTab === "activity" || activeTab === "conversations"
+        ? liveChatQueryOptions.refetchInterval
+        : false,
   });
   const endpoint = endpointQuery.data;
 
@@ -594,6 +606,7 @@ function Conversations({
   const query = useQuery({
     queryKey: queryKeys.chatEndpoints.conversations(endpointId),
     queryFn: () => chatEndpointsApi.listConversations(endpointId),
+    ...liveChatQueryOptions,
   });
   const rows = query.data ?? [];
   return (
@@ -664,6 +677,7 @@ function Activity({
   const query = useQuery({
     queryKey: queryKeys.chatEndpoints.activity(endpointId),
     queryFn: () => chatEndpointsApi.listActivity(endpointId),
+    ...liveChatQueryOptions,
   });
   const replay = useMutation({
     mutationFn: (item: ChatActivityItem) =>
