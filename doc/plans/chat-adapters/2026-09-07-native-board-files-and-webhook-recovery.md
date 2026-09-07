@@ -435,3 +435,29 @@ The full combined suite then passed **276/276** on the fresh migrated
 (64.52 seconds of tests). This run included the final frozen service/test files
 and all seven additions. Simulated provider failures in its log are intentional
 negative fixtures, not live-provider failures.
+
+## Snapshot 14: deployed; post-restart browser smoke remains unverified
+
+Loaded `2026.831.0+407.git.e6f52b4cc` at **20:44:52.362 UTC**. Health and
+startup recovery are ready; Discord Gateway connected. All four configured
+endpoints remain active. A read-only recheck confirms Maya still uses
+`paperclip_runner` / `codex` / `gpt-5.6-luna`; the four earlier successful text
+run rows retain `native` / `codex_app_server`. No model defaults were changed.
+
+The attempted live post-restart reaction smoke did not complete. Browser click
+and scroll calls returned without a visible effect in Slack and Paperclip,
+including a newly opened Board catalog tab. One browser-automation session reset
+and the documented alternate interaction API did not restore input. Navigation,
+rendered snapshots, and screenshots remained available. No new Slack reaction
+receipt arrived after this restart, and Maya's run counts remained 78 succeeded
+and 8 failed, with no queued or running run. No duplicate message or credential
+rotation was attempted as a workaround.
+
+The new early-reaction path therefore has the database/integration coverage
+above, but no passed post-deployment live reaction smoke. Snapshot 13's actual
+document/image and reaction results remain valid evidence for that version;
+they are not relabeled as snapshot 14 results. Browser-input recovery is a
+testing-tool limitation, not an established Slack or Paperclip product defect.
+Model-driven follow-ups still require restored Codex capacity; Teams still
+requires the eligible tenant/admin setup. The isolated server is left running,
+with the public webhook-only proxy and private Board boundary unchanged.
