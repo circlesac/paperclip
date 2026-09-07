@@ -694,3 +694,41 @@ recovery, and pending in-review participant recovery. The production guard
 requires an in-progress task, a successful external-chat run, and its
 company/issue-bound active or waiting conversation; explicit queued work
 is checked first and remains runnable.
+
+### Clean keep-open proof and split webhook topology — 2026-09-07, 13:59 UTC
+
+The clean-source keep-open retest on revision `5bd9c0d55` supersedes the
+remaining recovery caveat above:
+
+- GitHub run `c3335bdf-6a2e-49a5-82eb-8d31df92e4d0` ran from
+  `13:59:33.398Z` to `13:59:39.464Z` on the existing CHA-2 conversation.
+  [Bot comment 5571729974](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5571729974)
+  contained exactly `GITHUB-IDLE-WAIT-OK`.
+- Discord run `f8c9dbe2-7e94-469d-8345-717eb7dad1bf` ran from
+  `13:59:31.087Z` to `13:59:38.234Z` in native thread
+  `1546513811672932372`.
+  [Reply 1546520298793468036](https://discord.com/channels/1457808928258658549/1546513811672932372/1546520298793468036)
+  contained exactly `DISCORD-IDLE-WAIT-OK`.
+
+Both tasks intentionally remained `in_progress` with active conversations for
+more than eight minutes after those terminal replies. Neither received an
+additional run. This is the missing live proof that the recovery guard leaves
+healthy external-chat tasks idle until new inbound or explicitly queued work
+arrives.
+
+The public callback topology is now split without exposing the Board:
+
+- HTTPS `:8443` is the canonical Telegram webhook origin and forwards only to
+  the loopback webhook proxy on port 3104.
+- HTTPS `:10000` remains available for the existing Slack and GitHub callback
+  URLs and forwards through the same webhook-only proxy.
+- HTTPS `:443` remains tailnet-only for the private Board. Public health,
+  company API, and other Board routes are not forwarded by either webhook
+  listener.
+
+The latest setup-edge full chat integration suite passed **258/258**, zero
+skips. The combined process-recovery/status-payload suite passed **135/135**,
+zero skips. The deterministic browser suite passed **5/5** on clean revision
+`5bd9c0d55`, before the latest setup-edge/UI changes; it is still pending on
+the current working tree, so this checkpoint does not claim a current browser
+pass.

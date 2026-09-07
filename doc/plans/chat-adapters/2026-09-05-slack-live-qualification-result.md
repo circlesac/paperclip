@@ -1,6 +1,54 @@
 # Slack live qualification result — 2026-09-05
 
+For the later September 7 image/file handoff retake, see
+[media qualification](2026-09-07-media-live-qualification.md).
+
 > **Status: broad current-branch live evidence plus historical core-smoke evidence, not full release qualification.** The current runs cover channel roots, DMs, FIFO follow-ups, reactions, edits, pause/resume, the registered Slack command, a command-created thread, native inbound and outbound files, disabled-resource enforcement and recovery, an interleaved command/status/final race, a complete native question-to-continuation round trip, and one revocation/relink sequence. Slack is still missing the rest of the governance, failure-injection, reinstall, and cleanup matrix.
+
+## 2026-09-07 fresh-connection setup edge and recovery
+
+The new `maya-e2e` app/endpoint `e3948092-3d92-46a5-9e19-525bd31a53eb`
+reproduced the user's first-message failure on the isolated live instance. `CHA-5`
+was admitted as an unlinked guest and failed closed with
+`low_trust_isolation_unavailable`. The safety boundary was correct; the setup
+experience was not: setup offered a test before explaining identity readiness,
+then showed both a failed-run toast and an agent-wide error with a UUID.
+
+The repair explains identity readiness in the test step, provides **Review identity
+access** and a return **Continue setup** action, and never silently upgrades a
+previously admitted guest task. Recognized pre-adapter low-trust admission failures
+leave the healthy agent idle while preserving the failed run and safe external
+refusal. The isolated-workspace case now receives one actionable warning using
+the agent name. A failed refusal or a manually published Board comment cannot
+qualify setup: completion requires the assigned agent's succeeded run and a
+published final response.
+
+Through the signed-in Slack and Paperclip interfaces, the observed `dotta` identity
+was privately linked to Board. A **fresh root mention** created `CHA-6`
+(`967ce77c-9b64-4f79-8e49-1bfc377ce908`). Run
+`09d577dd-97e7-42d4-a2e4-9aeacac909d4` succeeded from
+`14:06:01.690Z` to `14:06:08.599Z`, and Slack visibly showed exact
+[`SLACK-LINKED-0907-OK`](https://papercliplabs.slack.com/archives/C0BUT55N9RV/p1788789962495849?thread_ts=1788789960.341109&cid=C0BUT55N9RV).
+The task remained `in_progress`, waiting for external input without an unsolicited
+recovery run through the `14:20Z` observation. `CHA-5` remains quarantined historical
+failure evidence. The root receipt reaction was still visible; this retest does
+not claim new Slack receipt-removal coverage.
+
+A plain, unmentioned thread reply on the combined server then passed on the same
+`CHA-6`: run `b3a2584b-ed42-4c3b-979b-427caf5b9267` succeeded from
+`14:23:26.401Z` to `14:23:32.423Z`, and Slack showed exact
+[`SLACK-THREAD-FOLLOWUP-0907-OK`](https://papercliplabs.slack.com/archives/C0BUT55N9RV/p1788791007411959?thread_ts=1788789960.341109&cid=C0BUT55N9RV).
+The real **I've sent the test message** action then completed the wizard and
+rendered **active** with no stale **Continue setup** action. The Settings page was
+visually inspected after navigation. This verifies the original setup recovery
+and the ordinary thread follow-up, not every notification animation or failure.
+
+Source: `5bd9c0d55` plus the setup-edge repairs in this change. The live server was
+restarted on the combined working tree at `14:20:00Z`. Fresh-database chat
+integration passed **258/258**, recovery/status tests **135/135**, and focused UI
+tests **47/47**. These are supporting regressions, not a replacement for the
+remaining live runbook matrix or a comprehensive notification/transition audit.
+The September 6 sections below remain historical evidence on their named builds.
 
 ## 2026-09-06 identity-revocation and callback-drift retest
 

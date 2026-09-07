@@ -7,7 +7,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, ExternalLink, Eye, EyeOff, Loader2 } from "lucide-react";
 import { AgentSelect } from "@/components/AgentMultiSelect";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,7 @@ import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { useToast } from "@/context/ToastContext";
 import { agentsApi } from "@/api/agents";
+import { instanceSettingsApi } from "@/api/instanceSettings";
 import {
   chatEndpointsApi,
   type ChatEndpoint,
@@ -24,6 +25,7 @@ import {
   type ChatEndpointSetupAction,
 } from "@/api/chatEndpoints";
 import { useNavigate, useSearchParams } from "@/lib/router";
+import { queryKeys } from "@/lib/queryKeys";
 import { isAgentStatusInvokable } from "@paperclipai/shared";
 import { sanitizedSetupErrorMessage } from "./chat-setup-error";
 import {
@@ -121,6 +123,7 @@ function SetupRail({ step }: { step: number }) {
 export function ChatEndpointSetup() {
   const [params] = useSearchParams();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { pushToast } = useToast();
@@ -170,15 +173,30 @@ export function ChatEndpointSetup() {
     enabled: Boolean(
       provider === "github" &&
       endpoint?.id &&
+      endpoint.setup?.step === "provider_setup" &&
       endpoint.setup?.webhookSecretConfigured &&
       !endpoint.setup.webhookVerifiedAt,
     ),
     refetchInterval: 1_500,
   });
   useEffect(() => {
-    if (!githubVerificationQuery.data) return;
+    if (
+      !githubVerificationQuery.data ||
+      provider !== "github" ||
+      !endpoint ||
+      endpoint.id !== githubVerificationQuery.data.id ||
+      endpoint.setup?.step !== "provider_setup" ||
+      !endpoint.setup?.webhookSecretConfigured ||
+      endpoint.setup.webhookVerifiedAt
+    )
+      return;
     setEndpoint(githubVerificationQuery.data);
-  }, [githubVerificationQuery.data]);
+  }, [endpoint, githubVerificationQuery.data, provider]);
+  const experimentalSettingsQuery = useQuery({
+    queryKey: queryKeys.instance.experimentalSettings,
+    queryFn: () => instanceSettingsApi.getExperimental(),
+    enabled: endpoint?.setup?.step === "test",
+  });
   const activeAgents = useMemo(
     () =>
       (agentsQuery.data ?? []).filter((agent) =>
@@ -186,13 +204,32 @@ export function ChatEndpointSetup() {
       ),
     [agentsQuery.data],
   );
+  const syncEndpointSnapshot = (
+    next: ChatEndpoint,
+    onlyIfStillVisible = false,
+  ) => {
+    setEndpoint((visible) =>
+      onlyIfStillVisible && visible?.id !== next.id ? visible : next,
+    );
+    queryClient.setQueryData(
+      ["chat-endpoint-setup-resume", next.id],
+      next,
+    );
+    queryClient.setQueryData(queryKeys.chatEndpoints.detail(next.id), next);
+    if (next.provider === "github") {
+      queryClient.setQueryData(
+        ["chat-endpoint-github-webhook-verification", next.id],
+        next,
+      );
+    }
+  };
   const createEndpoint = useMutation({
     mutationFn: () =>
       chatEndpointsApi.create(selectedCompanyId!, {
         provider: provider!,
         assignedAgentId: agentId,
       }),
-    onSuccess: setEndpoint,
+    onSuccess: syncEndpointSnapshot,
     onError: (error) =>
       pushToast({
         title: "Couldn't start setup",
@@ -211,28 +248,67 @@ export function ChatEndpointSetup() {
     onMutate: () => setSetupError(null),
     onSuccess: (next) => {
       setSetupError(null);
-      setEndpoint(next);
+      syncEndpointSnapshot(next);
     },
     onError: (error, variables) =>
       setSetupError(sanitizedSetupErrorMessage(error, variables.values)),
   });
   const generateSetupSecret = useMutation({
     mutationFn: () => chatEndpointsApi.generateSetupSecret(endpoint!.id),
-    onSuccess: ({ webhookSecret }) => {
+    onMutate: async () => {
+      const endpointId = endpoint!.id;
+      await Promise.all([
+        queryClient.cancelQueries({
+          queryKey: ["chat-endpoint-github-webhook-verification", endpointId],
+          exact: true,
+        }),
+        queryClient.cancelQueries({
+          queryKey: ["chat-endpoint-setup-resume", endpointId],
+          exact: true,
+        }),
+        queryClient.cancelQueries({
+          queryKey: queryKeys.chatEndpoints.detail(endpointId),
+          exact: true,
+        }),
+      ]);
+      return { endpointId };
+    },
+    onSuccess: async ({ webhookSecret }, _variables, context) => {
+      const endpointId = context.endpointId;
+      const markRotated = (current: ChatEndpoint) => ({
+        ...current,
+        setup: {
+          ...current.setup,
+          step: "provider_setup" as const,
+          webhookSecretConfigured: true,
+          webhookVerifiedAt: null,
+        },
+      });
+
+      queryClient.removeQueries({
+        queryKey: ["chat-endpoint-github-webhook-verification", endpointId],
+        exact: true,
+      });
       setGeneratedWebhookSecret(webhookSecret);
       setEndpoint((current) =>
-        current
-          ? {
-              ...current,
-              setup: {
-                ...current.setup,
-                step: current.setup?.step ?? "provider_setup",
-                webhookSecretConfigured: true,
-                webhookVerifiedAt: null,
-              },
-            }
-          : current,
+        current && current.id === endpointId ? markRotated(current) : current,
       );
+      queryClient.setQueryData<ChatEndpoint>(
+        ["chat-endpoint-setup-resume", endpointId],
+        (current) => (current ? markRotated(current) : current),
+      );
+      queryClient.setQueryData<ChatEndpoint>(
+        queryKeys.chatEndpoints.detail(endpointId),
+        (current) => (current ? markRotated(current) : current),
+      );
+
+      try {
+        const current = await chatEndpointsApi.get(endpointId);
+        syncEndpointSnapshot(current, true);
+      } catch {
+        // Keep the one-time secret copyable. Verification polling will retry the
+        // canonical endpoint read without restoring a pre-rotation snapshot.
+      }
     },
     onError: (error) =>
       pushToast({
@@ -244,8 +320,8 @@ export function ChatEndpointSetup() {
   const testConnection = useMutation({
     mutationFn: () => chatEndpointsApi.test(endpoint!.id),
     onSuccess: (next) => {
+      syncEndpointSnapshot(next);
       if (next.status === "active") navigate(`/apps/chat/${next.id}/settings`);
-      else setEndpoint(next);
     },
     onError: (error) =>
       pushToast({
@@ -388,12 +464,26 @@ export function ChatEndpointSetup() {
           </>
         ) : (
           <TryStep
+            endpointId={endpoint.id}
             provider={provider}
             agentName={selectedAgent?.name ?? endpoint.assignedAgentName}
             botLabel={endpoint.botLabel}
             botUsername={endpoint.botUsername}
             providerUrl={endpoint.setup?.providerUrl}
+            guestIsolationState={
+              experimentalSettingsQuery.isPending
+                ? "loading"
+                : experimentalSettingsQuery.isError
+                  ? "unknown"
+                  : experimentalSettingsQuery.data
+                        ?.enableIsolatedWorkspaces === true
+                    ? "enabled"
+                    : "disabled"
+            }
             pending={testConnection.isPending}
+            onOpenAccess={() =>
+              navigate(`/apps/chat/${endpoint.id}/access`)
+            }
             onTest={() => testConnection.mutate()}
           />
         )}
@@ -1355,22 +1445,84 @@ settings:
 }
 
 function TryStep({
+  endpointId,
   provider,
   agentName,
   botLabel,
   botUsername,
   providerUrl,
+  guestIsolationState,
   pending,
+  onOpenAccess,
   onTest,
 }: {
+  endpointId: string;
   provider: ChatProvider;
   agentName: string;
   botLabel?: string | null;
   botUsername?: string | null;
   providerUrl?: string | null;
+  guestIsolationState: "loading" | "enabled" | "disabled" | "unknown";
   pending: boolean;
+  onOpenAccess: () => void;
   onTest: () => void;
 }) {
+  const principalsQuery = useQuery({
+    queryKey: queryKeys.chatEndpoints.principals(endpointId),
+    queryFn: () => chatEndpointsApi.listPrincipals(endpointId),
+    refetchInterval: 1_500,
+  });
+  const identities = principalsQuery.data ?? [];
+  const unlinkedIdentities = identities.filter(
+    (identity) => identity.status !== "linked",
+  );
+  const freshConversationInstruction =
+    provider === "telegram"
+      ? "start a fresh conversation with /new and send the test message again"
+      : provider === "github"
+        ? "start a new issue or pull request conversation and mention the agent again"
+        : provider === "microsoft-teams"
+          ? "start a new channel post and mention the agent again"
+          : "send a new root mention to the agent";
+  const identityGuidance = principalsQuery.isError
+    ? {
+        tone: "warning" as const,
+        title: "Identity readiness could not be checked",
+        body: `Review Access before expecting an agent reply. After linking the account you are testing, ${freshConversationInstruction}.`,
+      }
+    : !principalsQuery.isSuccess || guestIsolationState === "loading"
+      ? null
+      : identities.length === 0
+        ? guestIsolationState === "disabled"
+          ? {
+              tone: "warning" as const,
+              title: "Link the account you’re testing",
+              body:
+                provider === "telegram"
+                  ? "Tap Start in Telegram to discover your account; the welcome does not start an agent run. Link the account privately in Access, then return and send the test message."
+                  : `Your first ${providerNames[provider]} message discovers the external account, but isolated guest work is off, so it cannot safely start ${agentName}. Send it once, link that account privately in Access, then ${freshConversationInstruction}.`,
+            }
+          : {
+              tone: "info" as const,
+              title: "Your first message identifies your account",
+              body:
+                provider === "telegram"
+                  ? "Tap Start in Telegram to discover your account. Until linked, it is a restricted guest and still needs a sandbox-backed isolated run; test that path intentionally, or link it in Access and then send the test message."
+                  : `Until linked, the account is a restricted guest and still needs a sandbox-backed isolated run. Test that guest path intentionally, or link the account in Access and then ${freshConversationInstruction}.`,
+            }
+        : unlinkedIdentities.length > 0
+          ? guestIsolationState === "disabled"
+            ? {
+                tone: "warning" as const,
+                title: "Link the account you’re testing",
+                body: `An observed external account is unlinked, and isolated guest work is off, so it cannot safely start ${agentName}. Link the account in Access, then ${freshConversationInstruction}; Paperclip does not replay the refused request.`,
+              }
+            : {
+                tone: "info" as const,
+                title: "Unlinked identity detected",
+                body: `An unlinked account is a restricted guest and still needs a sandbox-backed isolated run. Test guest access intentionally, or link the account in Access and then ${freshConversationInstruction}.`,
+              }
+          : null;
   const providerBotUsername = botUsername?.replace(/^@/, "");
   const normalizedBotUsername =
     provider === "github"
@@ -1419,25 +1571,53 @@ function TryStep({
           Complete this real conversation to finish setup.
         </p>
       </div>
+      {(!principalsQuery.isSuccess || guestIsolationState === "loading") &&
+      !principalsQuery.isError ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          Checking identity and guest readiness…
+        </p>
+      ) : null}
+      {identityGuidance ? (
+        <div
+          role={identityGuidance.tone === "warning" ? "alert" : "status"}
+          className={
+            identityGuidance.tone === "warning"
+              ? "rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm"
+              : "rounded-lg border border-border bg-muted/30 p-4 text-sm"
+          }
+        >
+          <h2 className="font-medium">{identityGuidance.title}</h2>
+          <p className="mt-1 text-muted-foreground">
+            {identityGuidance.body}
+          </p>
+          <Button
+            className="mt-3"
+            size="sm"
+            variant="outline"
+            onClick={onOpenAccess}
+          >
+            Review identity access
+          </Button>
+        </div>
+      ) : null}
       <ol className="list-decimal space-y-2 pl-5 text-sm">
         {instructions.map((item) => (
           <li key={item}>{item}</li>
         ))}
       </ol>
-      {providerUrl && (
-        <Button
-          variant="outline"
-          onClick={() =>
-            window.open(providerUrl, "_blank", "noopener,noreferrer")
-          }
-        >
-          Open {providerNames[provider]} <ExternalLink />
+      <div className="flex flex-wrap gap-2">
+        {providerUrl && (
+          <Button asChild variant="outline">
+            <a href={providerUrl} target="_blank" rel="noopener noreferrer">
+              Open {providerNames[provider]} <ExternalLink />
+            </a>
+          </Button>
+        )}
+        <Button disabled={pending} onClick={onTest}>
+          {pending && <Loader2 className="h-4 w-4 animate-spin" />}
+          I've sent the test message
         </Button>
-      )}
-      <Button disabled={pending} onClick={onTest}>
-        {pending && <Loader2 className="h-4 w-4 animate-spin" />}I've sent the
-        test message
-      </Button>
+      </div>
     </div>
   );
 }

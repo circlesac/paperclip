@@ -1559,6 +1559,8 @@ export interface IssueAttachment {
   companyId: string;
   issueId: string;
   issueCommentId: string | null;
+  /** Immutable run attribution recorded when an agent uploads the attachment. */
+  originatingRunId?: string | null;
   assetId: string;
   provider: string;
   objectKey: string;

@@ -108,9 +108,9 @@ function resolveAgentName(
   agentId: string,
 ): string | null {
   const agents = queryClient.getQueryData<Agent[]>(queryKeys.agents.list(companyId));
-  if (!agents) return null;
-  const agent = agents.find((a) => a.id === agentId);
-  return agent?.name ?? null;
+  const listedAgent = agents?.find((a) => a.id === agentId);
+  if (listedAgent?.name) return listedAgent.name;
+  return queryClient.getQueryData<Agent>(queryKeys.agents.detail(agentId))?.name ?? null;
 }
 
 function resolveUserName(
@@ -826,8 +826,24 @@ function buildRunStatusToast(
   if (!runId || !agentId || !status || !RUN_TOAST_STATUSES.has(status)) return null;
 
   const error = readString(payload.error);
+  const errorCode = readString(payload.errorCode);
+  const contextSource = readString(payload.contextSource);
   const triggerDetail = readString(payload.triggerDetail);
-  const name = nameOf(agentId) ?? `Agent ${shortId(agentId)}`;
+  const name = nameOf(agentId) ?? "Agent";
+  if (
+    status === "failed" &&
+    errorCode === "low_trust_isolation_unavailable" &&
+    contextSource?.startsWith("chat:")
+  ) {
+    return {
+      title: `${name} couldn't start this chat`,
+      body: "This external chat identity isn't linked, and isolated guest workspaces are disabled. Link the identity in Connectors or enable isolated workspaces, then start a new task.",
+      tone: "warn",
+      ttlMs: 10_000,
+      action: { label: "Open chat connections", href: "/apps" },
+      dedupeKey: `run-status:${runId}:${status}`,
+    };
+  }
   const tone = status === "succeeded" ? "success" : status === "cancelled" ? "warn" : "error";
   const statusLabel =
     status === "succeeded" ? "succeeded"

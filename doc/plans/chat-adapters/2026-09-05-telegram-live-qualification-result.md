@@ -1,6 +1,60 @@
 # Telegram live qualification result — 2026-09-05
 
+For the later September 7 image/file handoff and real download checks, see
+[media qualification](2026-09-07-media-live-qualification.md).
+
 > **Status: broad private-chat and group/topic live evidence, not full release qualification.** The latest live runs cover task controls, FIFO and burst handling, reactions, edits, native documents, task-generation races, the repaired interleaved status/final lane, group/topic isolation, removal/rejoin, the silent-publication boundary, and a complete native confirmation-to-continuation round trip. Broader media boundaries, global token revocation, and other runbook cases remain open.
+
+## 2026-09-07 fresh-bot webhook-port and setup recovery
+
+The user's new bot connection exposed a deployment/setup defect: the public
+Tailscale origin used port `10000`, which Telegram rejects. The connector now
+validates HTTPS and Telegram's allowed webhook ports **443, 80, 88, 8443** before
+provider access, credential writes, or reconnect lifecycle changes. Unsupported
+configuration returns the actionable `chat_telegram_webhook_url_unsupported`
+error without including the supplied URL or token. Regression coverage verifies
+both first setup and preservation of existing durable credentials on reconnect.
+
+The canonical Telegram origin now uses public Tailscale Funnel **8443** forwarding
+only to the webhook-only proxy on `3104`. Public `10000` remains a compatibility
+route for already-configured Slack/GitHub callbacks; private tailnet `443` still
+serves the Board. Public Board/health/API requests return `404`. This supersedes
+the older temporary-tunnel topology below and the earlier private-8443 checkpoint.
+
+The real **Reconnect bot** action reused the already-vaulted token successfully;
+the user did not need to create another bot or re-enter a secret. The verified
+bot is [MayaPaperclipQA1234bot](https://t.me/MayaPaperclipQA1234bot), endpoint
+`5b18b946-2b24-45b6-957f-783a0a735d8a`. Tapping **Start** discovered the account and
+displayed the native welcome without starting a failing agent run. The observed
+account was privately linked through Access, and **Continue setup** returned to
+the test step. Live inspection also found that **Open Telegram** incorrectly
+pointed back to BotFather; setup now projects the verified bot's own URL.
+
+The linked private-chat request created `CHA-8`
+(`8feb3fca-5fdc-4659-bd99-e11c3f64d032`), conversation
+`0e63c3fb-026f-49c1-af40-383d42cb5cfd`. Run
+`e1e53d28-8d96-44ec-bf16-9ec5660ccca4` succeeded from
+`14:15:31.904Z` to `14:15:39.979Z`. Telegram visibly showed exact
+`TELEGRAM-LINKED-0907-OK`; the final published at `14:15:40.994Z`. Working and final
+each published in one attempt and share provider message `417200359:4`, proving
+an in-place update rather than two bot messages. The task remained `in_progress`
+and its conversation active; the company had no pending, retry, streaming, or
+ambiguous publication at the `14:20Z` audit.
+
+The real **I've sent the test message** action completed setup on the restarted
+server and rendered **active**, with no stale **Continue setup** action. The
+Settings page was visually inspected. **Open Telegram** is now a native link
+with the verified bot URL rather than BotFather. Its href was verified in the
+live UI, but clicks did not create a tracked in-app-browser popup even after the
+native-link change; no visible blocker appeared. That host/external-link behavior
+remains unverified, and the working bot conversation is separate live evidence,
+not a claim that this popup opened successfully.
+
+Source: `5bd9c0d55` plus the setup-edge repairs in this change, with the combined
+server restarted at `14:20:00Z`. Fresh-database chat integration passed **258/258**,
+recovery/status tests **135/135**, and focused UI tests **47/47**. This fresh-bot
+core journey does not rerun or upgrade every historical group/media/governance
+case below to the current source.
 
 ## 2026-09-06 merged-build tunnel-rotation retest
 

@@ -10,7 +10,17 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
-import { and, asc, desc, eq, inArray, isNotNull, like, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  like,
+  or,
+  sql,
+} from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -36,6 +46,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueAttachments,
+  issueWorkProducts,
   issueQuestionResponseDeliveries,
   issueThreadInteractions,
   issues,
@@ -1330,6 +1341,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ChatChannelServiceOptions,
         | "deferWebhookProcessing"
         | "githubWebhookResponseBudgetMs"
+        | "publicBaseUrl"
         | "scheduleDeferredWork"
         | "setupSecretActivityLogger"
         | "setupSecretCredentialPersistBarrier"
@@ -7514,7 +7526,159 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await context.service.shutdown();
   });
 
-  it.each([undefined, "https://ingress.example"])(
+  it("rejects unsupported Telegram webhook ports before provider access or secret persistence", async () => {
+    const fixture = await seedCompany();
+    const providerFetch = vi.fn(async () => {
+      throw new Error("Telegram provider access must not start");
+    }) as unknown as typeof globalThis.fetch;
+    const { service } = createService(new FakeChatSdkRuntime(), providerFetch, {
+      webhookPublicBaseUrl: "https://unsupported-telegram-origin.example:10000",
+    });
+    const endpoint = await service.create(
+      fixture.companyId,
+      {
+        provider: "telegram",
+        assignedAgentId: fixture.assignedAgentId,
+      },
+      "owner-user",
+    );
+
+    const failure = await service
+      .configure(
+        endpoint.id,
+        {
+          action: "configure",
+          credentials: { botToken: "123456:telegram-port-canary" },
+        },
+        "owner-user",
+      )
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(failure).toMatchObject({
+      status: 422,
+      message:
+        "Telegram webhooks require PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL to use HTTPS on port 443, 80, 88, or 8443",
+      details: {
+        code: "chat_telegram_webhook_url_unsupported",
+        provider: "telegram",
+        supportedPorts: [443, 80, 88, 8443],
+      },
+    });
+    expect(String((failure as Error | null)?.message)).not.toContain(
+      "unsupported-telegram-origin",
+    );
+    expect(String((failure as Error | null)?.message)).not.toContain(
+      "telegram-port-canary",
+    );
+    expect(providerFetch).not.toHaveBeenCalled();
+    await expect(
+      db
+        .select({ refs: toolConnections.credentialSecretRefs })
+        .from(toolConnections)
+        .where(eq(toolConnections.id, endpoint.connectionId)),
+    ).resolves.toEqual([{ refs: [] }]);
+    await expect(
+      db
+        .select({ id: companySecretBindings.id })
+        .from(companySecretBindings)
+        .where(
+          and(
+            eq(companySecretBindings.companyId, fixture.companyId),
+            eq(companySecretBindings.targetType, "tool_connection"),
+            eq(companySecretBindings.targetId, endpoint.connectionId),
+          ),
+        ),
+    ).resolves.toEqual([]);
+    await expect(
+      db
+        .select({ id: companySecrets.id })
+        .from(companySecrets)
+        .where(eq(companySecrets.companyId, fixture.companyId)),
+    ).resolves.toEqual([]);
+    await expect(service.get(endpoint.id)).resolves.toMatchObject({
+      status: "draft",
+      providerAccountId: null,
+      botExternalId: null,
+    });
+    await service.shutdown();
+  });
+
+  it("preserves stored Telegram credentials and lifecycle when reconnect uses an unsupported webhook port", async () => {
+    const fixture = await seedCompany();
+    const configured = await configuredTelegramEndpoint(fixture);
+    await configured.service.shutdown();
+    await db
+      .update(chatEndpoints)
+      .set({
+        status: "attention",
+        healthMessage: "Telegram webhook registration needs attention",
+        lastError: "Telegram webhook registration failed",
+        updatedAt: new Date(),
+      })
+      .where(eq(chatEndpoints.id, configured.endpoint.id));
+    const [endpointBefore] = await db
+      .select()
+      .from(chatEndpoints)
+      .where(eq(chatEndpoints.id, configured.endpoint.id));
+    if (!endpointBefore) throw new Error("Expected Telegram endpoint row");
+    const [connectionBefore] = await db
+      .select({ refs: toolConnections.credentialSecretRefs })
+      .from(toolConnections)
+      .where(eq(toolConnections.id, configured.endpoint.connectionId));
+    const secretIdsBefore = await db
+      .select({ id: companySecrets.id })
+      .from(companySecrets)
+      .where(eq(companySecrets.companyId, fixture.companyId));
+    expect(connectionBefore?.refs).toHaveLength(2);
+
+    const providerFetch = vi.fn(async () => {
+      throw new Error("Telegram provider access must not start");
+    }) as unknown as typeof globalThis.fetch;
+    const reconnect = createService(new FakeChatSdkRuntime(), providerFetch, {
+      webhookPublicBaseUrl:
+        "https://unsupported-telegram-reconnect.example:10000",
+    });
+    await expect(
+      reconnect.service.configure(
+        configured.endpoint.id,
+        { action: "reconnect" },
+        "owner-user",
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "chat_telegram_webhook_url_unsupported" },
+    });
+
+    expect(providerFetch).not.toHaveBeenCalled();
+    await expect(
+      db
+        .select()
+        .from(chatEndpoints)
+        .where(eq(chatEndpoints.id, configured.endpoint.id)),
+    ).resolves.toEqual([endpointBefore]);
+    await expect(
+      db
+        .select({ refs: toolConnections.credentialSecretRefs })
+        .from(toolConnections)
+        .where(eq(toolConnections.id, configured.endpoint.connectionId)),
+    ).resolves.toEqual([connectionBefore]);
+    await expect(
+      db
+        .select({ id: companySecrets.id })
+        .from(companySecrets)
+        .where(eq(companySecrets.companyId, fixture.companyId)),
+    ).resolves.toEqual(secretIdsBefore);
+    await reconnect.service.shutdown();
+  });
+
+  it.each([
+    undefined,
+    "https://ingress.example",
+    "https://ingress.example:8443",
+  ])(
     "configures Telegram and preserves queued updates with webhook origin %s",
     async (webhookPublicBaseUrl) => {
       const fixture = await seedCompany();
@@ -7618,6 +7782,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         },
         "owner-user",
       );
+      expect(endpoint.setup).toMatchObject({
+        step: "provider_setup",
+        providerUrl: "https://t.me/BotFather",
+      });
 
       const configured = await service.configure(
         endpoint.id,
@@ -7640,7 +7808,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         botExternalId: String(botId),
         botUsername: "maya_paperclip_bot",
         capabilities: { messageEdits: true, messageDeletes: false },
-        setup: { step: "test" },
+        setup: {
+          step: "test",
+          providerUrl: "https://t.me/maya_paperclip_bot",
+        },
       });
       const providerConfig = runtime.configurations.get(
         endpoint.id,
@@ -9451,7 +9622,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
   });
 
-  it("accepts a published terminal failure for setup transport qualification", async () => {
+  it("requires a successful final response for setup qualification", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, service } =
       await configuredSlackEndpoint(fixture);
@@ -9521,10 +9692,140 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
     await service.processPendingPublications();
 
+    await expect(service.test(endpoint.id)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "chat_test_round_trip_incomplete" },
+    });
+
+    const contextSnapshot = await chatWakeContext({
+      endpointId: endpoint.id,
+      issueId: conversation.issueId,
+      provider: "slack",
+      providerMessageId: "9001.2",
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: endpoint.assignedAgentId,
+      status: "succeeded",
+      contextSnapshot,
+    });
+    await addSelectedChatFinal({
+      agentId: endpoint.assignedAgentId,
+      body: "Setup completed successfully.",
+      companyId: fixture.companyId,
+      issueId: conversation.issueId,
+      runId,
+    });
+    await service.processPendingPublications();
+
     await expect(service.test(endpoint.id)).resolves.toMatchObject({
       status: "active",
       setup: { step: "complete" },
     });
+  });
+
+  it("requires the successful setup final to consume the qualifying follow-up", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service } =
+      await configuredSlackEndpoint(fixture);
+    const testThread = makeThread({
+      channelId: "C-SETUP-RUN-PROVENANCE",
+      id: "slack:C-SETUP-RUN-PROVENANCE:9002.1",
+      name: "setup-run-provenance",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: testThread.thread,
+      message: makeMessage({
+        id: "9002.1",
+        text: "@maya begin a deliberately slow setup answer",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    if (!conversation) throw new Error("Expected setup conversation");
+
+    const rootContext = await chatWakeContext({
+      endpointId: endpoint.id,
+      issueId: conversation.issueId,
+      provider: "slack",
+      providerMessageId: "9002.1",
+    });
+    const rootRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: rootRunId,
+      companyId: fixture.companyId,
+      agentId: endpoint.assignedAgentId,
+      status: "succeeded",
+      contextSnapshot: rootContext,
+    });
+    await addSelectedChatFinal({
+      agentId: endpoint.assignedAgentId,
+      body: "The earlier root turn finished after the follow-up arrived.",
+      companyId: fixture.companyId,
+      issueId: conversation.issueId,
+      runId: rootRunId,
+    });
+
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: testThread.thread,
+      message: makeMessage({
+        id: "9002.2",
+        text: "This is the required setup follow-up.",
+      }),
+      trigger: "subscribed_message",
+    });
+    // Publish the older root run only after the follow-up has been accepted.
+    // Timestamp ordering alone must not make that unrelated final qualify.
+    await service.processPendingPublications();
+    await expect(service.test(endpoint.id)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "chat_test_round_trip_incomplete" },
+    });
+
+    const followUpContext = await chatWakeContext({
+      endpointId: endpoint.id,
+      issueId: conversation.issueId,
+      provider: "slack",
+      providerMessageId: "9002.2",
+    });
+    const followUpRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: followUpRunId,
+      companyId: fixture.companyId,
+      agentId: endpoint.assignedAgentId,
+      status: "succeeded",
+      contextSnapshot: {
+        issueId: followUpContext.issueId,
+        source: followUpContext.source,
+        // Deferred wakeups may coalesce several accepted messages and retain
+        // only the durable list of causal comment ids.
+        wakeCommentIds: [followUpContext.wakeCommentId],
+      },
+    });
+    await addSelectedChatFinal({
+      agentId: endpoint.assignedAgentId,
+      body: "The qualifying follow-up was handled successfully.",
+      companyId: fixture.companyId,
+      issueId: conversation.issueId,
+      runId: followUpRunId,
+    });
+    await service.processPendingPublications();
+
+    await expect(service.test(endpoint.id)).resolves.toMatchObject({
+      status: "active",
+      setup: { step: "complete" },
+    });
+    await service.shutdown();
   });
 
   it("durably retries a signed Slack session stop and cancels its exact linked run once", async () => {
@@ -12441,14 +12742,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
     const posts = runtime.endpoints.get(endpoint.id)?.posts ?? [];
     const channelAttachmentPost = posts.find((post) =>
-      post.text.includes("Shared channel-report.txt."),
+      post.text.includes(
+        "File saved on the Paperclip task: channel-report.txt.",
+      ),
+    );
+    expect(channelAttachmentPost?.text).toContain(
+      "This Microsoft Teams connection cannot upload file bytes into chats.",
     );
     expect(channelAttachmentPost?.text).toContain(
       `/issues/${channelConversation.issueId}`,
     );
     expect(channelAttachmentPost?.files).toBeUndefined();
     const personalAttachmentPost = posts.find((post) =>
-      post.text.includes("Shared personal-report.txt."),
+      post.text.includes(
+        "File saved on the Paperclip task: personal-report.txt.",
+      ),
+    );
+    expect(personalAttachmentPost?.text).toContain(
+      "This Microsoft Teams connection cannot upload file bytes into chats.",
     );
     expect(personalAttachmentPost?.text).toContain(
       `/issues/${personalConversation.issueId}`,
@@ -20406,7 +20717,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     ]);
     expect(providerRuntime.edits[0]?.text).toBe(
-      "Paperclip’s complete response is attached in the next message.",
+      "Paperclip is preparing the complete response as an attachment.",
     );
     expect(providerRuntime.posts).toHaveLength(1);
     expect(providerRuntime.posts[0]?.text).toBe("Complete response attached.");
@@ -20414,6 +20725,128 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       data: Buffer;
     };
     expect(replacementUpload.data.toString("utf8")).toBe(providerSafeSource);
+
+    providerRuntime.posts.length = 0;
+    providerRuntime.edits.length = 0;
+    providerRuntime.editAttempts.length = 0;
+    const rejectedRunId = randomUUID();
+    const rejectedCreatedAt = new Date();
+    await db.insert(chatPublications).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      conversationId: conversation.id,
+      issueId: conversation.issueId,
+      idempotencyKey: `run:${rejectedRunId}:working:${endpoint.id}`,
+      payload: { text: "Working on the attachment…", progressState: "working" },
+      state: "published",
+      providerMessageId: "working-message-rejected-attachment",
+      createdAt: rejectedCreatedAt,
+      updatedAt: rejectedCreatedAt,
+    });
+    const [rejectedPublication] = await db
+      .insert(chatPublications)
+      .values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        issueId: conversation.issueId,
+        idempotencyKey: `run:${rejectedRunId}:completed:${endpoint.id}`,
+        payload: { text: providerSafeSource, progressState: "completed" },
+        state: "pending",
+        createdAt: new Date(rejectedCreatedAt.getTime() + 1),
+        updatedAt: new Date(rejectedCreatedAt.getTime() + 1),
+      })
+      .returning();
+    let rejectAttachmentOnce = true;
+    providerRuntime.postHook = async () => {
+      if (!rejectAttachmentOnce) return;
+      rejectAttachmentOnce = false;
+      throw Object.assign(new Error("Discord rejected the attachment"), {
+        adapter: "discord",
+        response: { status: 400 },
+        status: 400,
+      });
+    };
+    await service.processPendingPublications();
+    providerRuntime.postHook = undefined;
+
+    const rejectedBatch = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        sql`${chatPublications.payload}->'transportPart'->>'batchId' = ${rejectedPublication.id}`,
+      )
+      .orderBy(
+        sql`(${chatPublications.payload}->'transportPart'->>'index')::int`,
+      );
+    expect(rejectedBatch.map((row) => row.state)).toEqual([
+      "published",
+      "failed",
+    ]);
+    const definiteFailureNotices = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, fixture.companyId),
+          like(
+            chatPublications.idempotencyKey,
+            `attachment-failure-notice:${rejectedBatch[1]!.id}:%`,
+          ),
+        ),
+      );
+    expect(definiteFailureNotices).toHaveLength(1);
+    const rejectedAttachmentNotice =
+      "Paperclip could not send the response attachment. The complete response remains on its Paperclip task for an operator to retry." +
+      ` Open task: https://paperclip.example/issues/${conversation.issueId}`;
+    expect(definiteFailureNotices[0]).toMatchObject({
+      commentId: null,
+      state: "published",
+      payload: {
+        text: rejectedAttachmentNotice,
+      },
+    });
+    expect(providerRuntime.editAttempts).toEqual([
+      {
+        threadId,
+        messageId: "working-message-rejected-attachment",
+      },
+    ]);
+    expect(providerRuntime.edits[0]?.text).toBe(
+      "Paperclip is preparing the complete response as an attachment.",
+    );
+    expect(providerRuntime.posts).toEqual([
+      {
+        threadId,
+        text: rejectedAttachmentNotice,
+      },
+    ]);
+    await service.processPendingPublications();
+    expect(providerRuntime.posts).toHaveLength(1);
+
+    const staleNoticeId = randomUUID();
+    await db.insert(chatPublications).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      conversationId: conversation.id,
+      issueId: conversation.issueId,
+      idempotencyKey: `attachment-failure-notice:${staleNoticeId}:999:${"a".repeat(64)}`,
+      payload: { text: "stale attachment failure notice" },
+      state: "pending",
+    });
+    await service.processPendingPublications();
+    await expect(
+      db
+        .select({ state: chatPublications.state })
+        .from(chatPublications)
+        .where(
+          eq(
+            chatPublications.idempotencyKey,
+            `attachment-failure-notice:${staleNoticeId}:999:${"a".repeat(64)}`,
+          ),
+        ),
+    ).resolves.toEqual([{ state: "cancelled" }]);
+    expect(providerRuntime.posts).toHaveLength(1);
 
     const cardKey = `discord-card-not-split:${endpoint.id}`;
     await db.insert(chatPublications).values({
@@ -20446,6 +20879,72 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     ]);
     expect(providerRuntime.posts.at(-1)?.files).toBeUndefined();
+
+    const ambiguousRunId = randomUUID();
+    const ambiguousCreatedAt = new Date();
+    await db.insert(chatPublications).values({
+      companyId: fixture.companyId,
+      endpointId: endpoint.id,
+      conversationId: conversation.id,
+      issueId: conversation.issueId,
+      idempotencyKey: `run:${ambiguousRunId}:working:${endpoint.id}`,
+      payload: { text: "Working on another attachment…", progressState: "working" },
+      state: "published",
+      providerMessageId: "working-message-ambiguous-attachment",
+      createdAt: ambiguousCreatedAt,
+      updatedAt: ambiguousCreatedAt,
+    });
+    const [ambiguousPublication] = await db
+      .insert(chatPublications)
+      .values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        issueId: conversation.issueId,
+        idempotencyKey: `run:${ambiguousRunId}:completed:${endpoint.id}`,
+        payload: { text: providerSafeSource, progressState: "completed" },
+        state: "pending",
+        createdAt: new Date(ambiguousCreatedAt.getTime() + 1),
+        updatedAt: new Date(ambiguousCreatedAt.getTime() + 1),
+      })
+      .returning();
+    providerRuntime.postHook = async () => {
+      throw Object.assign(new Error("Discord attachment response was lost"), {
+        adapter: "discord",
+        name: "NetworkError",
+      });
+    };
+    await service.processPendingPublications();
+    providerRuntime.postHook = undefined;
+    await expect(
+      db
+        .select({ state: chatPublications.state })
+        .from(chatPublications)
+        .where(
+          sql`${chatPublications.payload}->'transportPart'->>'batchId' = ${ambiguousPublication.id}`,
+        )
+        .orderBy(
+          sql`(${chatPublications.payload}->'transportPart'->>'index')::int`,
+        ),
+    ).resolves.toEqual([
+      { state: "published" },
+      { state: "delivery_unknown" },
+    ]);
+    await expect(
+      db
+        .select({ id: chatPublications.id })
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.companyId, fixture.companyId),
+            eq(chatPublications.state, "published"),
+            like(
+              chatPublications.idempotencyKey,
+              "attachment-failure-notice:%",
+            ),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
     await service.shutdown();
   });
 
@@ -20893,7 +21392,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     ]);
     expect(providerRuntime.edits[0]?.text).toBe(
-      "Paperclip’s complete response is attached in the next message.",
+      "Paperclip is preparing the complete response as an attachment.",
     );
     expect(providerRuntime.posts).toHaveLength(1);
     expect(providerRuntime.posts[0]?.text).toBe("Complete response attached.");
@@ -25663,86 +26162,232 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
-  it("publishes GitHub attachments as Paperclip task links without provider file bytes", async () => {
+  it("publishes truthful GitHub attachment fallbacks without provider file bytes", async () => {
+    for (const testCase of [
+      {
+        publicBaseUrl: "https://board.paperclip.example",
+        expectedFallback: (issueId: string) =>
+          `File saved on the Paperclip task: report.txt. This GitHub App connection cannot upload file bytes into comments. Download it: https://board.paperclip.example/issues/${issueId}`,
+      },
+      {
+        publicBaseUrl: "http://127.0.0.1:3103",
+        expectedFallback: () =>
+          "File saved on the private Paperclip task: report.txt. This GitHub App connection cannot upload file bytes into comments.",
+      },
+    ]) {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const { callbacks, endpoint, runtime, service } =
+        await configuredGitHubEndpoint(fixture, {
+          publicBaseUrl: testCase.publicBaseUrl,
+          storage: storage.storage,
+        });
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id: "github:paperclipai/paperclip:issue:452",
+        name: "paperclipai/paperclip",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "github",
+        thread: thread.thread,
+        message: makeMessage({
+          id: "45201",
+          text: "@maya create a downloadable report",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, endpoint.id));
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: fixture.companyId,
+        agentId: fixture.assignedAgentId,
+        status: "succeeded",
+        contextSnapshot: await chatWakeContext({
+          endpointId: endpoint.id,
+          issueId: conversation!.issueId,
+          provider: "github",
+          providerMessageId: "45201",
+        }),
+      });
+      const comment = await addSelectedChatFinal({
+        agentId: fixture.assignedAgentId,
+        body: "The report is ready.",
+        companyId: fixture.companyId,
+        issueId: conversation!.issueId,
+        runId,
+      });
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${conversation!.issueId}`,
+        originalFilename: "report.txt",
+        contentType: "text/plain",
+        body: Buffer.from("report contents", "utf8"),
+      });
+      await issueService(db).createAttachment({
+        issueId: conversation!.issueId,
+        issueCommentId: comment.id,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: fixture.assignedAgentId,
+        createdByRunId: runId,
+      });
+      await service.processPendingPublications();
+
+      const posts = runtime.endpoints.get(endpoint.id)?.posts ?? [];
+      expect(
+        posts.some((post) =>
+          post.text.includes(testCase.expectedFallback(conversation!.issueId)),
+        ),
+      ).toBe(true);
+      expect(
+        posts.every((post) => !post.text.includes("Shared report.txt.")),
+      ).toBe(true);
+      expect(posts.every((post) => post.files === undefined)).toBe(true);
+      expect(storage.storage.getObject).not.toHaveBeenCalled();
+      if (testCase.publicBaseUrl.startsWith("http://127.0.0.1")) {
+        expect(
+          posts.every((post) => !post.text.includes(testCase.publicBaseUrl)),
+        ).toBe(true);
+      }
+      await service.shutdown();
+    }
+  });
+
+  it("publishes one truthful notice when a selected PNG receives a definite provider rejection", async () => {
     const fixture = await seedCompany();
     const storage = createStorageService();
     const { callbacks, endpoint, runtime, service } =
-      await configuredGitHubEndpoint(fixture, {
+      await configuredSlackEndpoint(fixture, {
         storage: storage.storage,
       });
-    const thread = makeThread({
-      channelId: "paperclipai/paperclip",
-      id: "github:paperclipai/paperclip:issue:452",
-      name: "paperclipai/paperclip",
+    const channel = makeThread({
+      channelId: "C-ATTACHMENT-REJECTED",
+      id: "slack:C-ATTACHMENT-REJECTED:4521.1",
+      name: "attachment-rejected",
     });
     await deliverMessage({
       callbacks,
       endpointId: endpoint.id,
-      provider: "github",
-      thread: thread.thread,
+      thread: channel.thread,
       message: makeMessage({
-        id: "45201",
-        text: "@maya create a downloadable report",
+        id: "4521.1",
+        text: "@maya start an attachment failure test",
         mentioned: true,
       }),
       trigger: "mention",
     });
-    const [conversation] = await db
-      .select()
-      .from(chatConversations)
-      .where(eq(chatConversations.endpointId, endpoint.id));
-    const runId = randomUUID();
-    await db.insert(heartbeatRuns).values({
-      id: runId,
-      companyId: fixture.companyId,
-      agentId: fixture.assignedAgentId,
-      status: "succeeded",
-      contextSnapshot: await chatWakeContext({
-        endpointId: endpoint.id,
-        issueId: conversation!.issueId,
-        provider: "github",
-        providerMessageId: "45201",
-      }),
-    });
-    const comment = await addSelectedChatFinal({
-      agentId: fixture.assignedAgentId,
-      body: "The report is ready.",
-      companyId: fixture.companyId,
-      issueId: conversation!.issueId,
-      runId,
-    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Slack file conversation");
+    const png = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]);
     const stored = await storage.storage.putFile({
       companyId: fixture.companyId,
-      namespace: `issues/${conversation!.issueId}`,
-      originalFilename: "report.txt",
-      contentType: "text/plain",
-      body: Buffer.from("report contents", "utf8"),
+      namespace: `issues/${conversation.issueId}`,
+      originalFilename: "provider-rejected.png",
+      contentType: "image/png",
+      body: png,
     });
-    await issueService(db).createAttachment({
-      issueId: conversation!.issueId,
-      issueCommentId: comment.id,
+    const attachment = await issueService(db).createAttachment({
+      issueId: conversation.issueId,
       provider: stored.provider,
       objectKey: stored.objectKey,
       contentType: stored.contentType,
       byteSize: stored.byteSize,
       sha256: stored.sha256,
       originalFilename: stored.originalFilename,
-      createdByAgentId: fixture.assignedAgentId,
-      createdByRunId: runId,
+      createdByUserId: "owner-user",
     });
-    await service.processPendingPublications();
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack provider runtime");
+    providerRuntime.posts.length = 0;
+    let postAttempt = 0;
+    providerRuntime.postHook = async () => {
+      postAttempt += 1;
+      if (postAttempt !== 2) return;
+      throw Object.assign(new Error("Slack rejected the PNG upload"), {
+        adapter: "slack",
+        code: "slack_webapi_platform_error",
+        data: { error: "invalid_arguments" },
+      });
+    };
 
-    const posts = runtime.endpoints.get(endpoint.id)?.posts ?? [];
-    expect(posts.some((post) => post.text.includes("Shared report.txt."))).toBe(
-      true,
+    const failed = await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "The selected PNG should follow.",
+      "selected-png-provider-rejection",
+      "owner-user",
+      [attachment.id],
     );
-    expect(
-      posts.some((post) =>
-        post.text.includes(`/issues/${conversation!.issueId}`),
-      ),
-    ).toBe(true);
-    expect(posts.every((post) => post.files === undefined)).toBe(true);
-    expect(storage.storage.getObject).not.toHaveBeenCalled();
+    providerRuntime.postHook = undefined;
+
+    expect(failed).toMatchObject({ state: "failed" });
+    const selectedAttachmentNotice =
+      "Paperclip could not send an attachment. The file remains on its Paperclip task for an operator to retry." +
+      ` Open task: https://paperclip.example/issues/${conversation.issueId}`;
+    const publications = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, fixture.companyId),
+          eq(chatPublications.conversationId, conversation.id),
+          or(
+            eq(chatPublications.commentId, failed.commentId!),
+            like(
+              chatPublications.idempotencyKey,
+              "attachment-failure-notice:%",
+            ),
+          ),
+        ),
+      )
+      .orderBy(asc(chatPublications.createdAt));
+    expect(publications).toEqual([
+      expect.objectContaining({
+        state: "published",
+        payload: { text: "The selected PNG should follow." },
+      }),
+      expect.objectContaining({
+        id: failed.id,
+        state: "failed",
+        payload: expect.objectContaining({ attachmentIds: [attachment.id] }),
+      }),
+      expect.objectContaining({
+        commentId: null,
+        state: "published",
+        payload: {
+          text: selectedAttachmentNotice,
+        },
+      }),
+    ]);
+    expect(providerRuntime.posts).toEqual([
+      {
+        threadId: channel.thread.id,
+        text: "The selected PNG should follow.",
+      },
+      {
+        threadId: channel.thread.id,
+        text: selectedAttachmentNotice,
+      },
+    ]);
+    expect(storage.storage.getObject).toHaveBeenCalledOnce();
+    await service.processPendingPublications();
+    expect(providerRuntime.posts).toHaveLength(2);
+    await service.shutdown();
   });
 
   it("preserves the raw webhook request and returns the provider adapter response", async () => {
@@ -26690,6 +27335,771 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ],
       },
     ]);
+  });
+
+  it("hands an explicitly bound same-run image to Discord's final native file response", async () => {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredDiscordEndpoint(fixture, {
+        storage: storage.storage,
+      });
+    const rootMessageId = "555555555555555710";
+    const channel = makeThread({
+      channelId: "333333333333333710",
+      id: `discord:1457808928258658549:333333333333333710:${rootMessageId}`,
+      name: "agent-image",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message: makeMessage({
+        id: rootMessageId,
+        text: "@maya create and show an image",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    if (!conversation) throw new Error("Expected Discord conversation");
+
+    const insertRun = async (agentId: string, status = "succeeded") => {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: fixture.companyId,
+        agentId,
+        status,
+        contextSnapshot: await chatWakeContext({
+          endpointId: endpoint.id,
+          issueId: conversation.issueId,
+          provider: "discord",
+          providerMessageId: rootMessageId,
+        }),
+      });
+      return runId;
+    };
+    const createAgentAttachment = async (
+      runId: string,
+      agentId: string,
+      filename: string,
+      body: Buffer,
+      contentType = "image/png",
+    ) => {
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${conversation.issueId}`,
+        originalFilename: filename,
+        contentType,
+        body,
+      });
+      return issueService(db).createAttachment({
+        issueId: conversation.issueId,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: agentId,
+        createdByRunId: runId,
+      });
+    };
+    const bindAgentAttachment = (
+      runId: string,
+      agentId: string,
+      body: string,
+      attachmentId: string,
+      authorizationReason = "allow_self",
+    ) =>
+      db.transaction((tx) =>
+        issueService(tx as unknown as TestDb).addComment(
+          conversation.issueId,
+          body,
+          { agentId, runId },
+          {
+            attachmentIds: [attachmentId],
+            authorType: "agent",
+            authorizationReason,
+          },
+        ),
+      );
+
+    const runId = await insertRun(fixture.assignedAgentId, "running");
+    const imageBody = Buffer.from("generated cat image", "utf8");
+    const selected = await createAgentAttachment(
+      runId,
+      fixture.assignedAgentId,
+      "orange-tabby.png",
+      imageBody,
+    );
+    expect(selected.originatingRunId).toBe(runId);
+    const documentBody = Buffer.from("%PDF-1.7 generated report", "utf8");
+    const selectedDocument = await createAgentAttachment(
+      runId,
+      fixture.assignedAgentId,
+      "cat-notes.pdf",
+      documentBody,
+      "application/pdf",
+    );
+    const unbound = await createAgentAttachment(
+      runId,
+      fixture.assignedAgentId,
+      "private-draft.png",
+      Buffer.from("private unbound draft", "utf8"),
+    );
+    const directBody = Buffer.from("directly selected image", "utf8");
+    const directSelectionComment = await issueService(db).addComment(
+      conversation.issueId,
+      "Recorded a direct upload before final presentation.",
+      { agentId: fixture.assignedAgentId, runId },
+      { authorType: "agent", authorizationReason: "paperclip_runner_protocol" },
+    );
+    const storedDirect = await storage.storage.putFile({
+      companyId: fixture.companyId,
+      namespace: `issues/${conversation.issueId}`,
+      originalFilename: "direct-selection.png",
+      contentType: "image/png",
+      body: directBody,
+    });
+    const directSelection = await issueService(db).createAttachment({
+      issueId: conversation.issueId,
+      issueCommentId: directSelectionComment.id,
+      provider: storedDirect.provider,
+      objectKey: storedDirect.objectKey,
+      contentType: storedDirect.contentType,
+      byteSize: storedDirect.byteSize,
+      sha256: storedDirect.sha256,
+      originalFilename: storedDirect.originalFilename,
+      createdByAgentId: fixture.assignedAgentId,
+      createdByRunId: runId,
+    });
+    expect(directSelection.originatingRunId).toBe(runId);
+    await expect(
+      db
+        .select({ id: chatPublications.id })
+        .from(chatPublications)
+        .where(
+          eq(
+            chatPublications.idempotencyKey,
+            `attachment:${directSelection.id}:${endpoint.id}`,
+          ),
+        ),
+    ).resolves.toHaveLength(0);
+    const deletedSelectionComment = await issueService(db).addComment(
+      conversation.issueId,
+      "This selection was withdrawn before upload.",
+      { agentId: fixture.assignedAgentId, runId },
+      { authorType: "agent", authorizationReason: "allow_self" },
+    );
+    await db
+      .update(issueComments)
+      .set({ deletedAt: new Date() })
+      .where(eq(issueComments.id, deletedSelectionComment.id));
+    await expect(
+      issueService(db).createAttachment({
+        issueId: conversation.issueId,
+        issueCommentId: deletedSelectionComment.id,
+        provider: "local_disk",
+        objectKey: "issues/deleted-parent.png",
+        contentType: "image/png",
+        byteSize: 14,
+        sha256: "7".repeat(64),
+        originalFilename: "deleted-parent.png",
+        createdByAgentId: fixture.assignedAgentId,
+        createdByRunId: runId,
+      }),
+    ).rejects.toMatchObject({ status: 404 });
+    await expect(
+      db
+        .select({ id: assets.id })
+        .from(assets)
+        .where(eq(assets.objectKey, "issues/deleted-parent.png")),
+    ).resolves.toHaveLength(0);
+    const provisionalSelection = await issueService(db).addComment(
+      conversation.issueId,
+      "Selected the requested cat image for chat delivery.",
+      { agentId: fixture.assignedAgentId, runId },
+      { authorType: "agent", authorizationReason: "internal_agent_write" },
+    );
+    const selectionComment = await bindAgentAttachment(
+      runId,
+      fixture.assignedAgentId,
+      "Selected the requested cat image for chat delivery.",
+      selected.id,
+    );
+    expect(selectionComment.id).toBe(provisionalSelection.id);
+    // A lost HTTP response may make the helper retry the same binding. The
+    // retry must reuse the comment and must not fail or duplicate the file.
+    const selectionRetry = await bindAgentAttachment(
+      runId,
+      fixture.assignedAgentId,
+      "Selected the requested cat image for chat delivery.",
+      selected.id,
+    );
+    expect(selectionRetry.id).toBe(selectionComment.id);
+    const documentSelectionComment = await bindAgentAttachment(
+      runId,
+      fixture.assignedAgentId,
+      "Selected the requested notes for chat delivery.",
+      selectedDocument.id,
+    );
+
+    const otherRunId = await insertRun(fixture.assignedAgentId);
+    const otherRunAttachment = await createAgentAttachment(
+      otherRunId,
+      fixture.assignedAgentId,
+      "other-run.png",
+      Buffer.from("other run", "utf8"),
+    );
+    const otherRunComment = await bindAgentAttachment(
+      otherRunId,
+      fixture.assignedAgentId,
+      "This belongs to another run.",
+      otherRunAttachment.id,
+    );
+    await expect(
+      issueService(db).createAttachment({
+        issueId: conversation.issueId,
+        issueCommentId: otherRunComment.id,
+        provider: "local_disk",
+        objectKey: "issues/wrong-run-parent.png",
+        contentType: "image/png",
+        byteSize: 16,
+        sha256: "9".repeat(64),
+        originalFilename: "wrong-run-parent.png",
+        createdByAgentId: fixture.assignedAgentId,
+        createdByRunId: runId,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "issue_attachment_parent_run_mismatch" },
+    });
+
+    const remintedAttachment = await createAgentAttachment(
+      otherRunId,
+      fixture.assignedAgentId,
+      "reminted-old-run.png",
+      Buffer.from("old run provenance", "utf8"),
+    );
+    if (!remintedAttachment.artifactWorkProductId) {
+      throw new Error("Expected upload to create an artifact work product");
+    }
+    await db
+      .update(issueWorkProducts)
+      .set({ createdByRunId: runId })
+      .where(
+        eq(issueWorkProducts.id, remintedAttachment.artifactWorkProductId),
+      );
+    await expect(
+      bindAgentAttachment(
+        runId,
+        fixture.assignedAgentId,
+        "A mutable work-product update cannot change upload provenance.",
+        remintedAttachment.id,
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "issue_attachment_run_origin_mismatch" },
+    });
+    const [mutableWorkProduct] = await db
+      .select()
+      .from(issueWorkProducts)
+      .where(
+        eq(issueWorkProducts.id, remintedAttachment.artifactWorkProductId),
+      );
+    if (!mutableWorkProduct) {
+      throw new Error("Expected reminted attachment work product");
+    }
+    await db
+      .delete(issueWorkProducts)
+      .where(
+        eq(issueWorkProducts.id, remintedAttachment.artifactWorkProductId),
+      );
+    await db.insert(issueWorkProducts).values({
+      ...mutableWorkProduct,
+      id: randomUUID(),
+      createdByRunId: runId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await expect(
+      bindAgentAttachment(
+        runId,
+        fixture.assignedAgentId,
+        "Deleting and recreating metadata cannot change upload provenance.",
+        remintedAttachment.id,
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "issue_attachment_run_origin_mismatch" },
+    });
+
+    const legacyAttachment = await createAgentAttachment(
+      runId,
+      fixture.assignedAgentId,
+      "legacy-without-origin.png",
+      Buffer.from("legacy provenance unavailable", "utf8"),
+    );
+    await db
+      .update(issueAttachments)
+      .set({ originatingRunId: null })
+      .where(eq(issueAttachments.id, legacyAttachment.id));
+    await expect(
+      bindAgentAttachment(
+        runId,
+        fixture.assignedAgentId,
+        "Legacy attachment provenance fails closed.",
+        legacyAttachment.id,
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "issue_attachment_run_origin_mismatch" },
+    });
+
+    const otherAgentRunId = await insertRun(fixture.replacementAgentId);
+    const otherAgentAttachment = await createAgentAttachment(
+      otherAgentRunId,
+      fixture.replacementAgentId,
+      "other-agent.png",
+      Buffer.from("other agent", "utf8"),
+    );
+    await bindAgentAttachment(
+      otherAgentRunId,
+      fixture.replacementAgentId,
+      "This belongs to another agent.",
+      otherAgentAttachment.id,
+    );
+
+    const authorizationReason =
+      await resolveChatRunPresentationAuthorizationReason(db, {
+        companyId: fixture.companyId,
+        issueId: conversation.issueId,
+        runId,
+      });
+    expect(authorizationReason).toBe("allow_chat_run_presentation");
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    const response = await issueService(db).addComment(
+      conversation.issueId,
+      "Here is the requested cat image.",
+      { agentId: fixture.assignedAgentId, runId },
+      { authorType: "agent", authorizationReason },
+    );
+
+    await service.processPendingPublications();
+    const publications = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.conversationId, conversation.id),
+          inArray(chatPublications.commentId, [
+            response.id,
+            selectionComment.id,
+            documentSelectionComment.id,
+            directSelectionComment.id,
+          ]),
+        ),
+      )
+      .orderBy(asc(chatPublications.createdAt));
+    expect(publications).toEqual([
+      expect.objectContaining({
+        commentId: response.id,
+        state: "published",
+        payload: { text: "Here is the requested cat image." },
+      }),
+      expect.objectContaining({
+        commentId: directSelectionComment.id,
+        state: "published",
+        payload: expect.objectContaining({
+          attachmentIds: [directSelection.id],
+        }),
+      }),
+      expect.objectContaining({
+        commentId: selectionComment.id,
+        state: "published",
+        payload: expect.objectContaining({ attachmentIds: [selected.id] }),
+      }),
+      expect.objectContaining({
+        commentId: documentSelectionComment.id,
+        state: "published",
+        payload: expect.objectContaining({
+          attachmentIds: [selectedDocument.id],
+        }),
+      }),
+    ]);
+    expect(JSON.stringify(publications)).not.toContain(unbound.id);
+    expect(JSON.stringify(publications)).not.toContain(otherRunAttachment.id);
+    expect(JSON.stringify(publications)).not.toContain(remintedAttachment.id);
+    expect(JSON.stringify(publications)).not.toContain(legacyAttachment.id);
+    expect(JSON.stringify(publications)).not.toContain(otherAgentAttachment.id);
+    expect(runtime.endpoints.get(endpoint.id)?.posts).toEqual([
+      {
+        threadId: channel.thread.id,
+        text: "Here is the requested cat image.",
+      },
+      {
+        threadId: channel.thread.id,
+        text: "Shared direct-selection.png.",
+        files: [
+          expect.objectContaining({
+            filename: "direct-selection.png",
+            mimeType: "image/png",
+            data: directBody,
+          }),
+        ],
+      },
+      {
+        threadId: channel.thread.id,
+        text: "Shared orange-tabby.png.",
+        files: [
+          expect.objectContaining({
+            filename: "orange-tabby.png",
+            mimeType: "image/png",
+            data: imageBody,
+          }),
+        ],
+      },
+      {
+        threadId: channel.thread.id,
+        text: "Shared cat-notes.pdf.",
+        files: [
+          expect.objectContaining({
+            filename: "cat-notes.pdf",
+            mimeType: "application/pdf",
+            data: documentBody,
+          }),
+        ],
+      },
+    ]);
+    await expect(
+      db
+        .select({ issueCommentId: issueAttachments.issueCommentId })
+        .from(issueAttachments)
+        .where(eq(issueAttachments.id, unbound.id)),
+    ).resolves.toEqual([{ issueCommentId: null }]);
+  });
+
+  it("serializes and caps an agent run's selected Discord files before final handoff", async () => {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, service } = await configuredDiscordEndpoint(
+      fixture,
+      { storage: storage.storage },
+    );
+    const rootMessageId = "555555555555555711";
+    const channel = makeThread({
+      channelId: "333333333333333711",
+      id: `discord:1457808928258658549:333333333333333711:${rootMessageId}`,
+      name: "agent-file-cap",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message: makeMessage({
+        id: rootMessageId,
+        text: "@maya prepare the complete file set",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    if (!conversation) throw new Error("Expected Discord conversation");
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "succeeded",
+      contextSnapshot: await chatWakeContext({
+        endpointId: endpoint.id,
+        issueId: conversation.issueId,
+        provider: "discord",
+        providerMessageId: rootMessageId,
+      }),
+    });
+    const attachments: Array<{ id: string }> = [];
+    for (let index = 0; index < 21; index += 1) {
+      const body = Buffer.from(`selected file ${index + 1}`, "utf8");
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${conversation.issueId}`,
+        originalFilename: `selected-${String(index + 1).padStart(2, "0")}.txt`,
+        contentType: "text/plain",
+        body,
+      });
+      attachments.push(
+        await issueService(db).createAttachment({
+          issueId: conversation.issueId,
+          provider: stored.provider,
+          objectKey: stored.objectKey,
+          contentType: stored.contentType,
+          byteSize: stored.byteSize,
+          sha256: stored.sha256,
+          originalFilename: stored.originalFilename,
+          createdByAgentId: fixture.assignedAgentId,
+          createdByRunId: runId,
+        }),
+      );
+    }
+
+    const issuesSvc = issueService(db);
+    const initialSelection = await db.transaction((tx) =>
+      issuesSvc.addComment(
+        conversation.issueId,
+        "Prepared the selected file batch.",
+        { agentId: fixture.assignedAgentId, runId },
+        {
+          attachmentIds: attachments.slice(0, 19).map((item) => item.id),
+          authorType: "agent",
+          authorizationReason: "allow_self",
+        },
+        tx,
+      ),
+    );
+    const contenderBodies = [
+      "Prepared candidate file twenty.",
+      "Prepared candidate file twenty-one.",
+    ];
+    const contenderResults = await Promise.allSettled(
+      attachments.slice(19).map((attachment, index) =>
+        db.transaction((tx) =>
+          issuesSvc.addComment(
+            conversation.issueId,
+            contenderBodies[index]!,
+            { agentId: fixture.assignedAgentId, runId },
+            {
+              attachmentIds: [attachment.id],
+              authorType: "agent",
+              authorizationReason: "allow_self",
+            },
+            tx,
+          ),
+        ),
+      ),
+    );
+    const winnerIndex = contenderResults.findIndex(
+      (result) => result.status === "fulfilled",
+    );
+    const loserIndex = contenderResults.findIndex(
+      (result) => result.status === "rejected",
+    );
+    expect(winnerIndex).toBeGreaterThanOrEqual(0);
+    expect(loserIndex).toBeGreaterThanOrEqual(0);
+    if (winnerIndex < 0 || loserIndex < 0) {
+      throw new Error("Expected exactly one capped attachment contender");
+    }
+    const rejected = contenderResults[loserIndex];
+    if (rejected?.status !== "rejected") {
+      throw new Error("Expected the twenty-first attachment to be rejected");
+    }
+    expect(rejected.reason).toMatchObject({
+      status: 422,
+      details: {
+        code: "chat_attachment_selection_limit_exceeded",
+        limit: 20,
+        selectedCount: 21,
+      },
+    });
+    const winningAttachment = attachments[19 + winnerIndex]!;
+    const rejectedAttachment = attachments[19 + loserIndex]!;
+    await expect(
+      db
+        .select({
+          id: issueAttachments.id,
+          issueCommentId: issueAttachments.issueCommentId,
+        })
+        .from(issueAttachments)
+        .where(inArray(issueAttachments.id, attachments.map((item) => item.id)))
+        .then((rows) => ({
+          bound: rows.filter((row) => row.issueCommentId !== null).length,
+          rejected: rows.find((row) => row.id === rejectedAttachment.id),
+        })),
+    ).resolves.toEqual({
+      bound: 20,
+      rejected: {
+        id: rejectedAttachment.id,
+        issueCommentId: null,
+      },
+    });
+    await expect(
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.body, contenderBodies[loserIndex]!)),
+    ).resolves.toHaveLength(0);
+    await expect(
+      issuesSvc.createAttachment({
+        issueId: conversation.issueId,
+        issueCommentId: initialSelection.id,
+        provider: "local_disk",
+        objectKey: "issues/direct-selection-overflow.txt",
+        contentType: "text/plain",
+        byteSize: 25,
+        sha256: "8".repeat(64),
+        originalFilename: "direct-selection-overflow.txt",
+        createdByAgentId: fixture.assignedAgentId,
+        createdByRunId: runId,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "chat_attachment_selection_limit_exceeded",
+        limit: 20,
+        selectedCount: 21,
+      },
+    });
+    await expect(
+      db
+        .select({ id: assets.id })
+        .from(assets)
+        .where(eq(assets.objectKey, "issues/direct-selection-overflow.txt")),
+    ).resolves.toHaveLength(0);
+
+    const authorizationReason =
+      await resolveChatRunPresentationAuthorizationReason(db, {
+        companyId: fixture.companyId,
+        issueId: conversation.issueId,
+        runId,
+      });
+    expect(authorizationReason).toBe("allow_chat_run_presentation");
+    // Reusing the first selected attachment on the final comment makes that
+    // file appear in both the direct and carried sets. Dedupe must happen
+    // before the provider cap is applied, or the later winning file is lost.
+    const response = await db.transaction((tx) =>
+      issuesSvc.addComment(
+        conversation.issueId,
+        "Prepared the selected file batch.",
+        { agentId: fixture.assignedAgentId, runId },
+        {
+          attachmentIds: [attachments[0]!.id],
+          authorType: "agent",
+          authorizationReason,
+        },
+        tx,
+      ),
+    );
+    expect(response.id).toBe(initialSelection.id);
+
+    await service.processPendingPublications(1_000);
+    const publications = await db
+      .select({
+        payload: chatPublications.payload,
+        state: chatPublications.state,
+      })
+      .from(chatPublications)
+      .where(eq(chatPublications.conversationId, conversation.id));
+    const publishedAttachmentIds = publications.flatMap((publication) => {
+      const attachmentIds =
+        publication.payload &&
+        typeof publication.payload === "object" &&
+        "attachmentIds" in publication.payload &&
+        Array.isArray(publication.payload.attachmentIds)
+          ? publication.payload.attachmentIds
+          : [];
+      return attachmentIds.filter(
+        (attachmentId): attachmentId is string =>
+          typeof attachmentId === "string",
+      );
+    });
+    expect(publications.every((publication) => publication.state === "published"))
+      .toBe(true);
+    expect(publishedAttachmentIds).toHaveLength(20);
+    expect(new Set(publishedAttachmentIds).size).toBe(20);
+    expect(publishedAttachmentIds).toEqual(
+      expect.arrayContaining([
+        ...attachments.slice(0, 19).map((item) => item.id),
+        winningAttachment.id,
+      ]),
+    );
+    expect(publishedAttachmentIds).not.toContain(rejectedAttachment.id);
+
+    const nonChatRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: nonChatRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "succeeded",
+      contextSnapshot: {
+        issueId: conversation.issueId,
+        source: "issue.comment",
+      },
+    });
+    const nonChatAttachments: Array<{ id: string }> = [];
+    for (let index = 0; index < 21; index += 1) {
+      nonChatAttachments.push(
+        await issuesSvc.createAttachment({
+          issueId: conversation.issueId,
+          provider: "local_disk",
+          objectKey: `issues/non-chat-${index + 1}.txt`,
+          contentType: "text/plain",
+          byteSize: 1,
+          sha256: String(index).padStart(64, "0"),
+          originalFilename: `non-chat-${index + 1}.txt`,
+          createdByAgentId: fixture.assignedAgentId,
+          createdByRunId: nonChatRunId,
+        }),
+      );
+    }
+    const firstInternalBatch = await db.transaction((tx) =>
+      issuesSvc.addComment(
+        conversation.issueId,
+        "Internal task files one through twenty.",
+        { agentId: fixture.assignedAgentId, runId: nonChatRunId },
+        {
+          attachmentIds: nonChatAttachments.slice(0, 20).map((item) => item.id),
+          authorType: "agent",
+          authorizationReason: "allow_self",
+        },
+        tx,
+      ),
+    );
+    const secondInternalBatch = await db.transaction((tx) =>
+      issuesSvc.addComment(
+        conversation.issueId,
+        "Internal task file twenty-one.",
+        { agentId: fixture.assignedAgentId, runId: nonChatRunId },
+        {
+          attachmentIds: [nonChatAttachments[20]!.id],
+          authorType: "agent",
+          authorizationReason: "allow_self",
+        },
+        tx,
+      ),
+    );
+    expect(firstInternalBatch.id).not.toBe(secondInternalBatch.id);
+    await expect(
+      db
+        .select({ issueCommentId: issueAttachments.issueCommentId })
+        .from(issueAttachments)
+        .where(
+          inArray(
+            issueAttachments.id,
+            nonChatAttachments.map((item) => item.id),
+          ),
+        )
+        .then((rows) =>
+          rows.filter((attachment) => attachment.issueCommentId !== null),
+        ),
+    ).resolves.toHaveLength(21);
   });
 
   it("publishes a serialized Telegram run response after the preceding run completes the conversation", async () => {

@@ -184,6 +184,7 @@ const ALL_ISSUE_STATUSES = [
   "cancelled",
 ];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
+const MAX_CHAT_PRESENTATION_ATTACHMENTS = 20;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
 export const ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS = 100;
@@ -1159,6 +1160,65 @@ export function isExplicitExternalAgentComment(
 ): boolean {
   const reason = metadata?.authorizationReason?.trim() ?? "";
   return reason === "paperclip_runner_protocol" || reason.startsWith("allow_");
+}
+
+type SelectedChatPresentationAttachment = {
+  id: string;
+  commentId: string;
+  commentMetadata: IssueCommentMetadata | null;
+  originalFilename: string | null;
+};
+
+async function listSelectedChatPresentationAttachments(
+  dbOrTx: any,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    runId: string;
+  },
+): Promise<SelectedChatPresentationAttachment[]> {
+  const rows = await dbOrTx
+    .select({
+      id: issueAttachments.id,
+      commentId: issueComments.id,
+      commentMetadata: issueComments.metadata,
+      originalFilename: assets.originalFilename,
+    })
+    .from(issueAttachments)
+    .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
+    .innerJoin(
+      issueComments,
+      eq(issueAttachments.issueCommentId, issueComments.id),
+    )
+    .where(
+      and(
+        eq(issueAttachments.companyId, input.companyId),
+        eq(issueAttachments.issueId, input.issueId),
+        eq(issueAttachments.originatingRunId, input.runId),
+        eq(assets.companyId, input.companyId),
+        eq(assets.createdByAgentId, input.agentId),
+        eq(issueComments.companyId, input.companyId),
+        eq(issueComments.issueId, input.issueId),
+        eq(issueComments.createdByRunId, input.runId),
+        eq(issueComments.authorType, "agent"),
+        eq(issueComments.authorAgentId, input.agentId),
+        isNull(issueComments.deletedAt),
+        sql<boolean>`(
+          coalesce(${issueComments.metadata}->>'authorizationReason', '') = 'paperclip_runner_protocol'
+          or left(coalesce(${issueComments.metadata}->>'authorizationReason', ''), 6) = 'allow_'
+        )`,
+      ),
+    )
+    .orderBy(
+      asc(issueComments.createdAt),
+      asc(issueComments.id),
+      asc(issueAttachments.createdAt),
+      asc(issueAttachments.id),
+    );
+  return (rows as SelectedChatPresentationAttachment[]).filter((row) =>
+    isExplicitExternalAgentComment(row.commentMetadata),
+  );
 }
 
 /**
@@ -11653,6 +11713,47 @@ export function issueService(db: Db) {
           "dropping invalid createdByRunId for issue comment insert",
         );
       }
+      const attachmentIds = [...new Set(options?.attachmentIds ?? [])];
+      if (actor.agentId && attachmentIds.length > 0) {
+        if (!createdByRunId) {
+          throw unprocessable(
+            "Agent comment attachments require the current registered run",
+          );
+        }
+        // Routes commonly supply an existing transaction for attachment
+        // comments, so the outer addComment wrapper is not always responsible
+        // for serialization. Lock both stable parents here before selecting or
+        // binding files. Concurrent helper calls for the same run then observe
+        // one another's committed selection count instead of both admitting a
+        // twenty-first attachment.
+        const [lockedIssue] = await dbOrTx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, issue.companyId),
+            ),
+          )
+          .for("update");
+        if (!lockedIssue) throw notFound("Issue not found");
+        const [lockedRun] = await dbOrTx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, createdByRunId),
+              eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, actor.agentId),
+            ),
+          )
+          .for("update");
+        if (!lockedRun) {
+          throw unprocessable(
+            "Agent comment attachments require the current registered run",
+          );
+        }
+      }
       const onBehalfOfUserId = actor.agentId
         ? await resolveCommentResponsibleUserId(
             dbOrTx,
@@ -11708,32 +11809,49 @@ export function issueService(db: Db) {
               CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON &&
             existing.metadata?.authorizationReason !==
               CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON;
-          if (!shouldUpgradeExternalAuthorization) {
+          const shouldBindAttachments =
+            (options?.attachmentIds?.length ?? 0) > 0;
+          const shouldUpgradeAttachmentAuthorization =
+            shouldBindAttachments &&
+            isExplicitExternalAgentComment(metadata) &&
+            !isExplicitExternalAgentComment(existing.metadata);
+          if (
+            !shouldUpgradeExternalAuthorization &&
+            !shouldUpgradeAttachmentAuthorization &&
+            !shouldBindAttachments
+          ) {
             return redactIssueComment(
               existing,
               currentUserRedactionOptions.enabled,
             );
           }
-          comment = await dbOrTx
-            .update(issueComments)
-            .set({
-              // Preserve any structured provenance the provisional comment
-              // carried; the presentation pass only elevates its narrowly
-              // resolved external-publication authorization.
-              metadata: { ...(existing.metadata ?? {}), ...(metadata ?? {}) },
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(issueComments.id, existing.id),
-                eq(issueComments.companyId, issue.companyId),
-              ),
-            )
-            .returning()
-            .then(
-              (rows: Array<typeof issueComments.$inferSelect>) =>
-                rows[0] ?? null,
-            );
+          comment =
+            shouldUpgradeExternalAuthorization ||
+            shouldUpgradeAttachmentAuthorization
+              ? await dbOrTx
+                  .update(issueComments)
+                  .set({
+                    // Preserve any structured provenance the provisional comment
+                    // carried; the presentation pass only elevates its narrowly
+                    // resolved external-publication authorization.
+                    metadata: {
+                      ...(existing.metadata ?? {}),
+                      ...(metadata ?? {}),
+                    },
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(issueComments.id, existing.id),
+                      eq(issueComments.companyId, issue.companyId),
+                    ),
+                  )
+                  .returning()
+                  .then(
+                    (rows: Array<typeof issueComments.$inferSelect>) =>
+                      rows[0] ?? null,
+                  )
+              : existing;
         }
       }
       if (!comment) {
@@ -11759,9 +11877,9 @@ export function issueService(db: Db) {
       }
       if (!comment) throw new Error("Failed to create issue comment");
 
-      const attachmentIds = [...new Set(options?.attachmentIds ?? [])];
       const boundAttachments: Array<{
         id: string;
+        commentId: string;
         originalFilename: string | null;
       }> = [];
       if (attachmentIds.length > 0) {
@@ -11769,6 +11887,7 @@ export function issueService(db: Db) {
           .select({
             id: issueAttachments.id,
             issueCommentId: issueAttachments.issueCommentId,
+            originatingRunId: issueAttachments.originatingRunId,
             createdByAgentId: assets.createdByAgentId,
             originalFilename: assets.originalFilename,
           })
@@ -11785,6 +11904,7 @@ export function issueService(db: Db) {
         type CommentAttachmentRow = {
           id: string;
           issueCommentId: string | null;
+          originatingRunId: string | null;
           createdByAgentId: string | null;
           originalFilename: string | null;
         };
@@ -11803,61 +11923,78 @@ export function issueService(db: Db) {
         if (
           attachmentRows.some(
             (attachment: { issueCommentId: string | null }) =>
-              attachment.issueCommentId !== null,
+              attachment.issueCommentId !== null &&
+              attachment.issueCommentId !== comment.id,
           )
         ) {
           throw conflict(
             "Comment attachments are already bound to another comment",
           );
         }
-        if (actor.agentId) {
-          if (!createdByRunId) {
-            throw unprocessable(
-              "Agent comment attachments require the current registered run",
-            );
-          }
-          const runAttachmentIds = new Set(
-            await dbOrTx
-              .select({ id: issueWorkProducts.externalId })
-              .from(issueWorkProducts)
-              .where(
-                and(
-                  eq(issueWorkProducts.companyId, issue.companyId),
-                  eq(issueWorkProducts.issueId, issueId),
-                  eq(issueWorkProducts.provider, "paperclip"),
-                  eq(issueWorkProducts.createdByRunId, createdByRunId),
-                  inArray(issueWorkProducts.externalId, attachmentIds),
-                ),
-              )
-              .then((rows: Array<{ id: string | null }>) =>
-                rows.flatMap((row) => (row.id ? [row.id] : [])),
-              ),
-          );
+        if (actor.agentId && createdByRunId) {
           if (
             attachmentRows.some(
-              (attachment: { id: string; createdByAgentId: string | null }) =>
+              (attachment: CommentAttachmentRow) =>
                 attachment.createdByAgentId !== actor.agentId ||
-                !runAttachmentIds.has(attachment.id),
+                attachment.originatingRunId !== createdByRunId,
             )
           ) {
             throw unprocessable(
-              "Agent comment attachments must be uploaded by the same agent and run",
+              "Agent comment attachments must originate from the same agent and current run",
+              { code: "issue_attachment_run_origin_mismatch" },
             );
           }
+          const chatBindings = await resolveChatOriginPublicationBindings(
+            dbOrTx,
+            issue.companyId,
+            issueId,
+            createdByRunId,
+          );
+          if (chatBindings.length > 0) {
+            const alreadySelected =
+              await listSelectedChatPresentationAttachments(dbOrTx, {
+                companyId: issue.companyId,
+                issueId,
+                agentId: actor.agentId,
+                runId: createdByRunId,
+              });
+            const selectedIds = new Set(
+              alreadySelected.map((attachment) => attachment.id),
+            );
+            for (const attachmentId of attachmentIds) {
+              selectedIds.add(attachmentId);
+            }
+            if (selectedIds.size > MAX_CHAT_PRESENTATION_ATTACHMENTS) {
+              throw unprocessable(
+                `An agent run can select at most ${MAX_CHAT_PRESENTATION_ATTACHMENTS} attachments for one chat response`,
+                {
+                  code: "chat_attachment_selection_limit_exceeded",
+                  limit: MAX_CHAT_PRESENTATION_ATTACHMENTS,
+                  selectedCount: selectedIds.size,
+                },
+              );
+            }
+          }
         }
-        const attached = await dbOrTx
-          .update(issueAttachments)
-          .set({ issueCommentId: comment.id, updatedAt: new Date() })
-          .where(
-            and(
-              eq(issueAttachments.companyId, issue.companyId),
-              eq(issueAttachments.issueId, issueId),
-              inArray(issueAttachments.id, attachmentIds),
-              isNull(issueAttachments.issueCommentId),
-            ),
-          )
-          .returning({ id: issueAttachments.id });
-        if (attached.length !== attachmentIds.length) {
+        const unboundAttachmentIds = attachmentRows.flatMap(
+          (attachment: CommentAttachmentRow) =>
+            attachment.issueCommentId === null ? [attachment.id] : [],
+        );
+        const attached = unboundAttachmentIds.length
+          ? await dbOrTx
+              .update(issueAttachments)
+              .set({ issueCommentId: comment.id, updatedAt: new Date() })
+              .where(
+                and(
+                  eq(issueAttachments.companyId, issue.companyId),
+                  eq(issueAttachments.issueId, issueId),
+                  inArray(issueAttachments.id, unboundAttachmentIds),
+                  isNull(issueAttachments.issueCommentId),
+                ),
+              )
+              .returning({ id: issueAttachments.id })
+          : [];
+        if (attached.length !== unboundAttachmentIds.length) {
           throw conflict(
             "Comment attachments changed before they could be bound",
           );
@@ -11866,8 +12003,59 @@ export function issueService(db: Db) {
           const attachment = attachmentById.get(attachmentId)!;
           boundAttachments.push({
             id: attachment.id,
+            commentId: comment.id,
             originalFilename: attachment.originalFilename,
           });
+        }
+      }
+
+      // A chat-origin run binds only the files it explicitly selects to an
+      // ordinary agent comment while it is still running. That comment stays
+      // internal until heartbeat chooses the final provider presentation. At
+      // that point, carry those already-authorized same-agent/same-run files
+      // forward without inferring any unbound artifact from the run.
+      if (
+        authorType === "agent" &&
+        actor.agentId &&
+        createdByRunId &&
+        metadata?.authorizationReason ===
+          CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
+      ) {
+        const priorRows = await listSelectedChatPresentationAttachments(
+          dbOrTx,
+          {
+            companyId: issue.companyId,
+            issueId,
+            agentId: actor.agentId,
+            runId: createdByRunId,
+          },
+        );
+        const selectedIds = new Set(
+          boundAttachments.map((attachment) => attachment.id),
+        );
+        for (const attachment of priorRows) {
+          if (
+            selectedIds.has(attachment.id) ||
+            !isExplicitExternalAgentComment(attachment.commentMetadata)
+          ) {
+            continue;
+          }
+          selectedIds.add(attachment.id);
+          boundAttachments.push({
+            id: attachment.id,
+            commentId: attachment.commentId,
+            originalFilename: attachment.originalFilename,
+          });
+        }
+        if (boundAttachments.length > MAX_CHAT_PRESENTATION_ATTACHMENTS) {
+          throw unprocessable(
+            `An agent run can select at most ${MAX_CHAT_PRESENTATION_ATTACHMENTS} attachments for one chat response`,
+            {
+              code: "chat_attachment_selection_limit_exceeded",
+              limit: MAX_CHAT_PRESENTATION_ATTACHMENTS,
+              selectedCount: boundAttachments.length,
+            },
+          );
         }
       }
 
@@ -11940,7 +12128,7 @@ export function issueService(db: Db) {
                 endpointId: binding.endpointId,
                 conversationId: binding.conversationId,
                 issueId,
-                commentId: comment.id,
+                commentId: attachment.commentId,
                 idempotencyKey: `attachment:${attachment.id}:${binding.endpointId}`,
                 payload: projectSafeChatPublication({
                   classification: "external",
@@ -12016,41 +12204,116 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!issue) throw notFound("Issue not found");
 
-      let parentComment: {
-        id: string;
-        companyId: string;
-        issueId: string;
-        authorType: string | null;
-        authorAgentId: string | null;
-        createdByRunId: string | null;
-        metadata: IssueCommentMetadata | null;
-      } | null = null;
-      if (input.issueCommentId) {
-        parentComment = await db
-          .select({
-            id: issueComments.id,
-            companyId: issueComments.companyId,
-            issueId: issueComments.issueId,
-            authorType: issueComments.authorType,
-            authorAgentId: issueComments.authorAgentId,
-            createdByRunId: issueComments.createdByRunId,
-            metadata: issueComments.metadata,
-          })
-          .from(issueComments)
-          .where(eq(issueComments.id, input.issueCommentId))
-          .then((rows) => rows[0] ?? null);
-        if (!parentComment) throw notFound("Issue comment not found");
+      return db.transaction(async (tx) => {
+        if (input.createdByAgentId && input.issueCommentId) {
+          const [lockedIssue] = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.id, issue.id),
+                eq(issues.companyId, issue.companyId),
+              ),
+            )
+            .for("update");
+          if (!lockedIssue) throw notFound("Issue not found");
+        }
+        const registeredRun =
+          input.createdByRunId && isUuidLike(input.createdByRunId)
+            ? await tx
+                .select({
+                  id: heartbeatRuns.id,
+                  status: heartbeatRuns.status,
+                })
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(heartbeatRuns.id, input.createdByRunId),
+                    eq(heartbeatRuns.companyId, issue.companyId),
+                    ...(input.createdByAgentId
+                      ? [eq(heartbeatRuns.agentId, input.createdByAgentId)]
+                      : []),
+                  ),
+                )
+                .for("update")
+                .then((rows) => rows[0] ?? null)
+            : null;
+        const registeredRunId = registeredRun?.id ?? null;
+        const parentComment = input.issueCommentId
+          ? await tx
+              .select({
+                id: issueComments.id,
+                companyId: issueComments.companyId,
+                issueId: issueComments.issueId,
+                authorType: issueComments.authorType,
+                authorAgentId: issueComments.authorAgentId,
+                createdByRunId: issueComments.createdByRunId,
+                metadata: issueComments.metadata,
+              })
+              .from(issueComments)
+              .where(
+                and(
+                  eq(issueComments.id, input.issueCommentId),
+                  isNull(issueComments.deletedAt),
+                ),
+              )
+              .for("update")
+              .then((rows) => rows[0] ?? null)
+          : null;
+        if (input.issueCommentId && !parentComment) {
+          throw notFound("Issue comment not found");
+        }
         if (
-          parentComment.companyId !== issue.companyId ||
-          parentComment.issueId !== issue.id
+          parentComment &&
+          (parentComment.companyId !== issue.companyId ||
+            parentComment.issueId !== issue.id)
         ) {
           throw unprocessable(
             "Attachment comment must belong to same issue and company",
           );
         }
-      }
-
-      return db.transaction(async (tx) => {
+        if (input.createdByAgentId && parentComment) {
+          if (
+            !registeredRunId ||
+            parentComment.authorType !== "agent" ||
+            parentComment.authorAgentId !== input.createdByAgentId ||
+            parentComment.createdByRunId !== registeredRunId
+          ) {
+            throw unprocessable(
+              "Agent attachment comments must belong to the same agent and current run",
+              { code: "issue_attachment_parent_run_mismatch" },
+            );
+          }
+          const chatBindings = isExplicitExternalAgentComment(
+            parentComment.metadata,
+          )
+            ? await resolveChatOriginPublicationBindings(
+                tx,
+                issue.companyId,
+                issue.id,
+                registeredRunId,
+              )
+            : [];
+          if (chatBindings.length > 0) {
+            const alreadySelected =
+              await listSelectedChatPresentationAttachments(tx, {
+                companyId: issue.companyId,
+                issueId: issue.id,
+                agentId: input.createdByAgentId,
+                runId: registeredRunId,
+              });
+            if (alreadySelected.length >= MAX_CHAT_PRESENTATION_ATTACHMENTS) {
+              throw unprocessable(
+                `An agent run can select at most ${MAX_CHAT_PRESENTATION_ATTACHMENTS} attachments for one chat response`,
+                {
+                  code: "chat_attachment_selection_limit_exceeded",
+                  limit: MAX_CHAT_PRESENTATION_ATTACHMENTS,
+                  selectedCount: alreadySelected.length + 1,
+                },
+              );
+            }
+          }
+        }
         const [asset] = await tx
           .insert(assets)
           .values({
@@ -12073,25 +12336,9 @@ export function issueService(db: Db) {
             issueId: issue.id,
             assetId: asset.id,
             issueCommentId: input.issueCommentId ?? null,
+            originatingRunId: registeredRunId,
           })
           .returning();
-
-        const registeredRunId =
-          input.createdByRunId && isUuidLike(input.createdByRunId)
-            ? await tx
-                .select({ id: heartbeatRuns.id })
-                .from(heartbeatRuns)
-                .where(
-                  and(
-                    eq(heartbeatRuns.id, input.createdByRunId),
-                    eq(heartbeatRuns.companyId, issue.companyId),
-                    ...(input.createdByAgentId
-                      ? [eq(heartbeatRuns.agentId, input.createdByAgentId)]
-                      : []),
-                  ),
-                )
-                .then((rows) => rows[0]?.id ?? null)
-            : null;
         const contentPath = `/api/attachments/${attachment.id}/content`;
         const [artifactWorkProduct] = registeredRunId
           ? await tx
@@ -12127,7 +12374,8 @@ export function issueService(db: Db) {
           parentComment?.authorType === "agent" &&
           parentComment.authorAgentId === input.createdByAgentId &&
           parentComment.createdByRunId === registeredRunId &&
-          isExplicitExternalAgentComment(parentComment.metadata)
+          parentComment.metadata?.authorizationReason ===
+            CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
         ) {
           const bindings = await resolveChatOriginPublicationBindings(
             tx,
@@ -12162,6 +12410,7 @@ export function issueService(db: Db) {
           companyId: attachment.companyId,
           issueId: attachment.issueId,
           issueCommentId: attachment.issueCommentId,
+          originatingRunId: attachment.originatingRunId,
           assetId: attachment.assetId,
           provider: asset.provider,
           objectKey: asset.objectKey,
@@ -12185,6 +12434,7 @@ export function issueService(db: Db) {
           companyId: issueAttachments.companyId,
           issueId: issueAttachments.issueId,
           issueCommentId: issueAttachments.issueCommentId,
+          originatingRunId: issueAttachments.originatingRunId,
           assetId: issueAttachments.assetId,
           provider: assets.provider,
           objectKey: assets.objectKey,
@@ -12209,6 +12459,7 @@ export function issueService(db: Db) {
           companyId: issueAttachments.companyId,
           issueId: issueAttachments.issueId,
           issueCommentId: issueAttachments.issueCommentId,
+          originatingRunId: issueAttachments.originatingRunId,
           assetId: issueAttachments.assetId,
           provider: assets.provider,
           objectKey: assets.objectKey,
@@ -12234,6 +12485,7 @@ export function issueService(db: Db) {
             companyId: issueAttachments.companyId,
             issueId: issueAttachments.issueId,
             issueCommentId: issueAttachments.issueCommentId,
+            originatingRunId: issueAttachments.originatingRunId,
             assetId: issueAttachments.assetId,
             provider: assets.provider,
             objectKey: assets.objectKey,

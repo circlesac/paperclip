@@ -160,6 +160,10 @@ describe("GitHub published adapter stress contract", () => {
     });
     await runtime.initialize();
 
+    const uploadedImageUrl =
+      "https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555";
+    const uploadedTextUrl =
+      "https://github.com/user-attachments/files/31917991/media-qa-0907.txt";
     const cases = [
       {
         event: "issue_comment" as const,
@@ -181,7 +185,7 @@ describe("GitHub published adapter stress contract", () => {
       {
         event: "pull_request_review_comment" as const,
         payload: commentPayload({
-          body: "@maya-paperclip inline root",
+          body: `@maya-paperclip inline root\n\n<img width="1254" height="1254" alt="Image" src="${uploadedImageUrl}" />\n\n[media-qa-0907.txt](${uploadedTextUrl})`,
           commentId: 4401,
           number: 43,
           pullRequest: true,
@@ -195,18 +199,43 @@ describe("GitHub published adapter stress contract", () => {
       );
       expect(response.status).toBe(200);
     }
-    const followup = commentPayload({
-      body: "unmentioned issue follow-up",
-      commentId: 4202,
-      number: 42,
-    });
-    expect(
-      (
-        await runtime.handleWebhook(
-          signedGitHubRequest("issue_comment", followup),
-        )
-      ).status,
-    ).toBe(200);
+    for (const followup of [
+      {
+        event: "issue_comment" as const,
+        payload: commentPayload({
+          body: "unmentioned issue follow-up",
+          commentId: 4202,
+          number: 42,
+        }),
+      },
+      {
+        event: "issue_comment" as const,
+        payload: commentPayload({
+          body: "unmentioned PR follow-up",
+          commentId: 4302,
+          number: 43,
+          pullRequest: true,
+        }),
+      },
+      {
+        event: "pull_request_review_comment" as const,
+        payload: commentPayload({
+          body: "unmentioned inline review follow-up",
+          commentId: 4402,
+          number: 43,
+          pullRequest: true,
+          reviewRootId: 4401,
+        }),
+      },
+    ]) {
+      expect(
+        (
+          await runtime.handleWebhook(
+            signedGitHubRequest(followup.event, followup.payload),
+          )
+        ).status,
+      ).toBe(200);
+    }
     const selfEvent = commentPayload({
       body: "@maya-paperclip outbound self event",
       commentId: 4203,
@@ -248,12 +277,113 @@ describe("GitHub published adapter stress contract", () => {
         threadId: "github:paperclipai/chat-e2e:issue:42",
         trigger: "subscribed_message",
       },
+      {
+        id: "4302",
+        threadId: "github:paperclipai/chat-e2e:43",
+        trigger: "subscribed_message",
+      },
+      {
+        id: "4402",
+        threadId: "github:paperclipai/chat-e2e:43:rc:4401",
+        trigger: "subscribed_message",
+      },
     ]);
-    expect(providerRequests).toHaveLength(4);
+    expect(deliveries[2]?.message.text).toContain(uploadedImageUrl);
+    expect(deliveries[2]?.message.text).toContain(uploadedTextUrl);
+    expect(deliveries[2]?.message.attachments).toEqual([]);
+    expect(providerRequests).toHaveLength(6);
     expect(providerRequests.every((url) => url.includes("/reactions"))).toBe(
       true,
     );
     await runtime.shutdown();
+  });
+
+  it("posts and edits inline output through the review-thread API boundary", async () => {
+    const providerRequests: Array<{ method: string; url: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        const method =
+          input instanceof Request ? input.method : (init?.method ?? "GET");
+        providerRequests.push({ method, url });
+        if (
+          method === "POST" &&
+          url.endsWith(
+            "/repos/paperclipai/chat-e2e/pulls/43/comments/4401/replies",
+          )
+        ) {
+          return Response.json(
+            {
+              id: 9901,
+              body: "inline result",
+              created_at: "2026-09-05T12:01:00Z",
+              updated_at: "2026-09-05T12:01:00Z",
+              user: {
+                id: 9001,
+                login: "maya-paperclip[bot]",
+                type: "Bot",
+              },
+            },
+            { status: 201 },
+          );
+        }
+        if (
+          method === "PATCH" &&
+          url.endsWith("/repos/paperclipai/chat-e2e/pulls/comments/9901")
+        ) {
+          return Response.json({
+            id: 9901,
+            body: "final inline result",
+            created_at: "2026-09-05T12:01:00Z",
+            updated_at: "2026-09-05T12:02:00Z",
+            user: {
+              id: 9001,
+              login: "maya-paperclip[bot]",
+              type: "Bot",
+            },
+          });
+        }
+        throw new Error(`Unexpected GitHub provider request: ${method} ${url}`);
+      }),
+    );
+    const runtime = createChatSdkEndpointRuntime({
+      callbacks: { onMessage() {} },
+      companyId: "company-github-inline-egress",
+      endpointId: "endpoint-github-inline-egress",
+      logger: "silent",
+      persistence: memoryPersistence(),
+      providerConfig: {
+        provider: "github",
+        userName: "maya-paperclip",
+        credentials: {
+          botUserId: 9001,
+          token: "github-token-never-logged",
+          webhookSecret,
+        },
+      },
+    });
+
+    try {
+      const sent = await runtime
+        .thread("github:paperclipai/chat-e2e:43:rc:4401")
+        .post({ markdown: "inline result" });
+      expect(sent.id).toBe("9901");
+      const edited = await sent.edit({ markdown: "final inline result" });
+      expect(edited.id).toBe("9901");
+      expect(providerRequests).toEqual([
+        {
+          method: "POST",
+          url: "https://api.github.com/repos/paperclipai/chat-e2e/pulls/43/comments/4401/replies",
+        },
+        {
+          method: "PATCH",
+          url: "https://api.github.com/repos/paperclipai/chat-e2e/pulls/comments/9901",
+        },
+      ]);
+    } finally {
+      await runtime.shutdown();
+    }
   });
 
   it("keeps stable identities across reordered and exactly duplicated raw deliveries", async () => {

@@ -217,6 +217,51 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     );
   });
 
+  it("explains GitHub's link-only file boundary before publication", async () => {
+    mockChatEndpointsApi.getIssueBinding.mockResolvedValue({
+      endpointId: "endpoint-github",
+      provider: "github",
+      botLabel: "Maya",
+      externalLabel: "paperclipai/paperclip#42",
+      externalUrl: "https://github.com/paperclipai/paperclip/issues/42",
+      conversationId: "conversation-github",
+      publicationState: null,
+      assignedAgentLocked: true,
+    });
+    const attachment = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      issueId: "issue-1",
+      issueCommentId: null,
+      assetId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      provider: "local_disk",
+      objectKey: "issues/issue-1/result.txt",
+      contentType: "text/plain",
+      byteSize: 12,
+      sha256: "a".repeat(64),
+      originalFilename: "result.txt",
+      createdByAgentId: "agent-1",
+      createdByUserId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      contentPath:
+        "/api/attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/content",
+    } satisfies IssueAttachment;
+
+    await renderBanner([attachment]);
+    await act(() => findButton(container, "Send to channel").click());
+
+    expect(container.textContent).toContain(
+      "GitHub Apps cannot upload file bytes in comments.",
+    );
+    expect(container.textContent).toContain(
+      "GitHub receives an authenticated task link when this Board has a public URL, or a private-task notice otherwise.",
+    );
+    expect(container.textContent).not.toContain(
+      "Only checked files will be published to the external conversation.",
+    );
+  });
+
   it.each([
     ["pending", "Queued for channel"],
     ["streaming", "Publishing to channel"],

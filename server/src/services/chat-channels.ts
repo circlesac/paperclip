@@ -650,6 +650,122 @@ function credentialFingerprint(refs: ToolCredentialSecretRef[]): string {
     );
   return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
 }
+
+const ATTACHMENT_FAILURE_NOTICE_PREFIX = "attachment-failure-notice:";
+
+function attachmentFailureNoticeFence(
+  idempotencyKey: string,
+): LifecycleRuntimeFence | null {
+  const match =
+    /^attachment-failure-notice:[0-9a-f-]{36}:(\d+):([0-9a-f]{64})$/i.exec(
+      idempotencyKey,
+    );
+  if (!match) return null;
+  const generation = Number(match[1]);
+  if (!Number.isSafeInteger(generation) || generation < 0) return null;
+  return { generation, credentialFingerprint: match[2]!.toLowerCase() };
+}
+
+function definiteAttachmentProviderRejection(error: unknown): boolean {
+  const pending: Array<{ depth: number; value: unknown }> = [
+    { depth: 0, value: error },
+  ];
+  const seen = new Set<object>();
+  const statuses: number[] = [];
+  const names: string[] = [];
+  const codes: string[] = [];
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (
+      !current ||
+      current.depth > 4 ||
+      !current.value ||
+      typeof current.value !== "object" ||
+      seen.has(current.value)
+    ) {
+      continue;
+    }
+    seen.add(current.value);
+    const record = current.value as {
+      cause?: unknown;
+      code?: unknown;
+      details?: { code?: unknown; providerStatus?: unknown };
+      innerHttpError?: { statusCode?: unknown };
+      name?: unknown;
+      original?: unknown;
+      originalError?: unknown;
+      response?: { status?: unknown };
+      status?: unknown;
+      statusCode?: unknown;
+    };
+    for (const status of [
+      record.status,
+      record.statusCode,
+      record.response?.status,
+      record.details?.providerStatus,
+      record.innerHttpError?.statusCode,
+    ]) {
+      if (typeof status === "number" && Number.isInteger(status)) {
+        statuses.push(status);
+      }
+    }
+    if (typeof record.name === "string") names.push(record.name);
+    for (const code of [record.code, record.details?.code]) {
+      if (typeof code === "string") codes.push(code);
+    }
+    for (const nested of [
+      record.cause,
+      record.original,
+      record.originalError,
+    ]) {
+      pending.push({ depth: current.depth + 1, value: nested });
+    }
+  }
+  if (
+    names.some((name) =>
+      ["ValidationError", "NotImplementedError"].includes(name),
+    ) ||
+    codes.some((code) =>
+      [
+        "CHAT_ADAPTER_COMPATIBILITY_ERROR",
+        "CHAT_PROVIDER_PRETRANSPORT_REJECTED",
+        "NOT_IMPLEMENTED",
+        "VALIDATION_ERROR",
+      ].includes(code),
+    )
+  ) {
+    return false;
+  }
+  // Slack's Web API can reject a file operation with `ok: false` in an HTTP
+  // 200 response. The SDK's structured platform-error code is still a
+  // definitive provider rejection; the main disposition classifier has
+  // already excluded auth, destination, and rate-limit outcomes.
+  if (codes.includes("slack_webapi_platform_error")) return true;
+  return statuses.some(
+    (status) =>
+      status >= 400 &&
+      status < 500 &&
+      ![401, 403, 404, 410, 429].includes(status),
+  );
+}
+
+function attachmentFailureKind(
+  payload: SafeChatPublicationPayload,
+):
+  | { kind: "generated_response"; provider: "discord" | "telegram" }
+  | { kind: "selected_file"; provider: null }
+  | null {
+  if (payload.transportPart?.mode === "discord_markdown_attachment") {
+    return { kind: "generated_response", provider: "discord" };
+  }
+  if (payload.transportPart?.mode === "telegram_markdown_attachment") {
+    return { kind: "generated_response", provider: "telegram" };
+  }
+  if (payload.attachmentIds?.length) {
+    return { kind: "selected_file", provider: null };
+  }
+  return null;
+}
 type ConversationRow = typeof chatConversations.$inferSelect;
 type DeliveryRow = typeof chatDeliveries.$inferSelect;
 type LiveInboundMessage = {
@@ -1551,6 +1667,18 @@ function absoluteBaseUrl(value: string | null | undefined): string | null {
   }
 }
 
+const TELEGRAM_WEBHOOK_PORTS = new Set(["", "80", "88", "443", "8443"]);
+
+function isSupportedTelegramWebhookBaseUrl(value: string | null): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && TELEGRAM_WEBHOOK_PORTS.has(url.port);
+  } catch {
+    return false;
+  }
+}
+
 type GitHubLifecycleEvent = {
   actor?: LifecycleActor;
   eventKind: "message_updated" | "message_deleted";
@@ -2005,7 +2133,12 @@ function githubRepositoryInventoryItemFromPayload(
 function providerSetupState(
   endpoint: Pick<
     EndpointRow,
-    "provider" | "providerAccountId" | "publicId" | "status" | "setup"
+    | "provider"
+    | "providerAccountId"
+    | "publicId"
+    | "status"
+    | "setup"
+    | "botUsername"
   >,
   publicBaseUrl: string | null,
   assignedAgentName?: string | null,
@@ -2085,7 +2218,9 @@ function providerSetupState(
     case "telegram":
       return {
         step,
-        providerUrl: "https://t.me/BotFather",
+        providerUrl: endpoint.botUsername
+          ? `https://t.me/${encodeURIComponent(endpoint.botUsername)}`
+          : "https://t.me/BotFather",
         webhookUrl,
       } as const;
   }
@@ -7053,6 +7188,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         `A public HTTPS Paperclip URL is required before connecting ${PROVIDER_LABELS[endpoint.provider]}`,
       );
     }
+    if (
+      endpoint.provider === "telegram" &&
+      (input.action === "configure" || input.action === "reconnect") &&
+      !isSupportedTelegramWebhookBaseUrl(webhookPublicBaseUrl)
+    ) {
+      throw unprocessable(
+        "Telegram webhooks require PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL to use HTTPS on port 443, 80, 88, or 8443",
+        {
+          code: "chat_telegram_webhook_url_unsupported",
+          provider: "telegram",
+          supportedPorts: [443, 80, 88, 8443],
+        },
+      );
+    }
     if (input.action === "verify") {
       if (
         endpoint.provider !== "slack" ||
@@ -7505,6 +7654,48 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             payload: chatPublications.payload,
           })
           .from(chatPublications)
+          .innerJoin(
+            issueComments,
+            and(
+              eq(issueComments.id, chatPublications.commentId),
+              eq(issueComments.companyId, chatPublications.companyId),
+              eq(issueComments.issueId, chatPublications.issueId),
+              eq(issueComments.authorType, "agent"),
+              eq(issueComments.authorAgentId, endpoint.assignedAgentId),
+            ),
+          )
+          .innerJoin(
+            chatMessageLinks,
+            and(
+              eq(chatMessageLinks.companyId, chatPublications.companyId),
+              eq(chatMessageLinks.endpointId, chatPublications.endpointId),
+              eq(
+                chatMessageLinks.conversationId,
+                chatPublications.conversationId,
+              ),
+              eq(chatMessageLinks.deliveryId, qualifyingDelivery.id),
+              eq(chatMessageLinks.direction, "inbound"),
+              isNotNull(chatMessageLinks.commentId),
+            ),
+          )
+          .innerJoin(
+            heartbeatRuns,
+            and(
+              eq(heartbeatRuns.id, issueComments.createdByRunId),
+              eq(heartbeatRuns.companyId, chatPublications.companyId),
+              eq(heartbeatRuns.agentId, endpoint.assignedAgentId),
+              eq(heartbeatRuns.status, "succeeded"),
+              eq(
+                sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+                sql<string>`${chatPublications.issueId}::text`,
+              ),
+              or(
+                sql`${chatMessageLinks.commentId}::text = ${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
+                sql`${chatMessageLinks.commentId}::text = ${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
+                sql`coalesce(${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds', '[]'::jsonb) ? ${chatMessageLinks.commentId}::text`,
+              ),
+            ),
+          )
           .where(
             and(
               eq(chatPublications.companyId, endpoint.companyId),
@@ -7522,9 +7713,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             rows.find(
               (row) =>
                 row.payload.interactionId === undefined &&
-                ((row.payload.progressState === undefined &&
-                  row.commentId !== null) ||
-                  row.payload.progressState === "failed"),
+                row.payload.progressState === undefined &&
+                row.commentId !== null,
             ),
           );
         if (!finalPublication) {
@@ -21065,11 +21255,37 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           options.publicBaseUrl,
           input.publication.issueId,
         );
-        text = `${text}\n\n${
-          taskUrl
+        if (
+          input.endpoint.provider === "github" ||
+          input.endpoint.provider === "microsoft-teams"
+        ) {
+          // These providers have no safe binary-upload contract in Paperclip's
+          // durable adapter path. Replace only our generated `Shared ….` file
+          // caption; preserve any future custom text before the limitation.
+          const generatedFileLabel = /^Shared (.+)\.$/s.exec(text)?.[1] ?? null;
+          const limitation =
+            input.endpoint.provider === "github"
+              ? "This GitHub App connection cannot upload file bytes into comments."
+              : "This Microsoft Teams connection cannot upload file bytes into chats.";
+          if (generatedFileLabel) {
+            const saved = taskUrl
+              ? `File saved on the Paperclip task: ${generatedFileLabel}.`
+              : `File saved on the private Paperclip task: ${generatedFileLabel}.`;
+            text = taskUrl
+              ? `${saved} ${limitation} Download it: ${taskUrl}`
+              : `${saved} ${limitation}`;
+          } else {
+            const handoff = taskUrl
+              ? `Open the file on its Paperclip task: ${taskUrl}`
+              : "The file remains available only on the private Paperclip task.";
+            text = `${text}\n\n${limitation} ${handoff}`;
+          }
+        } else {
+          const attachmentFallback = taskUrl
             ? `Open the task in Paperclip: ${taskUrl}`
-            : "Open the task in Paperclip to download the attachment."
-        }`;
+            : "Open the task in Paperclip to download the attachment.";
+          text = `${text}\n\n${attachmentFallback}`;
+        }
       }
     }
     if (
@@ -21214,6 +21430,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         .for("update")
         .then((rows) => rows[0] ?? null);
       if (!currentPublication) return null;
+      const attachmentFailureFence = attachmentFailureNoticeFence(
+        input.publication.idempotencyKey,
+      );
+      if (
+        attachmentFailureFence &&
+        (attachmentFailureFence.generation !== input.runtimeContext.generation ||
+          attachmentFailureFence.credentialFingerprint !==
+            input.runtimeContext.credentialFingerprint)
+      ) {
+        return null;
+      }
       const endpoint = await runtimeCallbackEndpoint(
         tx,
         input.publication.endpointId,
@@ -21254,6 +21481,28 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               .for("update")
               .then((rows) => rows[0] ?? null)
           : null;
+      const attachmentFailureNoticeSuperseded =
+        attachmentFailureFence && conversation
+          ? await tx
+              .select({ id: chatConversations.id })
+              .from(chatConversations)
+              .where(
+                and(
+                  eq(chatConversations.companyId, conversation.companyId),
+                  eq(chatConversations.endpointId, conversation.endpointId),
+                  eq(
+                    chatConversations.externalThreadId,
+                    conversation.externalThreadId,
+                  ),
+                  gt(
+                    chatConversations.sessionGeneration,
+                    conversation.sessionGeneration,
+                  ),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows.length > 0)
+          : false;
       const isTaskControl =
         input.publication.idempotencyKey.startsWith("control:");
       const providerVisibleCompletion =
@@ -21290,6 +21539,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       if (
         !endpoint ||
         !conversation ||
+        (attachmentFailureFence &&
+          ((conversation.state !== "active" &&
+            conversation.state !== "waiting") ||
+            attachmentFailureNoticeSuperseded)) ||
         providerVisibleCompletion ||
         (isTaskControl && !authorizationAction?.principalId) ||
         !destinationAllowed
@@ -21932,6 +22185,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       disposition.kind === "retry" &&
       disposition.providerRateLimit !== true &&
       attempts >= 5;
+    const attachmentFailure = attachmentFailureKind(publication.payload);
+    const attachmentFailureRuntimeContext =
+      !providerAccepted &&
+      disposition.kind === "failed" &&
+      runtimeContext &&
+      attachmentFailure &&
+      definiteAttachmentProviderRejection(error)
+        ? runtimeContext
+        : null;
     let invalidateCurrentRuntime = false;
     const finalized = await db.transaction(async (tx) => {
       await credentialLease?.assertOwned(tx);
@@ -22065,6 +22327,66 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         }
       }
 
+      if (attachmentFailureRuntimeContext && attachmentFailure) {
+        const noticeEndpoint = await runtimeCallbackEndpoint(
+          tx,
+          publication.endpointId,
+          attachmentFailureRuntimeContext,
+          ["verifying", "active"],
+        );
+        const noticeConversation = noticeEndpoint
+          ? await tx
+              .select({
+                id: chatConversations.id,
+                state: chatConversations.state,
+              })
+              .from(chatConversations)
+              .where(
+                and(
+                  eq(chatConversations.companyId, publication.companyId),
+                  eq(chatConversations.endpointId, publication.endpointId),
+                  eq(chatConversations.id, publication.conversationId),
+                  inArray(chatConversations.state, ["active", "waiting"]),
+                ),
+              )
+              .for("no key update")
+              .then((rows) => rows[0] ?? null)
+          : null;
+        const providerCanSendTextNotice =
+          noticeEndpoint &&
+          ["slack", "discord", "telegram"].includes(noticeEndpoint.provider) &&
+          (attachmentFailure.provider === null ||
+            noticeEndpoint.provider === attachmentFailure.provider);
+        if (providerCanSendTextNotice && noticeConversation) {
+          const taskUrl = safeChatTaskUrl(
+            options.publicBaseUrl,
+            publication.issueId,
+          );
+          const noticeText =
+            attachmentFailure.kind === "generated_response"
+              ? "Paperclip could not send the response attachment. The complete response remains on its Paperclip task for an operator to retry."
+              : "Paperclip could not send an attachment. The file remains on its Paperclip task for an operator to retry.";
+          const idempotencyKey = `${ATTACHMENT_FAILURE_NOTICE_PREFIX}${publication.id}:${attachmentFailureRuntimeContext.generation}:${attachmentFailureRuntimeContext.credentialFingerprint}`;
+          await tx
+            .insert(chatPublications)
+            .values({
+              companyId: publication.companyId,
+              endpointId: publication.endpointId,
+              conversationId: publication.conversationId,
+              issueId: publication.issueId,
+              commentId: null,
+              idempotencyKey,
+              payload: projectSafeChatPublication({
+                classification: "external",
+                source: "safe_milestone",
+                text: taskUrl ? `${noticeText} Open task: ${taskUrl}` : noticeText,
+              }),
+              state: "pending",
+            })
+            .onConflictDoNothing();
+        }
+      }
+
       await credentialLease?.assertOwned(tx);
       return true;
     });
@@ -22172,7 +22494,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
         const handoffPayload: SafeChatPublicationPayload = {
           ...currentPayload,
-          text: "Paperclip’s complete response is attached in the next message.",
+          text: "Paperclip is preparing the complete response as an attachment.",
           transportPart: transportPart(0, 2, "inline"),
         };
         delete handoffPayload.attachmentIds;
@@ -22269,7 +22591,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
         const handoffPayload: SafeChatPublicationPayload = {
           ...currentPayload,
-          text: "Paperclip’s complete response is attached in the next message.",
+          text: "Paperclip is preparing the complete response as an attachment.",
           transportPart: transportPart(0, 2, "inline"),
         };
         delete handoffPayload.attachmentIds;

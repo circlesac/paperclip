@@ -260,6 +260,17 @@ and process-start evidence proves the prior controller is gone, or when the
 lease expires. Recovery generation changes do not increment the independent
 provider-attempt counter.
 
+## Attachment upload provenance
+
+`issue_attachments.originating_run_id` records server-derived run attribution at
+upload time. It is not writable through attachment or work-product update APIs.
+Legacy attachments and uploads without a registered run keep a null value; the
+migration deliberately does not infer attribution from mutable work products.
+Deleting the originating run clears the reference and fails closed for automatic
+chat handoff. An agent's external file selection must match the attachment's
+company, task, agent, and originating run. Editing or recreating a work-product
+record cannot reassign that authority to a later run.
+
 ## Question-response delivery receipts
 
 `issue_question_response_deliveries` is the retry-safe, content-free outbox for

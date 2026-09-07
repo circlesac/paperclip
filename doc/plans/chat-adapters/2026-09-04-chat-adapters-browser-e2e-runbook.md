@@ -589,7 +589,7 @@ Run C3, C5, and C6, then verify specifically:
 
 - DM, channel, and group output use bounded post/edit behavior; the current durable webhook pipeline advertises no native Teams streaming;
 - `FORM` uses an Adaptive Card and task module where supported, with server-side reauthorization on submit;
-- file references are not ingested without a separate Microsoft Graph connection, and outbound files use a safe authenticated Paperclip-link fallback on every Teams surface;
+- personal-chat Bot Framework file-download attachments are ingested only when the adapter supplies a scoped bot or anonymous download contract and the file passes Paperclip's allowed-content policy and configured size ceiling (10 MB by default); channel and group-chat files remain provider references without a separate Microsoft Graph grant; outbound files use a safe authenticated Paperclip-link fallback on every Teams surface because this connector has no production-safe native upload contract;
 - denials use targeted activity when supported, otherwise DM or concise text plus a Paperclip link;
 - tenant ID plus Entra object ID, not display name/email, determines identity;
 - edit a source message, soft-delete it, restore it, then edit it again; verify

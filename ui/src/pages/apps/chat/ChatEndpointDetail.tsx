@@ -180,6 +180,9 @@ export function ChatEndpointDetail() {
         </Button>
       </div>
     );
+  const setupIncomplete =
+    endpoint.setup?.step !== "complete" &&
+    ["draft", "verifying", "attention", "revoked"].includes(endpoint.status);
 
   return (
     <div className="max-w-5xl space-y-6 pb-12">
@@ -192,7 +195,21 @@ export function ChatEndpointDetail() {
             {endpoint.providerAccountLabel ?? "Chat connection"}
           </p>
         </div>
-        <StatusBadge status={endpoint.status} />
+        <div className="flex items-center gap-2">
+          {setupIncomplete ? (
+            <Button
+              variant="outline"
+              onClick={() =>
+                navigate(
+                  `/apps/chat/connect?provider=${endpoint.provider}&purpose=chat&resume=${endpoint.id}`,
+                )
+              }
+            >
+              Continue setup
+            </Button>
+          ) : null}
+          <StatusBadge status={endpoint.status} />
+        </div>
       </header>
       <Tabs
         value={activeTab}
@@ -482,7 +499,7 @@ function Access({
       </div>
       <SettingToggle
         label="Allow unlinked people"
-        detail="They may converse and attach safe files, but cannot approve, hire, spend, manage access, or reassign agents."
+        detail="They are restricted guests. Their tasks run only with an isolated workspace and sandbox environment; otherwise Paperclip safely refuses the request. They cannot approve, hire, spend, manage access, or reassign agents."
         checked={allowUnlinked}
         pending={updatePolicy.isPending}
         onChange={(value) => updatePolicy.mutate(value)}
@@ -854,7 +871,7 @@ function Activity({
                 disabled={lifecycle.isPending}
                 onClick={() =>
                   navigate(
-                    `/apps/chat/connect?provider=${endpoint.provider}&purpose=chat&resume=${endpoint.id}&reconnect=1`,
+                    `/apps/chat/connect?provider=${endpoint.provider}&purpose=chat&resume=${endpoint.id}${status === "draft" || status === "verifying" ? "" : "&reconnect=1"}`,
                   )
                 }
               >

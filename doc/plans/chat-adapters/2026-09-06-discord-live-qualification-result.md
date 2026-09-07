@@ -1,6 +1,9 @@
 # Discord live qualification result — 2026-09-06
 
-> **Status: core Discord transport has live proof, but the full DC1–DC7 matrix remains unqualified.** Paperclip has verified the dedicated bot identity, Message Content intent, Clawd membership, and a permission-complete text channel against Discord. A linked root created one native thread and one Paperclip task; an unmentioned follow-up in that thread produced the requested exact agent reply and cleared the working receipt. This proves the primary mention→thread→task→reply path, not queued bursts, negative channel reach, reconnect/restart, or the rest of the release matrix. The same live session exposed an unsolicited generic recovery run after the successful reply, which remains a release blocker until repaired and retested.
+For the reported missing-image failure and its successful September 7 retake,
+see [media qualification](2026-09-07-media-live-qualification.md).
+
+> **Status: core Discord transport, ordered follow-up bursts, receipt cleanup, and keep-open idle recovery have live proof, but the full DC1–DC7 matrix remains unqualified.** Paperclip has verified the dedicated bot identity, Message Content intent, Clawd membership, and a permission-complete text channel against Discord. The later clean-source checkpoint supersedes the intermediate unsolicited-recovery blocker.
 
 ## Resumed live setup — 2026-09-07 UTC
 
@@ -97,6 +100,29 @@ was present in the 13:58 UTC check, but `CHA-4` had been marked done by then;
 that observation does not independently prove the new in-progress recovery
 guard.
 
+### Clean keep-open recovery qualification — 2026-09-07, 13:59 UTC
+
+This checkpoint supersedes the pending keep-open retest and the earlier
+unsolicited-recovery blocker. On clean source revision `5bd9c0d55`, an
+unmentioned follow-up in native thread `1546513811672932372` left CHA-4
+deliberately `in_progress` and requested exactly `DISCORD-IDLE-WAIT-OK`. Run
+`f8c9dbe2-7e94-469d-8345-717eb7dad1bf` ran from `13:59:31.087Z` through
+`13:59:38.234Z` and succeeded. Discord
+[reply 1546520298793468036](https://discord.com/channels/1457808928258658549/1546513811672932372/1546520298793468036)
+contained exactly that marker.
+
+CHA-4 remained `in_progress` with its conversation active for more than eight
+minutes after the terminal reply, with no additional run. This proves the
+repaired idle-chat boundary live: an open conversation waits for new provider
+input instead of being reclassified as stranded work.
+
+After the latest setup-edge changes, the full chat integration suite passed
+**258/258** and the combined process-recovery/status-payload suite passed
+**135/135**, both with zero skips. The deterministic browser suite had passed
+**5/5** on clean revision `5bd9c0d55`, but has not yet been rerun after the
+latest setup-edge/UI changes; the current working tree is therefore not being
+claimed browser-green here.
+
 ## Historical live-attempt checkpoint — superseded above
 
 The authorized provider target is the `Clawd` Discord server, numeric ID `1457808928258658549`, using the user's Eigenjoy account. The latest in-app-browser attempt reached Discord's login/QR flow in both the Developer Portal and server tabs. It did not reach application creation or expose a bot token. Login completion is therefore the current external gate.
@@ -175,7 +201,8 @@ restart, file, action, negative-reach, token-rotation, and cleanup cases.
 Provider credential validation, Message Content intent, Clawd membership,
 `#general` enablement, root-thread creation, a linked unmentioned follow-up,
 exact final presentation, and working-receipt removal now have live proof. The
-unsolicited post-completion recovery run is the immediate current blocker.
+unsolicited post-completion recovery run was repaired, and the clean keep-open
+checkpoint above proves the fix against the real provider.
 The live three-message burst now proves ordered persistence, deferred coalescing,
 two causal runs, combined final presentation, and cleanup of every causal
 receipt, with the observed 82.6-second and 50.1-second turn latency recorded
@@ -183,6 +210,5 @@ above. Disabled-channel silence, denied-user behavior, provisional recovery,
 existing-thread reconciliation, duplicate/reconnect fencing, edits/deletes,
 embeds/actions, inbound/outbound files, DMs, ambiguous sends, token rotation,
 intent revocation, provider links, management surfaces, and cleanup remain
-open. Discord remains unqualified for stable release until the recovery defect
-is fixed and the remaining DC cases pass on one final clean release-candidate
-SHA.
+open. Discord remains unqualified for stable release until the remaining DC
+cases pass on one final clean release-candidate SHA.

@@ -31,6 +31,7 @@ import {
   documentAnnotationComments,
   documentAnnotationThreads,
   createDb,
+  closeRegisteredClients,
   documentRevisions,
   documents,
   environmentLeases,
@@ -141,7 +142,10 @@ import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL?.trim();
+const embeddedPostgresSupport = externalTestDatabaseUrl
+  ? { supported: true }
+  : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
   ? describe
   : describe.skip;
@@ -346,10 +350,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   const cleanupPids = new Set<number>();
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase(
-      "paperclip-heartbeat-recovery-",
-    );
-    db = createDb(tempDb.connectionString);
+    if (externalTestDatabaseUrl) {
+      db = createDb(externalTestDatabaseUrl);
+    } else {
+      tempDb = await startEmbeddedPostgresTestDatabase(
+        "paperclip-heartbeat-recovery-",
+      );
+      db = createDb(tempDb.connectionString);
+    }
     const now = new Date();
     await db.insert(authUsers).values({
       id: "responsible-user",
@@ -523,6 +531,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
     cleanupPids.clear();
     runningProcesses.clear();
+    if (externalTestDatabaseUrl) {
+      await closeRegisteredClients(externalTestDatabaseUrl);
+    }
     await tempDb?.cleanup();
   });
 
@@ -1449,6 +1460,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0]?.status),
     ).toBe("blocked");
+    await expect(
+      db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null),
+    ).resolves.toEqual({ status: "idle", errorReason: null });
   });
 
   it("does not queue immediate recovery when the failed run's issue is hidden", async () => {
@@ -4378,6 +4396,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           },
         ],
       },
+    });
+    await expect(
+      db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null),
+    ).resolves.toMatchObject({
+      status: "error",
+      errorReason: expect.stringContaining("configuration incomplete"),
     });
     // Value-free gate: no secret access events were recorded.
     expect(await svc.listAccessEvents(companyId, secret.id)).toHaveLength(0);

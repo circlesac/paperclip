@@ -45,8 +45,18 @@ describe("chat connector UI contract", () => {
 
   it("keeps provider capabilities automatic and settings focused on plausible reach", () => {
     const detail = source("./ChatEndpointDetail.tsx");
+    const setup = source("./ChatEndpointSetup.tsx");
     expect(detail).toContain("Allow direct messages");
     expect(detail).toContain("Allow group chats");
+    expect(detail).toContain("Their tasks run only with an isolated workspace");
+    expect(detail).toContain("otherwise Paperclip safely refuses the request");
+    expect(setup).toContain("Link the account you’re testing");
+    expect(setup).toContain("Paperclip does not replay the refused request");
+    expect(setup).toContain("Review identity access");
+    expect(setup).toContain("instanceSettingsApi.getExperimental()");
+    expect(setup).toContain("chatEndpointsApi.listPrincipals(endpointId)");
+    expect(setup).toContain("queryKeys.chatEndpoints.detail(next.id)");
+    expect(setup).toContain('target="_blank" rel="noopener noreferrer"');
     expect(detail).not.toContain("Enable streaming");
     expect(detail).not.toContain("Delivery transport");
   });
@@ -60,8 +70,11 @@ describe("chat connector UI contract", () => {
     const activity = detail.slice(detail.indexOf("function Activity"));
     expect(detail).toContain('"pause" | "resume" | "remove"');
     expect(detail).toContain("Remove this connection?");
-    expect(detail).toContain("purpose=chat&resume=${endpoint.id}&reconnect=1");
+    expect(detail).toContain("purpose=chat&resume=${endpoint.id}");
+    expect(detail).toContain('? "" : "&reconnect=1"');
     expect(detail).toContain("Finish setup");
+    expect(detail).toContain("Continue setup");
+    expect(detail).toContain('endpoint.setup?.step !== "complete"');
     expect(detail).toContain("Reconnect");
     expect(detail).not.toContain("Change agent");
     for (const label of ["Pause", "Resume", "Reconnect", "Remove connection"]) {

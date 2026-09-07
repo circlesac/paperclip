@@ -217,8 +217,9 @@ export function ExternallyConnectedTaskBanner({
                 Include task files
               </legend>
               <p className="text-xs text-muted-foreground">
-                Only checked files will be published to the external
-                conversation.
+                {binding.provider === "github"
+                  ? "GitHub Apps cannot upload file bytes in comments. Checked files stay on the Paperclip task; GitHub receives an authenticated task link when this Board has a public URL, or a private-task notice otherwise."
+                  : "Only checked files will be published to the external conversation."}
               </p>
               <div className="space-y-2">
                 {selectableAttachments.map((attachment) => {

@@ -10,6 +10,7 @@ function run(status: string, resultJson: Record<string, unknown> | null) {
     triggerDetail: "system",
     error: null,
     errorCode: null,
+    contextSnapshot: { source: "chat:slack" },
     startedAt: new Date("2026-07-23T12:00:00.000Z"),
     finishedAt: status === "running" ? null : new Date("2026-07-23T12:01:00.000Z"),
     resultJson,
@@ -25,6 +26,7 @@ describe("buildHeartbeatRunStatusLiveEventPayload", () => {
     ).toMatchObject({
       runId: "run-1",
       status: "succeeded",
+      contextSource: "chat:slack",
       finalText: "Hello! How can I help?",
     });
   });

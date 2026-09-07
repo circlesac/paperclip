@@ -308,6 +308,7 @@ type ChatMock = {
   configuredCredentialKeys: string[];
   githubPrivateKeyMatchedFile: boolean | null;
   githubPrivateKeyMatchedPaste: boolean | null;
+  githubSetupSecretRequests: number;
   setupAttempts: number;
   updatedResource: boolean;
   resourceUpdates: Array<Array<{ id: string; enabled: boolean }>>;
@@ -320,6 +321,7 @@ type ChatMock = {
   replayedDelivery: boolean;
   removed: boolean;
   setStatus: (status: string) => void;
+  setGitHubWebhookVerified: () => void;
 };
 
 async function installChatControlPlaneMock(
@@ -328,12 +330,17 @@ async function installChatControlPlaneMock(
   seed: Seed,
 ): Promise<ChatMock> {
   const endpoint = endpointFixture(provider, seed);
-  const state: ChatMock & { created: boolean } = {
+  const state: ChatMock & {
+    created: boolean;
+    failNextGitHubEndpointRead: boolean;
+  } = {
     created: false,
+    failNextGitHubEndpointRead: false,
     createdWithAgentId: null,
     configuredCredentialKeys: [],
     githubPrivateKeyMatchedFile: null,
     githubPrivateKeyMatchedPaste: null,
+    githubSetupSecretRequests: 0,
     setupAttempts: 0,
     updatedResource: false,
     resourceUpdates: [],
@@ -347,6 +354,9 @@ async function installChatControlPlaneMock(
     removed: false,
     setStatus: (status) => {
       endpoint.status = status;
+    },
+    setGitHubWebhookVerified: () => {
+      endpoint.setup.webhookVerifiedAt = new Date().toISOString();
     },
   };
   const resource = {
@@ -399,6 +409,14 @@ async function installChatControlPlaneMock(
 
     if (pathname === `/api/chat-endpoints/${endpoint.id}`) {
       if (method === "GET") {
+        if (
+          provider.provider === "github" &&
+          state.failNextGitHubEndpointRead
+        ) {
+          state.failNextGitHubEndpointRead = false;
+          await fulfill(route, { error: "Temporary read failure." }, 503);
+          return;
+        }
         await fulfill(route, endpoint);
         return;
       }
@@ -419,11 +437,27 @@ async function installChatControlPlaneMock(
     }
 
     if (
+      pathname === "/api/instance/settings/experimental" &&
+      method === "GET"
+    ) {
+      await fulfill(route, { enableIsolatedWorkspaces: false });
+      return;
+    }
+
+    if (
       pathname === `/api/chat-endpoints/${endpoint.id}/setup-secret` &&
       method === "POST"
     ) {
+      state.githubSetupSecretRequests += 1;
       endpoint.setup.webhookSecretConfigured = true;
-      endpoint.setup.webhookVerifiedAt = new Date().toISOString();
+      endpoint.setup.step = "provider_setup";
+      endpoint.setup.webhookVerifiedAt =
+        state.githubSetupSecretRequests === 1
+          ? new Date().toISOString()
+          : null;
+      if (state.githubSetupSecretRequests > 1) {
+        state.failNextGitHubEndpointRead = true;
+      }
       await fulfill(route, { webhookSecret: "github-webhook-secret" }, 201);
       return;
     }
@@ -1100,8 +1134,11 @@ async function expectProviderTryInstructions(
     await expect(page.getByText(instruction, { exact: true })).toBeVisible();
   }
   await expect(
-    page.getByRole("button", { name: `Open ${provider.name}` }),
+    page.getByRole("link", { name: `Open ${provider.name}` }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: `Open ${provider.name}` }),
+  ).toHaveAttribute("href", provider.externalUrl);
 }
 
 test.describe.serial("native chat adapter UI", () => {
@@ -1275,6 +1312,35 @@ test.describe.serial("native chat adapter UI", () => {
       await expect(
         page.getByRole("button", { name: "I've sent the test message" }),
       ).toBeVisible();
+      await expect(
+        page.getByRole("heading", {
+          name: "Link the account you’re testing",
+        }),
+      ).toBeVisible();
+      await expect(
+        page.getByText(
+          /An observed external account is unlinked, and isolated guest work is off, so it cannot safely start Maya/,
+        ),
+      ).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: "Review identity access" }),
+      ).toBeVisible();
+      await page
+        .getByRole("button", { name: "Review identity access" })
+        .click();
+      await expect(page).toHaveURL(
+        new RegExp(
+          `/${seed.prefix}/apps/chat/endpoint-${provider.provider}/access$`,
+        ),
+      );
+      await expect(
+        page.getByRole("button", { name: "Continue setup" }),
+      ).toBeVisible();
+      await page.getByRole("button", { name: "Continue setup" }).click();
+      expect(new URL(page.url()).searchParams.get("reconnect")).toBeNull();
+      await expect(
+        page.getByRole("heading", { name: `Try Maya in ${provider.name}` }),
+      ).toBeVisible();
       await expectSetupRail(page);
       await expectProviderTryInstructions(page, provider);
       expect(mock.configuredCredentialKeys).toEqual(
@@ -1295,6 +1361,9 @@ test.describe.serial("native chat adapter UI", () => {
       await expect(
         page.getByText(provider.accountLabel, { exact: true }),
       ).toBeVisible();
+      await expect(
+        page.getByRole("button", { name: "Continue setup" }),
+      ).toHaveCount(0);
       await expect(page.getByText("Change agent", { exact: true })).toHaveCount(
         0,
       );
@@ -1386,6 +1455,11 @@ test.describe.serial("native chat adapter UI", () => {
       await page.getByRole("tab", { name: "Access" }).click();
       await expect(
         page.getByRole("heading", { name: "External identity access" }),
+      ).toBeVisible();
+      await expect(
+        page.getByText(
+          /Their tasks run only with an isolated workspace and sandbox environment; otherwise Paperclip safely refuses the request/,
+        ),
       ).toBeVisible();
       const allowUnlinked = page.getByRole("switch", {
         name: "Allow unlinked people",
@@ -1511,12 +1585,79 @@ test.describe.serial("native chat adapter UI", () => {
           `/${seed.prefix}/apps/chat/connect\\?.*resume=endpoint-${provider.provider}`,
         ),
       );
+      expect(new URL(page.url()).searchParams.get("reconnect")).toBe("1");
       await expect(
         page.getByRole("heading", { name: provider.setupHeading }),
       ).toBeVisible();
       await expect(
         page.getByRole("button", { name: "Choose an active agent" }),
       ).toHaveCount(0);
+
+      if (provider.provider === "github") {
+        const connectButton = page.getByRole("button", {
+          name: provider.setupButton,
+        });
+        await page.getByLabel("GitHub App ID").fill("123456");
+        await page
+          .getByLabel("Private key (PEM)")
+          .fill("reconnect-private-key");
+        await expect(connectButton).toBeEnabled();
+        await page.evaluate((buttonName) => {
+          const state = window as typeof window & {
+            __githubConnectEnabledAfterRotation?: boolean;
+          };
+          state.__githubConnectEnabledAfterRotation = false;
+          new MutationObserver(() => {
+            const button = [...document.querySelectorAll("button")].find(
+              (candidate) => candidate.textContent?.trim() === buttonName,
+            );
+            if (button instanceof HTMLButtonElement && !button.disabled) {
+              state.__githubConnectEnabledAfterRotation = true;
+            }
+          }).observe(document.body, {
+            attributes: true,
+            childList: true,
+            subtree: true,
+          });
+        }, provider.setupButton);
+        await page
+          .getByRole("button", { name: "Regenerate webhook secret" })
+          .click();
+        await expect(connectButton).toBeDisabled();
+        await page.waitForTimeout(100);
+        expect(
+          await page.evaluate(
+            () =>
+              (
+                window as typeof window & {
+                  __githubConnectEnabledAfterRotation?: boolean;
+                }
+              ).__githubConnectEnabledAfterRotation,
+          ),
+        ).toBe(false);
+
+        await page.goBack();
+        await expect(
+          page.getByRole("heading", { name: "Connection activity" }),
+        ).toBeVisible();
+        await page
+          .getByRole("button", { name: "Reconnect", exact: true })
+          .click();
+        await expect(
+          page.getByRole("heading", { name: provider.setupHeading }),
+        ).toBeVisible();
+        await page.getByLabel("GitHub App ID").fill("123456");
+        await page
+          .getByLabel("Private key (PEM)")
+          .fill("reconnect-private-key");
+        await expect(
+          page.getByRole("button", { name: provider.setupButton }),
+        ).toBeDisabled();
+        mock.setGitHubWebhookVerified();
+        await expect(
+          page.getByRole("button", { name: provider.setupButton }),
+        ).toBeEnabled();
+      }
 
       mock.setStatus("active");
       await page.goto(

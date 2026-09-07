@@ -1,6 +1,9 @@
 # GitHub live qualification result — 2026-09-05
 
-> **Status: current App connection, signed Tailscale ingress, and exact agent reply proven; full production qualification remains open.** The September 7 checkpoint below supersedes the older login/credential gates. Live testing exposed and repaired shared runtime and final-response selection defects, then found an unsolicited task-recovery run that still requires a live retest.
+For the September 7 private-attachment limitation and live outbound task-notice
+check, see [media qualification](2026-09-07-media-live-qualification.md).
+
+> **Status: current App connection, signed Tailscale ingress, exact agent replies, ordered burst handling, and keep-open idle recovery are proven; full production qualification remains open.** The September 7 checkpoints below supersede the older login/credential gates and the intermediate unsolicited-recovery blocker.
 
 ## 2026-09-07 current live checkpoint
 
@@ -52,6 +55,133 @@ coalesced the last two into one deferred wake, and returned exactly
 `DELTA EPSILON` without mixing Discord's distinct test words. Its two causal
 runs took roughly 78 and 15 seconds. A keep-open task retest is still needed
 to verify the recovery guard live, because this burst ended with the task done.
+
+### Clean keep-open recovery qualification — 2026-09-07, 13:59 UTC
+
+This checkpoint supersedes the pending keep-open retest above. On clean source
+revision `5bd9c0d55`, an unmentioned follow-up on the existing CHA-2 issue left
+the task deliberately `in_progress` and requested exactly
+`GITHUB-IDLE-WAIT-OK`. Run `c3335bdf-6a2e-49a5-82eb-8d31df92e4d0` ran from
+`13:59:33.398Z` through `13:59:39.464Z` and succeeded. GitHub
+[bot comment 5571729974](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5571729974)
+contained exactly that marker.
+
+CHA-2 remained `in_progress` with its external conversation active for more
+than eight minutes after the terminal reply. No additional run appeared. This
+is live evidence that an idle, keep-open chat task is no longer mistaken for
+stranded productive work, while explicit inbound and queued work remain
+runnable. It supersedes the earlier checkpoint where generic recovery started
+an unsolicited run after a successful reply.
+
+### PR and review-comment boundary qualification — 2026-09-07, 14:29 UTC
+
+A live pull-request boundary check used disposable private
+[PR 3](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/pull/3),
+branch `qa/chat-review-0907`, commit
+`e5219350f17973895671f420c596de16852d1f10`, and the two-line file
+`chat-review-0907.txt`. No repository operation was delegated to the agent.
+
+The PR's main conversation received human comment `5572099126` and one
+[bot reply `5572100025`](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/pull/3#issuecomment-5572100025)
+containing exactly `GH-PR-LEVEL-0907-OK`. Paperclip bound provider thread
+`github:cryppadotta/paperclip-chat-e2e-enabled:3` to conversation
+`6f313c48-e684-421f-a730-dd68112c1e2c` and task
+`5329b4bf-6b16-40d5-ad69-65bcbeac2ab3`. Run
+`0d57af6e-2351-4bf2-8736-1d61cc877e67` ran from `14:29:10.041Z` through
+`14:29:16.354Z`.
+
+GitHub's current Files changed UI did not expose an actionable line-level
+comment control during this walkthrough. The test therefore used **Comment on
+this file** followed by **Add single comment**. Human review comment
+`3950666444` received one
+[bot reply `3950666803`](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/pull/3/changes#r3950666803)
+containing exactly `GH-PR-REVIEW-0907-OK`. Paperclip bound the distinct provider
+thread `github:cryppadotta/paperclip-chat-e2e-enabled:3:rc:3950666444` to
+conversation `241f99a5-54ff-4bef-a0e7-313d69bf72b2` and task
+`860c7878-f1a6-498d-995c-6feaa735eb27`. Run
+`78deae9a-eb13-4374-a272-645ef1aec2d1` ran from `14:32:16.599Z` through
+`14:33:29.285Z`. Its working publication at `14:32:17.750Z` and final
+publication at `14:33:30.445Z` both settled through provider message
+`3950666803` in one attempt, so progress-to-final used one edited comment rather
+than producing duplicates.
+
+This proves that a real PR main conversation and a real GitHub review-comment
+thread on the same PR bind to different Paperclip conversations and tasks, and
+that both can return an exact agent response. It does **not** qualify a
+line-specific review comment: the exercised GitHub control was file-level. The
+review reply also appeared only after a page reload. Its roughly 73-second
+latency was dominated by a 72-second model turn (`ensure_session` was about
+433 ms), not Paperclip queueing or provider transport; the result was correct,
+but that wait remains a user-experience risk and prevents calling this path
+fully production-ready.
+
+### Image and file boundary — 2026-09-07
+
+GitHub's native comment composer does not deliver uploaded bytes to the App.
+It first hosts the upload and writes a reference into the comment body. In the
+current GitHub UI, an image may appear as an HTML `<img src="https://github.com/user-attachments/assets/…">`
+element rather than Markdown image syntax; a general file appears as a
+Markdown link to `https://github.com/user-attachments/files/…`. Paperclip
+retains a bounded set of safe HTTPS destinations in the normalized task text,
+but deliberately does not fetch or store those provider-hosted bytes. GitHub's
+[anonymized-URL rules](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-anonymized-urls)
+also mean the URL itself can be a capability, so it remains ordinary external
+text rather than being republished as a Paperclip-owned attachment.
+
+The inverse direction is also link-only. The GitHub App issue-comment and
+pull-review-comment APIs accept a Markdown body, but expose no attachment-byte
+upload field. Using GitHub CLI's `--attach` workaround would require repository
+push access, which is intentionally outside this chat connection's Issues and
+Pull requests permissions. Paperclip therefore must not claim that a checked
+Board file was uploaded to GitHub. It now publishes an explicit limitation and,
+only when the Board has a safe externally configured URL, an authenticated
+Paperclip task link. A private/local Board produces a private-task notice with
+no unusable localhost or webhook-ingress URL.
+
+The task banner presents this provider-specific boundary before send: checked
+files remain on the Paperclip task, while GitHub receives the authenticated
+task link or the private-task notice. Focused adapter coverage exercises both
+GitHub's native HTML image form and Markdown file-link form while asserting
+that neither becomes a native attachment. Integration coverage asserts both
+outbound fallback variants and that no provider file bytes or storage reads
+occur. This is truthful link interoperability, not native GitHub file transfer.
+
+A live issue-comment exercise then used GitHub's native upload UI with a known
+image and a 128-byte text fixture. Human comment `5572301393` contained the
+default HTML image reference plus the Markdown file link. Run
+`0c252a02-51cc-4aeb-b829-73865415070e` ran from approximately `14:44:27Z`
+through `14:46:37Z`. The
+[bot reply `5572302077`](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5572302077)
+did not fabricate either file's contents, which is the correct safety outcome,
+but said that no authorized GitHub connection was available and suggested a
+new connection request. That explanation is misleading: the GitHub **chat**
+connection was active and transported the hosted links, but it intentionally
+grants neither GitHub repository-tool authority nor credentials for fetching
+provider-hosted attachment bytes. Chat-origin guidance must state that precise
+boundary instead of implying the existing App is disconnected or requesting a
+duplicate chat connection. Until that wording is corrected and the optional
+separate-tool path is qualified, inbound GitHub media remains link-preservation
+evidence, not readable-file qualification.
+
+Focused adapter regression coverage now includes unmentioned follow-ups in PR
+and review-comment threads plus the native review reply/edit HTTP boundary.
+That file passed **3/3**, and the server typecheck passed. The broader
+current-tree integration result remains pending after the latest causal issue
+fence, so the earlier full-suite count is not advanced by this checkpoint.
+
+The current split ingress topology keeps the board private. Public HTTPS
+`:10000` remains available for the existing Slack and GitHub callback URLs;
+public HTTPS `:8443` is the canonical webhook-only origin used for Telegram.
+Both terminate at the narrow loopback proxy on port 3104. HTTPS `:443` remains
+tailnet-only for the board, and the public webhook listeners do not forward
+board health or company API routes.
+
+After the latest setup-edge changes, the full chat integration suite passed
+**258/258** and the combined process-recovery/status-payload suite passed
+**135/135**, both with zero skips. The deterministic browser suite had passed
+**5/5** on clean revision `5bd9c0d55`, but has not yet been rerun after the
+latest setup-edge/UI changes; the current working tree is therefore not being
+claimed browser-green here.
 
 The [live addendum](2026-09-06-live-qualification-addendum.md) records exact
 delivery and runtime evidence. Broader burst/fault coverage, recovery, reviews/PRs,

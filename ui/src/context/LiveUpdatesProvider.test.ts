@@ -1155,6 +1155,81 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
       tone: "error",
     });
   });
+
+  it("turns an unlinked chat isolation precondition into one actionable warning without an agent UUID", () => {
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-low-trust",
+          agentId: "31f56712-3944-423e-b7c7-404bb8fbb993",
+          status: "failed",
+          error: "Low-trust execution requires isolated workspaces to be enabled.",
+          errorCode: "low_trust_isolation_unavailable",
+          contextSource: "chat:slack",
+        },
+        () => "Maya E2E",
+      ),
+    ).toEqual({
+      title: "Maya E2E couldn't start this chat",
+      body: "This external chat identity isn't linked, and isolated guest workspaces are disabled. Link the identity in Connectors or enable isolated workspaces, then start a new task.",
+      tone: "warn",
+      ttlMs: 10_000,
+      action: { label: "Open chat connections", href: "/apps" },
+      dedupeKey: "run-status:run-low-trust:failed",
+    });
+
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-low-trust-uncached",
+          agentId: "31f56712-3944-423e-b7c7-404bb8fbb993",
+          status: "failed",
+          errorCode: "low_trust_isolation_unavailable",
+          contextSource: "chat:slack",
+        },
+        () => null,
+      )?.title,
+    ).toBe("Agent couldn't start this chat");
+  });
+
+  it("keeps non-chat and genuine runtime failures on the ordinary error path", () => {
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-low-trust-board",
+          agentId: "agent-1",
+          status: "failed",
+          error: "Low-trust execution requires isolated workspaces to be enabled.",
+          errorCode: "low_trust_isolation_unavailable",
+          contextSource: "issue.assignment",
+        },
+        () => "CodexCoder",
+      ),
+    ).toMatchObject({
+      title: "CodexCoder run failed",
+      tone: "error",
+      action: { label: "View run" },
+    });
+
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-adapter-failure",
+          agentId: "agent-1",
+          status: "failed",
+          error: "Adapter process exited",
+          errorCode: "adapter_failed",
+          contextSource: "chat:slack",
+        },
+        () => "CodexCoder",
+      ),
+    ).toMatchObject({
+      title: "CodexCoder run failed",
+      body: "Adapter process exited",
+      tone: "error",
+      action: { label: "View run" },
+    });
+  });
 });
 
 describe("applyRunLifecycleToCompanyLiveRuns", () => {

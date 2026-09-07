@@ -1730,6 +1730,13 @@
       "when": 1788714691806,
       "tag": "0248_nebulous_iron_lad",
       "breakpoints": true
+    },
+    {
+      "idx": 249,
+      "version": "7",
+      "when": 1788793844054,
+      "tag": "0249_cynical_hellcat",
+      "breakpoints": true
     }
   ]
 }
