@@ -17252,6 +17252,43 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               !Array.isArray(parsedPayload)
                 ? (parsedPayload as { action?: unknown }).action
                 : null;
+            const ignoreDisabledResource = async () => {
+              // Record only an authenticated, content-free admission decision.
+              // Do not make operators infer a working callback from silence,
+              // or retain the comment/actor/thread from a disabled repository.
+              const providerEventId = `github:filtered_ingress:${createHash("sha256")
+                .update(providerDeliveryId)
+                .digest("hex")}`;
+              const eventKind =
+                action === "edited"
+                  ? "message_updated"
+                  : action === "deleted"
+                    ? "message_deleted"
+                    : "message";
+              await tx
+                .insert(chatDeliveries)
+                .values({
+                  companyId: currentEndpoint.companyId,
+                  endpointId: currentEndpoint.id,
+                  providerEventId,
+                  deduplicationKey: providerEventId,
+                  eventKind,
+                  state: "filtered",
+                  processedAt: new Date(),
+                  redactedError: "Destination is not enabled in Paperclip",
+                  normalizedEvent: {
+                    providerEventId,
+                    kind: eventKind,
+                    filtering: {
+                      contentRetained: false,
+                      reason: "destination_not_enabled",
+                      resourceId: matchingResource.id,
+                    },
+                  },
+                })
+                .onConflictDoNothing();
+              return "ignored" as const;
+            };
             if (
               currentEndpoint.status !== "verifying" ||
               action !== "created" ||
@@ -17260,7 +17297,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 currentEndpoint.botUsername,
               )
             ) {
-              return "ignored" as const;
+              return ignoreDisabledResource();
             }
             const enabledResourceCount = await tx
               .select({ count: sql<number>`count(*)::int` })
@@ -17274,7 +17311,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 ),
               )
               .then((rows) => rows[0]?.count ?? 0);
-            if (enabledResourceCount !== 0) return "ignored" as const;
+            if (enabledResourceCount !== 0) return ignoreDisabledResource();
           }
         }
 

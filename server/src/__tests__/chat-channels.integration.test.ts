@@ -5683,6 +5683,126 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it("records one content-free GitHub receipt for a disabled repository without admitting work", async () => {
+    const fixture = await seedCompany();
+    const { endpoint, runtime, service, webhookSecret, wakeup } =
+      await configuredGitHubEndpoint(fixture);
+    await db
+      .update(chatEndpoints)
+      .set({ status: "active" })
+      .where(eq(chatEndpoints.id, endpoint.id));
+    const resources = await service.listResources(endpoint.id);
+    await service.replaceResources(endpoint.id, [
+      { id: resources[0]!.id, enabled: false },
+    ]);
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected GitHub provider runtime");
+    providerRuntime.webhookRequest = null;
+    const delivery = `github-disabled-${randomUUID()}`;
+    const marker = `private-disabled-body-${randomUUID()}`;
+    const makeRequest = () =>
+      signedGitHubWebhookRequest({
+        delivery,
+        event: "issue_comment",
+        payload: {
+          action: "created",
+          installation: { id: 2468 },
+          repository: {
+            id: 97531,
+            full_name: "paperclipai/paperclip",
+            name: "paperclip",
+            owner: { id: 1357, login: "paperclipai" },
+          },
+          issue: { number: 91, body: marker },
+          comment: { id: 9191, body: marker },
+          sender: { id: 42, login: "private-disabled-author" },
+        },
+        webhookSecret,
+      });
+    const invalid = makeRequest();
+    invalid.headers.set("x-hub-signature-256", "sha256=invalid");
+    expect(
+      (await service.handleWebhook(endpoint.publicId, "github", invalid))
+        .status,
+    ).toBe(401);
+    await expect(
+      db
+        .select()
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id)),
+    ).resolves.toEqual([]);
+
+    const responses = await Promise.all(
+      [1, 2, 3].map(() =>
+        service.handleWebhook(endpoint.publicId, "github", makeRequest()),
+      ),
+    );
+    expect(responses.map((response) => response.status)).toEqual([
+      200, 200, 200,
+    ]);
+    const rows = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.endpointId, endpoint.id));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      state: "filtered",
+      eventKind: "message",
+      conversationId: null,
+      principalId: null,
+      redactedError: "Destination is not enabled in Paperclip",
+      normalizedEvent: {
+        kind: "message",
+        filtering: {
+          contentRetained: false,
+          reason: "destination_not_enabled",
+          resourceId: resources[0]!.id,
+        },
+      },
+    });
+    expect(JSON.stringify(rows)).not.toContain(marker);
+    expect(JSON.stringify(rows)).not.toContain("private-disabled-author");
+    expect(Object.keys(rows[0]!.normalizedEvent).sort()).toEqual([
+      "filtering",
+      "kind",
+      "providerEventId",
+    ]);
+    expect(providerRuntime.webhookRequest).toBeNull();
+    expect(wakeup).not.toHaveBeenCalled();
+    await expect(service.listConversations(endpoint.id)).resolves.toEqual([]);
+    await expect(service.listActivity(endpoint.id)).resolves.toContainEqual(
+      expect.objectContaining({
+        id: rows[0]!.id,
+        status: "filtered",
+        summary: "message ignored",
+        detail: "Destination is not enabled in Paperclip",
+        replayable: false,
+      }),
+    );
+    await expect(
+      db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(
+              chatActions.providerActionId,
+              `github_webhook_ingress:${delivery}`,
+            ),
+          ),
+        ),
+    ).resolves.toEqual([]);
+
+    await service.replaceResources(endpoint.id, [
+      { id: resources[0]!.id, enabled: true },
+    ]);
+    await service.processPendingDeliveries();
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(providerRuntime.webhookRequest).toBeNull();
+    await service.shutdown();
+  });
+
   it("does not retain signed GitHub events outside the configured App event set", async () => {
     const fixture = await seedCompany();
     const { endpoint, runtime, service, webhookSecret } =

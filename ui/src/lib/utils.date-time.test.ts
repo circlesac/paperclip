@@ -19,8 +19,8 @@ describe("formatDateTime", () => {
   });
 
   it("formats serialized server timestamps identically to Date values", () => {
-    expect(formatDateTime(timestamp.toISOString(), { includeSeconds: true })).toBe(
-      formatDateTime(timestamp, { includeSeconds: true }),
-    );
+    expect(
+      formatDateTime(timestamp.toISOString(), { includeSeconds: true }),
+    ).toBe(formatDateTime(timestamp, { includeSeconds: true }));
   });
 });
