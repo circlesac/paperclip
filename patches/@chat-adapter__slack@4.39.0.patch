@@ -1,5 +1,5 @@
 diff --git a/dist/index.js b/dist/index.js
-index b80888b6d87e8ad429d18cc955c4c5048a55722a..35f533a9e2aeffe8324ff5ebda7cab3237853888 100644
+index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499f59a801b 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -2154,6 +2154,7 @@ var SlackAdapter = class _SlackAdapter {
@@ -100,7 +100,7 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..35f533a9e2aeffe8324ff5ebda7cab32
      }
      this.logger.debug("Slack API: files.uploadV2 (batch)", {
        fileCount: fileUploads.length,
-@@ -4219,14 +4225,106 @@ var SlackAdapter = class _SlackAdapter {
+@@ -4219,14 +4225,127 @@ var SlackAdapter = class _SlackAdapter {
      const result = await this._client.files.uploadV2(uploadArgs);
      this.logger.debug("Slack API: files.uploadV2 response", { ok: result.ok });
      const fileIds = [];
@@ -132,34 +132,55 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..35f533a9e2aeffe8324ff5ebda7cab32
 +      threadTs
 +    );
 +    if (!messageId) {
-+      let timeout;
-+      try {
-+        const lookup = Promise.all(
-+          fileIds.map(async (file) => this._client.files.info(
-+            await this.withToken({ file })
-+          ))
-+        );
-+        const infos = await Promise.race([
-+          lookup,
-+          new Promise((_, reject) => {
-+            timeout = setTimeout(
-+              () => reject(new Error("Slack file identity lookup timed out")),
-+              5e3
-+            );
-+            timeout.unref?.();
-+          })
-+        ]);
-+        const infoFiles = infos.map((info) => info.file);
-+        if (infoFiles.some((file, index) => !file || file.id !== fileIds[index])) {
-+          throw new Error("Slack file identity lookup did not match the uploaded files");
++      const deadline = Date.now() + 5e3;
++      const retryDelays = [100, 250, 500, 1e3];
++      let lookupAttempt = 0;
++      while (!messageId && Date.now() < deadline) {
++        let timeout;
++        try {
++          const lookup = Promise.all(
++            fileIds.map(async (file) => {
++              const args = await this.withToken({ file });
++              if (Date.now() >= deadline) {
++                throw new Error("Slack file identity lookup timed out");
++              }
++              return this._client.files.info(args);
++            })
++          );
++          const infos = await Promise.race([
++            lookup,
++            new Promise((_, reject) => {
++              timeout = setTimeout(
++                () => reject(new Error("Slack file identity lookup timed out")),
++                Math.max(1, deadline - Date.now())
++              );
++              timeout.unref?.();
++            })
++          ]);
++          const infoFiles = infos.map((info) => info.file);
++          if (infoFiles.some((file, index) => !file || file.id !== fileIds[index])) {
++            throw new Error("Slack file identity lookup did not match the uploaded files");
++          }
++          messageId = this.slackFileShareMessageId(infoFiles, channel, threadTs);
++        } catch {
++          throw new Error(
++            "Slack file upload completed, but its message identity could not be confirmed"
++          );
++        } finally {
++          clearTimeout(timeout);
 +        }
-+        messageId = this.slackFileShareMessageId(infoFiles, channel, threadTs);
-+      } catch {
-+        throw new Error(
-+          "Slack file upload completed, but its message identity could not be confirmed"
++        if (messageId) break;
++        const remaining = deadline - Date.now();
++        if (remaining <= 0) break;
++        const delay = Math.min(
++          retryDelays[Math.min(lookupAttempt, retryDelays.length - 1)],
++          remaining
 +        );
-+      } finally {
-+        clearTimeout(timeout);
++        lookupAttempt += 1;
++        await new Promise((resolve) => {
++          const retryTimer = setTimeout(resolve, delay);
++          retryTimer.unref?.();
++        });
 +      }
 +    }
 +    if (!messageId) {
@@ -211,7 +232,7 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..35f533a9e2aeffe8324ff5ebda7cab32
    }
    async editMessage(threadId, messageId, _message) {
      const message = await this.resolveMessageMentions(_message, threadId);
-@@ -5636,6 +5734,7 @@ var SlackAdapter = class _SlackAdapter {
+@@ -5636,6 +5755,7 @@ var SlackAdapter = class _SlackAdapter {
        method: "POST",
        headers: { "Content-Type": "application/json" },
 -      body: JSON.stringify(payload)

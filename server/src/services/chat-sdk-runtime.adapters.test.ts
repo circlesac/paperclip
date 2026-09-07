@@ -1021,19 +1021,25 @@ describe("Chat SDK published adapter integration", () => {
       ok: true,
       files: [{ ok: true, files: [{ id: "F-SPARSE" }] }],
     }));
-    const fileInfo = vi.fn(async () => ({
-      ok: true,
-      file: {
-        id: "F-SPARSE",
-        shares: {
-          private: {
-            "D-PAPERCLIP": [
-              { thread_ts: "1788.400", ts: "1788.401" },
-            ],
+    const fileInfo = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        file: { id: "F-SPARSE", shares: {} },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        file: {
+          id: "F-SPARSE",
+          shares: {
+            private: {
+              "D-PAPERCLIP": [
+                { thread_ts: "1788.400", ts: "1788.401" },
+              ],
+            },
           },
         },
-      },
-    }));
+      });
     const postMessage = vi.fn();
     try {
       await runtime.initialize();
@@ -1056,7 +1062,8 @@ describe("Chat SDK published adapter integration", () => {
       adapter._client.files.uploadV2 = uploadV2;
       adapter._client.files.info = fileInfo;
       adapter._client.chat.postMessage = postMessage;
-      const sent = await adapter.postMessage("slack:D-PAPERCLIP:1788.400", {
+      vi.useFakeTimers();
+      const sentPromise = adapter.postMessage("slack:D-PAPERCLIP:1788.400", {
         markdown: "",
         files: [
           {
@@ -1066,13 +1073,17 @@ describe("Chat SDK published adapter integration", () => {
           },
         ],
       });
+      await vi.advanceTimersByTimeAsync(100);
+      const sent = await sentPromise;
       expect(sent.id).toBe("1788.401");
-      expect(fileInfo).toHaveBeenCalledOnce();
+      expect(uploadV2).toHaveBeenCalledOnce();
+      expect(fileInfo).toHaveBeenCalledTimes(2);
       expect(fileInfo).toHaveBeenCalledWith(
         expect.objectContaining({ file: "F-SPARSE" }),
       );
       expect(postMessage).not.toHaveBeenCalled();
     } finally {
+      vi.useRealTimers();
       await runtime.shutdown();
     }
   });
@@ -1131,7 +1142,8 @@ describe("Chat SDK published adapter integration", () => {
       adapter._client.files.uploadV2 = uploadV2;
       adapter._client.files.info = fileInfo;
       adapter._client.chat.postMessage = postMessage;
-      await expect(
+      vi.useFakeTimers();
+      const rejected = expect(
         adapter.postMessage("slack:C-PAPERCLIP:1788.500", {
           markdown: "",
           files: [
@@ -1146,9 +1158,162 @@ describe("Chat SDK published adapter integration", () => {
         message:
           "Slack file upload completed, but its message identity could not be confirmed",
       });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await rejected;
+      expect(uploadV2).toHaveBeenCalledOnce();
+      expect(fileInfo).toHaveBeenCalledTimes(8);
+      expect(postMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      await runtime.shutdown();
+    }
+  });
+
+  it("bounds a stalled Slack file identity lookup without uploading again", async () => {
+    const runtime = createChatSdkEndpointRuntime({
+      callbacks: { onMessage() {} },
+      companyId: "company-slack-file-timeout",
+      endpointId: "endpoint-slack-file-timeout",
+      logger: "silent",
+      persistence,
+      providerConfig: {
+        provider: "slack",
+        userName: "paperclip-agent",
+        credentials: {
+          botToken: "xoxb-test",
+          botUserId: "U-PAPERCLIP-BOT",
+          signingSecret: "secret",
+        },
+      },
+    });
+    const uploadV2 = vi.fn(async () => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F-TIMEOUT" }] }],
+    }));
+    const fileInfo = vi.fn(() => new Promise<never>(() => undefined));
+    const postMessage = vi.fn();
+    try {
+      await runtime.initialize();
+      const adapter = runtime.getProviderAdapter() as unknown as {
+        _client: {
+          chat: { postMessage: typeof postMessage };
+          files: {
+            info: typeof fileInfo;
+            uploadV2: typeof uploadV2;
+          };
+        };
+        postMessage(
+          threadId: string,
+          message: {
+            files: Array<{ data: Buffer; filename: string; mimeType: string }>;
+            markdown: string;
+          },
+        ): Promise<{ id: string }>;
+      };
+      adapter._client.files.uploadV2 = uploadV2;
+      adapter._client.files.info = fileInfo;
+      adapter._client.chat.postMessage = postMessage;
+      vi.useFakeTimers();
+      const rejected = expect(
+        adapter.postMessage("slack:C-PAPERCLIP:1788.700", {
+          markdown: "",
+          files: [
+            {
+              data: Buffer.from("safe artifact"),
+              filename: "result.txt",
+              mimeType: "text/plain",
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        message:
+          "Slack file upload completed, but its message identity could not be confirmed",
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await rejected;
+      expect(uploadV2).toHaveBeenCalledOnce();
       expect(fileInfo).toHaveBeenCalledOnce();
       expect(postMessage).not.toHaveBeenCalled();
     } finally {
+      vi.useRealTimers();
+      await runtime.shutdown();
+    }
+  });
+
+  it("does not start a Slack file lookup after token resolution exceeds the deadline", async () => {
+    const runtime = createChatSdkEndpointRuntime({
+      callbacks: { onMessage() {} },
+      companyId: "company-slack-file-late-token",
+      endpointId: "endpoint-slack-file-late-token",
+      logger: "silent",
+      persistence,
+      providerConfig: {
+        provider: "slack",
+        userName: "paperclip-agent",
+        credentials: {
+          botToken: "xoxb-test",
+          botUserId: "U-PAPERCLIP-BOT",
+          signingSecret: "secret",
+        },
+      },
+    });
+    const uploadV2 = vi.fn(async () => ({
+      ok: true,
+      files: [{ ok: true, files: [{ id: "F-LATE-TOKEN" }] }],
+    }));
+    const fileInfo = vi.fn();
+    const postMessage = vi.fn();
+    try {
+      await runtime.initialize();
+      const adapter = runtime.getProviderAdapter() as unknown as {
+        _client: {
+          chat: { postMessage: typeof postMessage };
+          files: {
+            info: typeof fileInfo;
+            uploadV2: typeof uploadV2;
+          };
+        };
+        postMessage(
+          threadId: string,
+          message: {
+            files: Array<{ data: Buffer; filename: string; mimeType: string }>;
+            markdown: string;
+          },
+        ): Promise<{ id: string }>;
+        withToken<T extends object>(input: T): Promise<T>;
+      };
+      adapter._client.files.uploadV2 = uploadV2;
+      adapter._client.files.info = fileInfo;
+      adapter._client.chat.postMessage = postMessage;
+      vi.useFakeTimers();
+      adapter.withToken = async <T extends object>(input: T): Promise<T> => {
+        await new Promise((resolve) => setTimeout(resolve, 6_000));
+        return input;
+      };
+      const rejected = expect(
+        adapter.postMessage("slack:C-PAPERCLIP:1788.800", {
+          markdown: "",
+          files: [
+            {
+              data: Buffer.from("safe artifact"),
+              filename: "result.txt",
+              mimeType: "text/plain",
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        message:
+          "Slack file upload completed, but its message identity could not be confirmed",
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await rejected;
+      expect(uploadV2).toHaveBeenCalledOnce();
+      expect(fileInfo).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fileInfo).not.toHaveBeenCalled();
+      expect(postMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
       await runtime.shutdown();
     }
   });

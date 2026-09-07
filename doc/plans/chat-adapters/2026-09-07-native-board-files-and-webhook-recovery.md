@@ -291,3 +291,45 @@ and scheduling behavior follows separately.
 The separate early-reaction race remains open: a reaction arriving before the
 outbound message link commits currently has no exact lineage and is dropped.
 Resolving real Slack file IDs fixes normal post-commit matching, not that race.
+
+## Snapshot 12: fast resume passes; Slack share visibility exposes a failure
+
+Loaded snapshot 12, `2026.831.0+402.git.dc1d17351`, at **20:09:56.742 UTC**;
+health/recovery and Discord Gateway were ready. Paused Slack and sent
+`SLACK-UPLOAD-ID-CHECK` at **20:10:56.530** with `slack-upload-id-note.txt` and
+`slack-upload-id-cat.png`. Reload retained both checked, disabled filenames.
+While paused, all three publications had zero attempts and null retry deadlines.
+
+Resumed at **20:11:15.347**. The text published at **20:11:16.915**, a 1.568-second
+resume-to-acknowledgement sample, without the prior synthetic delay. However,
+the document then entered `delivery_unknown` at **20:11:17.645** because the
+one-shot file metadata lookup could not resolve its share. The image remained
+pending behind that uncertain result. The Board truthfully showed **Delivery
+not confirmed**, **1 of 3 parts published**, and kept its exact draft.
+
+Slack visibly contained the document and correct `cobalt otter 47` content.
+Its native permalink timestamp was `1788811877.783349`, corresponding to
+**20:11:17.783**: the actual share appeared about 138 ms after the adapter had
+given up. This is failed file-identity qualification and evidence of eventual
+share visibility, not a successful automatic file receipt. No upload retry was
+performed. The follow-up uses bounded read-only polling for the same uploaded
+file IDs, keeping the original upload and ambiguity safeguards unchanged.
+
+- Canonical comment: `1181fcde-c098-4136-a2c9-e3dd13c6dd0c`.
+- Text: `12b3bef4-390f-4e89-9dcf-cb930aa52f13`, real ID `1788811876.864209`.
+- Held document: `ad9e2afb-85ab-4ed6-90bb-5168f760688a`.
+- Pending image: `24d08c07-63de-45af-9f4b-8d1a8b00342b`.
+
+The current operator **Mark delivered** action records an audited confirmation
+but does not accept a recovered provider message ID or reconstruct its message
+link. An operator-resolved document therefore must not be counted as a passed
+automatic lineage/reaction test; a fresh normally acknowledged file is needed.
+
+The follow-up adapter change polls sparse, matching `files.info` results under
+one absolute five-second deadline, with paced 100/250/500/1000 ms waits. It never
+uploads again and cannot start a lookup after a delayed token resolution has
+exhausted that deadline. Missing/mismatched identities and lookup errors still
+produce a safe uncertain-delivery result. Focused adapter and hydration tests
+passed **51/51**; the first typecheck caught a generic mock typing error in the
+new late-token test. The corrected test and server typecheck pass. Live qualification of
+this polling change is recorded below rather than inferred from those tests.
