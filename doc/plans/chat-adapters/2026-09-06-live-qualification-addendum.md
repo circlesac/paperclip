@@ -179,6 +179,40 @@ observations or claiming a completed provider conversation.
 - The App remains uninstalled. A signed ping proves webhook delivery and
   signature verification only, not repository reach or an issue/PR round trip.
 
+#### GitHub live checkpoint — 2026-09-07 13:00 UTC
+
+This later checkpoint supersedes the uninstalled/no-private-key state above.
+The operator authorized a newly downloaded private key, and it was imported
+through Paperclip's masked file control without reading, displaying, or
+recording its contents. Paperclip verified App `4853886`, discovered the single
+installation `159668881`, and reconciled exactly the two approved private test
+repositories.
+
+The first real setup issue is
+[`cryppadotta/paperclip-chat-e2e-enabled#1`](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/1).
+Root comment `5570993571` produced exactly one Paperclip task, `CHA-1`
+(`07a57128-20ef-4905-aa85-3bbcb4f2769e`), and one external conversation
+(`6a6d6bfa-4b21-45d7-87b3-9a8885449c5a`). GitHub displayed one eyes reaction
+and bot reply `5570994445`. The reply correctly failed closed because the turn
+belonged to an unlinked external guest and isolated guest execution was not
+available. This proves signed issue-comment ingress, repository admission,
+one-issue/one-task binding, reaction delivery, and safe containment; it does not
+prove a successful agent response.
+
+The endpoint remains `verifying`. Paperclip opened the private confirmation
+flow for `cryppadotta` to the signed-in board account, but the user-controlled
+identity confirmation is still pending. No confirmation URL or token was
+recorded. The retained `CHA-1` task remains low-trust; after confirmation, a
+fresh GitHub issue is required to qualify the linked path and the unmentioned
+follow-up response.
+
+The current Cloudflare webhook-only receiver remains in service for this test.
+The host's Tailscale connection is healthy, but Funnel is disabled for the
+tailnet and awaits administrator enablement before it can replace that receiver.
+The GitHub App homepage still points to the earlier temporary public host; that
+is a minor setup-polish defect, while the signed webhook callback itself remains
+the operative ingress route.
+
 ### Discord
 
 - The user completed App creation. `Paperclip Maya E2E` now exists under
@@ -496,3 +530,40 @@ integration suite passed **252/252**, zero skips, on fresh database
 `.paperclip-runtime/chat-adapters-live/github-install-draft-integration.json`.
 Only the regression and evidence documentation changed in this checkpoint;
 the running, previously browser-qualified implementation remains `f535dde54`.
+
+### Discord connection repair and GitHub credential qualification — 2026-09-07
+
+The user-reported Discord **Invalid Form Body** failure was a real request-shape
+defect: guild-member lookup used `@me` where Discord requires a numeric user ID.
+The corrected request uses the already-verified bot ID. Live setup then succeeded
+with the existing token and reached **Try Maya E2E in Discord**; no token reset
+was needed. The separate Discord chat session still requires Eigenjoy login, so
+native message/thread/run qualification has not advanced beyond connection.
+
+GitHub accepted the user-authorized PEM import through Paperclip's file chooser.
+Its live issue mention created CHA-1, received a receipt reaction, and received
+the expected guest-isolation refusal rather than an agent answer. The private
+identity confirmation for `cryppadotta` to the local Board account is staged for
+the user; that permission grant has not been confirmed. Recovery copy now
+correctly explains that an administrator creates the private identity link.
+
+Tailscale is connected, but Funnel requires tailnet enablement. The pending
+request targets only the webhook-only proxy on port 3104 through HTTPS port
+10000; existing tailnet-only routes are unchanged. Until that administrative
+step completes, GitHub remains on the current Cloudflare webhook ingress and
+the board remains local/private. No stable Tailscale webhook success is claimed.
+
+Verification after the fixes:
+
+- Focused Discord and run-publication unit tests: **19/19**.
+- Server `tsc --noEmit`: passed.
+- Fresh full chat integration: **252/252**, zero skips, database
+  `chat_adapters_test_20260907_discord_member_02`; report
+  `.paperclip-runtime/chat-adapters-live/discord-member-integration-20260907-02.json`.
+- The first fresh run was **251/252** because a Slack exact-redelivery test
+  sampled its transport count before prior durable denial effects finished.
+  The test now waits for those effects and additionally proves redelivery
+  creates no new effect row; no production queue behavior was relaxed.
+- Live browser checks covered real provider credential verification and the
+  GitHub guest-refusal round trip, not a successful agent conversation. The
+  broader deterministic browser suite was not rerun for these server changes.

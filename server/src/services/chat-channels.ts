@@ -6229,6 +6229,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return {
           credentials,
           inventory: await listDiscordBotChannels({
+            botUserId: credentials.applicationId,
             botToken: credentials.botToken,
             fetch: fetchImpl,
             guildId: credentials.guildId,

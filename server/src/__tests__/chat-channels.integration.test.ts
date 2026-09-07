@@ -552,7 +552,7 @@ function fakeDiscordFetch(
         flags: 1 << 18,
       },
       [`/api/v10/guilds/${guildId}`]: { id: guildId, name: "Clawd" },
-      [`/api/v10/guilds/${guildId}/members/@me`]: {
+      [`/api/v10/guilds/${guildId}/members/${applicationId}`]: {
         roles: ["222222222222222222"],
         user: { id: applicationId },
       },
@@ -6564,7 +6564,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             flags: 1 << 18,
           },
           [`/api/v10/guilds/${guildId}`]: { id: guildId, name: "Clawd" },
-          [`/api/v10/guilds/${guildId}/members/@me`]: {
+          [`/api/v10/guilds/${guildId}/members/${applicationId}`]: {
             roles: ["222222222222222222"],
             user: { id: applicationId },
           },
@@ -7133,7 +7133,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         let body: unknown;
         if (path === `/api/v10/guilds/${guildId}`) {
           body = { id: guildId, name: `Guild ${guildId}` };
-        } else if (path.endsWith("/members/@me")) {
+        } else if (path.endsWith(`/members/${applicationId}`)) {
           body = {
             roles: ["923456789012345678"],
             user: { id: applicationId },
@@ -17146,7 +17146,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).toMatchObject({
       progressState: "failed",
       text: expect.stringContaining(
-        "Link your identity to Paperclip, then start a new task; or ask a Paperclip admin to enable isolated guest execution.",
+        "Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.",
       ),
     });
   });
@@ -21365,6 +21365,37 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         fallbackToDM: false,
       },
     );
+    const providerEffectsBeforeExactRedelivery = await db
+      .select({ id: chatActions.id })
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.endpointId, endpoint.id),
+          eq(chatActions.kind, "provider_effect"),
+        ),
+      );
+    expect(providerEffectsBeforeExactRedelivery.length).toBeGreaterThan(0);
+    // Action callbacks acknowledge after the denial and its provider effect are
+    // durable, while the actual ephemeral send runs asynchronously. Drain those
+    // already-staged notices before using the transport call count to prove that
+    // the exact redelivery below does not send another notice.
+    await vi.waitFor(async () => {
+      const providerEffects = await db
+        .select({ status: chatActions.status })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.kind, "provider_effect"),
+          ),
+        );
+      expect(providerEffects).toHaveLength(
+        providerEffectsBeforeExactRedelivery.length,
+      );
+      expect(
+        providerEffects.every(({ status }) => status === "processed"),
+      ).toBe(true);
+    });
     const ephemeralCountBeforeExactRedelivery =
       channel.postEphemeral.mock.calls.length;
     const nativeResolutionCountBeforeExactRedelivery =
@@ -21376,6 +21407,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(resolveNativeQuestion).toHaveBeenCalledTimes(
       nativeResolutionCountBeforeExactRedelivery,
     );
+    await expect(
+      db
+        .select({ id: chatActions.id })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.kind, "provider_effect"),
+          ),
+        ),
+    ).resolves.toHaveLength(providerEffectsBeforeExactRedelivery.length);
     const [storedInteraction] = await db
       .select()
       .from(issueThreadInteractions)

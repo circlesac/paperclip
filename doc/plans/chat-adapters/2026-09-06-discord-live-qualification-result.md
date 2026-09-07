@@ -1,14 +1,40 @@
 # Discord live qualification result — 2026-09-06
 
-> **Status: implementation and local regression evidence only; blocked before provider setup.** No Discord application, Paperclip endpoint, server installation, Gateway event, thread, task, publication, or recovery scenario has been qualified live on the current working tree.
+> **Status: real bot setup connected; message round trip and DC1–DC7 remain unqualified.** Paperclip has verified the dedicated bot identity, Message Content intent, Clawd membership, and a permission-complete text channel against Discord. No native mention, Discord thread, Paperclip task, agent response, or recovery scenario has yet been qualified live.
 
-## Live-attempt checkpoint
+## Resumed live setup — 2026-09-07 UTC
+
+The operator entered the existing bot token directly into Paperclip's masked
+field; it was not reset, displayed, logged, or copied into this result. The
+first connection attempt reached Discord but failed with HTTP 400 / code 50035
+because Paperclip called the numeric Get Guild Member route with the literal
+`@me`. The scoped repair now uses the already verified Application ID as the
+bot user snowflake.
+
+After that repair, the preserved provider token connected successfully on the
+working tree based on `f5f31d2e1`. The Paperclip endpoint reached its real
+`verifying` state with bot external ID `1546330979860221952` and provider
+account/server ID `1457808928258658549`; the UI advanced to **Try Maya E2E in
+Discord**. This provider-backed transition proves that the token identifies the
+configured Application ID, Message Content intent is enabled, the bot is a
+member of Clawd, and at least one text channel grants the complete required
+permission set. The scoped fix and this result must be committed and its
+automated checks recorded before treating the revision as a release candidate.
+
+This is partial DC1 setup evidence, not a conversation pass. The target channel
+`1457808933082108089` has not yet produced a provider-visible root mention,
+native public thread, Paperclip task, or safe agent reply on this source. DC2–DC7
+also remain open.
+
+## Historical live-attempt checkpoint — superseded above
 
 The authorized provider target is the `Clawd` Discord server, numeric ID `1457808928258658549`, using the user's Eigenjoy account. The latest in-app-browser attempt reached Discord's login/QR flow in both the Developer Portal and server tabs. It did not reach application creation or expose a bot token. Login completion is therefore the current external gate.
 
 ### Release decision at this checkpoint
 
-Discord remains a release blocker for the five-provider claim. The authorized target is the `Clawd` server (`1457808928258658549`) under the Eigenjoy account, but the current browser session is still gated by Discord login/QR or passkey. No application or bot has been created or installed, no token has been entered, and no Gateway event has reached Paperclip. The deterministic Gateway, migration, adapter-patch, browser, and database checks below are implementation evidence only; they do not qualify a real Discord bot identity or any DC1–DC7 behavior.
+At this historical checkpoint, Discord remained blocked before provider setup.
+The resumed setup evidence above supersedes that gate while preserving this
+record of what had not yet been tested.
 
 Once the authenticated session is available, the required path is:
 
@@ -61,4 +87,13 @@ This evidence supports implementation integrity but does not replace provider lo
 
 ## Qualification gap
 
-Every live Discord scenario remains open: first-time setup, least-privilege install, enabled/disabled channel behavior, denied-user behavior, root-thread creation, provisional recovery, existing-thread reconciliation, ordered follow-ups, duplicate/reconnect fencing, reactions, edits/deletes, embeds/actions, inbound/outbound files, DMs, linked/unlinked identities, ambiguous sends, token rotation, intent revocation, provider links, management surfaces, and cleanup. Discord remains unqualified for stable release until those cases pass on one final release-candidate SHA. The current external blocker is the Eigenjoy Discord login/QR gate, not a known unresolved root-activation implementation defect.
+Provider credential validation, Message Content intent, Clawd membership, and
+the existence of at least one permission-complete text channel now have live
+proof. The rest of DC1 and every DC2–DC7 journey remain open: the target-channel
+allowlist and message test; enabled/disabled behavior; denied-user behavior;
+root-thread creation; provisional recovery; existing-thread reconciliation;
+ordered follow-ups; duplicate/reconnect fencing; reactions; edits/deletes;
+embeds/actions; inbound/outbound files; DMs; linked/unlinked identities;
+ambiguous sends; token rotation; intent revocation; provider links; management
+surfaces; and cleanup. Discord remains unqualified for stable release until
+those cases pass on one final release-candidate SHA.

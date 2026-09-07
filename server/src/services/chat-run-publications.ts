@@ -97,7 +97,7 @@ export function safeMilestoneText(input: {
   const taskUrl = safeChatTaskUrl(input.publicBaseUrl, input.issueId);
   const recovery =
     input.errorCode === "low_trust_isolation_unavailable"
-      ? `${input.agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Link your identity to Paperclip, then start a new task; or ask a Paperclip admin to enable isolated guest execution.`
+      ? `${input.agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.`
       : `${input.agentName} stopped before completing this turn.`;
   return `${recovery}${
     taskUrl

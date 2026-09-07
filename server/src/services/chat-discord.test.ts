@@ -113,11 +113,50 @@ describe("Discord bot validation and inventory", () => {
     ).rejects.toThrow("Message Content intent is not enabled");
   });
 
+  it("identifies the failed Discord lookup without exposing provider response text", async () => {
+    const rawProviderText = "Invalid Form Body contains private canary";
+    const failure = await verifyDiscordBot({
+      applicationId,
+      botToken: "discord-secret",
+      fetch: fetchFixture({
+        "/api/v10/users/@me": {
+          id: applicationId,
+          username: "maya",
+          bot: true,
+        },
+        "/api/v10/oauth2/applications/@me": () =>
+          json(
+            {
+              code: 50035,
+              message: rawProviderText,
+              errors: {
+                application_id: {
+                  _errors: [
+                    { code: "NUMBER_TYPE_COERCE", message: rawProviderText },
+                  ],
+                },
+              },
+            },
+            400,
+          ),
+        [`/api/v10/guilds/${guildId}`]: { id: guildId, name: "Clawd" },
+      }),
+      guildId,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      "Discord application lookup failed (HTTP 400, code 50035, invalid fields: application_id)",
+    );
+    expect((failure as Error).message).not.toContain(rawProviderText);
+    expect((failure as Error).message).not.toContain("discord-secret");
+  });
+
   it("discovers only text channels where the bot has the complete safe feature set", async () => {
     const requiredPermissions = "309237763136";
     const fetch = fetchFixture({
       [`/api/v10/guilds/${guildId}`]: { id: guildId, name: "Clawd" },
-      [`/api/v10/guilds/${guildId}/members/@me`]: {
+      [`/api/v10/guilds/${guildId}/members/${applicationId}`]: {
         roles: ["222222222222222222"],
         user: { id: applicationId },
       },
@@ -148,6 +187,7 @@ describe("Discord bot validation and inventory", () => {
 
     await expect(
       listDiscordBotChannels({
+        botUserId: applicationId,
         botToken: "discord-secret",
         fetch,
         guildId,
@@ -170,7 +210,7 @@ describe("Discord bot validation and inventory", () => {
   it("fails closed when no channel grants the full required permission set", async () => {
     const fetch = fetchFixture({
       [`/api/v10/guilds/${guildId}`]: { id: guildId, name: "Clawd" },
-      [`/api/v10/guilds/${guildId}/members/@me`]: {
+      [`/api/v10/guilds/${guildId}/members/${applicationId}`]: {
         roles: [],
         user: { id: applicationId },
       },
@@ -184,6 +224,7 @@ describe("Discord bot validation and inventory", () => {
 
     await expect(
       listDiscordBotChannels({
+        botUserId: applicationId,
         botToken: "discord-secret",
         fetch,
         guildId,

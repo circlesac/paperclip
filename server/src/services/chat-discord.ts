@@ -77,6 +77,18 @@ type DiscordChannel = {
   type?: number;
 };
 
+type DiscordErrorBody = {
+  code?: unknown;
+  errors?: unknown;
+};
+
+const SAFE_DISCORD_ERROR_FIELDS = new Set([
+  "application_id",
+  "channel_id",
+  "guild_id",
+  "user_id",
+]);
+
 export interface DiscordBotIdentity {
   botAvatarUrl?: string;
   botExternalId: string;
@@ -110,6 +122,7 @@ async function discordJson<T>(
   fetchImpl: typeof globalThis.fetch,
   token: string,
   path: string,
+  operation: string,
 ): Promise<T> {
   const response = await fetchImpl(`${DISCORD_API_URL}${path}`, {
     signal: requestSignal(),
@@ -122,11 +135,19 @@ async function discordJson<T>(
     throw new Error("Discord returned an unreadable response");
   }
   if (!response.ok) {
-    const message =
-      body && typeof body === "object" && "message" in body
-        ? String((body as { message?: unknown }).message)
-        : String(response.status);
-    throw new Error(`Discord rejected the bot connection: ${message}`);
+    const errorBody =
+      body && typeof body === "object" ? (body as DiscordErrorBody) : null;
+    const codeValue = String(errorBody?.code ?? "");
+    const code = /^\d{1,10}$/.test(codeValue) ? codeValue : null;
+    const invalidFields =
+      errorBody?.errors && typeof errorBody.errors === "object"
+        ? Object.keys(errorBody.errors)
+            .filter((field) => SAFE_DISCORD_ERROR_FIELDS.has(field))
+            .slice(0, 8)
+        : [];
+    throw new Error(
+      `Discord ${operation} failed (HTTP ${response.status}${code ? `, code ${code}` : ""}${invalidFields.length > 0 ? `, invalid fields: ${invalidFields.join(", ")}` : ""})`,
+    );
   }
   return body as T;
 }
@@ -186,16 +207,23 @@ export async function verifyDiscordBot(input: {
   );
   const guildId = snowflake(input.guildId, "Discord Server ID");
   const [user, application, guild] = await Promise.all([
-    discordJson<DiscordUser>(input.fetch, input.botToken, "/users/@me"),
+    discordJson<DiscordUser>(
+      input.fetch,
+      input.botToken,
+      "/users/@me",
+      "bot identity lookup",
+    ),
     discordJson<DiscordApplication>(
       input.fetch,
       input.botToken,
       "/oauth2/applications/@me",
+      "application lookup",
     ),
     discordJson<DiscordGuild>(
       input.fetch,
       input.botToken,
       `/guilds/${encodeURIComponent(guildId)}`,
+      "server membership lookup",
     ),
   ]);
   if (!user.bot || !user.id || !user.username) {
@@ -229,31 +257,37 @@ export async function verifyDiscordBot(input: {
 }
 
 export async function listDiscordBotChannels(input: {
+  botUserId: string;
   botToken: string;
   fetch: typeof globalThis.fetch;
   guildId: string;
 }): Promise<ChatProviderInventoryResult> {
   const guildId = snowflake(input.guildId, "Discord Server ID");
+  const botUserId = snowflake(input.botUserId, "Discord bot user ID");
   const [guild, member, roles, channels] = await Promise.all([
     discordJson<DiscordGuild>(
       input.fetch,
       input.botToken,
       `/guilds/${encodeURIComponent(guildId)}`,
+      "server lookup",
     ),
     discordJson<DiscordMember>(
       input.fetch,
       input.botToken,
-      `/guilds/${encodeURIComponent(guildId)}/members/@me`,
+      `/guilds/${encodeURIComponent(guildId)}/members/${encodeURIComponent(botUserId)}`,
+      "bot membership lookup",
     ),
     discordJson<DiscordRole[]>(
       input.fetch,
       input.botToken,
       `/guilds/${encodeURIComponent(guildId)}/roles`,
+      "server roles lookup",
     ),
     discordJson<DiscordChannel[]>(
       input.fetch,
       input.botToken,
       `/guilds/${encodeURIComponent(guildId)}/channels`,
+      "server channels lookup",
     ),
   ]);
   const memberId = member.user?.id;
