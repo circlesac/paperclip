@@ -178,6 +178,20 @@ expandable tool activity, and the queued/delivered timestamps for burst inputs.
 The corresponding provider thread contains the selected answers, not the
 internal operational commentary.
 
+Follow-up read-only audit on September 7 reconfirmed the live agent configuration
+as `paperclip_runner` / `codex` / `gpt-5.6-luna`, and the four text-run records
+above as `native` / `codex_app_server`. No global defaults were changed. Focused
+projection, stream, run-publication, interaction-publication, and heartbeat
+summary tests passed **82/82** across five files. No live model call was made for
+this follow-up because the account quota remains exhausted.
+
+The Board's rich native activity projection is not safe to forward wholesale:
+its objects can include command output, targets, and research queries. Native
+`report_progress` is also Board-only for chat-origin runs. External stream
+chunking presents already-selected safe prose; it is not token-live Runner
+reasoning. Any richer external activity would require a separate closed,
+sanitized projection, not reuse of the Board transcript objects.
+
 The new runner does not have the legacy operational skill or a general
 Paperclip API key. Consequently, the previous shell-helper file instructions
 were not a valid native-runner qualification. Native runs now receive a scoped
