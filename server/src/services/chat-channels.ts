@@ -558,6 +558,13 @@ const SUPPLIED_CREDENTIAL_KEYS: Record<ChatProvider, readonly string[]> = {
 const MAX_INBOUND_TEXT = 100_000;
 const MAX_ERROR_TEXT = 2_000;
 const DELIVERY_PROCESSING_STALE_MS = 60_000;
+// Reactions can beat the transaction that persists a just-sent provider
+// message link. Keep that narrow gap durable, but never retain an unbound
+// reaction indefinitely or let it enter the ordinary inbound-message FIFO.
+const REACTION_LINK_RETRY_DELAY_MS = 250;
+const REACTION_LINK_MAX_DELAY_MS = 5_000;
+const REACTION_LINK_MAX_ATTEMPTS = 20;
+const REACTION_LINK_MAX_AGE_MS = 2 * 60_000;
 // A Discord root mention is durably staged before the adapter creates its
 // provider thread. Give the bounded provider retry loop ample time to finish;
 // if the process disappears, the delivery worker verifies that thread over
@@ -1064,6 +1071,12 @@ export interface ChatChannelServiceOptions {
   reachAuthorizationBarrier?: () => Promise<void>;
   /** Testable boundary after receipt-reaction durability and before transport. */
   receiptReactionTransportBarrier?: () => Promise<void>;
+  /** Testable boundary between the first reaction-link and streaming lookups. */
+  reactionLinkPreflightBarrier?: () => Promise<void>;
+  /** Testable boundary after replay locks its endpoint and before conversation. */
+  reactionReplayEndpointLockBarrier?: () => Promise<void>;
+  /** Testable boundary after replay locks its conversation. */
+  reactionReplayConversationLockBarrier?: () => Promise<void>;
   /** Narrow fault-injection boundary before durable publication preparation. */
   publicationTransportPreparationBarrier?: (input: {
     publicationId: string;
@@ -10887,6 +10900,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         and(
           eq(chatDeliveries.endpointId, endpointId),
           inArray(chatDeliveries.state, ["received", "retry", "processing"]),
+          notInArray(chatDeliveries.eventKind, [
+            "reaction_added",
+            "reaction_removed",
+          ]),
           externalThreadIdentityCondition(externalThreadId, threadId),
         ),
       )
@@ -12147,6 +12164,232 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
   }
 
+  function reactionConversationThreadCondition(
+    provider: ChatProvider,
+    threadId: string,
+  ): SQL | undefined {
+    const exact = externalThreadIdentityCondition(
+      sql<string>`${chatConversations.externalThreadId}`,
+      threadId,
+    );
+    const slackDmChannel =
+      provider === "slack" ? slackThreadChannelId(threadId) : null;
+    return slackDmChannel && /^D[A-Z0-9-]*$/i.test(slackDmChannel)
+      ? or(
+          exact,
+          and(
+            eq(chatConversations.isDirectMessage, true),
+            eq(chatConversations.externalThreadId, `slack:${slackDmChannel}:`),
+          ),
+        )
+      : exact;
+  }
+
+  async function reactionConversationForMessage(
+    database: DbOrTransaction,
+    endpoint: EndpointRow,
+    threadId: string,
+    providerMessageId: string,
+    direction?: "outbound",
+  ): Promise<ConversationRow | null> {
+    return database
+      .select({ conversation: chatConversations })
+      .from(chatMessageLinks)
+      .innerJoin(
+        chatConversations,
+        and(
+          eq(chatConversations.companyId, chatMessageLinks.companyId),
+          eq(chatConversations.endpointId, chatMessageLinks.endpointId),
+          eq(chatConversations.id, chatMessageLinks.conversationId),
+        ),
+      )
+      .where(
+        and(
+          eq(chatMessageLinks.companyId, endpoint.companyId),
+          eq(chatMessageLinks.endpointId, endpoint.id),
+          eq(chatMessageLinks.providerMessageId, providerMessageId),
+          direction ? eq(chatMessageLinks.direction, direction) : undefined,
+          reactionConversationThreadCondition(endpoint.provider, threadId),
+        ),
+      )
+      .orderBy(desc(chatConversations.sessionGeneration))
+      .limit(1)
+      .then((rows) => rows[0]?.conversation ?? null);
+  }
+
+  async function lockReactionConversationForMessage(
+    tx: DbTransaction,
+    endpoint: EndpointRow,
+    threadId: string,
+    providerMessageId: string,
+    direction?: "outbound",
+  ): Promise<ConversationRow | null> {
+    const candidate = await reactionConversationForMessage(
+      tx,
+      endpoint,
+      threadId,
+      providerMessageId,
+      direction,
+    );
+    if (!candidate) return null;
+    const current = await tx
+      .select()
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          eq(chatConversations.id, candidate.id),
+        ),
+      )
+      // Publication settlement inserts the outbound message link before it
+      // updates the endpoint. NO KEY UPDATE serializes state changes while
+      // remaining compatible with that link's conversation FK KEY SHARE.
+      .for("no key update")
+      .then((rows) => rows[0] ?? null);
+    if (
+      !current ||
+      !(current.isDirectMessage
+        ? ["active", "waiting", "completed"].includes(current.state)
+        : ["active", "waiting"].includes(current.state))
+    ) {
+      return null;
+    }
+    const linkStillExists = await tx
+      .select({ id: chatMessageLinks.id })
+      .from(chatMessageLinks)
+      .where(
+        and(
+          eq(chatMessageLinks.companyId, endpoint.companyId),
+          eq(chatMessageLinks.endpointId, endpoint.id),
+          eq(chatMessageLinks.conversationId, current.id),
+          eq(chatMessageLinks.providerMessageId, providerMessageId),
+          direction ? eq(chatMessageLinks.direction, direction) : undefined,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    return linkStillExists ? current : null;
+  }
+
+  async function streamingReactionConversation(
+    database: DbOrTransaction,
+    endpoint: EndpointRow,
+    threadId: string,
+  ): Promise<ConversationRow | null> {
+    const candidates = await database
+      .selectDistinct({
+        conversation: chatConversations,
+        sessionGeneration: chatConversations.sessionGeneration,
+      })
+      .from(chatConversations)
+      .innerJoin(
+        chatPublications,
+        and(
+          eq(chatPublications.companyId, chatConversations.companyId),
+          eq(chatPublications.endpointId, chatConversations.endpointId),
+          eq(chatPublications.conversationId, chatConversations.id),
+        ),
+      )
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          or(
+            inArray(chatConversations.state, ["active", "waiting"]),
+            and(
+              eq(chatConversations.isDirectMessage, true),
+              eq(chatConversations.state, "completed"),
+            ),
+          ),
+          reactionConversationThreadCondition(endpoint.provider, threadId),
+          eq(chatPublications.state, "streaming"),
+        ),
+      )
+      .orderBy(desc(chatConversations.sessionGeneration))
+      .limit(2);
+    if (candidates.length !== 1) return null;
+    return candidates[0]!.conversation;
+  }
+
+  async function lockStreamingReactionConversation(
+    tx: DbTransaction,
+    endpoint: EndpointRow,
+    threadId: string,
+  ): Promise<ConversationRow | null> {
+    const candidate = await streamingReactionConversation(
+      tx,
+      endpoint,
+      threadId,
+    );
+    if (!candidate) return null;
+    const current = await tx
+      .select()
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          eq(chatConversations.id, candidate.id),
+          or(
+            inArray(chatConversations.state, ["active", "waiting"]),
+            and(
+              eq(chatConversations.isDirectMessage, true),
+              eq(chatConversations.state, "completed"),
+            ),
+          ),
+        ),
+      )
+      // Keep the same lock strength/order as the exact-link path above so an
+      // in-flight message-link insert cannot deadlock reaction admission.
+      .for("no key update")
+      .then((rows) => rows[0] ?? null);
+    if (!current) return null;
+    const stillStreaming = await tx
+      .select({ id: chatPublications.id })
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, endpoint.companyId),
+          eq(chatPublications.endpointId, endpoint.id),
+          eq(chatPublications.conversationId, current.id),
+          eq(chatPublications.state, "streaming"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    return stillStreaming ? current : null;
+  }
+
+  async function authorizeReactionConversation(
+    tx: DbTransaction,
+    endpoint: EndpointRow,
+    conversation: ConversationRow,
+    principalId: string,
+  ): Promise<boolean> {
+    const resource =
+      conversation.resourceId && !conversation.isDirectMessage
+        ? await tx
+            .select()
+            .from(chatEndpointResources)
+            .where(
+              and(
+                eq(chatEndpointResources.companyId, endpoint.companyId),
+                eq(chatEndpointResources.endpointId, endpoint.id),
+                eq(chatEndpointResources.id, conversation.resourceId),
+              ),
+            )
+            .for("update")
+            .then((rows) => rows[0] ?? null)
+        : null;
+    const destinationAllowed = conversation.isDirectMessage
+      ? endpoint.allowDirectMessages
+      : nonDirectDestinationAllowed(endpoint, resource);
+    if (!destinationAllowed) return false;
+    return (await lockCurrentPrincipalAuthorization(tx, endpoint, principalId))
+      .allowed;
+  }
+
   async function handleReaction(
     event: ChatSdkCallbackEvent<ReactionEvent>,
     runtimeContext: RuntimeContext,
@@ -12170,49 +12413,35 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // A DM can have a newer task generation while this reaction still belongs
     // to an older linked message. Resolve its exact lineage before choosing a
     // generation; never attach it to the latest task merely sharing the chat.
-    // Slack alone adds the message timestamp to a top-level DM callback's
-    // thread ID. Keep that fallback confined to the same D-prefixed DM.
-    const slackDmChannel =
-      event.provider === "slack"
-        ? slackThreadChannelId(event.event.threadId)
-        : null;
-    const conversation = await db
-      .select({ conversation: chatConversations })
-      .from(chatMessageLinks)
-      .innerJoin(
-        chatConversations,
-        and(
-          eq(chatConversations.companyId, chatMessageLinks.companyId),
-          eq(chatConversations.endpointId, chatMessageLinks.endpointId),
-          eq(chatConversations.id, chatMessageLinks.conversationId),
-        ),
-      )
-      .where(
-        and(
-          eq(chatMessageLinks.companyId, record.endpoint.companyId),
-          eq(chatMessageLinks.endpointId, event.endpointId),
-          eq(chatMessageLinks.providerMessageId, event.event.messageId),
-          or(
-            externalThreadIdentityCondition(
-              sql<string>`${chatConversations.externalThreadId}`,
-              event.event.threadId,
-            ),
-            slackDmChannel && /^D[A-Z0-9-]*$/i.test(slackDmChannel)
-              ? and(
-                  eq(chatConversations.isDirectMessage, true),
-                  eq(
-                    chatConversations.externalThreadId,
-                    `slack:${slackDmChannel}:`,
-                  ),
-                )
-              : undefined,
-          ),
-        ),
-      )
-      .orderBy(desc(chatConversations.sessionGeneration))
-      .limit(1)
-      .then((rows) => rows[0]?.conversation ?? null);
-    if (!conversation) return;
+    // A just-sent provider message can be visible before its publication/link
+    // transaction commits. Only that exact thread's streaming publication is
+    // enough evidence to stage an otherwise-unbound reaction for replay.
+    let conversation = await reactionConversationForMessage(
+      db,
+      record.endpoint,
+      event.event.threadId,
+      event.event.messageId,
+    );
+    await options.reactionLinkPreflightBarrier?.();
+    const plausibleStreamingConversation = conversation
+      ? null
+      : await streamingReactionConversation(
+          db,
+          record.endpoint,
+          event.event.threadId,
+        );
+    if (!conversation && !plausibleStreamingConversation) {
+      // Settlement can commit between the first exact-link lookup and the
+      // streaming-publication lookup. Recheck the durable link before treating
+      // the callback as an arbitrary unknown message.
+      conversation = await reactionConversationForMessage(
+        db,
+        record.endpoint,
+        event.event.threadId,
+        event.event.messageId,
+      );
+      if (!conversation) return;
+    }
 
     const principal = await ensurePrincipal(
       record.endpoint,
@@ -12243,6 +12472,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       event.event.rawEmoji,
       rawFingerprint,
     ].join(":");
+    const normalizedEvent = {
+      providerEventId,
+      kind: eventKind,
+      conversation: { externalThreadId: event.event.threadId },
+      message: { providerMessageId: event.event.messageId },
+      reaction: {
+        emoji: event.event.emoji.name,
+        rawEmoji: event.event.rawEmoji,
+        added: event.event.added,
+      },
+      runtimeContext: {
+        generation: runtimeContext.generation,
+        credentialFingerprint: runtimeContext.credentialFingerprint,
+      },
+    };
     const admitted = await db.transaction(async (tx) => {
       const currentEndpoint = await runtimeCallbackEndpoint(
         tx,
@@ -12251,82 +12495,134 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ["active"],
       );
       if (!currentEndpoint) return false;
-      const currentConversation = await tx
-        .select()
-        .from(chatConversations)
-        .where(
-          and(
-            eq(chatConversations.companyId, currentEndpoint.companyId),
-            eq(chatConversations.endpointId, currentEndpoint.id),
-            eq(chatConversations.id, conversation.id),
-            inArray(
-              chatConversations.state,
-              conversation.isDirectMessage
-                ? ["active", "waiting", "completed"]
-                : ["active", "waiting"],
-            ),
-          ),
-        )
-        .for("update")
-        .then((rows) => rows[0] ?? null);
-      if (!currentConversation) return false;
-      const currentResource =
-        currentConversation.resourceId && !currentConversation.isDirectMessage
-          ? await tx
-              .select()
-              .from(chatEndpointResources)
-              .where(
-                and(
-                  eq(
-                    chatEndpointResources.companyId,
-                    currentEndpoint.companyId,
-                  ),
-                  eq(chatEndpointResources.endpointId, currentEndpoint.id),
-                  eq(chatEndpointResources.id, currentConversation.resourceId),
-                ),
-              )
-              .for("update")
-              .then((rows) => rows[0] ?? null)
-          : null;
-      const destinationAllowed = currentConversation.isDirectMessage
-        ? currentEndpoint.allowDirectMessages
-        : nonDirectDestinationAllowed(currentEndpoint, currentResource);
-      if (!destinationAllowed) return false;
-      const authorization = await lockCurrentPrincipalAuthorization(
+      const linkedConversation = await lockReactionConversationForMessage(
         tx,
         currentEndpoint,
-        principal.principal.id,
+        event.event.threadId,
+        event.event.messageId,
       );
-      if (!authorization.allowed) return false;
-      await tx
+      const currentConversation =
+        linkedConversation ??
+        (await lockStreamingReactionConversation(
+          tx,
+          currentEndpoint,
+          event.event.threadId,
+        ));
+      if (
+        !currentConversation ||
+        !(await authorizeReactionConversation(
+          tx,
+          currentEndpoint,
+          currentConversation,
+          principal.principal.id,
+        ))
+      ) {
+        return false;
+      }
+      const now = new Date();
+      if (linkedConversation) {
+        const expiryCutoff = new Date(now.getTime() - REACTION_LINK_MAX_AGE_MS);
+        const hasOutboundLink = await tx
+          .select({ id: chatMessageLinks.id })
+          .from(chatMessageLinks)
+          .where(
+            and(
+              eq(chatMessageLinks.companyId, currentEndpoint.companyId),
+              eq(chatMessageLinks.endpointId, currentEndpoint.id),
+              eq(chatMessageLinks.conversationId, linkedConversation.id),
+              eq(chatMessageLinks.providerMessageId, event.event.messageId),
+              eq(chatMessageLinks.direction, "outbound"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows.length > 0);
+        const reconciled = hasOutboundLink
+          ? await tx
+              .update(chatDeliveries)
+              .set({
+                conversationId: linkedConversation.id,
+                state: "processed",
+                attempts: sql`${chatDeliveries.attempts} + 1`,
+                nextAttemptAt: null,
+                processedAt: now,
+                redactedError: null,
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(chatDeliveries.endpointId, currentEndpoint.id),
+                  eq(chatDeliveries.providerEventId, providerEventId),
+                  inArray(chatDeliveries.state, ["received", "retry"]),
+                  gt(chatDeliveries.receivedAt, expiryCutoff),
+                  lt(chatDeliveries.attempts, REACTION_LINK_MAX_ATTEMPTS),
+                  sql`${chatDeliveries.normalizedEvent}->'runtimeContext'->>'generation' = ${String(runtimeContext.generation)}`,
+                  sql`${chatDeliveries.normalizedEvent}->'runtimeContext'->>'credentialFingerprint' = ${runtimeContext.credentialFingerprint}`,
+                ),
+              )
+              .returning({ id: chatDeliveries.id })
+          : [];
+        if (reconciled.length > 0) return true;
+        const expired = await tx
+          .update(chatDeliveries)
+          .set({
+            state: "filtered",
+            nextAttemptAt: null,
+            processedAt: now,
+            redactedError:
+              "Reaction target did not become linked before replay expiry",
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, currentEndpoint.id),
+              eq(chatDeliveries.providerEventId, providerEventId),
+              inArray(chatDeliveries.state, ["received", "retry"]),
+              or(
+                lte(chatDeliveries.receivedAt, expiryCutoff),
+                gte(chatDeliveries.attempts, REACTION_LINK_MAX_ATTEMPTS),
+              ),
+              sql`${chatDeliveries.normalizedEvent}->'runtimeContext'->>'generation' = ${String(runtimeContext.generation)}`,
+              sql`${chatDeliveries.normalizedEvent}->'runtimeContext'->>'credentialFingerprint' = ${runtimeContext.credentialFingerprint}`,
+            ),
+          )
+          .returning({ id: chatDeliveries.id });
+        if (expired.length > 0) return false;
+      }
+      const inserted = await tx
         .insert(chatDeliveries)
         .values({
-          companyId: record.endpoint.companyId,
-          endpointId: event.endpointId,
-          conversationId: conversation.id,
+          companyId: currentEndpoint.companyId,
+          endpointId: currentEndpoint.id,
+          conversationId: linkedConversation?.id ?? null,
           principalId: principal.principal.id,
           providerEventId,
           deduplicationKey: createHash("sha256")
             .update(providerEventId)
             .digest("hex"),
           eventKind,
-          normalizedEvent: {
-            providerEventId,
-            kind: eventKind,
-            conversation: { externalThreadId: event.event.threadId },
-            message: { providerMessageId: event.event.messageId },
-            reaction: {
-              emoji: event.event.emoji.name,
-              rawEmoji: event.event.rawEmoji,
-              added: event.event.added,
-            },
-          },
-          state: "processed",
-          attempts: 1,
-          processedAt: new Date(),
+          normalizedEvent,
+          state: linkedConversation ? "processed" : "received",
+          attempts: linkedConversation ? 1 : 0,
+          nextAttemptAt: linkedConversation
+            ? null
+            : new Date(now.getTime() + REACTION_LINK_RETRY_DELAY_MS),
+          processedAt: linkedConversation ? now : null,
         })
-        .onConflictDoNothing();
-      return true;
+        .onConflictDoNothing()
+        .returning({ id: chatDeliveries.id });
+      if (inserted.length > 0) return true;
+      return tx
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, currentEndpoint.id),
+            eq(chatDeliveries.providerEventId, providerEventId),
+            inArray(chatDeliveries.state, ["received", "retry", "processed"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
     });
     if (admitted) {
       await recordCurrentMicrosoftTeamsRoute(
@@ -19077,6 +19373,328 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return response;
   }
 
+  function normalizedPendingReaction(delivery: DeliveryRow): {
+    added: boolean;
+    emoji: string;
+    messageId: string;
+    rawEmoji: string;
+    runtimeContext: LifecycleRuntimeFence;
+    threadId: string;
+  } | null {
+    if (
+      delivery.eventKind !== "reaction_added" &&
+      delivery.eventKind !== "reaction_removed"
+    ) {
+      return null;
+    }
+    const normalized = delivery.normalizedEvent;
+    if (
+      !normalized ||
+      typeof normalized !== "object" ||
+      Array.isArray(normalized)
+    ) {
+      return null;
+    }
+    const value = normalized as Record<string, unknown>;
+    const conversation = value.conversation;
+    const message = value.message;
+    const reaction = value.reaction;
+    const runtimeContext = lifecycleRuntimeFence(delivery);
+    if (
+      !conversation ||
+      typeof conversation !== "object" ||
+      Array.isArray(conversation) ||
+      !message ||
+      typeof message !== "object" ||
+      Array.isArray(message) ||
+      !reaction ||
+      typeof reaction !== "object" ||
+      Array.isArray(reaction) ||
+      !runtimeContext
+    ) {
+      return null;
+    }
+    const threadId = (conversation as Record<string, unknown>).externalThreadId;
+    const messageId = (message as Record<string, unknown>).providerMessageId;
+    const reactionRecord = reaction as Record<string, unknown>;
+    const added = reactionRecord.added;
+    const emoji = reactionRecord.emoji;
+    const rawEmoji = reactionRecord.rawEmoji;
+    return typeof threadId === "string" &&
+      threadId.length > 0 &&
+      typeof messageId === "string" &&
+      messageId.length > 0 &&
+      typeof added === "boolean" &&
+      added === (delivery.eventKind === "reaction_added") &&
+      typeof emoji === "string" &&
+      emoji.length > 0 &&
+      typeof rawEmoji === "string" &&
+      rawEmoji.length > 0
+      ? { added, emoji, messageId, rawEmoji, runtimeContext, threadId }
+      : null;
+  }
+
+  async function processPendingReactionDelivery(
+    candidate: DeliveryRow,
+  ): Promise<void> {
+    const reaction = normalizedPendingReaction(candidate);
+    if (!reaction || !candidate.principalId) {
+      const now = new Date();
+      await db
+        .update(chatDeliveries)
+        .set({
+          state: "failed",
+          nextAttemptAt: null,
+          processedAt: now,
+          redactedError: "Normalized reaction delivery is incomplete",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(chatDeliveries.id, candidate.id),
+            inArray(chatDeliveries.state, ["received", "retry"]),
+          ),
+        );
+      return;
+    }
+    const principalId = candidate.principalId;
+
+    await db.transaction(async (tx) => {
+      const currentEndpoint = await runtimeCallbackEndpoint(
+        tx,
+        candidate.endpointId,
+        reaction.runtimeContext,
+        ["active"],
+      );
+      let conversation: ConversationRow | null = null;
+      let disposition:
+        | { kind: "processed"; conversationId: string }
+        | { kind: "retry" }
+        | { kind: "filtered"; reason: string };
+
+      if (!currentEndpoint) {
+        disposition = {
+          kind: "filtered",
+          reason: "Reaction callback belonged to an unavailable runtime",
+        };
+      } else {
+        await options.reactionReplayEndpointLockBarrier?.();
+        conversation = await lockReactionConversationForMessage(
+          tx,
+          currentEndpoint,
+          reaction.threadId,
+          reaction.messageId,
+          "outbound",
+        );
+        if (conversation) {
+          await options.reactionReplayConversationLockBarrier?.();
+        }
+        if (conversation) {
+          disposition = (await authorizeReactionConversation(
+            tx,
+            currentEndpoint,
+            conversation,
+            principalId,
+          ))
+            ? { kind: "processed", conversationId: conversation.id }
+            : {
+                kind: "filtered",
+                reason:
+                  "Reaction destination or principal is no longer authorized",
+              };
+        } else {
+          conversation = await lockStreamingReactionConversation(
+            tx,
+            currentEndpoint,
+            reaction.threadId,
+          );
+          if (conversation) {
+            await options.reactionReplayConversationLockBarrier?.();
+          }
+          if (!conversation) {
+            disposition = {
+              kind: "filtered",
+              reason: "Reaction target was not linked to a sent message",
+            };
+          } else {
+            disposition = (await authorizeReactionConversation(
+              tx,
+              currentEndpoint,
+              conversation,
+              principalId,
+            ))
+              ? { kind: "retry" }
+              : {
+                  kind: "filtered",
+                  reason:
+                    "Reaction destination or principal is no longer authorized",
+                };
+          }
+        }
+      }
+
+      // Endpoint, conversation, destination and identity locks are acquired
+      // before the delivery row so pause/revoke and replay use one lock order.
+      const locked = await tx
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.id, candidate.id),
+            inArray(chatDeliveries.state, ["received", "retry"]),
+          ),
+        )
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      // Authorization locks may wait behind a concurrent lifecycle mutation.
+      // Sample the expiry clock only after this delivery is exclusively held.
+      const decisionAt = new Date();
+      if (!locked || !deliveryReady(locked, decisionAt)) return;
+      const lockedReaction = normalizedPendingReaction(locked);
+      if (
+        !lockedReaction ||
+        lockedReaction.runtimeContext.generation !==
+          reaction.runtimeContext.generation ||
+        lockedReaction.runtimeContext.credentialFingerprint !==
+          reaction.runtimeContext.credentialFingerprint
+      ) {
+        disposition = {
+          kind: "filtered",
+          reason: "Reaction delivery identity changed before replay",
+        };
+      }
+
+      const nextAttempts = locked.attempts + 1;
+      const expired =
+        decisionAt.getTime() - locked.receivedAt.getTime() >=
+        REACTION_LINK_MAX_AGE_MS;
+      if (expired || locked.attempts >= REACTION_LINK_MAX_ATTEMPTS) {
+        disposition = {
+          kind: "filtered",
+          reason: "Reaction target did not become linked before replay expiry",
+        };
+      }
+      if (disposition.kind === "retry" && !expired) {
+        if (nextAttempts < REACTION_LINK_MAX_ATTEMPTS) {
+          const delay = Math.min(
+            REACTION_LINK_RETRY_DELAY_MS *
+              2 ** Math.min(Math.max(locked.attempts, 0), 5),
+            REACTION_LINK_MAX_DELAY_MS,
+          );
+          await tx
+            .update(chatDeliveries)
+            .set({
+              state: "retry",
+              attempts: nextAttempts,
+              nextAttemptAt: new Date(decisionAt.getTime() + delay),
+              redactedError: "Waiting for the sent message link",
+              updatedAt: decisionAt,
+            })
+            .where(
+              and(
+                eq(chatDeliveries.id, locked.id),
+                eq(chatDeliveries.state, locked.state),
+                eq(chatDeliveries.attempts, locked.attempts),
+              ),
+            );
+          return;
+        }
+        disposition = {
+          kind: "filtered",
+          reason: "Reaction target did not become linked before retry expiry",
+        };
+      } else if (disposition.kind === "retry") {
+        disposition = {
+          kind: "filtered",
+          reason: "Reaction target did not become linked before age expiry",
+        };
+      }
+
+      const processedAt = new Date();
+      await tx
+        .update(chatDeliveries)
+        .set(
+          disposition.kind === "processed"
+            ? {
+                conversationId: disposition.conversationId,
+                state: "processed",
+                attempts: nextAttempts,
+                nextAttemptAt: null,
+                processedAt,
+                redactedError: null,
+                updatedAt: processedAt,
+              }
+            : {
+                state: "filtered",
+                attempts: nextAttempts,
+                nextAttemptAt: null,
+                processedAt,
+                redactedError: disposition.reason,
+                updatedAt: processedAt,
+              },
+        )
+        .where(
+          and(
+            eq(chatDeliveries.id, locked.id),
+            eq(chatDeliveries.state, locked.state),
+            eq(chatDeliveries.attempts, locked.attempts),
+          ),
+        );
+    });
+  }
+
+  async function processPendingReactionDeliveries(
+    limit: number,
+    onlyDeliveryId?: string,
+  ): Promise<number> {
+    const now = new Date();
+    const candidates = await db
+      .select()
+      .from(chatDeliveries)
+      .where(
+        and(
+          onlyDeliveryId ? eq(chatDeliveries.id, onlyDeliveryId) : undefined,
+          inArray(chatDeliveries.eventKind, [
+            "reaction_added",
+            "reaction_removed",
+          ]),
+          or(
+            and(
+              eq(chatDeliveries.state, "received"),
+              or(
+                isNull(chatDeliveries.nextAttemptAt),
+                lte(chatDeliveries.nextAttemptAt, now),
+              ),
+            ),
+            and(
+              eq(chatDeliveries.state, "retry"),
+              or(
+                isNull(chatDeliveries.nextAttemptAt),
+                lte(chatDeliveries.nextAttemptAt, now),
+              ),
+            ),
+          ),
+        ),
+      )
+      .orderBy(asc(chatDeliveries.receivedAt), asc(chatDeliveries.id))
+      .limit(limit);
+    for (const candidate of candidates) {
+      try {
+        await processPendingReactionDelivery(candidate);
+      } catch (error) {
+        logger.warn(
+          {
+            endpointId: candidate.endpointId,
+            deliveryId: candidate.id,
+            error: redactError(error),
+          },
+          "chat reaction-link reconciliation failed",
+        );
+      }
+    }
+    return candidates.length;
+  }
+
   /**
    * Reconcile a verified normalized delivery whose original request was
    * interrupted. Closed, credential-free provider descriptors reconstruct
@@ -19101,90 +19719,122 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           // admission; a stale in-flight post is quarantined as unknown.
           processPendingSlackTaskStarts(limit),
         ]);
-    const now = new Date();
-    const staleBefore = new Date(now.getTime() - DELIVERY_PROCESSING_STALE_MS);
-    const rows = await db
-      .select()
-      .from(chatDeliveries)
-      .where(
-        and(
-          onlyDeliveryId ? eq(chatDeliveries.id, onlyDeliveryId) : undefined,
-          or(
-            and(
-              eq(chatDeliveries.state, "received"),
-              or(
-                isNull(chatDeliveries.nextAttemptAt),
-                lte(chatDeliveries.nextAttemptAt, now),
+    const reactionRecovery = processPendingReactionDeliveries(
+      limit,
+      onlyDeliveryId,
+    ).catch((error) => {
+      logger.warn(
+        { error: redactError(error) },
+        "chat reaction-link recovery selection failed",
+      );
+      return 0;
+    });
+    let ordinaryFailed = false;
+    let ordinaryError: unknown = null;
+    let rows: DeliveryRow[] = [];
+    try {
+      const now = new Date();
+      const staleBefore = new Date(
+        now.getTime() - DELIVERY_PROCESSING_STALE_MS,
+      );
+      rows = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            onlyDeliveryId ? eq(chatDeliveries.id, onlyDeliveryId) : undefined,
+            notInArray(chatDeliveries.eventKind, [
+              "reaction_added",
+              "reaction_removed",
+            ]),
+            or(
+              and(
+                eq(chatDeliveries.state, "received"),
+                or(
+                  isNull(chatDeliveries.nextAttemptAt),
+                  lte(chatDeliveries.nextAttemptAt, now),
+                ),
               ),
-            ),
-            and(
-              eq(chatDeliveries.state, "retry"),
-              or(
-                isNull(chatDeliveries.nextAttemptAt),
-                lte(chatDeliveries.nextAttemptAt, now),
+              and(
+                eq(chatDeliveries.state, "retry"),
+                or(
+                  isNull(chatDeliveries.nextAttemptAt),
+                  lte(chatDeliveries.nextAttemptAt, now),
+                ),
               ),
-            ),
-            and(
-              eq(chatDeliveries.state, "processing"),
-              lte(chatDeliveries.updatedAt, staleBefore),
+              and(
+                eq(chatDeliveries.state, "processing"),
+                lte(chatDeliveries.updatedAt, staleBefore),
+              ),
             ),
           ),
-        ),
-      )
-      .orderBy(asc(chatDeliveries.receivedAt))
-      .limit(limit);
-    const conversations = new Set<string>();
-    for (const delivery of rows) {
-      const lifecycleEffect = normalizedLifecycleEffect(delivery);
-      if (lifecycleEffect) {
-        const record = await endpointRecord(delivery.endpointId);
-        if (!record || record.endpoint.status === "archived") {
+        )
+        .orderBy(asc(chatDeliveries.receivedAt))
+        .limit(limit);
+      const conversations = new Set<string>();
+      for (const delivery of rows) {
+        const lifecycleEffect = normalizedLifecycleEffect(delivery);
+        if (lifecycleEffect) {
+          const record = await endpointRecord(delivery.endpointId);
+          if (!record || record.endpoint.status === "archived") {
+            await db
+              .update(chatDeliveries)
+              .set({
+                state: "failed",
+                redactedError: "Chat endpoint is no longer available",
+                updatedAt: new Date(),
+              })
+              .where(eq(chatDeliveries.id, delivery.id));
+            continue;
+          }
+          try {
+            await applyProviderLifecycleEffect(
+              record.endpoint,
+              lifecycleEffect,
+            );
+          } catch (error) {
+            logger.warn(
+              {
+                endpointId: delivery.endpointId,
+                deliveryId: delivery.id,
+                error: redactError(error),
+              },
+              "chat provider lifecycle retry failed",
+            );
+          }
+          continue;
+        }
+        const externalThreadId = normalizedDeliveryThreadId(delivery);
+        if (!externalThreadId) {
           await db
             .update(chatDeliveries)
             .set({
               state: "failed",
-              redactedError: "Chat endpoint is no longer available",
+              redactedError: "Normalized delivery is incomplete",
               updatedAt: new Date(),
             })
             .where(eq(chatDeliveries.id, delivery.id));
           continue;
         }
-        try {
-          await applyProviderLifecycleEffect(record.endpoint, lifecycleEffect);
-        } catch (error) {
-          logger.warn(
-            {
-              endpointId: delivery.endpointId,
-              deliveryId: delivery.id,
-              error: redactError(error),
-            },
-            "chat provider lifecycle retry failed",
-          );
-        }
-        continue;
+        const key = conversationDrainKey(delivery.endpointId, externalThreadId);
+        if (conversations.has(key)) continue;
+        conversations.add(key);
+        await drainConversationDeliveries(
+          delivery.endpointId,
+          externalThreadId,
+        );
       }
-      const externalThreadId = normalizedDeliveryThreadId(delivery);
-      if (!externalThreadId) {
-        await db
-          .update(chatDeliveries)
-          .set({
-            state: "failed",
-            redactedError: "Normalized delivery is incomplete",
-            updatedAt: new Date(),
-          })
-          .where(eq(chatDeliveries.id, delivery.id));
-        continue;
-      }
-      const key = conversationDrainKey(delivery.endpointId, externalThreadId);
-      if (conversations.has(key)) continue;
-      conversations.add(key);
-      await drainConversationDeliveries(delivery.endpointId, externalThreadId);
+    } catch (error) {
+      ordinaryFailed = true;
+      ordinaryError = error;
     }
     // Provider recovery runs independently so a slow Slack Web API request
     // cannot hold unrelated verified inbound messages behind it. Callers that
     // explicitly replay one delivery skip these global sweeps entirely.
     if (actionRecovery) await actionRecovery;
-    return rows.length;
+    const reactionCount = await reactionRecovery;
+    if (ordinaryFailed) throw ordinaryError;
+    return reactionCount + rows.length;
   }
 
   async function listResources(endpointId: string) {

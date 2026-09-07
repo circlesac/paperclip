@@ -887,6 +887,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "conversationLeaseRenewalIntervalMs"
         | "questionFormOpenAuthorizationBarrier"
         | "questionResolutionPersistBarrier"
+        | "reactionLinkPreflightBarrier"
+        | "reactionReplayConversationLockBarrier"
+        | "reactionReplayEndpointLockBarrier"
         | "receiptReactionTransportBarrier"
         | "resolveNativeQuestion"
         | "renewCredentialMutationLease"
@@ -35652,6 +35655,943 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         item.summary.startsWith("reaction "),
       ),
     ).toHaveLength(2);
+  });
+
+  it("rechecks the outbound link when publication commits between reaction preflight reads", async () => {
+    const fixture = await seedCompany();
+    let releasePreflight!: () => void;
+    const preflightRelease = new Promise<void>((resolve) => {
+      releasePreflight = resolve;
+    });
+    let reachedPreflight!: () => void;
+    const preflightReached = new Promise<void>((resolve) => {
+      reachedPreflight = resolve;
+    });
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture, {
+        reactionLinkPreflightBarrier: async () => {
+          reachedPreflight();
+          await preflightRelease;
+        },
+      });
+    const channel = makeThread({
+      channelId: "C-REACTION-PREFLIGHT",
+      id: "slack:C-REACTION-PREFLIGHT:7125.1",
+      name: "reaction-preflight",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: "7125.1",
+        text: "@maya send a reply for the preflight race",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Slack conversation");
+    const wakeupCount = wakeup.mock.calls.length;
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack endpoint runtime");
+    const targetMessageId = "7125.2";
+    const targetMessage = makeMessage({ id: targetMessageId, text: "" });
+    const reaction = {
+      endpointId: endpoint.id,
+      provider: "slack" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "thumbs_up",
+          toJSON: () => ":thumbs_up:",
+          toString: () => ":thumbs_up:",
+        },
+        message: targetMessage,
+        messageId: targetMessageId,
+        raw: { event_ts: "7125.25" },
+        rawEmoji: "+1",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: targetMessage.author,
+      },
+    };
+    let reactionPromise: Promise<void> | null = null;
+    providerRuntime.postResultIds.push(targetMessageId);
+    providerRuntime.postHook = async () => {
+      if (reactionPromise) return;
+      reactionPromise = callbacks.onReaction!(reaction);
+      await preflightReached;
+      // Return to the provider send while the callback is between its first
+      // exact-link lookup and its streaming lookup.
+    };
+    await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "The preflight race reply",
+      "reaction-preflight-link-commit",
+      "owner-user",
+    );
+    providerRuntime.postHook = undefined;
+    releasePreflight();
+    await reactionPromise;
+
+    await expect(
+      db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        ),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        conversationId: conversation.id,
+        state: "processed",
+      }),
+    ]);
+    expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
+  });
+
+  it("durably replays a reaction that arrives before its outbound link without waking the task", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    const channel = makeThread({
+      channelId: "C-EARLY-REACTION",
+      id: "slack:C-EARLY-REACTION:7130.1",
+      name: "early-reaction",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: "7130.1",
+        text: "@maya prepare an outbound reply",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Slack conversation");
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack endpoint runtime");
+    const targetMessageId = "7130.2";
+    const targetMessage = makeMessage({
+      id: targetMessageId,
+      text: "",
+      mentioned: false,
+    });
+    const reaction = (messageId: string, eventTs: string) => ({
+      endpointId: endpoint.id,
+      provider: "slack" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "thumbs_up",
+          toJSON: () => ":thumbs_up:",
+          toString: () => ":thumbs_up:",
+        },
+        message: { ...targetMessage, id: messageId },
+        messageId,
+        raw: { event_ts: eventTs },
+        rawEmoji: "+1",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: targetMessage.author,
+      },
+    });
+    let stagedId: string | null = null;
+    let intercepted = false;
+    providerRuntime.postResultIds.push(targetMessageId);
+    providerRuntime.postHook = async () => {
+      if (intercepted) return;
+      intercepted = true;
+      const event = reaction(targetMessageId, "7130.25");
+      await callbacks.onReaction!(event);
+      await callbacks.onReaction!(event);
+      const staged = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        );
+      expect(staged).toHaveLength(1);
+      expect(staged[0]).toMatchObject({
+        conversationId: null,
+        state: "received",
+        attempts: 0,
+        normalizedEvent: expect.objectContaining({
+          conversation: { externalThreadId: channel.thread.id },
+          message: { providerMessageId: targetMessageId },
+          runtimeContext: {
+            generation: expect.any(Number),
+            credentialFingerprint: expect.any(String),
+          },
+        }),
+      });
+      stagedId = staged[0]!.id;
+    };
+    await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "A provider-visible reply",
+      "early-reaction-before-link",
+      "owner-user",
+    );
+    providerRuntime.postHook = undefined;
+    if (!stagedId) throw new Error("Expected a staged reaction delivery");
+
+    // An arbitrary message in the same thread is not plausible once no send
+    // is in flight, so it does not even create a durable reaction row.
+    await callbacks.onReaction(reaction("7130.unknown", "7130.3"));
+    await expect(
+      db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
+
+    const commentCount = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, conversation.issueId))
+      .then((rows) => rows.length);
+    const issueCount = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.companyId, fixture.companyId))
+      .then((rows) => rows.length);
+    const runCount = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, fixture.companyId))
+      .then((rows) => rows.length);
+    const wakeupCount = wakeup.mock.calls.length;
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: new Date(0) })
+      .where(eq(chatDeliveries.id, stagedId));
+    const restarted = createService();
+    await restarted.service.processPendingDeliveries(1, stagedId);
+    const [replayed] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, stagedId));
+    expect(replayed).toMatchObject({
+      conversationId: conversation.id,
+      state: "processed",
+      attempts: 1,
+      nextAttemptAt: null,
+      redactedError: null,
+    });
+
+    // The provider's exact retry after the link commit is the same immutable
+    // event and therefore neither duplicates nor replays task work.
+    await callbacks.onReaction(reaction(targetMessageId, "7130.25"));
+    await expect(
+      db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
+    await expect(
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, conversation.issueId))
+        .then((rows) => rows.length),
+    ).resolves.toBe(commentCount);
+    await expect(
+      db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.companyId, fixture.companyId))
+        .then((rows) => rows.length),
+    ).resolves.toBe(issueCount);
+    await expect(
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, fixture.companyId))
+        .then((rows) => rows.length),
+    ).resolves.toBe(runCount);
+    expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
+    expect(restarted.wakeup).not.toHaveBeenCalled();
+    await restarted.service.shutdown();
+  });
+
+  it("does not deadlock reaction replay against publication link settlement", async () => {
+    const fixture = await seedCompany();
+    let beginContention!: () => void;
+    const contention = new Promise<void>((resolve) => {
+      beginContention = resolve;
+    });
+    let endpointLocked!: () => void;
+    const endpointLockReached = new Promise<void>((resolve) => {
+      endpointLocked = resolve;
+    });
+    let conversationLocked!: () => void;
+    const conversationLockReached = new Promise<void>((resolve) => {
+      conversationLocked = resolve;
+    });
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture, {
+        reactionReplayEndpointLockBarrier: async () => {
+          endpointLocked();
+          await contention;
+        },
+        reactionReplayConversationLockBarrier: async () => {
+          conversationLocked();
+        },
+      });
+    const channel = makeThread({
+      channelId: "C-REACTION-LINK-LOCK",
+      id: "slack:C-REACTION-LINK-LOCK:7135.1",
+      name: "reaction-link-lock",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: "7135.1",
+        text: "@maya send a reply for the link lock race",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Slack conversation");
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack endpoint runtime");
+    const targetMessageId = "7135.2";
+    providerRuntime.postResultIds.push(targetMessageId);
+    const publication = await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "The link-lock race reply",
+      "reaction-link-lock-settlement",
+      "owner-user",
+    );
+    const [link] = await db
+      .select()
+      .from(chatMessageLinks)
+      .where(
+        and(
+          eq(chatMessageLinks.publicationId, publication.id),
+          eq(chatMessageLinks.providerMessageId, targetMessageId),
+        ),
+      );
+    if (!link) throw new Error("Expected the initial outbound link");
+    await db.delete(chatMessageLinks).where(eq(chatMessageLinks.id, link.id));
+    await db
+      .update(chatPublications)
+      .set({
+        state: "streaming",
+        providerMessageId: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(chatPublications.id, publication.id));
+    const targetMessage = makeMessage({ id: targetMessageId, text: "" });
+    await callbacks.onReaction({
+      endpointId: endpoint.id,
+      provider: "slack",
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "thumbs_up",
+          toJSON: () => ":thumbs_up:",
+          toString: () => ":thumbs_up:",
+        },
+        message: targetMessage,
+        messageId: targetMessageId,
+        raw: { event_ts: "7135.25" },
+        rawEmoji: "+1",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: targetMessage.author,
+      },
+    });
+    const [staged] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.endpointId, endpoint.id),
+          eq(chatDeliveries.eventKind, "reaction_added"),
+        ),
+      );
+    if (!staged) throw new Error("Expected a staged reaction delivery");
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: new Date(0) })
+      .where(eq(chatDeliveries.id, staged.id));
+    let linkInserted!: () => void;
+    const linkInsertReached = new Promise<void>((resolve) => {
+      linkInserted = resolve;
+    });
+    const settlement = db.transaction(async (tx) => {
+      await tx
+        .update(chatPublications)
+        .set({
+          state: "published",
+          providerMessageId: targetMessageId,
+          publishedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(chatPublications.id, publication.id));
+      await tx.insert(chatMessageLinks).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        publicationId: publication.id,
+        commentId: publication.commentId,
+        providerMessageId: targetMessageId,
+        direction: "outbound",
+      });
+      linkInserted();
+      await contention;
+      await tx
+        .update(chatEndpoints)
+        .set({ updatedAt: new Date() })
+        .where(eq(chatEndpoints.id, endpoint.id));
+    });
+    await linkInsertReached;
+    const wakeupCount = wakeup.mock.calls.length;
+    const replay = service.processPendingDeliveries(1, staged.id);
+    await endpointLockReached;
+    beginContention();
+    await conversationLockReached;
+    await Promise.all([settlement, replay]);
+
+    const [waitingForLink] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, staged.id));
+    expect(waitingForLink).toMatchObject({
+      conversationId: null,
+      state: "retry",
+      attempts: 1,
+      redactedError: "Waiting for the sent message link",
+    });
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: new Date(0) })
+      .where(eq(chatDeliveries.id, staged.id));
+    await service.processPendingDeliveries(1, staged.id);
+    const [processed] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, staged.id));
+    expect(processed).toMatchObject({
+      conversationId: conversation.id,
+      state: "processed",
+      attempts: 2,
+    });
+    expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
+  });
+
+  it("filters a late duplicate instead of bypassing the bounded reaction-link lifetime", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture);
+    const channel = makeThread({
+      channelId: "C-EXPIRED-REACTION",
+      id: "slack:C-EXPIRED-REACTION:7140.1",
+      name: "expired-reaction",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: "7140.1",
+        text: "@maya prepare another reply",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Slack conversation");
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack endpoint runtime");
+    const targetMessageId = "7140.2";
+    const targetMessage = makeMessage({ id: targetMessageId, text: "" });
+    const reaction = {
+      endpointId: endpoint.id,
+      provider: "slack" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "eyes",
+          toJSON: () => ":eyes:",
+          toString: () => ":eyes:",
+        },
+        message: targetMessage,
+        messageId: targetMessageId,
+        raw: { event_ts: "7140.25" },
+        rawEmoji: "eyes",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: targetMessage.author,
+      },
+    };
+    let stagedId: string | null = null;
+    providerRuntime.postResultIds.push(targetMessageId);
+    providerRuntime.postHook = async () => {
+      if (stagedId) return;
+      await callbacks.onReaction!(reaction);
+      stagedId = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        )
+        .then((rows) => rows[0]?.id ?? null);
+    };
+    await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "Another provider-visible reply",
+      "expired-reaction-before-link",
+      "owner-user",
+    );
+    providerRuntime.postHook = undefined;
+    if (!stagedId) throw new Error("Expected a staged reaction delivery");
+    await db
+      .update(chatDeliveries)
+      .set({
+        receivedAt: new Date(Date.now() - 2 * 60_000 - 1),
+        nextAttemptAt: new Date(0),
+      })
+      .where(eq(chatDeliveries.id, stagedId));
+
+    await callbacks.onReaction(reaction);
+    const [expired] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, stagedId));
+    expect(expired).toMatchObject({
+      conversationId: null,
+      state: "filtered",
+      redactedError:
+        "Reaction target did not become linked before replay expiry",
+    });
+  });
+
+  it("resamples reaction expiry after replay waits on authorization locks", async () => {
+    const fixture = await seedCompany();
+    const baseTime = new Date("2026-09-07T20:30:00.000Z");
+    let advanceReplayClock = false;
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture, {
+        reactionReplayEndpointLockBarrier: async () => {
+          if (advanceReplayClock) {
+            vi.setSystemTime(new Date(baseTime.getTime() + 2_000));
+          }
+        },
+      });
+    const channel = makeThread({
+      channelId: "C-REACTION-EXPIRY-LOCK",
+      id: "slack:C-REACTION-EXPIRY-LOCK:7142.1",
+      name: "reaction-expiry-lock",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: "7142.1",
+        text: "@maya prepare the expiry-lock reply",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation) throw new Error("Expected Slack conversation");
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack endpoint runtime");
+    const targetMessageId = "7142.2";
+    const targetMessage = makeMessage({ id: targetMessageId, text: "" });
+    let stagedId: string | null = null;
+    providerRuntime.postResultIds.push(targetMessageId);
+    providerRuntime.postHook = async () => {
+      if (stagedId) return;
+      await callbacks.onReaction!({
+        endpointId: endpoint.id,
+        provider: "slack",
+        event: {
+          adapter: {} as never,
+          added: true,
+          emoji: {
+            name: "eyes",
+            toJSON: () => ":eyes:",
+            toString: () => ":eyes:",
+          },
+          message: targetMessage,
+          messageId: targetMessageId,
+          raw: { event_ts: "7142.25" },
+          rawEmoji: "eyes",
+          thread: channel.thread,
+          threadId: channel.thread.id,
+          user: targetMessage.author,
+        },
+      });
+      stagedId = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        )
+        .then((rows) => rows[0]?.id ?? null);
+    };
+    await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "The expiry-lock reply",
+      "reaction-expiry-after-lock",
+      "owner-user",
+    );
+    providerRuntime.postHook = undefined;
+    if (!stagedId) throw new Error("Expected a staged reaction delivery");
+    await db
+      .update(chatDeliveries)
+      .set({
+        receivedAt: new Date(baseTime.getTime() - 2 * 60_000 + 1_000),
+        nextAttemptAt: new Date(0),
+      })
+      .where(eq(chatDeliveries.id, stagedId));
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(baseTime);
+      advanceReplayClock = true;
+      await service.processPendingDeliveries(1, stagedId);
+    } finally {
+      vi.useRealTimers();
+    }
+    const [filtered] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, stagedId));
+    expect(filtered).toMatchObject({
+      conversationId: null,
+      state: "filtered",
+      redactedError:
+        "Reaction target did not become linked before replay expiry",
+    });
+  });
+
+  it("filters a staged reaction when destination reach is revoked before replay", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    const channel = makeThread({
+      channelId: "C-REVOKED-EARLY-REACTION",
+      id: "slack:C-REVOKED-EARLY-REACTION:7145.1",
+      name: "revoked-early-reaction",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: "7145.1",
+        text: "@maya prepare a reply before reach changes",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const [conversation] = await service.listConversations(endpoint.id);
+    if (!conversation?.resourceId)
+      throw new Error("Expected a resource-backed Slack conversation");
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack endpoint runtime");
+    const targetMessageId = "7145.2";
+    const targetMessage = makeMessage({ id: targetMessageId, text: "" });
+    const reaction = {
+      endpointId: endpoint.id,
+      provider: "slack" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "thumbs_up",
+          toJSON: () => ":thumbs_up:",
+          toString: () => ":thumbs_up:",
+        },
+        message: targetMessage,
+        messageId: targetMessageId,
+        raw: { event_ts: "7145.25" },
+        rawEmoji: "+1",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: targetMessage.author,
+      },
+    };
+    let stagedId: string | null = null;
+    providerRuntime.postResultIds.push(targetMessageId);
+    providerRuntime.postHook = async () => {
+      if (stagedId) return;
+      await callbacks.onReaction!(reaction);
+      stagedId = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        )
+        .then((rows) => rows[0]?.id ?? null);
+    };
+    await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "A reply whose reach will be revoked",
+      "revoked-reaction-before-link",
+      "owner-user",
+    );
+    providerRuntime.postHook = undefined;
+    if (!stagedId) throw new Error("Expected a staged reaction delivery");
+    const commentCount = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, conversation.issueId))
+      .then((rows) => rows.length);
+    const wakeupCount = wakeup.mock.calls.length;
+    await db
+      .update(chatEndpointResources)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(eq(chatEndpointResources.id, conversation.resourceId));
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: new Date(0) })
+      .where(eq(chatDeliveries.id, stagedId));
+    await service.processPendingDeliveries(1, stagedId);
+
+    const [filtered] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, stagedId));
+    expect(filtered).toMatchObject({
+      conversationId: null,
+      state: "filtered",
+      redactedError:
+        "Reaction destination or principal is no longer authorized",
+    });
+    await callbacks.onReaction(reaction);
+    await expect(
+      db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
+    await expect(
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, conversation.issueId))
+        .then((rows) => rows.length),
+    ).resolves.toBe(commentCount);
+    expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
+  });
+
+  it("replays a pre-link reaction into the completed DM generation that sent the message", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    const channelId = "D-EARLY-REACTION";
+    const dm = makeThread({
+      channelId,
+      id: `slack:${channelId}:`,
+      isDM: true,
+      name: "Slack early-reaction DM",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: dm.thread,
+      message: makeMessage({
+        id: "7150.1",
+        text: "Prepare the first DM generation reply",
+        userId: "U-EARLY-DM",
+      }),
+      trigger: "direct_message",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Slack reaction callback was not registered");
+    const [firstConversation] = await service.listConversations(endpoint.id);
+    if (!firstConversation) throw new Error("Expected Slack DM conversation");
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack endpoint runtime");
+    const targetMessageId = "7150.2";
+    const targetMessage = makeMessage({
+      id: targetMessageId,
+      text: "",
+      userId: "U-EARLY-DM",
+    });
+    const reaction = {
+      endpointId: endpoint.id,
+      provider: "slack" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "thumbs_up",
+          toJSON: () => ":thumbs_up:",
+          toString: () => ":thumbs_up:",
+        },
+        message: targetMessage,
+        messageId: targetMessageId,
+        raw: { event_ts: "7150.25" },
+        rawEmoji: "+1",
+        thread: dm.thread,
+        threadId: dm.thread.id,
+        user: targetMessage.author,
+      },
+    };
+    let stagedId: string | null = null;
+    providerRuntime.postResultIds.push(targetMessageId);
+    providerRuntime.postHook = async () => {
+      if (stagedId) return;
+      const completedAt = new Date();
+      await db
+        .update(issues)
+        .set({ status: "done", completedAt, updatedAt: completedAt })
+        .where(eq(issues.id, firstConversation.issueId));
+      await db
+        .update(chatConversations)
+        .set({ state: "completed", updatedAt: completedAt })
+        .where(eq(chatConversations.id, firstConversation.id));
+      await callbacks.onReaction!(reaction);
+      stagedId = await db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        )
+        .then((rows) => rows[0]?.id ?? null);
+    };
+    await service.publishBoardMessage(
+      endpoint.id,
+      firstConversation.id,
+      "The first DM generation reply",
+      "completed-dm-reaction-before-link",
+      "owner-user",
+    );
+    providerRuntime.postHook = undefined;
+    if (!stagedId) throw new Error("Expected a staged DM reaction");
+
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: dm.thread,
+      message: makeMessage({
+        id: "7150.3",
+        text: "Start the next DM generation",
+        userId: "U-EARLY-DM",
+      }),
+      trigger: "direct_message",
+    });
+    const conversations = await service.listConversations(endpoint.id);
+    expect(conversations).toHaveLength(2);
+    const nextConversation = conversations.find(
+      (candidate) => candidate.id !== firstConversation.id,
+    );
+    expect(nextConversation).toMatchObject({
+      state: "active",
+      sessionGeneration: 2,
+    });
+    const wakeupCount = wakeup.mock.calls.length;
+    const runCount = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, fixture.companyId))
+      .then((rows) => rows.length);
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: new Date(0) })
+      .where(eq(chatDeliveries.id, stagedId));
+    await service.processPendingDeliveries(1, stagedId);
+    const [replayed] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, stagedId));
+    expect(replayed).toMatchObject({
+      conversationId: firstConversation.id,
+      state: "processed",
+    });
+    expect(replayed.conversationId).not.toBe(nextConversation?.id);
+    expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
+    await expect(
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, fixture.companyId))
+        .then((rows) => rows.length),
+    ).resolves.toBe(runCount);
   });
 
   it("maps a timestamp-bearing Slack DM reaction to the completed generation that owns its linked message", async () => {

@@ -397,3 +397,41 @@ read-only metadata lookups under current authorization, require the same unique
 share match, and transactionally bind the identity without another upload or
 repeating manual-completion side effects. That path is not implemented or
 claimed in this qualification.
+
+## Early-reaction recovery hardening
+
+The previously open reaction-before-link race now has a durable, bounded path.
+If the exact message link is not yet visible, only a currently authorized
+destination with an unambiguous in-flight publication can stage a minimal
+reaction receipt. It has no conversation/task association until the exact
+outbound message link exists. Recovery rechecks the endpoint/runtime fence,
+destination reach, and current principal authorization; it never creates a task,
+comment, run, or wake. Unknown unrelated messages are not admitted just because
+they share a channel.
+
+Pending reactions stay outside both ordinary inbound FIFO selectors. Their
+metadata-only recovery runs alongside ordinary deliveries, with paced retries
+bounded by 20 attempts and two minutes. Exact provider-event deduplication is
+preserved across the original callback, retry, and server restart. A completed
+DM generation can own its late reaction; a newer generation is never guessed.
+
+Independent review found and corrected three subtle interleavings: publication
+commit between the unlocked preflight reads; conversation FK key-share locks
+deadlocking with endpoint-first reaction admission; and a pre-lock timestamp
+allowing replay after expiry. Conversation locks now use `NO KEY UPDATE`, and
+expiry is evaluated after acquiring the delivery lock. Recovery promises are
+observed immediately and joined even if ordinary delivery processing throws,
+before the original error is rethrown.
+
+Seven focused real-PostgreSQL cases passed on fresh `reaction_focus_01` (5/5)
+and `reaction_focus_02` (2/2): preflight recheck, durable duplicate/restart replay
+without task work, publication-link lock overlap, late-duplicate expiry,
+post-lock clock expiry, revoked destination, and completed older-DM ownership.
+Server, shared, and UI typechecks passed. Cross-endpoint liveness under a held
+reaction lock was code-reviewed, not a separately executed eighth fixture.
+
+The full combined suite then passed **276/276** on the fresh migrated
+`chat_adapters_test_20260907_reaction_full_01` database, in 72.10 seconds
+(64.52 seconds of tests). This run included the final frozen service/test files
+and all seven additions. Simulated provider failures in its log are intentional
+negative fixtures, not live-provider failures.
