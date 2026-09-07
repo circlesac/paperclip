@@ -185,6 +185,15 @@ function publicationAttachmentIds(payload: unknown): string[] {
     : [];
 }
 
+function isUuid(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      value,
+    )
+  );
+}
+
 function encodeListCursor(cursor: ListCursor): string {
   return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
 }
@@ -210,8 +219,8 @@ function decodeListCursor(
       parsed.conversationId !== conversationId ||
       (parsed.sourceCommentId ?? null) !== sourceCommentId ||
       Number.isNaN(parsedDate.getTime()) ||
-      typeof parsed.attachmentId !== "string" ||
-      typeof parsed.sourceCommentIdTieBreak !== "string"
+      !isUuid(parsed.attachmentId) ||
+      !isUuid(parsed.sourceCommentIdTieBreak)
     ) {
       throw new Error("invalid");
     }
@@ -434,6 +443,8 @@ async function sourceLineageExists(
       and(
         eq(chatDeliveries.id, chatMessageLinks.deliveryId),
         eq(chatDeliveries.companyId, chatMessageLinks.companyId),
+        eq(chatDeliveries.endpointId, chatMessageLinks.endpointId),
+        eq(chatDeliveries.conversationId, chatMessageLinks.conversationId),
       ),
     )
     .where(
@@ -472,6 +483,7 @@ async function sourceLineageExists(
     .select({
       payload: chatPublications.payload,
       providerMessageId: chatPublications.providerMessageId,
+      publishedAt: chatPublications.publishedAt,
     })
     .from(chatPublications)
     .where(
@@ -484,36 +496,38 @@ async function sourceLineageExists(
         eq(chatPublications.state, "published"),
       ),
     );
-  const matchingPublications = publications.filter((row) =>
-    publicationAttachmentIds(row.payload).includes(source.attachmentId),
+  const matchingPublications = publications.filter(
+    (row) =>
+      row.providerMessageId !== null &&
+      row.publishedAt !== null &&
+      publicationAttachmentIds(row.payload).includes(source.attachmentId),
   );
   if (matchingPublications.length === 0) return false;
-  const providerMessageIds = matchingPublications.flatMap((row) =>
-    row.providerMessageId ? [row.providerMessageId] : [],
-  );
-  if (providerMessageIds.length === 0) return true;
-  const [lifecycle] = await tx
-    .select({ id: chatDeliveries.id })
-    .from(chatDeliveries)
-    .where(
-      and(
-        eq(chatDeliveries.companyId, binding.companyId),
-        eq(chatDeliveries.endpointId, conversation.endpointId),
-        eq(chatDeliveries.conversationId, conversation.conversationId),
-        inArray(chatDeliveries.eventKind, [
-          "message_updated",
-          "message_deleted",
-          "message_restored",
-        ]),
-        eq(chatDeliveries.state, "processed"),
-        inArray(
-          sql<string>`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId'`,
-          providerMessageIds,
+  for (const publication of matchingPublications) {
+    const [lifecycle] = await tx
+      .select({ id: chatDeliveries.id })
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.companyId, binding.companyId),
+          eq(chatDeliveries.endpointId, conversation.endpointId),
+          eq(chatDeliveries.conversationId, conversation.conversationId),
+          inArray(chatDeliveries.eventKind, [
+            "message_updated",
+            "message_deleted",
+            "message_restored",
+          ]),
+          eq(chatDeliveries.state, "processed"),
+          eq(
+            sql<string>`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId'`,
+            publication.providerMessageId!,
+          ),
         ),
-      ),
-    )
-    .limit(1);
-  return !lifecycle;
+      )
+      .limit(1);
+    if (!lifecycle) return true;
+  }
+  return false;
 }
 
 async function loadSource(
@@ -695,6 +709,16 @@ export async function listAuthorizedChatAttachments(input: {
         where attachment.company_id = ${input.binding.companyId}::uuid
           and attachment.issue_id = ${input.binding.issueId}::uuid
           and (${sourceFilter}::uuid is null or link.comment_id = ${sourceFilter}::uuid)
+          and not exists (
+            select 1
+            from chat_deliveries lifecycle
+            where lifecycle.company_id = ${input.binding.companyId}::uuid
+              and lifecycle.endpoint_id = ${conversation.endpointId}::uuid
+              and lifecycle.conversation_id = ${conversation.conversationId}::uuid
+              and lifecycle.state = 'processed'
+              and lifecycle.event_kind in ('message_updated', 'message_deleted', 'message_restored')
+              and lifecycle.normalized_event->'message'->>'targetProviderEventId' = delivery.provider_event_id
+          )
 
         union all
 
@@ -714,6 +738,8 @@ export async function listAuthorizedChatAttachments(input: {
           and publication.conversation_id = ${conversation.conversationId}::uuid
           and publication.issue_id = ${input.binding.issueId}::uuid
           and publication.state = 'published'
+          and publication.published_at is not null
+          and publication.provider_message_id is not null
           and publication.comment_id is not null
           and publication.payload->'attachmentIds' ? attachment.id::text
         join issue_comments source_comment
@@ -724,6 +750,16 @@ export async function listAuthorizedChatAttachments(input: {
         where attachment.company_id = ${input.binding.companyId}::uuid
           and attachment.issue_id = ${input.binding.issueId}::uuid
           and (${sourceFilter}::uuid is null or publication.comment_id = ${sourceFilter}::uuid)
+          and not exists (
+            select 1
+            from chat_deliveries lifecycle
+            where lifecycle.company_id = ${input.binding.companyId}::uuid
+              and lifecycle.endpoint_id = ${conversation.endpointId}::uuid
+              and lifecycle.conversation_id = ${conversation.conversationId}::uuid
+              and lifecycle.state = 'processed'
+              and lifecycle.event_kind in ('message_updated', 'message_deleted', 'message_restored')
+              and lifecycle.normalized_event->'message'->>'providerMessageId' = publication.provider_message_id
+          )
       ), candidates as (
         select distinct on (attachment_id)
           attachment_id,
@@ -833,6 +869,7 @@ async function readSourceBytes(
   storage: StorageService,
   companyId: string,
   source: ChatAttachmentReuseSource,
+  timeoutMs: number,
 ): Promise<Buffer> {
   let acquisitionTimedOut = false;
   let rejectAcquisition!: (error: Error) => void;
@@ -844,7 +881,7 @@ async function readSourceBytes(
     rejectAcquisition(
       new Error("paperclip_runner_chat_attachment_source_read_timed_out"),
     );
-  }, 10_000);
+  }, timeoutMs);
   acquisitionTimer.unref?.();
   const objectPromise = storage
     .getObject(companyId, source.objectKey)
@@ -862,7 +899,7 @@ async function readSourceBytes(
     object.stream.destroy(
       new Error("paperclip_runner_chat_attachment_source_read_timed_out"),
     );
-  }, 10_000);
+  }, timeoutMs);
   timeout.unref?.();
   const chunks: Buffer[] = [];
   let total = 0;
@@ -897,12 +934,73 @@ async function readSourceBytes(
   return body;
 }
 
+const DEFAULT_STORAGE_TIMEOUT_MS = 10_000;
+
+async function deleteStorageObjectWithin(
+  storage: StorageService,
+  companyId: string,
+  objectKey: string,
+  timeoutMs: number,
+): Promise<void> {
+  const deletion = storage
+    .deleteObject(companyId, objectKey)
+    .catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      deletion,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function putStorageObjectWithin(
+  storage: StorageService,
+  input: Parameters<StorageService["putFile"]>[0],
+  timeoutMs: number,
+): Promise<Awaited<ReturnType<StorageService["putFile"]>>> {
+  let timedOut = false;
+  let rejectTimeout!: (error: Error) => void;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    rejectTimeout(
+      new Error("paperclip_runner_chat_attachment_storage_write_timed_out"),
+    );
+  }, timeoutMs);
+  timer.unref?.();
+  const write = storage.putFile(input).then((stored) => {
+    if (timedOut) {
+      void deleteStorageObjectWithin(
+        storage,
+        input.companyId,
+        stored.objectKey,
+        timeoutMs,
+      );
+    }
+    return stored;
+  });
+  try {
+    return await Promise.race([write, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function prepareReusedChatAttachment(input: {
   db: Db;
   binding: ChatReuseBinding;
   source: ChatAttachmentReuseSource;
   title: string;
   storage?: StorageService;
+  storageTimeoutMs?: number;
 }): Promise<PreparedReusedChatAttachment> {
   const [issue] = await input.db
     .select({ statusVersion: issues.statusVersion })
@@ -930,18 +1028,29 @@ export async function prepareReusedChatAttachment(input: {
   if (!issue)
     throw new Error("paperclip_runner_chat_attachment_binding_denied");
   const storage = input.storage ?? getStorageService();
+  const storageTimeoutMs =
+    typeof input.storageTimeoutMs === "number" &&
+    Number.isFinite(input.storageTimeoutMs) &&
+    input.storageTimeoutMs > 0
+      ? input.storageTimeoutMs
+      : DEFAULT_STORAGE_TIMEOUT_MS;
   const body = await readSourceBytes(
     storage,
     input.binding.companyId,
     input.source,
+    storageTimeoutMs,
   );
-  const stored = await storage.putFile({
-    companyId: input.binding.companyId,
-    namespace: `issues/${input.binding.issueId}`,
-    originalFilename: input.source.filename,
-    contentType: input.source.contentType,
-    body,
-  });
+  const stored = await putStorageObjectWithin(
+    storage,
+    {
+      companyId: input.binding.companyId,
+      namespace: `issues/${input.binding.issueId}`,
+      originalFilename: input.source.filename,
+      contentType: input.source.contentType,
+      body,
+    },
+    storageTimeoutMs,
+  );
   try {
     if (
       stored.byteSize !== body.length ||
@@ -1037,13 +1146,21 @@ export async function prepareReusedChatAttachment(input: {
         },
       },
       rollbackDefinitePreCommitFailure: async () => {
-        await storage.deleteObject(input.binding.companyId, stored.objectKey);
+        await deleteStorageObjectWithin(
+          storage,
+          input.binding.companyId,
+          stored.objectKey,
+          storageTimeoutMs,
+        );
       },
     };
   } catch (error) {
-    await storage
-      .deleteObject(input.binding.companyId, stored.objectKey)
-      .catch(() => undefined);
+    await deleteStorageObjectWithin(
+      storage,
+      input.binding.companyId,
+      stored.objectKey,
+      storageTimeoutMs,
+    );
     throw error;
   }
 }

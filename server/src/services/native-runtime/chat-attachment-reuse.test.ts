@@ -32,8 +32,13 @@ import {
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
 import { createStorageService } from "../../storage/service.js";
+import type { StorageService } from "../../storage/types.js";
 import { issueService } from "../issues.js";
 import { mergeHeartbeatRunResultJson } from "../heartbeat-run-summary.js";
+import {
+  prepareReusedChatAttachment,
+  type ChatAttachmentReuseSource,
+} from "./chat-attachment-reuse.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
 describe("native same-conversation chat attachment reuse", () => {
@@ -446,6 +451,78 @@ describe("native same-conversation chat attachment reuse", () => {
     });
   });
 
+  it("bounds a stalled storage write and removes the late object without creating rows", async () => {
+    const [source] = await db
+      .select({
+        sourceCommentId: issueAttachments.issueCommentId,
+        attachmentId: issueAttachments.id,
+        filename: assets.originalFilename,
+        contentType: assets.contentType,
+        byteSize: assets.byteSize,
+        sha256: assets.sha256,
+        objectKey: assets.objectKey,
+        createdAt: issueAttachments.createdAt,
+      })
+      .from(issueAttachments)
+      .innerJoin(assets, eq(assets.id, issueAttachments.assetId))
+      .where(eq(issueAttachments.id, sourceAttachmentId));
+    if (!source?.sourceCommentId || !source.filename) {
+      throw new Error("source fixture missing");
+    }
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let resolveDeleted!: (objectKey: string) => void;
+    const deleted = new Promise<string>((resolve) => {
+      resolveDeleted = resolve;
+    });
+    const delayedStorage: StorageService = {
+      ...storage,
+      putFile: async (input) => {
+        const stored = await storage.putFile(input);
+        await writeGate;
+        return stored;
+      },
+      deleteObject: async (targetCompanyId, objectKey) => {
+        await storage.deleteObject(targetCompanyId, objectKey);
+        resolveDeleted(objectKey);
+      },
+    };
+    const before = await db
+      .select({ id: issueAttachments.id })
+      .from(issueAttachments)
+      .where(eq(issueAttachments.issueId, issueId));
+    await expect(
+      prepareReusedChatAttachment({
+        db,
+        binding: { companyId, issueId, runId, agentId },
+        source: source as ChatAttachmentReuseSource,
+        title: "Must time out",
+        storage: delayedStorage,
+        storageTimeoutMs: 20,
+      }),
+    ).rejects.toThrow(
+      "paperclip_runner_chat_attachment_storage_write_timed_out",
+    );
+    releaseWrite();
+    const deletedObjectKey = await Promise.race([
+      deleted,
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("late object was not removed")), 500),
+      ),
+    ]);
+    expect((await storage.headObject(companyId, deletedObjectKey)).exists).toBe(
+      false,
+    );
+    expect(
+      await db
+        .select({ id: issueAttachments.id })
+        .from(issueAttachments)
+        .where(eq(issueAttachments.issueId, issueId)),
+    ).toEqual(before);
+  });
+
   it("pages a stable deduplicated attachment history with equal timestamps", async () => {
     const equalCreatedAt = new Date("2026-09-07T18:00:00.000Z");
     const newAttachmentIds: string[] = [];
@@ -550,6 +627,211 @@ describe("native same-conversation chat attachment reuse", () => {
       new Set([sourceAttachmentId, ...newAttachmentIds]),
     );
     expect(seen).toHaveLength(4);
+    const invalidCursor = Buffer.from(
+      JSON.stringify({
+        schema: "paperclip.chat-attachment-list-cursor.v1",
+        conversationId,
+        sourceCommentId: null,
+        createdAt: equalCreatedAt.toISOString(),
+        attachmentId: "not-a-uuid",
+        sourceCommentIdTieBreak: "also-not-a-uuid",
+      }),
+      "utf8",
+    ).toString("base64url");
+    await expect(
+      authority().execute({
+        tool: "list_chat_attachments",
+        callId: "malformed-cursor",
+        arguments: { cursor: invalidCursor },
+      }),
+    ).rejects.toThrow("paperclip_runner_chat_attachment_cursor_invalid");
+  });
+
+  it("keeps an older confirmed lineage when a newer publication was deleted", async () => {
+    const stored = await storage.putFile({
+      companyId,
+      namespace: `issues/${issueId}`,
+      originalFilename: "published-twice.txt",
+      contentType: "text/plain",
+      body: Buffer.from("published twice\n", "utf8"),
+    });
+    const parent = await issueService(db).addComment(
+      issueId,
+      "Internal preparation parent",
+      { userId },
+    );
+    const attachment = await issueService(db).createAttachment({
+      issueId,
+      issueCommentId: parent.id,
+      provider: stored.provider,
+      objectKey: stored.objectKey,
+      contentType: stored.contentType,
+      byteSize: stored.byteSize,
+      sha256: stored.sha256,
+      originalFilename: stored.originalFilename,
+      createdByUserId: userId,
+    });
+    const olderCommentId = "20000000-0000-4000-8000-000000000111";
+    const newerCommentId = "20000000-0000-4000-8000-000000000222";
+    await db.insert(issueComments).values([
+      {
+        id: olderCommentId,
+        companyId,
+        issueId,
+        authorType: "user",
+        authorUserId: userId,
+        body: "First confirmed publication",
+      },
+      {
+        id: newerCommentId,
+        companyId,
+        issueId,
+        authorType: "user",
+        authorUserId: userId,
+        body: "Later deleted publication",
+      },
+    ]);
+    await db.insert(chatPublications).values([
+      {
+        companyId,
+        endpointId,
+        conversationId,
+        issueId,
+        commentId: olderCommentId,
+        idempotencyKey: "confirmed-published-older",
+        payload: { text: "First send", attachmentIds: [attachment.id] },
+        state: "published",
+        providerMessageId: "confirmed-older",
+        publishedAt: new Date("2026-09-07T18:01:00.000Z"),
+      },
+      {
+        companyId,
+        endpointId,
+        conversationId,
+        issueId,
+        commentId: newerCommentId,
+        idempotencyKey: "confirmed-published-newer",
+        payload: { text: "Second send", attachmentIds: [attachment.id] },
+        state: "published",
+        providerMessageId: "confirmed-newer",
+        publishedAt: new Date("2026-09-07T18:02:00.000Z"),
+      },
+    ]);
+    await db.insert(chatDeliveries).values({
+      companyId,
+      endpointId,
+      conversationId,
+      principalId,
+      providerEventId: "delete-newer-publication",
+      deduplicationKey: "delete-newer-publication",
+      eventKind: "message_deleted",
+      normalizedEvent: {
+        message: { providerMessageId: "confirmed-newer" },
+      },
+      state: "processed",
+      attempts: 1,
+      processedAt: new Date(),
+    });
+
+    const page = (await authority().execute({
+      tool: "list_chat_attachments",
+      callId: "multi-lineage-list",
+      arguments: { limit: 50 },
+    })) as {
+      attachments: Array<{ attachmentId: string; sourceCommentId: string }>;
+    };
+    expect(
+      page.attachments.find(
+        (candidate) => candidate.attachmentId === attachment.id,
+      ),
+    ).toMatchObject({ sourceCommentId: olderCommentId });
+    await expect(
+      authority().execute({
+        tool: "reuse_chat_attachment",
+        callId: "deleted-newer-lineage",
+        arguments: {
+          idempotencyKey: "deleted-newer-lineage",
+          sourceCommentId: newerCommentId,
+          attachmentId: attachment.id,
+          title: "Deleted newer copy",
+        },
+      }),
+    ).rejects.toThrow("paperclip_runner_chat_attachment_source_denied");
+    await expect(
+      authority().execute({
+        tool: "reuse_chat_attachment",
+        callId: "confirmed-older-lineage",
+        arguments: {
+          idempotencyKey: "confirmed-older-lineage",
+          sourceCommentId: olderCommentId,
+          attachmentId: attachment.id,
+          title: "Still confirmed older copy",
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "applied" });
+
+    const unconfirmedStored = await storage.putFile({
+      companyId,
+      namespace: `issues/${issueId}`,
+      originalFilename: "unconfirmed.txt",
+      contentType: "text/plain",
+      body: Buffer.from("never confirmed\n", "utf8"),
+    });
+    const unconfirmedParent = await issueService(db).addComment(
+      issueId,
+      "Unconfirmed preparation parent",
+      { userId },
+    );
+    const unconfirmedAttachment = await issueService(db).createAttachment({
+      issueId,
+      issueCommentId: unconfirmedParent.id,
+      provider: unconfirmedStored.provider,
+      objectKey: unconfirmedStored.objectKey,
+      contentType: unconfirmedStored.contentType,
+      byteSize: unconfirmedStored.byteSize,
+      sha256: unconfirmedStored.sha256,
+      originalFilename: unconfirmedStored.originalFilename,
+      createdByUserId: userId,
+    });
+    const unconfirmedComment = await issueService(db).addComment(
+      issueId,
+      "Publication row without provider confirmation",
+      { userId },
+    );
+    await db.insert(chatPublications).values({
+      companyId,
+      endpointId,
+      conversationId,
+      issueId,
+      commentId: unconfirmedComment.id,
+      idempotencyKey: "unconfirmed-publication",
+      payload: {
+        text: "Not actually sent",
+        attachmentIds: [unconfirmedAttachment.id],
+      },
+      state: "published",
+      providerMessageId: null,
+      publishedAt: null,
+    });
+    expect(
+      await authority().execute({
+        tool: "list_chat_attachments",
+        callId: "unconfirmed-list",
+        arguments: { sourceCommentId: unconfirmedComment.id },
+      }),
+    ).toEqual({ attachments: [], nextCursor: null, complete: true });
+    await expect(
+      authority().execute({
+        tool: "reuse_chat_attachment",
+        callId: "unconfirmed-reuse",
+        arguments: {
+          idempotencyKey: "unconfirmed-reuse",
+          sourceCommentId: unconfirmedComment.id,
+          attachmentId: unconfirmedAttachment.id,
+          title: "Must remain internal",
+        },
+      }),
+    ).rejects.toThrow("paperclip_runner_chat_attachment_source_denied");
   });
 
   it("rejects forged source pairs, stale reach, and deleted historical sources", async () => {
