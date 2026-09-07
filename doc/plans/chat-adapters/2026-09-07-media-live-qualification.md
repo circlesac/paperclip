@@ -31,7 +31,7 @@ it does **not** prove the agent handoff fix.
 | Discord | Cat rendered in the native media viewer; text file rendered with its exact contents. Image message `1546531868575535114`; file message `1546531871523995698`, in thread `1546513811672932372`. |
 | Slack | Bot image loaded at 1024×1024 and text file preview contained the exact fixture contents in the existing CHA-6 thread. |
 | Telegram | Bot image loaded at 800×800; document message `417200359:11` downloaded through the actual UI. The downloaded 128-byte file matched the source SHA-256 exactly. |
-| GitHub | App comment transport is link-only for attachments; direct upload is not qualified. Live Board file send published a caption and one explicit private-task notice per selected file, starting with comment `5572594232`. No file bytes or loopback URLs were exposed. The generic `Shared filename` preface was still misleading and is being made neutral. |
+| GitHub | App comment transport is link-only for attachments; direct upload is not qualified. Live Board file send published a caption and one explicit private-task notice per selected file, starting with comment `5572594232`. No file bytes or loopback URLs were exposed. The misleading generic `Shared filename` preface was replaced and the final live retake verified the neutral wording below. |
 | Teams | No live media claim: Microsoft 365 tenant/admin setup remains unavailable. |
 
 Text fixture SHA-256:
@@ -91,9 +91,9 @@ This repairs the reported missing-image failure, but the 283–333 second agent
 turns are too slow for a polished simple file reply. The Discord run made 28
 completed/failed tool calls, including avoidable connection discovery. The task
 prompt now explicitly directs external file replies to the installed artifact
-helper and away from provider-tool discovery or fetching a CLI. That latency
-improvement still needs a separate live measurement; native delivery success
-does not prove the interaction is fast enough.
+helper and away from provider-tool discovery or fetching a CLI. The final retake
+below measures the improvement; native delivery success does not prove the
+interaction is fast enough.
 
 The Paperclip task transcript also passed a live UI check: inbound images and
 files appeared even when the comment had no Markdown reference, the image opened
@@ -135,7 +135,52 @@ in the gallery at full size, and the text-file link opened its exact content.
   UI token gates passed. These build checks precede the final provenance edits;
   final targeted compile is repeated before handoff.
 
-The broad workspace test run is separate and is not claimed green here.
+## Final merged-build retake
+
+Merged `origin/master` at `f6a211479`, retained the media hardening, and corrected
+the connection wizard's tool-method selector after reconciliation. Restarted the
+live server with migration 0249 applied. Three ordinary requests were sent from
+the signed-in provider composers at 15:30:25–27 UTC, without helper instructions.
+
+| Provider | Observed result on the final media implementation |
+| --- | --- |
+| Discord | Run `15f7af18-d052-44d3-9698-127433b9e941` succeeded in 163 seconds. Native image `1546543862883946597` visibly rendered the cat; file `1546543864142102529` previewed `DISCORD-MEDIA-FINAL-0907-OK`. |
+| Slack | Run `d5e7b996-1fc0-41e4-92fd-c5522fd23fbb` succeeded in 183 seconds. Native file message `1788795212.198169` previewed `SLACK-MEDIA-FINAL-0907-OK`; image message `1788795215.443269` visibly rendered the cat in the same thread. |
+| Telegram | Run `783a9af6-eefd-4d24-a39b-ce8eac97bdcf` succeeded in 151 seconds. Photo `417200359:18` loaded at 800 pixels wide; document `417200359:19` downloaded through the real UI. |
+| GitHub | Fresh Board file send `4a82fa40-5fc0-42f7-99ac-ddc97c5b2ff8` produced comment `5572840135`: the file is saved on the private Paperclip task and this GitHub App connection cannot upload file bytes into comments. No misleading “Shared” preface or public file URL. |
+
+All six native attachment publications were `published` with one attempt each;
+each upload carried the correct immutable originating run. The refreshed
+Paperclip task transcript showed the newly bound images/files, and the native
+provider threads showed one copy of each selected file. GitHub's first fallback
+retake attempted to reuse already comment-bound attachment IDs and correctly
+received 409; a fresh QA upload was used instead, not a forced rebinding.
+
+The downloaded Telegram file was 29 bytes with SHA-256
+`464d31c3110370919f443cfb3576b836812f8590dd3bbf8572352d2cf4ed3136`, exactly matching
+Paperclip's stored asset. It contained the requested marker **plus a trailing
+newline**. The transport preserved the bytes correctly, but this is not an
+exact-byte content-generation success. Discord's text also included a newline;
+Slack's 25-byte marker had none. Do not silently rewrite generated file bytes in
+the transport to hide a model-content mismatch.
+
+Functional delivery is repaired. The 151–183 second turns improved substantially
+from 283–333 seconds, but remain too slow for a polished simple file reply.
+GitHub private inbound attachment bytes remain unqualified and the current
+outbound adapter remains link-only. Teams remains live-unqualified without the
+Microsoft 365 tenant/admin setup; no universal “files work everywhere” claim.
+
+Post-merge verification:
+
+- Connection/GitHub/tool-access/migration regression slice: **387/387**, no skips.
+- Workspace typecheck and workspace build: passed on the final merged sources.
+- Deterministic provider browser flows: **5/5** on another fresh database.
+- UI token gates and `git diff --check`: passed.
+
+The broad workspace run was stopped after fixture/mock failures and does not
+have a passing final summary. It also overlapped upstream reconciliation, so it
+is not a valid final-tree checkpoint. Only the explicit focused runs above are
+claimed green.
 
 GitHub's [issue-comment REST API](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment)
 accepts a comment body, unlike the browser's separate
