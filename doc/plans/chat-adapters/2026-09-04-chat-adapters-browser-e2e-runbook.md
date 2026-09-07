@@ -334,7 +334,7 @@ Run these assertions within each platform-specific procedure.
 5. Verify default queue order in the task and publications.
 6. Edit one human provider message, then delete another test message.
 7. Verify Paperclip appends a correction/tombstone rather than rewriting audit history.
-8. Where the provider emits reaction callbacks, add and then remove a reaction on a linked test message. Verify Activity records both events, while the task receives no new comment, wakeup, approval, or governed action.
+8. Where the provider emits reaction callbacks, add and then remove a reaction on a linked test message, then repeat the same add/remove cycle. Verify Activity records all four distinct occurrences, while a duplicate delivery of the same provider event is deduplicated. Keep Activity open to check automatic refresh. In DMs, also react to a message from a completed task after a newer generation starts; the event must remain on the original task and obey current destination/access restrictions. The task must receive no new comment, wakeup, approval, or governed action.
 9. Send `FAIL <run-id>`, verify the safe failed state, then use the authorized retry action from Activity.
 
 **Pass:** every supported native feature is used. Questions and confirmations follow the adapter's documented text/link/private fallback when native controls are unavailable; richer governance interactions remain Paperclip-only. Inputs apply once, queued turns retain order, edits/deletes and reactions remain auditable, reactions are never interpreted as authority, and retry does not duplicate task state or provider output.

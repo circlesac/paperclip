@@ -78,7 +78,7 @@ index 8cd0ed50d2c4971cffe75dd86c12764d837ab8cc..a2b135fd06b34f2b53c0cbdec71e4855
  }
  declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
      readonly name = "discord";
-+    readonly paperclipCompatibilityRevision = "paperclip-discord-v4";
++    readonly paperclipCompatibilityRevision = "paperclip-discord-v5";
      readonly userName: string;
      protected readonly apiBaseUrl: string;
      protected readonly botTokenProvider: () => Promise<string>;
@@ -122,7 +122,30 @@ index 8cd0ed50d2c4971cffe75dd86c12764d837ab8cc..a2b135fd06b34f2b53c0cbdec71e4855
          id: string;
          name: string;
      }>;
-@@ -809,4 +870,4 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+@@ -743,7 +804,7 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+     /**
+      * Set up legacy Gateway handlers for direct processing (when webhookUrl is not provided).
+      */
+-    protected setupLegacyGatewayHandlers(client: Client, isShuttingDown: () => boolean): void;
++    protected setupLegacyGatewayHandlers(client: Client, isShuttingDown: () => boolean): () => void;
+     /**
+      * Forward a Gateway event to the webhook endpoint.
+      */
+@@ -773,7 +834,12 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+         id: string;
+         username: string;
+         bot: boolean;
+-    }, added: boolean): Promise<void>;
++    }, added: boolean, gatewayDispatch?: {
++        eventType: "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE";
++        sequence: number;
++        sessionFingerprint: string;
++        shardId: number;
++    }): Promise<void>;
+     /**
+      * Derive channel ID from a Discord thread ID.
+      * Discord: discord:{guildId}:{channelId}:{threadId} -> discord:{guildId}:{channelId}
+@@ -809,4 +875,4 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
   */
  declare function createDiscordAdapter(config?: DiscordAdapterConfig): DiscordAdapter;
 
@@ -132,6 +155,13 @@ diff --git a/dist/index.js b/dist/index.js
 index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3961e2d59 100644
 --- a/dist/index.js
 +++ b/dist/index.js
+@@ -1,5 +1,6 @@
+ // src/index.ts
+ import { AsyncLocalStorage } from "async_hooks";
++import { createHash } from "node:crypto";
+ import {
+   downloadAttachment,
+   extractCard,
 @@ -783,6 +783,7 @@ ${tableToAscii(node)}
  // src/index.ts
  var DISCORD_API_BASE = "https://discord.com/api/v10";
@@ -221,7 +251,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
  }
  var DiscordAdapter = class _DiscordAdapter {
    name = "discord";
-+  paperclipCompatibilityRevision = "paperclip-discord-v4";
++  paperclipCompatibilityRevision = "paperclip-discord-v5";
    userName;
    apiBaseUrl;
    botTokenProvider;
@@ -671,7 +701,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
          new DiscordApiError(response.status, errorText)
        );
      }
-@@ -2372,9 +2520,16 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2372,9 +2520,17 @@ var DiscordAdapter = class _DiscordAdapter {
          GatewayIntentBits.GuildMessageReactions,
          GatewayIntentBits.DirectMessageReactions
        ],
@@ -686,6 +716,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
 +    const failGateway = (error) => {
 +      if (!isShuttingDown) rejectGatewayFailure(error);
 +    };
++    let cleanupLegacyGatewayHandlers;
      if (webhookUrl) {
        client.on("raw", async (packet) => {
          if (isShuttingDown) {
@@ -698,7 +729,10 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
                  }
                );
                return null;
-@@ -2419,45 +2574,111 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2417,47 +2586,114 @@ var DiscordAdapter = class _DiscordAdapter {
+     } else {
+-      this.setupLegacyGatewayHandlers(client, () => isShuttingDown);
++      cleanupLegacyGatewayHandlers = this.setupLegacyGatewayHandlers(client, () => isShuttingDown);
      }
      client.on(Events.ClientReady, () => {
        this.logger.info("Discord Gateway connected", {
@@ -831,6 +865,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
 +      throw error;
      } finally {
        isShuttingDown = true;
++      cleanupLegacyGatewayHandlers?.();
 +      if (lifetimeTimer) clearTimeout(lifetimeTimer);
 +      if (abortSignal && lifetimeAbort) {
 +        abortSignal.removeEventListener("abort", lifetimeAbort);
@@ -838,7 +873,85 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
        client.destroy();
        this.logger.info("Discord Gateway listener stopped");
      }
-@@ -2474,7 +2695,6 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2466,6 +2702,77 @@ var DiscordAdapter = class _DiscordAdapter {
+    * Set up legacy Gateway handlers for direct processing (when webhookUrl is not provided).
+    */
+   setupLegacyGatewayHandlers(client, isShuttingDown) {
++    const gatewaySessionFingerprints = /* @__PURE__ */ new Map();
++    const reactionDispatchesByPacket = /* @__PURE__ */ new WeakMap();
++    let activeReactionDispatch;
++    const reactionDispatchKey = (type, data, shardId) => JSON.stringify([
++      shardId,
++      type,
++      data?.guild_id ?? null,
++      data?.channel_id ?? null,
++      data?.message_id ?? null,
++      data?.user_id ?? null,
++      data?.emoji?.id ?? null,
++      data?.emoji?.name ?? null
++    ]);
++    const queueReactionDispatch = (packet, shardId) => {
++      if (packet?.op !== 0 || typeof packet.t !== "string") return;
++      if (packet.t === "READY") {
++        const sessionId = packet.d?.session_id;
++        if (typeof sessionId === "string" && sessionId.length > 0) {
++          gatewaySessionFingerprints.set(
++            shardId,
++            createHash("sha256").update(sessionId).digest("hex").slice(0, 24)
++          );
++        }
++        return;
++      }
++      if (packet.t !== "MESSAGE_REACTION_ADD" && packet.t !== "MESSAGE_REACTION_REMOVE") return;
++      const sessionFingerprint = gatewaySessionFingerprints.get(shardId);
++      if (!sessionFingerprint || !Number.isSafeInteger(packet.s) || packet.s < 0) return;
++      const key = reactionDispatchKey(packet.t, packet.d, shardId);
++      reactionDispatchesByPacket.set(packet, {
++        identity: {
++          eventType: packet.t,
++          sequence: packet.s,
++          sessionFingerprint,
++          shardId
++        },
++        key
++      });
++    };
++    const takeReactionDispatch = (reaction, user, added) => {
++      const shardId = reaction.message.guild?.shardId ?? 0;
++      const type = added ? "MESSAGE_REACTION_ADD" : "MESSAGE_REACTION_REMOVE";
++      const key = reactionDispatchKey(type, {
++        guild_id: reaction.message.guildId,
++        channel_id: reaction.message.channelId,
++        message_id: reaction.message.id,
++        user_id: user.id,
++        emoji: { id: reaction.emoji.id, name: reaction.emoji.name }
++      }, shardId);
++      if (activeReactionDispatch?.key !== key) return void 0;
++      return activeReactionDispatch.identity;
++    };
++    client.on(Events.Raw, (packet, shardId = 0) => {
++      queueReactionDispatch(packet, shardId);
++    });
++    if (typeof client.ws?.handlePacket !== "function") {
++      throw new Error(
++        "Discord Gateway compatibility error: packet handler is unavailable"
++      );
++    }
++    const originalHandlePacket = client.ws.handlePacket;
++    const handlePacketWithReactionDispatch = function(packet, shard) {
++      const previousReactionDispatch = activeReactionDispatch;
++      activeReactionDispatch = packet && typeof packet === "object" ? reactionDispatchesByPacket.get(packet) : void 0;
++      try {
++        return originalHandlePacket.call(this, packet, shard);
++      } finally {
++        activeReactionDispatch = previousReactionDispatch;
++      }
++    };
++    client.ws.handlePacket = handlePacketWithReactionDispatch;
+     client.on(Events.MessageCreate, async (message) => {
+       if (isShuttingDown()) {
+         this.logger.debug("Ignoring message - Gateway is shutting down");
+@@ -2474,7 +2774,6 @@ var DiscordAdapter = class _DiscordAdapter {
        if (message.author.bot) {
          this.logger.debug("Ignoring message from bot", {
            authorId: message.author.id,
@@ -890,7 +1003,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
      client.on(Events.InteractionCreate, async (interaction) => {
        if (isShuttingDown()) {
          this.logger.debug("Ignoring interaction - Gateway is shutting down");
-@@ -2516,7 +2761,7 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2516,65 +2852,66 @@ var DiscordAdapter = class _DiscordAdapter {
          await this.handleGatewayInteraction(interaction);
        } catch (error) {
          this.logger.error("Error handling Gateway interaction", {
@@ -899,7 +1012,10 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
            interactionId: interaction.id
          });
        }
-@@ -2526,26 +2771,23 @@ var DiscordAdapter = class _DiscordAdapter {
+     });
+     client.on(Events.MessageReactionAdd, async (reaction, user) => {
++      const gatewayDispatch = takeReactionDispatch(reaction, user, true);
+       if (isShuttingDown()) {
          this.logger.debug("Ignoring reaction - Gateway is shutting down");
          return;
        }
@@ -937,12 +1053,14 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
 -          true
 -        );
 -      }
-+        await this.handleGatewayReaction(resolvedReaction, resolvedUser, true);
++        await this.handleGatewayReaction(resolvedReaction, resolvedUser, true, gatewayDispatch);
 +      }, { event: "reaction_add", messageId: reaction.message.id });
      });
      client.on(Events.MessageReactionRemove, async (reaction, user) => {
++      const gatewayDispatch = takeReactionDispatch(reaction, user, false);
        if (isShuttingDown()) {
-@@ -2554,26 +2796,23 @@ var DiscordAdapter = class _DiscordAdapter {
+         this.logger.debug(
+           "Ignoring reaction removal - Gateway is shutting down"
          );
          return;
        }
@@ -980,11 +1098,17 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
 -          false
 -        );
 -      }
-+        await this.handleGatewayReaction(resolvedReaction, resolvedUser, false);
++        await this.handleGatewayReaction(resolvedReaction, resolvedUser, false, gatewayDispatch);
 +      }, { event: "reaction_remove", messageId: reaction.message.id });
      });
++    return () => {
++      if (client.ws.handlePacket === handlePacketWithReactionDispatch) {
++        client.ws.handlePacket = originalHandlePacket;
++      }
++    };
    }
    /**
+    * Forward a Gateway event to the webhook endpoint.
 @@ -2584,14 +2823,15 @@ var DiscordAdapter = class _DiscordAdapter {
        const botToken = await this.resolveBotToken();
        this.logger.debug("Forwarding Gateway event to webhook", {
@@ -1142,7 +1266,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
          content: message.content,
          author: {
            id: message.author.id,
-@@ -2696,14 +2998,95 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2696,19 +3085,100 @@ var DiscordAdapter = class _DiscordAdapter {
        // Add isMention flag for the chat handlers
        isMention: isMentioned
      });
@@ -1245,7 +1369,13 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
    }
    /**
     * Handle a reaction received via the Gateway WebSocket.
-@@ -2716,7 +3080,7 @@ var DiscordAdapter = class _DiscordAdapter {
+    */
+-  async handleGatewayReaction(reaction, user, added) {
++  async handleGatewayReaction(reaction, user, added, gatewayDispatch) {
+     if (!this.chat) {
+       return;
+     }
+@@ -2716,7 +3186,7 @@ var DiscordAdapter = class _DiscordAdapter {
      const channelId = reaction.message.channelId;
      const isInThread = reaction.message.channel?.isThread?.();
      let parentChannelId = channelId;
@@ -1254,8 +1384,13 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
      if (isInThread && reaction.message.channel?.parentId) {
        discordThreadId = channelId;
        parentChannelId = reaction.message.channel.parentId;
-@@ -2751,7 +3115,7 @@ var DiscordAdapter = class _DiscordAdapter {
-         user_id: user.id
+@@ -2748,10 +3218,11 @@ var DiscordAdapter = class _DiscordAdapter {
+         message_id: reaction.message.id,
+         channel_id: reaction.message.channelId,
+         guild_id: reaction.message.guildId,
+-        user_id: user.id
++        user_id: user.id,
++        ...gatewayDispatch ? { gateway_dispatch: gatewayDispatch } : {}
        }
      };
 -    this.chat.processReaction(reactionEvent);

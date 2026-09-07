@@ -56,8 +56,26 @@ function gatewayComponent(overrides: Record<string, unknown> = {}) {
 
 function harness(config: Record<string, unknown> = {}) {
   const handlers = new Map<string, GatewayHandler>();
+  const ws = {
+    handlePacket(packet: unknown) {
+      const record = packet as {
+        t?: string;
+        testReaction?: unknown;
+        testUser?: unknown;
+      };
+      const event =
+        record.t === "MESSAGE_REACTION_ADD"
+          ? "messageReactionAdd"
+          : record.t === "MESSAGE_REACTION_REMOVE"
+            ? "messageReactionRemove"
+            : undefined;
+      if (!event || !record.testReaction || !record.testUser) return false;
+      return handlers.get(event)?.(record.testReaction, record.testUser);
+    },
+  };
   const client = {
     user: { id: "123456789012345678" },
+    ws,
     on(event: string, handler: GatewayHandler) {
       handlers.set(event, handler);
       return this;
@@ -1290,6 +1308,161 @@ describe("Paperclip Discord adapter patch", () => {
         event: "reaction_add",
         messageId: "message-3",
       }),
+    );
+  });
+
+  it("preserves Discord Gateway reaction sequence identity across cycles and replay", async () => {
+    const { adapter, chat, client, handlers } = harness();
+    await adapter.initialize(chat as never);
+    const originalHandlePacket = client.ws.handlePacket;
+    const cleanup = (
+      adapter as unknown as {
+        setupLegacyGatewayHandlers(
+          client: unknown,
+          shuttingDown: () => boolean,
+        ): () => void;
+      }
+    ).setupLegacyGatewayHandlers(client, () => false);
+
+    const reaction = {
+      partial: false,
+      emoji: { id: null, name: "thumbsup" },
+      message: gatewayMessage({ id: "message-reaction-cycle" }),
+    };
+    const user = {
+      id: "user-1",
+      username: "ada",
+      bot: false,
+      partial: false,
+    };
+    const raw = {
+      guild_id: "1457808928258658549",
+      channel_id: "thread-1",
+      message_id: "message-reaction-cycle",
+      user_id: "user-1",
+      emoji: { id: null, name: "thumbsup" },
+    };
+    const ready = {
+      op: 0,
+      t: "READY",
+      s: 1,
+      d: { session_id: "private-gateway-session" },
+    };
+    handlers.get("raw")?.(ready, 0);
+    await client.ws.handlePacket(ready);
+    const dispatch = async (
+      type: "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE",
+      sequence: number,
+      delayed = false,
+    ) => {
+      const packet = {
+        op: 0,
+        t: type,
+        s: sequence,
+        d: raw,
+        testReaction: reaction,
+        testUser: user,
+      };
+      handlers.get("raw")?.(packet, 0);
+      if (delayed) await Promise.resolve();
+      await client.ws.handlePacket(packet);
+    };
+
+    await dispatch("MESSAGE_REACTION_ADD", 42, true);
+    await dispatch("MESSAGE_REACTION_ADD", 42);
+    const suppressedPacket = {
+      op: 0,
+      t: "MESSAGE_REACTION_REMOVE",
+      s: 43,
+      d: raw,
+    };
+    handlers.get("raw")?.(suppressedPacket, 0);
+    await client.ws.handlePacket(suppressedPacket);
+    await dispatch("MESSAGE_REACTION_REMOVE", 44);
+    await dispatch("MESSAGE_REACTION_ADD", 45);
+    const resumed = { op: 0, t: "RESUMED", s: 46, d: {} };
+    handlers.get("raw")?.(resumed, 0);
+    await client.ws.handlePacket(resumed);
+    await dispatch("MESSAGE_REACTION_ADD", 45);
+    const replacementReady = {
+      op: 0,
+      t: "READY",
+      s: 1,
+      d: { session_id: "replacement-private-gateway-session" },
+    };
+    handlers.get("raw")?.(replacementReady, 0);
+    await client.ws.handlePacket(replacementReady);
+    await dispatch("MESSAGE_REACTION_ADD", 42);
+
+    const callbacks = chat.handleReactionEvent.mock.calls.map(
+      ([event]) => event as { raw: Record<string, unknown> },
+    );
+    expect(callbacks).toHaveLength(6);
+    expect(
+      callbacks.map(({ raw: eventRaw }) => eventRaw.gateway_dispatch),
+    ).toEqual([
+      expect.objectContaining({
+        eventType: "MESSAGE_REACTION_ADD",
+        sequence: 42,
+        shardId: 0,
+        sessionFingerprint: expect.stringMatching(/^[a-f0-9]{24}$/u),
+      }),
+      expect.objectContaining({
+        eventType: "MESSAGE_REACTION_ADD",
+        sequence: 42,
+        shardId: 0,
+      }),
+      expect.objectContaining({
+        eventType: "MESSAGE_REACTION_REMOVE",
+        sequence: 44,
+        shardId: 0,
+      }),
+      expect.objectContaining({
+        eventType: "MESSAGE_REACTION_ADD",
+        sequence: 45,
+        shardId: 0,
+      }),
+      expect.objectContaining({
+        eventType: "MESSAGE_REACTION_ADD",
+        sequence: 45,
+        shardId: 0,
+      }),
+      expect.objectContaining({
+        eventType: "MESSAGE_REACTION_ADD",
+        sequence: 42,
+        shardId: 0,
+      }),
+    ]);
+    expect(JSON.stringify(callbacks)).not.toContain("private-gateway-session");
+    expect(
+      (callbacks[0]?.raw.gateway_dispatch as { sessionFingerprint: string })
+        .sessionFingerprint,
+    ).not.toBe(
+      (callbacks[5]?.raw.gateway_dispatch as { sessionFingerprint: string })
+        .sessionFingerprint,
+    );
+    expect(callbacks[3]?.raw.gateway_dispatch).toEqual(
+      callbacks[4]?.raw.gateway_dispatch,
+    );
+    cleanup();
+    expect(client.ws.handlePacket).toBe(originalHandlePacket);
+  });
+
+  it("fails closed when Discord's pinned Gateway packet hook is unavailable", async () => {
+    const { adapter, chat, client } = harness();
+    await adapter.initialize(chat as never);
+
+    expect(() =>
+      (
+        adapter as unknown as {
+          setupLegacyGatewayHandlers(
+            client: unknown,
+            shuttingDown: () => boolean,
+          ): () => void;
+        }
+      ).setupLegacyGatewayHandlers({ ...client, ws: {} }, () => false),
+    ).toThrow(
+      "Discord Gateway compatibility error: packet handler is unavailable",
     );
   });
 

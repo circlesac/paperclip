@@ -38,12 +38,12 @@ After restarting with the latest-message fix, each provider received
 “What is 61 + 8? Reply with only the number.” Telegram's wording additionally
 made explicit that this was a new message. All four provider UIs showed `69`.
 
-| Provider | Native run ID | Agent runtime | Send to publication acknowledgement |
-| --- | --- | ---: | ---: |
-| Discord | `a37453a9-9a01-42bc-a6c2-73b1a1793761` | 11.169 s | 13.472 s |
-| Telegram | `b950314c-1a62-4046-8db7-2dd31f1fc27a` | 12.288 s | 14.743 s |
-| Slack | `9001a484-ce26-489f-99f9-26446d979447` | 11.015 s | 13.554 s |
-| GitHub | `7ba05f32-5cb4-4477-b3a5-1c07d537a8e9` | 11.493 s | 16.467 s |
+| Provider | Native run ID                          | Agent runtime | Send to publication acknowledgement |
+| -------- | -------------------------------------- | ------------: | ----------------------------------: |
+| Discord  | `a37453a9-9a01-42bc-a6c2-73b1a1793761` |      11.169 s |                            13.472 s |
+| Telegram | `b950314c-1a62-4046-8db7-2dd31f1fc27a` |      12.288 s |                            14.743 s |
+| Slack    | `9001a484-ce26-489f-99f9-26446d979447` |      11.015 s |                            13.554 s |
+| GitHub   | `7ba05f32-5cb4-4477-b3a5-1c07d537a8e9` |      11.493 s |                            16.467 s |
 
 Agent runtime is persisted `finishedAt - startedAt`. The final column is the
 browser send timestamp to Paperclip's provider publication acknowledgement,
@@ -73,12 +73,12 @@ UIs, the first run answered ALPHA and the following run answered BETA and GAMMA
 together. The latter run's persisted wake IDs contained both pending messages.
 No requested marker was omitted and no duplicate final answer was observed.
 
-| Provider | First run | Coalesced follow-up run |
-| --- | --- | --- |
-| Discord | `948adf45-9264-4060-84fd-66dcdb2ffb5b` | `1e4b610e-a61e-4054-b3b3-adb1c2b6d241` |
+| Provider | First run                              | Coalesced follow-up run                |
+| -------- | -------------------------------------- | -------------------------------------- |
+| Discord  | `948adf45-9264-4060-84fd-66dcdb2ffb5b` | `1e4b610e-a61e-4054-b3b3-adb1c2b6d241` |
 | Telegram | `61044c8b-a6ab-4f7a-afa5-41aa3239b00c` | `efb8fee1-15ad-4b83-bd62-aa6a8a7e1895` |
-| Slack | `838b739d-0361-4a01-bc3f-48703b65d426` | `bccb60a2-4f52-4153-b1e9-62354b8dbe27` |
-| GitHub | `abed454d-5e7c-45d1-a4b1-80b152beb160` | `8ddd5631-54f2-4c3b-b3d2-41dbd8002fa9` |
+| Slack    | `838b739d-0361-4a01-bc3f-48703b65d426` | `bccb60a2-4f52-4153-b1e9-62354b8dbe27` |
+| GitHub   | `abed454d-5e7c-45d1-a4b1-80b152beb160` | `8ddd5631-54f2-4c3b-b3d2-41dbd8002fa9` |
 
 Pending messages wait for the current turn before their run is materialized;
 the run-row queue metric alone does not include this intentional wait.
@@ -187,16 +187,16 @@ existing audited publication path still owns provider delivery.
 
 ### Native media evidence
 
-| Provider / case | Native run | Observed result |
-| --- | --- | --- |
-| Telegram, generated text file | `8047d0ca-aabf-42d7-b8a9-753a84edbade` | Actual `native-telegram-0907.txt` document, 23 bytes; exact content `NATIVE-TELEGRAM-0907-OK`, no newline. |
-| Telegram, inbound text | `21e85d82-f13e-4e9a-9003-7f8f08834d36` | Read new 103-byte fixture and returned the correct unseen phrase `violet birch 82`; 21.099 s. |
-| Telegram, image round-trip | `c7fa20f1-d2d5-4ec2-91b2-00293735e5d5` | Described the orange tabby, sofa, and plant, then returned an actual photo; visually opened and inspected. 38.885 s. |
-| Discord, generated text file | `d97f9736-f4be-417b-b38e-cf452f22f245` | Actual `native-discord-0907-c.txt` attachment and inline content preview; exact 24 bytes, no newline. 45.663 s. |
-| Slack, generated text file | `71e4a887-21b1-4ecb-8b00-8a875aef04d6` | Actual `native-slack-0907-b.txt` file with preview in the original thread; exact 22 bytes, no newline. 38.576 s. |
-| GitHub, generated file fallback | `cf8c2192-4643-4983-905e-2258c0a4162b` | Canonical `native-github-0907-b.txt`, exact 23 bytes, no newline. GitHub explicitly reported private-task storage and that this App cannot upload file bytes into comments. 43.761 s. |
-| Discord, combined incoming text/image retest | `7f6cd1db-321b-4a02-a764-8db7496b1e19` | Exact phrase `violet birch 82`, correct cat/green-eyes/plant description, and actual returned PNG; 54.778 s. |
-| Slack, combined incoming text/image retest | `9bcc22ea-14dd-4e57-ac12-c22dad7b2f95` | Exact phrase and correct cat/sofa/plant description in the final answer, with returned image visibly rendered in the original thread; 55.855 s. |
+| Provider / case                              | Native run                             | Observed result                                                                                                                                                                       |
+| -------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Telegram, generated text file                | `8047d0ca-aabf-42d7-b8a9-753a84edbade` | Actual `native-telegram-0907.txt` document, 23 bytes; exact content `NATIVE-TELEGRAM-0907-OK`, no newline.                                                                            |
+| Telegram, inbound text                       | `21e85d82-f13e-4e9a-9003-7f8f08834d36` | Read new 103-byte fixture and returned the correct unseen phrase `violet birch 82`; 21.099 s.                                                                                         |
+| Telegram, image round-trip                   | `c7fa20f1-d2d5-4ec2-91b2-00293735e5d5` | Described the orange tabby, sofa, and plant, then returned an actual photo; visually opened and inspected. 38.885 s.                                                                  |
+| Discord, generated text file                 | `d97f9736-f4be-417b-b38e-cf452f22f245` | Actual `native-discord-0907-c.txt` attachment and inline content preview; exact 24 bytes, no newline. 45.663 s.                                                                       |
+| Slack, generated text file                   | `71e4a887-21b1-4ecb-8b00-8a875aef04d6` | Actual `native-slack-0907-b.txt` file with preview in the original thread; exact 22 bytes, no newline. 38.576 s.                                                                      |
+| GitHub, generated file fallback              | `cf8c2192-4643-4983-905e-2258c0a4162b` | Canonical `native-github-0907-b.txt`, exact 23 bytes, no newline. GitHub explicitly reported private-task storage and that this App cannot upload file bytes into comments. 43.761 s. |
+| Discord, combined incoming text/image retest | `7f6cd1db-321b-4a02-a764-8db7496b1e19` | Exact phrase `violet birch 82`, correct cat/green-eyes/plant description, and actual returned PNG; 54.778 s.                                                                          |
+| Slack, combined incoming text/image retest   | `9bcc22ea-14dd-4e57-ac12-c22dad7b2f95` | Exact phrase and correct cat/sofa/plant description in the final answer, with returned image visibly rendered in the original thread; 55.855 s.                                       |
 
 The returned Telegram JPEG matched the received image's 221,327 bytes and
 SHA-256 `1d22f8c026abf16ff0dde087d6c46a3b4a41978cfb4cee62c62e159e5550ce8a`.
@@ -345,3 +345,24 @@ Codex `usageLimitExceeded` response. Historical-file resend is not historical
 file inspection: this tool intentionally returns no earlier file bytes to the
 model. Teams and GitHub's private-task attachment fallback retain the limits
 described above.
+
+### Historical-file discovery and bounded storage follow-up
+
+Commit `3e932de55` fixes a narrower discovery defect: selecting the newest
+publication before excluding deleted or edited provider messages could hide an
+older, still-valid publication of the same attachment. Listing now filters
+invalid lineages before choosing a candidate. An explicit request using the
+older known source-comment pair could already succeed; the defect was not a
+blanket inability to reuse that file.
+
+The same follow-up requires a provider message ID and publication timestamp for
+confirmed outbound lineage, scopes inbound joins to the exact endpoint and
+conversation, validates cursor UUIDs before querying, and bounds storage reads,
+writes, and cleanup. A write that completes after its timeout schedules cleanup
+of that exact newly written object.
+
+The expanded package-local database suite passed **5/5**, covering valid older
+lineage, unconfirmed publication rejection, malformed cursors, stalled writes
+and late cleanup, byte identity, idempotency, and source/access revocation.
+Server TypeScript passed. This is supporting local verification, not a new
+live model-driven resend or quota-recovery pass; those remain unqualified.

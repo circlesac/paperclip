@@ -20364,6 +20364,121 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
   });
 
+  it("audits repeated Discord reaction cycles while deduplicating an exact Gateway replay", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service, wakeup } =
+      await configuredDiscordEndpoint(fixture);
+    const rootMessageId = "555555555555555597";
+    const channel = makeThread({
+      channelId: "333333333333333330",
+      id: `discord:1457808928258658549:333333333333333330:${rootMessageId}`,
+      name: "discord-reaction-cycles",
+    });
+    const original = makeMessage({
+      id: rootMessageId,
+      mentioned: true,
+      text: "@maya observe repeated reactions",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message: original,
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction) {
+      throw new Error("Discord reaction callback was not registered");
+    }
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    if (!conversation) throw new Error("Expected Discord conversation");
+    const commentCountBefore = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, conversation.issueId))
+      .then((rows) => rows.length);
+    const wakeupCountBefore = wakeup.mock.calls.length;
+    const emoji = {
+      name: "thumbsup",
+      toJSON: () => "👍",
+      toString: () => "👍",
+    };
+    const reaction = (
+      added: boolean,
+      sessionFingerprint: string,
+      sequence: number,
+    ) => ({
+      endpointId: endpoint.id,
+      provider: "discord" as const,
+      event: {
+        adapter: {} as never,
+        added,
+        emoji,
+        message: original,
+        messageId: original.id,
+        raw: {
+          channel_id: "333333333333333330",
+          emoji: { id: null, name: "👍" },
+          gateway_dispatch: {
+            eventType: added
+              ? "MESSAGE_REACTION_ADD"
+              : "MESSAGE_REACTION_REMOVE",
+            sequence,
+            sessionFingerprint,
+            shardId: 0,
+          },
+          guild_id: "1457808928258658549",
+          message_id: original.id,
+          user_id: original.author.userId,
+        },
+        rawEmoji: "👍",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: original.author,
+      },
+    });
+    const firstSession = "a".repeat(24);
+    const nextSession = "b".repeat(24);
+
+    await callbacks.onReaction(reaction(true, firstSession, 42));
+    await callbacks.onReaction(reaction(true, firstSession, 42));
+    await callbacks.onReaction(reaction(false, firstSession, 43));
+    await callbacks.onReaction(reaction(true, firstSession, 44));
+    await callbacks.onReaction(reaction(false, firstSession, 45));
+    await callbacks.onReaction(reaction(true, nextSession, 42));
+
+    const reactions = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.conversationId, conversation.id))
+      .then((rows) =>
+        rows.filter((row) => row.eventKind.startsWith("reaction_")),
+      );
+    expect(reactions).toHaveLength(5);
+    expect(new Set(reactions.map((row) => row.providerEventId)).size).toBe(5);
+    expect(reactions.map((row) => row.eventKind).sort()).toEqual([
+      "reaction_added",
+      "reaction_added",
+      "reaction_added",
+      "reaction_removed",
+      "reaction_removed",
+    ]);
+    expect(reactions.every((row) => row.state === "processed")).toBe(true);
+    await expect(
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, conversation.issueId)),
+    ).resolves.toHaveLength(commentCountBefore);
+    expect(wakeup.mock.calls).toHaveLength(wakeupCountBefore);
+    await service.shutdown();
+  });
+
   it("durably audits a rejected Discord Gateway action before surfacing transport rejection", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, service } =
@@ -34609,7 +34724,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
   });
 
-  it("audits Telegram reactions idempotently without comments or runs", async () => {
+  it("audits Telegram reactions on completed DM generations idempotently without comments or runs", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, service, wakeup } =
       await configuredTelegramEndpoint(fixture);
@@ -34641,10 +34756,38 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: new Date(), updatedAt: new Date() })
+      .where(eq(issues.id, conversation.issueId));
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "telegram",
+      thread: dm.thread,
+      message: makeMessage({
+        id: `${chatId}:82`,
+        text: "Start the next Telegram DM task",
+        userId: chatId,
+      }),
+      trigger: "direct_message",
+    });
+    const conversations = await service.listConversations(endpoint.id);
+    expect(conversations).toHaveLength(2);
+    expect(
+      conversations.find((row) => row.id === conversation.id),
+    ).toMatchObject({ state: "completed", sessionGeneration: 1 });
+    const newerConversation = conversations.find(
+      (row) => row.id !== conversation.id,
+    )!;
+    expect(newerConversation).toMatchObject({
+      state: "active",
+      sessionGeneration: 2,
+    });
     const commentCount = await db
       .select()
       .from(issueComments)
-      .where(eq(issueComments.issueId, conversation.issueId))
+      .where(eq(issueComments.companyId, fixture.companyId))
       .then((rows) => rows.length);
     const wakeupCount = wakeup.mock.calls.length;
     const runCount = await db
@@ -34676,6 +34819,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await callbacks.onReaction(reaction(true, 8_001));
     await callbacks.onReaction(reaction(true, 8_001));
     await callbacks.onReaction(reaction(false, 8_002));
+    await callbacks.onReaction(reaction(true, 8_003));
+    await callbacks.onReaction(reaction(false, 8_004));
+    const foreignThreadReaction = reaction(true, 8_005);
+    foreignThreadReaction.event.threadId = "telegram:77112238";
+    await callbacks.onReaction(foreignThreadReaction);
+    await service.update(
+      endpoint.id,
+      { allowDirectMessages: false },
+      "owner-user",
+    );
+    await callbacks.onReaction(reaction(true, 8_006));
 
     const reactions = await db
       .select()
@@ -34684,16 +34838,33 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .then((rows) =>
         rows.filter((row) => row.eventKind.startsWith("reaction_")),
       );
-    expect(reactions).toHaveLength(2);
+    expect(reactions).toHaveLength(4);
     expect(reactions.map((row) => row.eventKind).sort()).toEqual([
       "reaction_added",
+      "reaction_added",
+      "reaction_removed",
       "reaction_removed",
     ]);
+    expect(reactions.every((row) => row.state === "processed")).toBe(true);
+    await expect(
+      db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.conversationId, newerConversation.id),
+            inArray(chatDeliveries.eventKind, [
+              "reaction_added",
+              "reaction_removed",
+            ]),
+          ),
+        ),
+    ).resolves.toHaveLength(0);
     expect(
       await db
         .select()
         .from(issueComments)
-        .where(eq(issueComments.issueId, conversation.issueId))
+        .where(eq(issueComments.companyId, fixture.companyId))
         .then((rows) => rows.length),
     ).toBe(commentCount);
     expect(wakeup).toHaveBeenCalledTimes(wakeupCount);

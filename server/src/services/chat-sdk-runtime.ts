@@ -508,9 +508,9 @@ interface DiscordChatInternals {
 
 function assertDiscordAdapterCompatibility(adapter: Adapter, chat: Chat): void {
   const discord = adapter as unknown as DiscordAdapterInternals;
-  if (discord.paperclipCompatibilityRevision !== "paperclip-discord-v4") {
+  if (discord.paperclipCompatibilityRevision !== "paperclip-discord-v5") {
     throw new DiscordAdapterCompatibilityError(
-      "Paperclip patch revision paperclip-discord-v4 is unavailable",
+      "Paperclip patch revision paperclip-discord-v5 is unavailable",
     );
   }
   if (typeof discord.startGatewayListener !== "function") {

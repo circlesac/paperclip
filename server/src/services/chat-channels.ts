@@ -12003,67 +12003,52 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     ) {
       return;
     }
-    let conversation: ConversationRow | null = await conversationForThread(
-      event.endpointId,
-      event.event.threadId,
-    );
-    // Slack's reaction callback represents a top-level DM message as
-    // `slack:D...:<message-ts>`, while ordinary top-level DM ingestion binds
-    // the conversation to the channel-only `slack:D...:` thread. Limit the
-    // normalization fallback to D-prefixed Slack conversations and anchor it
-    // on the exact durable message link. A newer task generation can already
-    // be active in the same DM, while a reaction still belongs to the prior
-    // completed generation. Channel roots and replies retain exact provider-
-    // thread matching.
-    if (!conversation && event.provider === "slack") {
-      const channelId = slackThreadChannelId(event.event.threadId);
-      if (channelId && /^D[A-Z0-9-]*$/i.test(channelId)) {
-        const linkedConversation = await db
-          .select({ conversationId: chatMessageLinks.conversationId })
-          .from(chatMessageLinks)
-          .innerJoin(
-            chatConversations,
-            and(
-              eq(chatConversations.companyId, chatMessageLinks.companyId),
-              eq(chatConversations.endpointId, chatMessageLinks.endpointId),
-              eq(chatConversations.id, chatMessageLinks.conversationId),
-            ),
-          )
-          .where(
-            and(
-              eq(chatConversations.companyId, record.endpoint.companyId),
-              eq(chatConversations.endpointId, event.endpointId),
-              eq(chatConversations.externalThreadId, `slack:${channelId}:`),
-              eq(chatConversations.isDirectMessage, true),
-              eq(chatMessageLinks.providerMessageId, event.event.messageId),
-            ),
-          )
-          .orderBy(desc(chatConversations.sessionGeneration))
-          .then((rows) => rows[0] ?? null);
-        conversation = linkedConversation
-          ? await db
-              .select()
-              .from(chatConversations)
-              .where(
-                eq(chatConversations.id, linkedConversation.conversationId),
-              )
-              .then((rows) => rows[0] ?? null)
-          : null;
-      }
-    }
-    if (!conversation) return;
-    const linkedMessage = await db
-      .select({ id: chatMessageLinks.id })
+    // A DM can have a newer task generation while this reaction still belongs
+    // to an older linked message. Resolve its exact lineage before choosing a
+    // generation; never attach it to the latest task merely sharing the chat.
+    // Slack alone adds the message timestamp to a top-level DM callback's
+    // thread ID. Keep that fallback confined to the same D-prefixed DM.
+    const slackDmChannel =
+      event.provider === "slack"
+        ? slackThreadChannelId(event.event.threadId)
+        : null;
+    const conversation = await db
+      .select({ conversation: chatConversations })
       .from(chatMessageLinks)
-      .where(
+      .innerJoin(
+        chatConversations,
         and(
-          eq(chatMessageLinks.endpointId, event.endpointId),
-          eq(chatMessageLinks.conversationId, conversation.id),
-          eq(chatMessageLinks.providerMessageId, event.event.messageId),
+          eq(chatConversations.companyId, chatMessageLinks.companyId),
+          eq(chatConversations.endpointId, chatMessageLinks.endpointId),
+          eq(chatConversations.id, chatMessageLinks.conversationId),
         ),
       )
-      .then((rows) => rows[0] ?? null);
-    if (!linkedMessage) return;
+      .where(
+        and(
+          eq(chatMessageLinks.companyId, record.endpoint.companyId),
+          eq(chatMessageLinks.endpointId, event.endpointId),
+          eq(chatMessageLinks.providerMessageId, event.event.messageId),
+          or(
+            externalThreadIdentityCondition(
+              sql<string>`${chatConversations.externalThreadId}`,
+              event.event.threadId,
+            ),
+            slackDmChannel && /^D[A-Z0-9-]*$/i.test(slackDmChannel)
+              ? and(
+                  eq(chatConversations.isDirectMessage, true),
+                  eq(
+                    chatConversations.externalThreadId,
+                    `slack:${slackDmChannel}:`,
+                  ),
+                )
+              : undefined,
+          ),
+        ),
+      )
+      .orderBy(desc(chatConversations.sessionGeneration))
+      .limit(1)
+      .then((rows) => rows[0]?.conversation ?? null);
+    if (!conversation) return;
 
     const principal = await ensurePrincipal(
       record.endpoint,
