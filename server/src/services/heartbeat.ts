@@ -206,7 +206,7 @@ import {
   HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS,
   HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
   hasAcceptedSemanticResult,
-  isExternalChatContinuationPresentationContext,
+  isExternalChatPresentationContext,
   mergeHeartbeatRunResultJson,
   readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
@@ -22164,9 +22164,7 @@ export function heartbeatService(
               existingComment: existingRunComment,
               finalAgentMessage,
               preferFinalResponseOverExistingComment:
-                isExternalChatContinuationPresentationContext(
-                  livenessRun.contextSnapshot,
-                ),
+                isExternalChatPresentationContext(livenessRun.contextSnapshot),
             });
             let presentationDecision: RunPresentationDecision =
               resolved.decision;

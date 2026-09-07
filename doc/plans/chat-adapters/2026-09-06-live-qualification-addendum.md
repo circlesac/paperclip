@@ -567,3 +567,130 @@ Verification after the fixes:
 - Live browser checks covered real provider credential verification and the
   GitHub guest-refusal round trip, not a successful agent conversation. The
   broader deterministic browser suite was not rerun for these server changes.
+
+### Stable ingress and linked-account qualification — 2026-09-07, continued
+
+The operator completed Tailscale Funnel enablement and the GitHub identity
+confirmation. These observations supersede the pending gates above:
+
+- The stable webhook origin is
+  `https://dottas-macbook-pro.tail29c1aa.ts.net:10000`. Funnel forwards only to
+  the webhook-only proxy on loopback port 3104. Existing tailnet-only routes on
+  443 and 8443 were not made public. Public board health/company requests
+  return **404**, and an unsigned recognized GitHub ping returns **401**.
+- GitHub's App settings and Paperclip now use that stable origin with the
+  existing endpoint path and signing secret. A signed, real issue comment
+  reached Paperclip through Tailscale. The obsolete temporary Cloudflare
+  tunnel was stopped after this positive ingress evidence.
+- The private confirmation flow linked `cryppadotta` to the local Board account.
+  A new conversation, rather than the earlier guest-admitted CHA-1, was used
+  for the linked-account test.
+- [Enabled-repository issue 2](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5571135634)
+  created exactly one conversation and task **CHA-2** and received a receipt
+  reaction. **This was not a successful agent-answer test:** the pinned Codex
+  ACP runtime converted an unsupported-model provider error into assistant
+  text and reported the run as completed. Paperclip then published that raw
+  diagnostic. This is a release-blocking error-classification/publication
+  defect, not acceptable chat output.
+- The installed `codex-acp` 1.6.2 process runs its bundled Codex 0.148.0, not the
+  separately installed CLI. The test agent had inherited the operator's Astra
+  model. Only the isolated Maya fixture was pinned to Paperclip's existing
+  `gpt-5.6-sol` default for further qualification; no global model, CLI,
+  credential, or unrelated agent configuration was changed. Successful live
+  runtime execution still needs proof after the typed-failure repair.
+- [Disabled-repository issue 1](https://github.com/cryppadotta/paperclip-chat-e2e-disabled/issues/1#issuecomment-5571234021)
+  received an explicit bot mention. GitHub delivery
+  `9b1d68a0-aabe-11f1-80a1-0922ed513425` returned **200**, body **ignored**.
+  The repository remains disabled in Paperclip, with no conversation or task
+  created. This is provider-backed negative-reach evidence, not merely an
+  absence of a visible reply.
+- GitHub's real redelivery control resent the existing CHA-2 root delivery
+  `8c9c7240-aabd-11f1-86a6-ed31986fb576`. Tailscale ingress returned **202** at
+  `2026-09-07T13:27:39Z`. Before/after counts were unchanged: two endpoint
+  conversations, three CHA-2 runs, two CHA-2 publications, and six CHA-2
+  comments. Redelivery did not create another task, wakeup, or publication.
+- Discord's signed-in browser session now reaches Clawd. A real root mention
+  created its native thread and **CHA-3**, with a receipt reaction and the
+  expected safe guest-isolation refusal. Eigenjoy was subsequently linked to
+  the local Board account through the private confirmation flow. A fresh
+  linked Discord thread is still required; CHA-3 retains its original guest
+  trust classification.
+
+No provider secret, private key, clipboard value, or one-time confirmation URL
+is recorded here. Neither GitHub nor Discord is being declared fully qualified
+from connection, receipt, or guest-refusal evidence alone.
+
+### Real final replies and queue-quality findings — 2026-09-07, 13:45 UTC
+
+The shared typed ACP terminal-error repair was committed and pushed as
+`1325329e3`. Both supported acpx patches now negotiate typed session-failure
+metadata and fail closed on terminal errors rather than treating their raw
+provider diagnostics as an assistant answer. Warnings and ordinary quoted
+error-like content are not classified by text matching. The broad focused ACP
+regression slice passed **211/211**, with zero skipped cases.
+
+The next live run exposed a second, independent defect: the model returned the
+requested exact answer, but Paperclip selected an earlier bookkeeping comment
+for publication. The working-tree fix gives the runner-selected final sole
+ownership of the external response for chat-origin runs. Intermediate comments
+remain internal, and a yielded or missing final cannot publish an internal note
+as a fallback. Explicit Board **Send to channel** remains a separate action.
+
+The isolated server restarted at `2026-09-07T13:44:55Z` with that fix, durable
+Discord receipt removal, and independent reconciliation lanes. Real UI tests
+then verified:
+
+- GitHub's unmentioned follow-up stayed on CHA-2. Run
+  `b7190e01-0176-4af7-a471-c1e013c2a015` succeeded and
+  [reply 5571558895](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5571558895)
+  contained exactly `GH-LIVE-0907-ROUNDTRIP-OK`.
+- Discord's linked root created CHA-4 and native thread `1546513811672932372`.
+  An unmentioned follow-up stayed in that task; run
+  `2443fa37-ea1e-436b-a1af-3ad6e58afc51` succeeded and
+  [reply 1546516692031504485](https://discord.com/channels/1457808928258658549/1546513811672932372/1546516692031504485)
+  contained exactly `DISCORD-LIVE-0907-ROUNDTRIP-OK`. Its receipt reaction
+  cleared after the terminal reply.
+- Both setup wizards completed through their real **I've sent the test
+  message** controls; both endpoints are now `active` with setup complete.
+
+These are successful core live replies, not a full production-quality pass.
+The follow-on observation found that generic stranded-task recovery incorrectly
+started an extra run after each completed turn. The tasks intentionally stay
+`in_progress` while their external conversations wait for another user message;
+that state was mistaken for unfinished productive work. A narrow recovery
+repair and live no-extra-run retest are still pending at this checkpoint.
+
+The focused server checks passed **70/70** and deterministic browser checks
+passed **5/5** on the final-selection/scheduler/receipt changes. Shared, server,
+UI, adapter-utils, and codex-local TypeScript checks passed. The fresh full
+chat integration run is being repeated after its synthetic final-response
+fixtures were updated to the new explicit runner-selection contract. These
+figures do not claim the repository-wide suite or remaining live matrix passed.
+
+### Ordered bursts and recovery regression — 2026-09-07, 13:58 UTC
+
+After restarting the isolated server at `13:54:51Z` with the chat durable-wait
+guard, three messages were sent rapidly through each real provider UI. All six
+inbound comments persisted in provider order on the existing CHA-2 and CHA-4
+tasks. Each provider started one run for the first message and coalesced the
+two following messages into one durable deferred wake and one subsequent run.
+GitHub returned `DELTA`, then exactly `DELTA EPSILON`; Discord returned its
+first-word acknowledgement, then exactly `ALPHA BETA`. The separate threads
+did not mix their code words. Discord cleared all three working receipts.
+
+The four causal runs succeeded. No unsolicited recovery run appeared in the
+post-burst observation. Both tasks were marked done by the agent, however, so
+that absence alone does not prove the narrower in-progress chat-wait guard.
+A live keep-open retest remains necessary. The first runs took about 78–83
+seconds, and the queued runs took about 15 seconds for GitHub and 50 seconds
+for Discord. Ordering and correctness passed; those observed delays are not
+an instantaneous-chat performance claim.
+
+The final fresh chat integration suite passed **255/255**, with zero skips,
+on `chat_adapters_test_20260907_live_hardening_05`. The final full process
+recovery suite passed **133/133**, with zero skips, including active/waiting
+chat idle behavior, completed-conversation recovery, ordinary non-chat
+recovery, and pending in-review participant recovery. The production guard
+requires an in-progress task, a successful external-chat run, and its
+company/issue-bound active or waiting conversation; explicit queued work
+is checked first and remains runnable.

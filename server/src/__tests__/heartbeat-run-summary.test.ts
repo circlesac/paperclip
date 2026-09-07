@@ -5,7 +5,7 @@ import {
   LEGACY_WITHHELD_RUN_COMMENT,
   projectHistoricalHeartbeatRunComment,
   findHeartbeatRunCompletionComment,
-  isExternalChatContinuationPresentationContext,
+  isExternalChatPresentationContext,
   mergeHeartbeatRunResultJson,
   readCompletedAssistantMessageCandidate,
   resolveHeartbeatRunResponse,
@@ -490,7 +490,7 @@ describe("resolveHeartbeatRunResponse", () => {
     ).toBe(text);
   });
 
-  it("prefers the exact completed final over a lifecycle comment only for an external-chat continuation", () => {
+  it("prefers the exact completed final over a bookkeeping comment for external chat", () => {
     const resolved = resolveHeartbeatRunResponse({
       resultJson,
       existingComment: {
@@ -512,9 +512,7 @@ describe("resolveHeartbeatRunResponse", () => {
         sourceEventId: "event-continuation-final",
         commentAction: "create",
         commentId: null,
-        reasonCodes: expect.arrayContaining([
-          "external_chat_continuation_final_precedence",
-        ]),
+        reasonCodes: expect.arrayContaining(["external_chat_final_precedence"]),
       },
     });
   });
@@ -541,9 +539,78 @@ describe("resolveHeartbeatRunResponse", () => {
         chosenSource: "semantic_result_summary",
         commentAction: "create",
         commentId: null,
-        reasonCodes: expect.arrayContaining([
-          "external_chat_continuation_final_precedence",
-        ]),
+        reasonCodes: expect.arrayContaining(["external_chat_final_precedence"]),
+      },
+    });
+  });
+
+  it("prefers a legacy adapter final over an earlier root-chat acknowledgement", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: { summary: "GITHUB-LIVE-FINAL-MARKER" },
+        existingComment: {
+          id: "acknowledgement-comment",
+          body: "Acknowledged the latest comment; it changes my next action.",
+        },
+        preferFinalResponseOverExistingComment: true,
+      }),
+    ).toMatchObject({
+      text: "GITHUB-LIVE-FINAL-MARKER",
+      decision: {
+        chosenSource: "adapter_final_response",
+        commentAction: "create",
+        commentId: null,
+        reasonCodes: [
+          "legacy_adapter_summary_compatibility",
+          "external_chat_final_precedence",
+        ],
+      },
+    });
+  });
+
+  it("withholds a root-chat acknowledgement when no completed final is available", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: {},
+        existingComment: {
+          id: "acknowledgement-comment",
+          body: "Acknowledged; I am starting the requested work.",
+        },
+        preferFinalResponseOverExistingComment: true,
+      }),
+    ).toMatchObject({
+      text: null,
+      decision: {
+        chosenSource: "none",
+        commentAction: "none",
+        commentId: null,
+        reasonCodes: ["external_chat_final_response_unavailable"],
+      },
+    });
+  });
+
+  it("withholds root-chat bookkeeping while a governed interaction owns output", () => {
+    expect(
+      resolveHeartbeatRunResponse({
+        resultJson: {
+          nativeResult: {
+            schema: "paperclip.run_result.v1",
+            reportedWorkDisposition: "yielded",
+            summary: "Waiting for a provider answer.",
+          },
+        },
+        existingComment: {
+          id: "acknowledgement-comment",
+          body: "I created the question and am waiting.",
+        },
+        preferFinalResponseOverExistingComment: true,
+      }),
+    ).toMatchObject({
+      text: null,
+      decision: {
+        chosenSource: "none",
+        commentAction: "none",
+        reasonCodes: ["yielded_control_plane_wait"],
       },
     });
   });
@@ -573,24 +640,32 @@ describe("resolveHeartbeatRunResponse", () => {
     });
   });
 
-  it("recognizes only explicit external-chat continuation presentation markers", () => {
+  it("recognizes root and continuation external-chat presentation contexts", () => {
     expect(
-      isExternalChatContinuationPresentationContext({
+      isExternalChatPresentationContext({
+        source: "chat:github",
+      }),
+    ).toBe(true);
+    expect(
+      isExternalChatPresentationContext({
         externalChatContinuation: true,
       }),
     ).toBe(true);
     expect(
-      isExternalChatContinuationPresentationContext({
+      isExternalChatPresentationContext({
         paperclipWake: { externalInteractionContinuation: true },
       }),
     ).toBe(true);
     expect(
-      isExternalChatContinuationPresentationContext({
+      isExternalChatPresentationContext({
         externalChatContinuation: false,
         paperclipWake: { externalInteractionContinuation: false },
       }),
     ).toBe(false);
-    expect(isExternalChatContinuationPresentationContext(null)).toBe(false);
+    expect(isExternalChatPresentationContext({ source: "chatty:github" })).toBe(
+      false,
+    );
+    expect(isExternalChatPresentationContext(null)).toBe(false);
   });
 });
 

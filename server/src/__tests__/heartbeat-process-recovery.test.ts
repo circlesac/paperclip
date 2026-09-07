@@ -20,6 +20,8 @@ import {
   agentWakeupRequests,
   authUsers,
   budgetPolicies,
+  chatConversations,
+  chatEndpoints,
   companySecretBindings,
   companySecrets,
   companySkills,
@@ -50,6 +52,8 @@ import {
   plugins,
   projects,
   projectWorkspaces,
+  toolApplications,
+  toolConnections,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -424,6 +428,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(plugins);
     await db.delete(issuePlanDecompositions);
     await db.delete(issueThreadInteractions);
+    await db.delete(chatConversations);
+    await db.delete(chatEndpoints);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
     await db.delete(documentAnnotationComments);
     await db.delete(documentAnnotationAnchorSnapshots);
     await db.delete(documentAnnotationThreads);
@@ -894,6 +902,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
 
     return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId };
+  }
+
+  async function bindChatConversation(input: {
+    agentId: string;
+    companyId: string;
+    issueId: string;
+    state: "active" | "waiting" | "completed";
+  }) {
+    const applicationId = randomUUID();
+    const connectionId = randomUUID();
+    const endpointId = randomUUID();
+    await db.insert(toolApplications).values({
+      id: applicationId,
+      companyId: input.companyId,
+      applicationKey: `chat:slack:${endpointId}`,
+      name: `Slack ${endpointId}`,
+      type: "chat",
+      status: "active",
+    });
+    await db.insert(toolConnections).values({
+      id: connectionId,
+      companyId: input.companyId,
+      applicationId,
+      name: "Slack channel",
+      uid: `chat-slack-${endpointId}`,
+      connectionPurpose: "channel",
+      transport: "chat_sdk",
+      status: "active",
+      enabled: true,
+    });
+    await db.insert(chatEndpoints).values({
+      id: endpointId,
+      companyId: input.companyId,
+      connectionId,
+      provider: "slack",
+      publicId: randomUUID(),
+      assignedAgentId: input.agentId,
+      status: "active",
+    });
+    await db.insert(chatConversations).values({
+      companyId: input.companyId,
+      endpointId,
+      issueId: input.issueId,
+      externalConversationId: `slack-conversation-${input.issueId}`,
+      externalThreadId: `slack:CCHATWAIT:${randomUUID()}`,
+      externalLabel: "Slack thread",
+      state: input.state,
+    });
   }
 
   async function seedInReviewParticipantRunFixture(input?: {
@@ -6576,14 +6632,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it("re-enqueues an already stranded execution-review participant during reconciliation", async () => {
-    const { agentId, issueId, runId, wakeupRequestId, stageId } =
+  it("does not let an active chat conversation suppress stranded execution-review participant recovery", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture();
     const finishedAt = new Date("2026-03-19T00:05:00.000Z");
     await db
       .update(heartbeatRuns)
       .set({
         status: "succeeded",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "execution_review_requested",
+          source: "chat:slack",
+        },
         startedAt: new Date("2026-03-19T00:00:00.000Z"),
         finishedAt,
         updatedAt: finishedAt,
@@ -6597,6 +6659,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         updatedAt: finishedAt,
       })
       .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await bindChatConversation({
+      agentId,
+      companyId,
+      issueId,
+      state: "active",
+    });
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -8941,6 +9009,99 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         return context?.retryReason === "issue_continuation_needed";
       }),
     ).toBeUndefined();
+  });
+
+  it.each(["active", "waiting"] as const)(
+    "leaves a successful external-chat turn idle while its conversation is %s",
+    async (state) => {
+      const { companyId, agentId, issueId, runId } =
+        await seedStrandedIssueFixture({
+          status: "in_progress",
+          runStatus: "succeeded",
+          runSource: "chat:slack",
+          livenessState: "advanced",
+        });
+      await bindChatConversation({
+        agentId,
+        companyId,
+        issueId,
+        state,
+      });
+
+      const result = await heartbeatService(
+        db,
+      ).reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.issueIds).toEqual([]);
+      await expect(
+        db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId)),
+      ).resolves.toEqual([{ id: runId }]);
+    },
+  );
+
+  it("recovers productive chat work after its conversation is completed", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        runSource: "chat:slack",
+        livenessState: "advanced",
+      });
+    await bindChatConversation({
+      agentId,
+      companyId,
+      issueId,
+      state: "completed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.find((row) => row.id !== runId));
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      source: "issue.productive_terminal_continuation_recovery",
+    });
+    if (retryRun) await waitForRunToSettle(heartbeat, retryRun.id);
+  });
+
+  it("recovers a non-chat productive run even when its issue has an active chat conversation", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        runSource: "issue.assignment",
+        livenessState: "advanced",
+      });
+    await bindChatConversation({
+      agentId,
+      companyId,
+      issueId,
+      state: "active",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.find((row) => row.id !== runId));
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      retryReason: "issue_continuation_needed",
+      source: "issue.productive_terminal_continuation_recovery",
+    });
+    if (retryRun) await waitForRunToSettle(heartbeat, retryRun.id);
   });
 
   it("leaves the productive-but-stranded continuation path unchanged under the new classifier", async () => {

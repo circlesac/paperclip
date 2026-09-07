@@ -1,6 +1,6 @@
 # Discord live qualification result — 2026-09-06
 
-> **Status: real bot setup connected; message round trip and DC1–DC7 remain unqualified.** Paperclip has verified the dedicated bot identity, Message Content intent, Clawd membership, and a permission-complete text channel against Discord. No native mention, Discord thread, Paperclip task, agent response, or recovery scenario has yet been qualified live.
+> **Status: core Discord transport has live proof, but the full DC1–DC7 matrix remains unqualified.** Paperclip has verified the dedicated bot identity, Message Content intent, Clawd membership, and a permission-complete text channel against Discord. A linked root created one native thread and one Paperclip task; an unmentioned follow-up in that thread produced the requested exact agent reply and cleared the working receipt. This proves the primary mention→thread→task→reply path, not queued bursts, negative channel reach, reconnect/restart, or the rest of the release matrix. The same live session exposed an unsolicited generic recovery run after the successful reply, which remains a release blocker until repaired and retested.
 
 ## Resumed live setup — 2026-09-07 UTC
 
@@ -21,10 +21,81 @@ member of Clawd, and at least one text channel grants the complete required
 permission set. The scoped fix and this result must be committed and its
 automated checks recorded before treating the revision as a release candidate.
 
-This is partial DC1 setup evidence, not a conversation pass. The target channel
-`1457808933082108089` has not yet produced a provider-visible root mention,
-native public thread, Paperclip task, or safe agent reply on this source. DC2–DC7
-also remain open.
+This was partial DC1 setup evidence at the time. The linked conversation pass
+below supersedes that limitation, while DC2–DC7 and the unexercised DC1 cases
+remain open.
+
+## First native root checkpoint — 2026-09-07 UTC
+
+In Clawd channel `1457808933082108089`, a real root mention produced the `eyes`
+receipt, exactly one native public thread (`1546509943639773244`), exactly one
+Paperclip task (`CHA-3`, issue `1976d84b-0bdf-4342-8afa-1a3e5d9be57c`), and one
+bound conversation (`123b687c-96d7-4164-bf58-bc95edf2bc8c`). Because the
+Eigenjoy Discord principal was unlinked at admission, the turn correctly
+published the safe low-trust-isolation refusal in that thread instead of agent
+output. The operator then completed the private identity link to the local
+Paperclip board; no one-time link or credential is recorded here. A fresh root
+must still prove the linked path because linking cannot retroactively change
+the trust boundary of the already admitted guest turn.
+
+The live refusal also exposed a receipt-lifecycle defect: the `eyes` reaction
+remained on the root after the visible terminal failure. The implementation
+had a durable add-only action and never invoked the adapter's idempotent
+reaction removal, despite DC4 requiring both add and remove. The scoped repair
+stages a Discord-only removal in the same transaction that records the causal
+terminal publication, then attempts it under the same credential lease; a
+crash or transient provider error resumes from the durable action without
+replaying the terminal message. It removes the working receipt rather than
+replacing it with a success or failure emoji. The fresh linked turn below
+verified that the receipt is now cleared after the terminal reply.
+
+## Successful linked round trip — 2026-09-07 UTC
+
+The live source was the dirty working tree based on `1325329e3`, started at
+13:44:55 UTC; this evidence must therefore be repeated on the final clean
+release-candidate SHA before release. In Clawd `#general`, the linked Eigenjoy
+principal created native thread `1546513811672932372`, exactly one Paperclip
+task (`CHA-4`, issue `c65f32f8-a612-4f85-97c5-61bed2de58e2`), and one bound
+conversation. Only `#general` was enabled in Paperclip; the other ten discovered
+channels were disabled.
+
+An unmentioned follow-up (`1546516684129575123`) in that native thread asked
+for the exact text `DISCORD-LIVE-0907-ROUNDTRIP-OK`. Run
+`2443fa37-ea1e-436b-a1af-3ad6e58afc51` ran from 13:45:11 to 13:45:17 UTC and
+succeeded. Discord reply `1546516692031504485` contained the exact marker, and
+the working receipt was cleared. This proves a real linked root boundary,
+native thread reuse for an unmentioned follow-up, task/run execution, exact
+final presentation, and terminal receipt cleanup through the configured bot.
+
+The endpoint `af23c9d0-8d7f-495c-a45c-ba9ab1ee9686` was active and setup-complete
+in the UI. After the successful reply, however, generic task recovery spawned
+an unsolicited additional run (`6a3e0303-b5f2-4e32-8e36-790a892f07b6`). That is
+not acceptable production behavior: a completed Discord turn must not trigger
+new agent work without a new admitted user event. The recovery fix and a clean
+live rerun are still required. No provider credential, identity-link secret, or
+private callback value is recorded here.
+
+### Rapid follow-up burst checkpoint
+
+A later three-message burst on the same `CHA-4` Discord thread persisted all
+three inbound messages in order. The first message started run
+`4e42c03d-2c80-45ed-bb99-84a5b7c94c02`; the second and third messages were
+coalesced into one deferred wake and then run
+`2ae3cb6e-b33c-4c93-a029-02916210d142`. The provider-visible result was two
+replies for the three inputs: an initial `ALPHA` acknowledgement, followed by
+the combined exact `ALPHA BETA` result. The first turn took approximately 82.6
+seconds and the second approximately 50.1 seconds, so this is ordered-delivery
+and coalescing evidence, not an instant-response claim. All three working
+receipts were cleared when their causal runs reached terminal publication.
+
+The receipt-retirement audit confirms why the coalesced case is lossless:
+deferred wake merging preserves the ordered `wakeCommentIds` set, promotion
+copies that set to the successor run, and terminal Discord publication selects
+receipt actions for every exact linked inbound comment in that run. It does not
+clear unrelated or later thread receipts. No additional automatic recovery run
+was present in the 13:58 UTC check, but `CHA-4` had been marked done by then;
+that observation does not independently prove the new in-progress recovery
+guard.
 
 ## Historical live-attempt checkpoint — superseded above
 
@@ -47,7 +118,7 @@ There is no managed bot-provisioning path, public webhook URL, interactions publ
 
 No bot token, cookie, password, MFA value, or one-time identity-link URL is recorded here.
 
-## Implemented behavior awaiting live proof
+## Implemented behavior and remaining live proof
 
 The current native Discord implementation includes:
 
@@ -63,13 +134,23 @@ The current native Discord implementation includes:
 - 25-second REST deadlines and structured preservation of Discord 401, 403, 404, 429, and `retry_after` failures without copying raw provider bodies, user content, credentials, interaction tokens, or derived thread names into exceptions or logs; and
 - the shared safe-publication, ambiguous-delivery, identity, permission, audit, and internal-content boundaries used by the other providers.
 
-These are code-level claims until the real provider run demonstrates them.
+The linked run above now demonstrates the primary root, thread-reuse, exact
+final-response, and receipt-cleanup path. The remaining items are still
+code-level claims until the corresponding DC cases exercise them against the
+real provider.
 
-## Current production-quality status
+## Historical code-audit status before the linked live run
 
 The final hardening removed the code-level release blockers found in the root-activation and lifecycle audit: denied roots no longer create an inert provider thread; a crash between Discord thread creation and Paperclip binding now resumes through the persisted provisional receipt and idempotent reconciliation; provider response bodies and callback errors no longer disclose content or credentials through diagnostics; retry scheduling honors long Discord backoff windows; reconnect now has a distinct, payload-redacted activity action; and Discord `50001`/`50013` destination permission failures disable only the affected resource rather than putting the whole endpoint into attention. True token/app authentication failures and unrelated authorization errors remain endpoint-wide. The compatibility marker, required patched-method checks, clean patch application against the pristine package, and 25-second REST boundary make SDK drift and stalled provider calls fail visibly rather than weakening those guarantees. Per repository policy, CI owns `pnpm-lock.yaml`; its PR workflow regenerates a lockfile artifact from the manifests before running the frozen install.
 
-No current code-audit blocker is recorded here. Discord is nevertheless not production-ready because none of the behavior has been observed against the real provider account/server. In particular, live proof must cover denied-root silence, provisional recovery, existing-thread reconciliation, files/interactions, Gateway reconnect, rate limits, token rotation, and the visible management surfaces. The adapter patch remains version-sensitive; any dependency update requires the compatibility and provider contracts to rerun.
+At that checkpoint, no code-audit blocker was recorded and none of the behavior
+had yet been observed against the real provider account/server. The linked live
+run above supersedes the latter statement and exposed the unsolicited recovery
+run as a current blocker. Live proof must still cover denied-root silence,
+provisional recovery, existing-thread reconciliation, files/interactions,
+Gateway reconnect, rate limits, token rotation, and the visible management
+surfaces. The adapter patch remains version-sensitive; any dependency update
+requires the compatibility and provider contracts to rerun.
 
 ## Local regression evidence
 
@@ -83,17 +164,25 @@ No current code-audit blocker is recorded here. Discord is nevertheless not prod
 - The post-audit Discord adapter/runtime subset passed 48/48, including raw-provider-body and callback-error redaction plus a 120-second `retry_after` contract; the focused reconnect/removal PostgreSQL scenario also passed and proved secret replacement, old-secret retirement, runtime replacement, identity/history/access preservation, redacted reconnect activity, and final Paperclip credential cleanup. Endpoint removal does not uninstall the bot from the Discord server or delete its Developer Portal application; those remain separate provider-side cleanup steps.
 - The final Discord permission classifier/adapter subset passed 49/49, and its database-backed publication regression proved that `50013` cancels only the affected publication/resource while the endpoint remains active. The final combined working tree then passed 193/193 chat-channel integration tests on fresh migrated database `chat_adapters_test_final_20260906_1257`, 111/111 focused runtime/error/privacy tests, all package typechecks, token gates, and the deterministic five-provider browser suite.
 
-This evidence supports implementation integrity but does not replace provider login, installation, Message Content intent, effective channel permission, Gateway, rate-limit, reconnect, native thread, file, action, identity-governance, negative-reach, token-rotation, and cleanup proof.
+This evidence supports implementation integrity. Provider installation,
+Message Content intent, effective `#general` permission, a native root/thread,
+linked identity, exact final reply, and receipt cleanup now also have live
+proof. It does not replace the remaining Gateway-reconnect, rate-limit,
+restart, file, action, negative-reach, token-rotation, and cleanup cases.
 
 ## Qualification gap
 
-Provider credential validation, Message Content intent, Clawd membership, and
-the existence of at least one permission-complete text channel now have live
-proof. The rest of DC1 and every DC2–DC7 journey remain open: the target-channel
-allowlist and message test; enabled/disabled behavior; denied-user behavior;
-root-thread creation; provisional recovery; existing-thread reconciliation;
-ordered follow-ups; duplicate/reconnect fencing; reactions; edits/deletes;
-embeds/actions; inbound/outbound files; DMs; linked/unlinked identities;
-ambiguous sends; token rotation; intent revocation; provider links; management
-surfaces; and cleanup. Discord remains unqualified for stable release until
-those cases pass on one final release-candidate SHA.
+Provider credential validation, Message Content intent, Clawd membership,
+`#general` enablement, root-thread creation, a linked unmentioned follow-up,
+exact final presentation, and working-receipt removal now have live proof. The
+unsolicited post-completion recovery run is the immediate current blocker.
+The live three-message burst now proves ordered persistence, deferred coalescing,
+two causal runs, combined final presentation, and cleanup of every causal
+receipt, with the observed 82.6-second and 50.1-second turn latency recorded
+above. Disabled-channel silence, denied-user behavior, provisional recovery,
+existing-thread reconciliation, duplicate/reconnect fencing, edits/deletes,
+embeds/actions, inbound/outbound files, DMs, ambiguous sends, token rotation,
+intent revocation, provider links, management surfaces, and cleanup remain
+open. Discord remains unqualified for stable release until the recovery defect
+is fixed and the remaining DC cases pass on one final clean release-candidate
+SHA.

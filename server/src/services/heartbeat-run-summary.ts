@@ -182,12 +182,15 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
-export function isExternalChatContinuationPresentationContext(
+export function isExternalChatPresentationContext(
   contextSnapshot: unknown,
 ): boolean {
   const context = record(contextSnapshot);
   const wake = record(context.paperclipWake);
+  const source =
+    typeof context.source === "string" ? context.source.trim() : "";
   return (
+    source.startsWith("chat:") ||
     context.externalChatContinuation === true ||
     wake.externalInteractionContinuation === true
   );
@@ -417,23 +420,33 @@ export function resolveHeartbeatRunResponse(input: {
     return null;
   };
 
-  if (
-    input.preferFinalResponseOverExistingComment === true &&
-    !hasYieldedSemanticResult(resultJson)
-  ) {
-    const upstream = resolveCompletedUpstreamResponse();
-    if (upstream) {
-      return {
-        ...upstream,
-        decision: {
-          ...upstream.decision,
-          reasonCodes: [
-            ...upstream.decision.reasonCodes,
-            "external_chat_continuation_final_precedence",
-          ],
-        },
-      };
+  if (input.preferFinalResponseOverExistingComment === true) {
+    if (!hasYieldedSemanticResult(resultJson)) {
+      const upstream = resolveCompletedUpstreamResponse();
+      if (upstream) {
+        return {
+          ...upstream,
+          decision: {
+            ...upstream.decision,
+            reasonCodes: [
+              ...upstream.decision.reasonCodes,
+              "external_chat_final_precedence",
+            ],
+          },
+        };
+      }
     }
+    return {
+      text: null,
+      decision: decision("none", {
+        commentAction: "none",
+        reasonCodes: [
+          hasYieldedSemanticResult(resultJson)
+            ? "yielded_control_plane_wait"
+            : "external_chat_final_response_unavailable",
+        ],
+      }),
+    };
   }
 
   const existingText = readCommentText(input.existingComment?.body);

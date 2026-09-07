@@ -681,6 +681,7 @@ type ProviderEffectPayload = {
 
 type ReceiptReactionPayload = {
   version: 1;
+  operation: "add" | "remove";
   threadId: string;
   messageId: string;
   reaction: "eyes";
@@ -732,8 +733,10 @@ function telegramMaintenancePayload(
 function receiptReactionPayload(
   payload: Record<string, unknown>,
 ): ReceiptReactionPayload | null {
+  const operation = payload.operation ?? "add";
   if (
     payload.version !== 1 ||
+    (operation !== "add" && operation !== "remove") ||
     typeof payload.threadId !== "string" ||
     !payload.threadId ||
     typeof payload.messageId !== "string" ||
@@ -745,7 +748,7 @@ function receiptReactionPayload(
   ) {
     return null;
   }
-  return payload as ReceiptReactionPayload;
+  return { ...payload, operation } as ReceiptReactionPayload;
 }
 
 function githubWebhookIngressPayload(
@@ -2551,6 +2554,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         providerActionId: `receipt_reaction:${input.deliveryId}`,
         payload: {
           version: 1,
+          operation: "add",
           threadId: input.thread.id,
           messageId: input.message.id,
           reaction: "eyes",
@@ -2702,11 +2706,52 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         .where(eq(chatActions.id, action.id));
       return;
     }
+    if (payload.operation === "add" && action.deliveryId) {
+      const terminalRemoval = await db
+        .select({ id: chatActions.id })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, action.endpointId),
+            eq(
+              chatActions.providerActionId,
+              `receipt_reaction_remove:${action.deliveryId}`,
+            ),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      if (terminalRemoval) {
+        await db.transaction(async (tx) => {
+          await credentialLease.assertOwned(tx);
+          await tx
+            .update(chatActions)
+            .set({
+              status: "cancelled",
+              result: {
+                ...(typeof action!.result?.attempts === "number"
+                  ? { attempts: action!.result.attempts }
+                  : {}),
+                code: "receipt_reaction_superseded_by_terminal_publication",
+              },
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatActions.id, action!.id),
+                eq(chatActions.status, action!.status),
+              ),
+            );
+          await credentialLease.assertOwned(tx);
+        });
+        return;
+      }
+    }
     if (action.status === "processing") {
       if (action.updatedAt > new Date(Date.now() - PROVIDER_EFFECT_STALE_MS))
         return;
-      // Adding the same reaction is idempotent. A worker interruption can be
-      // retried safely without an ambiguous duplicate-message boundary.
+      // Adding or removing the same reaction is idempotent. A worker
+      // interruption can be retried safely without an ambiguous
+      // duplicate-message boundary.
       await db
         .update(chatActions)
         .set({
@@ -2810,11 +2855,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         payload.threadId,
       ).adapter;
       await credentialLease.assertOwned();
-      await adapter.addReaction(
-        payload.threadId,
-        payload.messageId,
-        payload.reaction,
-      );
+      if (payload.operation === "remove") {
+        await adapter.removeReaction(
+          payload.threadId,
+          payload.messageId,
+          payload.reaction,
+        );
+      } else {
+        await adapter.addReaction(
+          payload.threadId,
+          payload.messageId,
+          payload.reaction,
+        );
+      }
       // The provider may already have accepted the idempotent reaction. Fence
       // the local success receipt so a reclaimed lease cannot report success
       // for an obsolete runtime.
@@ -2856,6 +2909,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       });
     } catch (error) {
       if (
+        payload.operation === "add" &&
         reactionProvider === "slack" &&
         isSlackReceiptReactionAlreadyApplied(error)
       ) {
@@ -2908,8 +2962,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         disposition.kind === "retry"
           ? disposition.retryAfterMs
           : 100 * 2 ** Math.max(0, attempt - 1);
+      const operationLabel =
+        payload.operation === "remove" ? " reaction removal" : " reaction";
       const diagnostic =
-        `Receipt reaction ${retryable ? "deferred" : "failed"} after ${attempt} attempt${attempt === 1 ? "" : "s"} (${disposition.kind}): ${redactError(error)}`.slice(
+        `Receipt${operationLabel} ${retryable ? "deferred" : "failed"} after ${attempt} attempt${attempt === 1 ? "" : "s"} (${disposition.kind}): ${redactError(error)}`.slice(
           0,
           MAX_ERROR_TEXT,
         );
@@ -2924,7 +2980,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             status: "failed",
             result: {
               attempts: attempt,
-              code: `receipt_reaction_${disposition.kind}`,
+              code:
+                payload.operation === "remove"
+                  ? `receipt_reaction_removal_${disposition.kind}`
+                  : `receipt_reaction_${disposition.kind}`,
               redactedError: diagnostic,
               retryable,
               retryAt,
@@ -2958,6 +3017,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           deliveryId: action.deliveryId,
           attempts: attempt,
           disposition: disposition.kind,
+          operation: payload.operation,
           retryAt,
         },
         "external chat receipt reaction deferred",
@@ -21362,6 +21422,172 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       });
   }
 
+  async function receiptReactionCompletionRunId(
+    tx: Db,
+    publication: typeof chatPublications.$inferSelect,
+    payload: SafeChatPublicationPayload,
+  ): Promise<string | null> {
+    if (
+      payload.progressState === "completed" ||
+      payload.progressState === "failed"
+    ) {
+      return runIdFromMilestonePublication(publication);
+    }
+    if (publication.commentId) {
+      const runId = await tx
+        .select({ runId: issueComments.createdByRunId })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.id, publication.commentId),
+            eq(issueComments.companyId, publication.companyId),
+          ),
+        )
+        .then((rows) => rows[0]?.runId ?? null);
+      return isUuidLike(runId) ? runId : null;
+    }
+    if (
+      payload.interactionId &&
+      publication.idempotencyKey ===
+        `interaction:${payload.interactionId}:${publication.endpointId}`
+    ) {
+      const runId = await tx
+        .select({ runId: issueThreadInteractions.sourceRunId })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.id, payload.interactionId),
+            eq(issueThreadInteractions.companyId, publication.companyId),
+            eq(issueThreadInteractions.issueId, publication.issueId),
+          ),
+        )
+        .then((rows) => rows[0]?.runId ?? null);
+      return isUuidLike(runId) ? runId : null;
+    }
+    return null;
+  }
+
+  async function stageDiscordReceiptReactionRemovals(
+    tx: Db,
+    input: {
+      endpoint: EndpointRow;
+      publication: typeof chatPublications.$inferSelect;
+      payload: SafeChatPublicationPayload;
+      runtimeContext: RuntimeContext;
+    },
+  ): Promise<string[]> {
+    if (input.endpoint.provider !== "discord") return [];
+    const runId = await receiptReactionCompletionRunId(
+      tx,
+      input.publication,
+      input.payload,
+    );
+    if (!runId) return [];
+
+    const receipts = await tx
+      .select({
+        actionId: chatActions.id,
+        deliveryId: chatMessageLinks.deliveryId,
+        payload: chatActions.payload,
+        result: chatActions.result,
+        status: chatActions.status,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(
+        chatMessageLinks,
+        and(
+          eq(chatMessageLinks.companyId, heartbeatRuns.companyId),
+          eq(chatMessageLinks.endpointId, input.publication.endpointId),
+          eq(chatMessageLinks.conversationId, input.publication.conversationId),
+          eq(chatMessageLinks.direction, "inbound"),
+          or(
+            sql`${chatMessageLinks.commentId}::text = ${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
+            sql`${chatMessageLinks.commentId}::text = ${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
+            sql`coalesce(${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds', '[]'::jsonb) ? ${chatMessageLinks.commentId}::text`,
+          ),
+        ),
+      )
+      .innerJoin(
+        chatActions,
+        and(
+          eq(chatActions.endpointId, chatMessageLinks.endpointId),
+          eq(chatActions.deliveryId, chatMessageLinks.deliveryId),
+          eq(chatActions.kind, "receipt_reaction"),
+          sql`${chatActions.providerActionId} = 'receipt_reaction:' || ${chatMessageLinks.deliveryId}::text`,
+        ),
+      )
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.companyId, input.publication.companyId),
+          eq(
+            sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+            input.publication.issueId,
+          ),
+        ),
+      );
+    const removals = receipts.flatMap((receipt) => {
+      if (!receipt.deliveryId) return [];
+      const payload = receiptReactionPayload(receipt.payload);
+      if (!payload || payload.operation !== "add") return [];
+      return [
+        {
+          companyId: input.publication.companyId,
+          endpointId: input.publication.endpointId,
+          conversationId: input.publication.conversationId,
+          deliveryId: receipt.deliveryId,
+          kind: "receipt_reaction",
+          providerActionId: `receipt_reaction_remove:${receipt.deliveryId}`,
+          payload: {
+            ...payload,
+            operation: "remove" as const,
+            runtimeGeneration: input.runtimeContext.generation,
+            credentialFingerprint: input.runtimeContext.credentialFingerprint,
+          } satisfies ReceiptReactionPayload,
+          status: "received",
+        },
+      ];
+    });
+    if (removals.length === 0) return [];
+    for (const receipt of receipts) {
+      if (!["received", "failed", "processing"].includes(receipt.status)) {
+        continue;
+      }
+      await tx
+        .update(chatActions)
+        .set({
+          status: "cancelled",
+          result: {
+            ...(typeof receipt.result?.attempts === "number"
+              ? { attempts: receipt.result.attempts }
+              : {}),
+            code: "receipt_reaction_superseded_by_terminal_publication",
+          },
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatActions.id, receipt.actionId),
+            eq(chatActions.status, receipt.status),
+          ),
+        );
+    }
+    await tx.insert(chatActions).values(removals).onConflictDoNothing();
+    return tx
+      .select({ id: chatActions.id })
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.endpointId, input.publication.endpointId),
+          inArray(
+            chatActions.providerActionId,
+            removals.map((removal) => removal.providerActionId),
+          ),
+        ),
+      )
+      .then((rows) => rows.map((row) => row.id));
+  }
+
   async function interactionResolutionPublicationToReplace(
     publication: typeof chatPublications.$inferSelect,
     payload: SafeChatPublicationPayload,
@@ -22215,7 +22441,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return result;
   }
 
-  async function processPendingSlackSessionSyncs(limit = 25) {
+  async function processPendingSlackSessionSyncs(
+    limit = 25,
+    onlyActionId?: string,
+  ) {
     const now = new Date();
     const actions = await db
       .select()
@@ -22223,6 +22452,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .where(
         and(
           eq(chatActions.kind, "slack_session_sync"),
+          ...(onlyActionId ? [eq(chatActions.id, onlyActionId)] : []),
           or(
             and(
               eq(chatActions.status, "received"),
@@ -23026,6 +23256,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 });
                 providerAccepted = true;
                 const { authorizationActionId } = authorizationClaim;
+                const receiptRemovalActionIds: string[] = [];
                 await db.transaction(async (tx) => {
                   await credentialLease.assertOwned(tx);
                   const committedAt = new Date();
@@ -23131,8 +23362,29 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                         currentPublicationRuntimeContext.credentialFingerprint,
                     });
                   }
+                  receiptRemovalActionIds.push(
+                    ...(await stageDiscordReceiptReactionRemovals(
+                      tx as unknown as Db,
+                      {
+                        endpoint: authorizationClaim.endpoint,
+                        publication,
+                        payload,
+                        runtimeContext: currentPublicationRuntimeContext,
+                      },
+                    )),
+                  );
                   await credentialLease.assertOwned(tx);
                 });
+                // Receipt cleanup is non-critical provider I/O. Dispatch it
+                // after the terminal reply and durable action commit so a
+                // slow reaction endpoint cannot hold the publication lane.
+                // If this process stops first, the action outbox resumes the
+                // idempotent removal on a later reconciliation sweep.
+                for (const actionId of receiptRemovalActionIds) {
+                  scheduleMessageProcessing(() =>
+                    processReceiptReaction(actionId),
+                  );
+                }
               } catch (error) {
                 // Authentication, membership, and destination failures mutate
                 // endpoint/runtime state. Settle them before releasing the
@@ -23153,7 +23405,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
     }
     await processPendingInteractionWakeups(limit);
-    await processPendingSlackSessionSyncs(limit);
     return attemptedIds.length;
   }
 

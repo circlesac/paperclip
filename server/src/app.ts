@@ -255,6 +255,49 @@ export function shouldEnablePrivateHostnameGuard(opts: {
   );
 }
 
+type ChatReconciliationLane =
+  "provider runtimes" | "deliveries" | "publications" | "Slack session status";
+
+/**
+ * Provider recovery can wait on slow external I/O. Keep each existing durable
+ * lane single-flight without making an optional provider effect suppress the
+ * next publication sweep for every endpoint.
+ */
+export function createChatReconciliationCoordinator(input: {
+  reconcileProviderRuntimes: () => Promise<unknown>;
+  processPendingDeliveries: () => Promise<unknown>;
+  flushPublications: () => Promise<unknown>;
+  processPendingSlackSessionSyncs: () => Promise<unknown>;
+  onError: (lane: ChatReconciliationLane, error: unknown) => void;
+}) {
+  const inFlight = new Map<ChatReconciliationLane, Promise<void>>();
+  const start = (
+    lane: ChatReconciliationLane,
+    task: () => Promise<unknown>,
+  ) => {
+    if (inFlight.has(lane)) return;
+    const pending = Promise.resolve()
+      .then(task)
+      .then(() => undefined)
+      .catch((error) => input.onError(lane, error))
+      .finally(() => {
+        if (inFlight.get(lane) === pending) inFlight.delete(lane);
+      });
+    inFlight.set(lane, pending);
+  };
+  return {
+    reconcile() {
+      start("provider runtimes", input.reconcileProviderRuntimes);
+      start("deliveries", input.processPendingDeliveries);
+      start("publications", input.flushPublications);
+      start("Slack session status", input.processPendingSlackSessionSyncs);
+    },
+    async drain() {
+      await Promise.allSettled([...inFlight.values()]);
+    },
+  };
+}
+
 export function createManagedBundledPluginWorkerRecovery(input: {
   managedBundledPluginKeys: readonly string[];
   workerManager: Pick<
@@ -1014,32 +1057,24 @@ export async function createApp(
     });
     await chatChannels.processPendingPublications();
   };
-  let chatReconciliationInFlight: Promise<void> | null = null;
-  const reconcileChatChannels = () => {
-    if (chatReconciliationInFlight) return chatReconciliationInFlight;
-    chatReconciliationInFlight = Promise.all([
-      chatChannels.reconcileProviderRuntimes(),
-      chatChannels.processPendingDeliveries(),
-      flushChatPublications(),
-    ])
-      .then(() => undefined)
-      .finally(() => {
-        chatReconciliationInFlight = null;
-      });
-    return chatReconciliationInFlight;
-  };
+  const chatReconciliation = createChatReconciliationCoordinator({
+    reconcileProviderRuntimes: () => chatChannels.reconcileProviderRuntimes(),
+    processPendingDeliveries: () => chatChannels.processPendingDeliveries(),
+    flushPublications: () => flushChatPublications(),
+    processPendingSlackSessionSyncs: () =>
+      chatChannels.processPendingSlackSessionSyncs(),
+    onError: (lane, err) => {
+      logger.error({ err, lane }, `Failed to reconcile chat ${lane}`);
+    },
+  });
   let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
     () => {
-      void reconcileChatChannels().catch((err) => {
-        logger.error({ err }, "Failed to reconcile chat channels");
-      });
+      chatReconciliation.reconcile();
     },
     CHAT_PUBLICATION_FLUSH_INTERVAL_MS,
   );
   chatPublicationTimer.unref?.();
-  void reconcileChatChannels().catch((err) => {
-    logger.error({ err }, "Failed to reconcile chat channels at startup");
-  });
+  chatReconciliation.reconcile();
   // Abandoned chunked-import spool sweep: hourly (plus once at startup),
   // deleting spool dirs whose transfer saw no activity for 24h and cancelling
   // their still-open ledger runs. Same setInterval + unref + shutdown-clear
@@ -1159,7 +1194,7 @@ export async function createApp(
         clearInterval(chatPublicationTimer);
         chatPublicationTimer = null;
       }
-      await chatReconciliationInFlight;
+      await chatReconciliation.drain();
       if (importTransferSweepTimer) {
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;

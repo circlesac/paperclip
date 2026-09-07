@@ -129,7 +129,7 @@ import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
-  isExternalChatContinuationPresentationContext,
+  isExternalChatPresentationContext,
   LEGACY_WITHHELD_RUN_COMMENT,
   projectHistoricalHeartbeatRunComment,
 } from "./heartbeat-run-summary.js";
@@ -11882,15 +11882,14 @@ export function issueService(db: Db) {
       // recovery, automation, and ordinary internal agent comments stay in
       // Paperclip even while a bound conversation is active.
       if (authorType === "agent" && isExplicitExternalAgentComment(metadata)) {
-        // A dedicated external-interaction continuation may perform ordinary
-        // Paperclip lifecycle writes before its adapter result is finalized.
-        // Those writes remain internal: only heartbeat's selected final
-        // presentation may consume this provider response slot.
-        const continuationFinalOwnsProviderReply =
+        // An external-chat run may perform ordinary Paperclip lifecycle or
+        // bookkeeping writes before its adapter result is finalized. Those
+        // writes remain internal: only heartbeat's selected final presentation
+        // may consume this provider response slot. Explicit board "Send to
+        // channel" publications use the separate publication path.
+        const chatFinalOwnsProviderReply =
           createdByRun !== null &&
-          isExternalChatContinuationPresentationContext(
-            createdByRun.contextSnapshot,
-          ) &&
+          isExternalChatPresentationContext(createdByRun.contextSnapshot) &&
           metadata?.authorizationReason !==
             CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON;
         const interactionOwnsProviderReply = createdByRunId
@@ -11901,7 +11900,7 @@ export function issueService(db: Db) {
             })
           : false;
         const bindings =
-          interactionOwnsProviderReply || continuationFinalOwnsProviderReply
+          interactionOwnsProviderReply || chatFinalOwnsProviderReply
             ? []
             : await resolveChatOriginPublicationBindings(
                 dbOrTx,

@@ -1,8 +1,64 @@
 # GitHub live qualification result — 2026-09-05
 
-> **Status: current setup-path hardening plus historical core-smoke evidence, not current live release qualification.** No current-branch GitHub webhook/task round trip has run. The setup flow is still blocked at GitHub's six-digit sudo verification prompt, and the older provider round trip below must not be treated as a rerun of the current source.
+> **Status: current App connection, signed Tailscale ingress, and exact agent reply proven; full production qualification remains open.** The September 7 checkpoint below supersedes the older login/credential gates. Live testing exposed and repaired shared runtime and final-response selection defects, then found an unsolicited task-recovery run that still requires a live retest.
 
-## 2026-09-06 evidence checkpoint
+## 2026-09-07 current live checkpoint
+
+On `95cbbd08e`, the user-authorized PEM import connected **Paperclip Maya E2E
+0906** (App ID `4853886`, installation `159668881`) to endpoint
+`e516ceb3-397c-4a28-9640-1b2779515fb9`. The installation is restricted to two
+private disposable repositories. The operator's `cryppadotta` identity is
+linked to the local Board account through the private confirmation flow.
+
+The App now sends signed webhooks through stable Tailscale Funnel origin
+`https://dottas-macbook-pro.tail29c1aa.ts.net:10000`. Only provider webhook
+ingress is public; the board remains local/private. The temporary Cloudflare
+tunnel was stopped after a real signed issue comment reached Paperclip.
+
+- [Issue 1](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/1)
+  created CHA-1 before identity linking and received the expected safe guest
+  refusal. That task retains its guest trust classification.
+- [Issue 2](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2)
+  created CHA-2 after identity linking, with a receipt reaction. Its bundled
+  Codex ACP process incorrectly reported an unsupported-model provider error
+  as a completed assistant response, which was published to GitHub. This is a
+  release-blocking defect at that checkpoint, not a successful answer. Commit
+  `1325329e3` repairs the typed ACP terminal-error classification. The later
+  response-selection repair described below is separately required.
+- [Disabled-repository issue 1](https://github.com/cryppadotta/paperclip-chat-e2e-disabled/issues/1#issuecomment-5571234021)
+  produced a GitHub webhook response **200 / ignored**, with no Paperclip
+  conversation or task. Provider installation access did not override the
+  Paperclip allowlist.
+
+At `2026-09-07T13:45Z`, on `1325329e3` plus the final-response selection,
+receipt, and scheduler working-tree changes, an unmentioned follow-up in
+issue 2 requested exactly `GH-LIVE-0907-ROUNDTRIP-OK`. Run
+`b7190e01-0176-4af7-a471-c1e013c2a015` succeeded and
+[bot comment 5571558895](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5571558895)
+contained exactly that response. The existing conversation and CHA-2 task
+were retained. The setup UI subsequently completed and the endpoint is now
+`active`.
+
+The preceding live run had produced the correct model final but published an
+earlier internal bookkeeping comment instead. External-chat runs now publish
+only the runner-selected final; intermediate lifecycle comments remain
+internal. A yielded or missing final cannot fall back to an internal note.
+After the corrected reply, generic productive-task recovery incorrectly
+started an unsolicited extra run. That separate queue defect is under repair;
+the exact reply is not evidence that the entire interaction lifecycle passes.
+The narrow recovery fix subsequently passed the full 133-case process-recovery
+suite. A rapid three-message live test also retained all messages on CHA-2,
+coalesced the last two into one deferred wake, and returned exactly
+`DELTA EPSILON` without mixing Discord's distinct test words. Its two causal
+runs took roughly 78 and 15 seconds. A keep-open task retest is still needed
+to verify the recovery guard live, because this burst ended with the task done.
+
+The [live addendum](2026-09-06-live-qualification-addendum.md) records exact
+delivery and runtime evidence. Broader burst/fault coverage, recovery, reviews/PRs,
+actions/files, and the rest of the release matrix remain open. All checkpoints
+below are historical, not descriptions of the current login or credential state.
+
+## Historical 2026-09-06 evidence checkpoint
 
 The evidence boundary is unchanged but is now quantified more precisely:
 
@@ -16,7 +72,7 @@ The evidence boundary is unchanged but is now quantified more precisely:
 
 GitHub remains a release blocker for the five-provider claim. The current browser session is still stopped at the six-digit sudo-mode MFA prompt, before App creation, key generation, installation, signed ping, or any issue/PR/review webhook. Deterministic browser, integration, signature, lifecycle, concurrency, and permission tests establish implementation coverage only; they do not convert the historical deleted-repository run into current-source provider evidence. A temporary tunnel response would prove only that Paperclip's route is reachable, not that a durable production callback, GitHub App identity, or real event round trip is qualified.
 
-## Current-run evidence and blocker
+## Historical setup-run evidence and blocker
 
 - Last pre-merge setup-attempt source revision: `77ad5383e3a8badf7b1b0933a7e9c66469186d55`
 - Latest implementation revision covered by focused checks: `83018c688`

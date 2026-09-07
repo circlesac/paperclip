@@ -11,6 +11,7 @@ import {
   agentWakeupRequests,
   approvals,
   activityLog,
+  chatConversations,
   companies,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
@@ -37,6 +38,7 @@ import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
+import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
@@ -857,8 +859,36 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
-  async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
+  async function hasPersistedDurableWaitPath(
+    issue: typeof issues.$inferSelect,
+    latestRun: LatestIssueRun,
+  ) {
     if (issue.monitorNextCheckAt) return true;
+
+    // A provider thread owns the next wake for a successful external-chat
+    // turn. The Paperclip issue intentionally remains in progress so the next
+    // message can reuse it; that idle state is not stranded execution. Keep
+    // this scoped to the run that actually came from chat so an unrelated
+    // board/internal run on the same issue retains normal recovery semantics.
+    if (
+      issue.status === "in_progress" &&
+      latestRun?.status === "succeeded" &&
+      isExternalChatPresentationContext(latestRun.contextSnapshot)
+    ) {
+      const activeConversation = await db
+        .select({ id: chatConversations.id })
+        .from(chatConversations)
+        .where(
+          and(
+            eq(chatConversations.companyId, issue.companyId),
+            eq(chatConversations.issueId, issue.id),
+            inArray(chatConversations.state, ["active", "waiting"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (activeConversation) return true;
+    }
 
     return db
       .select({ id: issueRelations.issueId })
@@ -3010,7 +3040,10 @@ export function recoveryService(
         }
         continue;
       }
-      if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+      if (
+        latestRun?.status === "succeeded" &&
+        (await hasPersistedDurableWaitPath(issue, latestRun))
+      ) {
         result.skipped += 1;
         continue;
       }
