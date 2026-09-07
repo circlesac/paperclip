@@ -1542,6 +1542,21 @@ test.describe.serial("native chat adapter UI", () => {
       await expect(
         page.getByText("Credential values and request bodies are redacted."),
       ).toBeVisible();
+      const deliveryTimestamp = page
+        .getByText(`Inbound ${provider.name} delivery could not be processed`)
+        .locator("..")
+        .locator("time");
+      await expect(deliveryTimestamp).toHaveText(
+        /\w+ \d+, \d{4}, \d{1,2}:\d{2}:\d{2} [AP]M/,
+      );
+      await expect(deliveryTimestamp).toHaveAttribute(
+        "datetime",
+        /\d{4}-\d{2}-\d{2}T/,
+      );
+      await expect(deliveryTimestamp).toHaveAttribute(
+        "title",
+        (await deliveryTimestamp.getAttribute("datetime"))!,
+      );
       await expect(page.getByText("xoxb-e2e-redacted")).toHaveCount(0);
       await expect(page.getByText("teams-client-secret")).toHaveCount(0);
       await expect(page.getByText("github-webhook-secret")).toHaveCount(0);

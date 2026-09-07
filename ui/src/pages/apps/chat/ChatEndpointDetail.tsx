@@ -34,7 +34,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { Tabs } from "@/components/ui/tabs";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useToast } from "@/context/ToastContext";
-import { formatDate } from "@/lib/utils";
+import { formatDateTime } from "@/lib/utils";
 import { queryKeys } from "@/lib/queryKeys";
 import { Link, Navigate, useNavigate, useParams } from "@/lib/router";
 
@@ -819,7 +819,16 @@ function Activity({
                 </p>
                 {surface.observedAt && (
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Last observed {formatDate(surface.observedAt)}
+                    Last observed{" "}
+                    <time
+                      dateTime={surface.observedAt}
+                      title={surface.observedAt}
+                      className="font-mono"
+                    >
+                      {formatDateTime(surface.observedAt, {
+                        includeSeconds: true,
+                      })}
+                    </time>
                   </p>
                 )}
               </div>
@@ -936,9 +945,13 @@ function Activity({
                       {activityKindLabels[item.kind]}
                     </span>
                     <StatusBadge status={item.status} />
-                    <span className="text-xs text-muted-foreground">
-                      {formatDate(item.createdAt)}
-                    </span>
+                    <time
+                      dateTime={item.createdAt}
+                      title={item.createdAt}
+                      className="font-mono text-xs text-muted-foreground"
+                    >
+                      {formatDateTime(item.createdAt, { includeSeconds: true })}
+                    </time>
                   </div>
                   <p className="mt-2 text-sm font-medium">{item.summary}</p>
                   {item.detail && (

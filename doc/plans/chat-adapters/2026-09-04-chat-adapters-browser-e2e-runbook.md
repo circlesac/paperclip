@@ -34,15 +34,21 @@ A webhook provider is not deployment-qualified merely because it passed through 
 
 ### Current setup gates — 2026-09-07 UTC
 
-GitHub App creation, sudo confirmation, and installation on the two private test
-repositories have completed; its PEM is still required. Discord App creation
-completed and the operator reported the Clawd installation; Paperclip still needs the bot token, and the
-browser session needs renewed login for provider-side proof. Slack and Telegram
-require replacement of the previously exposed test tokens. Teams still requires
-an eligible work/school tenant and its admin-controlled setup. See the
-[live qualification addendum](./2026-09-06-live-qualification-addendum.md) for the
-latest verified code, isolated ingress, and exact evidence. None is a complete
-current-source live qualification.
+Slack, GitHub, Discord, and Telegram are configured and active in the isolated
+live instance. The GitHub PEM, Discord bot installation/token, and replacement
+Slack/Telegram credentials have been supplied. Webhook providers use the stable
+Tailscale Funnel origin on port 8443; Discord uses its outbound Gateway.
+The public proxy exposes verified webhook routes, not the private Board or files.
+
+Maya E2E now uses native Paperclip Runner with Codex `gpt-5.6-luna`. The
+[native qualification report](./2026-09-07-native-runner-chat-qualification.md)
+records real text, queue, and media results as well as failures and fixes. Further
+model-dependent qualification is blocked by the Codex account's actual
+`usageLimitExceeded` response, not missing provider login. Teams still requires
+an eligible Microsoft 365 work/school tenant and its admin-controlled setup.
+The [reach audit](./2026-09-07-native-chat-reach-audit.md) records subsequent
+model-independent live checks. These are scenario-specific evidence, not a
+complete final-source qualification of every provider and feature.
 
 ### Historical qualification snapshot — 2026-09-06
 
