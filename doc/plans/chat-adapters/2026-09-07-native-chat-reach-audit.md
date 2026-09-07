@@ -101,5 +101,38 @@ fix, the full chat integration suite passed **265/265** on fresh database
 `chat_adapters_test_20260907_latency_09`. The added case covers invalid
 signatures, three concurrent identical deliveries producing one receipt,
 metadata-only Activity, no agent wake or ingress action, and no replay when
-the repository is re-enabled. Live retesting of this follow-up is pending;
-the earlier four-provider reach result is not retroactively attributed to it.
+the repository is re-enabled.
+
+### Live follow-up result
+
+Restarted the isolated server at commit
+`639bf1a20af9ca9afaecae126c12b7add714f19c`, with startup recovery ready before
+the test. From Connectors → Browse → Manage GitHub → Settings, disabled only
+`paperclip-chat-e2e-enabled`, then sent `GITHUB-REACH-RECEIPT-0907-1325` at
+**18:24:59.455 UTC** in the same live test issue. The comment persisted after
+navigating out to the repository's issue list and reopening the issue:
+[issuecomment-5574403287](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5574403287).
+
+Paperclip Activity showed “message ignored”, “Destination is not enabled in
+Paperclip”, and **Sep 7, 2026, 1:25:02 PM** (local time). The rendered row was
+readable with no clipping at the observed desktop viewport. The initial
+Activity visit preceded the new receipt appearing; revisiting the tab showed
+it. This does not establish instantaneous live refresh or all transition
+timings.
+
+Delivery `fdec8621-2423-45b1-8349-83666a30f48e` was received at
+**18:25:02.157 UTC** and processed at **18:25:02.158 UTC**. It had filtered
+state, null conversation/principal, and only the hashed provider event ID,
+event kind, disabled-resource ID, and content-retention-false reason. There
+was no retained message text and no new GitHub ingress action.
+
+From baseline **18:24:49.768** through **18:26:00.895 UTC**, counts remained
+Maya runs **86**, company tasks **17**, internal comments **216**, and
+publications **200**. Restored the enabled repository; the separate disabled
+repository stayed off. Maya's persisted configuration remained
+`paperclip_runner` → `codex` → `gpt-5.6-luna`.
+
+Functional outcome: the original missing-receipt symptom is fixed in this
+live case without admitting refused work or retaining its content. Experience
+quality: this diagnostic path is now understandable from the Board; the
+broader model-driven and Teams release gaps remain open.
