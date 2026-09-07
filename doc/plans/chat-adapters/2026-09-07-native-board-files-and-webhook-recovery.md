@@ -619,3 +619,24 @@ Supporting verification so far:
   real PostgreSQL, not new live-provider or process-kill qualification. The
   earlier frozen-install, upstream, browser-input, model-capacity, and Teams
   gates remain open; this is not a whole-product readiness sign-off.
+
+## Snapshot 15: receipt repair deployed; live ambiguity proof still open
+
+Committed and pushed `9277e0dc5`. The isolated instance restarted with loaded
+version `2026.831.0+411.git.9277e0dc5`; startup recovery was ready at
+**21:36:00.332 UTC**. The health endpoint and `/CHA/apps` both returned 200,
+and Discord Gateway connected. Slack, GitHub, Discord, and Telegram endpoints
+remain active. Maya still uses `paperclip_runner` / `codex` /
+`gpt-5.6-luna`; no global defaults or agent model settings changed. There were
+no active Maya runs at restart. The webhook-only proxy stayed running on 3104,
+and the Board remains private on 3103.
+
+The live rare-path test—Slack accepts bytes, share identity is temporarily
+unavailable, and durable metadata recovery later binds the real message—is
+still unqualified. Snapshot 13's fast-path file evidence is not relabeled as
+this new recovery-path evidence. Browser-input recovery remains unresolved,
+and a fresh account-limit check still reports exhausted weekly Codex capacity
+with no reset credit. No model-driven retry, historical-file resend, or Teams
+live pass is claimed by this deployment. The final automated evidence for the
+deployed source remains 282/282 database cases, 59/59 adapter/coordinator cases,
+server TypeScript, and exact pinned-patch reproduction.
