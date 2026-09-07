@@ -155,6 +155,73 @@ success toast; the final clean runs supersede it. The initial red browser test
 also established that the old component made zero status GETs for eight seconds
 and kept the completed send disabled.
 
-Live retesting on the updated backend remains separate from these deterministic
+The updated-backend live retest below is separate from these deterministic
 results. A further code audit found synthetic Slack file-share message IDs;
 reaction matching on uploaded Slack files is not yet qualified.
+
+## Updated-backend live retest
+
+Restarted only the isolated Board server as snapshot 11. Health reported loaded
+`2026.831.0+399.git.43b63da40`, process start **19:52:33.594 UTC**, startup recovery
+ready, and the Discord Gateway connected. Maya's safe configuration fields were
+rechecked: `paperclip_runner`, provider `codex`, model `gpt-5.6-luna`. The stored
+reasoning-effort setting is `low`, but the current native input contract does
+not propagate that legacy field, as documented in the native-runner report.
+The following checks do not invoke the model.
+
+### Slack: paused queue, reload, and automatic completion
+
+Used the connector Activity **Pause** control, then the canonical `CHA-6` task's
+**Send to channel** UI. Selected only `board-queue-retest-note.txt` and
+`board-queue-retest-cat.png`; the previous internal-only fixture stayed unchecked.
+Clicked Send at **19:53:07.191 UTC** with marker `BOARD-QUEUE-RELOAD-1954`.
+
+The mounted timeline immediately showed exactly one Board comment and both
+attachments. The composer truthfully showed **Queued for channel**, **0 of 3
+parts published**, and a locked draft. Reloading preserved that exact draft and
+status. A database check while still paused confirmed one comment and three
+pending rows, not a duplicate submission:
+
+- Comment: `9e461b1e-ccc9-478b-9799-5fce4c6d96b1`.
+- Publications: `85a6121d-4554-4c52-89ad-7725b0603329`,
+  `acb97e67-a44a-439b-8828-ad2ab4c95114`, and
+  `ecc5e90f-d5cb-4fcd-b8be-3dda7ffe84f9`.
+
+Clicked **Resume** at **19:53:35.884**. Text published at **19:53:38.067**, document
+at **19:53:38.560**, and image at **19:53:39.154**, all with null errors. By the
+next UI observation at **19:53:42.451**, the same mounted task had automatically
+closed the draft and re-enabled Send. Slack's actual thread visibly contained
+the marker text, the document preview with `cobalt otter 47`, and the cat image.
+There was still one canonical comment. Slack was left active.
+
+One remaining experience defect was observed and assigned for correction: once
+the selected attachments bind to the new comment, they disappear from the
+pending selection list, leaving only the unchecked internal-only file visible.
+Although the timeline and three-part status are correct, the composer should
+continue showing the exact locked selected filenames through reload.
+
+### Discord, Telegram, and GitHub on the same backend
+
+Uploaded two new unbound fixtures per provider using the Board attachment API,
+then selected them through each canonical task's actual Send composer. Markers
+were `BOARD-NEW-BACKEND-{PROVIDER}`. Unrelated and internal-only files stayed
+unchecked. No agent reply was requested.
+
+| Provider | Board click UTC | All three parts published UTC | Canonical comment |
+| --- | --- | --- | --- |
+| Discord | 19:54:40.669 | 19:54:46.478 | `0cbe837f-b48c-42dc-b36f-f2bc7c901ec2` |
+| Telegram | 19:55:11.630 | 19:55:14.991 | `57639d0a-4c3e-4b2b-80c8-e36c5311fdc6` |
+| GitHub | 19:55:36.324 | 19:55:38.967 | `0b206e5a-4171-4fb8-b8af-773ad612f419` |
+
+All nine rows were published with real provider message IDs and null errors.
+Discord visibly rendered the text preview and cat; Telegram rendered its 128-byte
+document card and cat photo. The composer closed automatically on each task.
+GitHub posted the accurate private-file notices. Its already-mounted canonical
+`CHA-2` timeline now showed the new comment and files without reopening; the cat
+opened successfully in the private task's full image viewer.
+
+Final counts were **86 Maya runs, 17 tasks, 224 comments, 224 publications**.
+All four configured endpoints were active; all four previous internal-only
+fixtures remained unbound. These checks establish successful transport and Board
+recovery on the updated backend, not additional model qualification, a throughput
+SLA, downloaded provider-byte checksums, or native GitHub file upload support.
