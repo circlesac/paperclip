@@ -50,6 +50,11 @@ The [reach audit](./2026-09-07-native-chat-reach-audit.md) records subsequent
 model-independent live checks. These are scenario-specific evidence, not a
 complete final-source qualification of every provider and feature.
 
+Release installation is also unqualified: the preserved lockfile currently
+fails the frozen, offline configuration check. The [deployment follow-up](./2026-09-07-native-board-files-and-webhook-recovery.md#frozen-install-release-gate)
+records the exact failure and the no-lockfile-edit constraint. Successful tests
+against the existing installed modules do not qualify a clean installation.
+
 ### Historical qualification snapshot — 2026-09-06
 
 - **Evidence baseline:** committed revision `a534e07a6` pins the current evidence ledger. Its implementation parent `83018c688` contains the Discord log-redaction and setup-copy corrections. Parent merge `da8f83d6c9befe7bf958f6d9cf12a95fc7e59e88` passed the five-provider deterministic browser suite plus the focused merged-build live checks described below; `83018c688` then passed the 42-test Discord adapter/runtime subset, the 34-test Discord/OpenAPI/UI contract subset, and server/UI typechecks. Working-tree fixes made after this checkpoint remain deterministic evidence until the combined suite and relevant provider scenario are rerun.

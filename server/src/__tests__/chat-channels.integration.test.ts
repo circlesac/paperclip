@@ -1235,6 +1235,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "fetch"
         | "questionFormOpenAuthorizationBarrier"
         | "questionResolutionPersistBarrier"
+        | "reactionReplayEndpointLockBarrier"
         | "reachAuthorizationBarrier"
         | "resolveNativeQuestion"
         | "renewCredentialMutationLease"
@@ -35946,6 +35947,328 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(restarted.wakeup).not.toHaveBeenCalled();
     await restarted.service.shutdown();
   });
+
+  it.each(["action_first", "reaction_first"] as const)(
+    "joins in-flight recovery before rethrowing an ordinary drain failure (%s)",
+    async (releaseOrder) => {
+      const gate = () => {
+        let release!: () => void;
+        const promise = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return { promise, release };
+      };
+      const actionGate = gate();
+      const reactionGate = gate();
+      let recoveryArmed = false;
+      let actionEntered = false;
+      let reactionEntered = false;
+      const fixture = await seedCompany();
+      const { callbacks, endpoint, runtime, service, wakeup } =
+        await configuredSlackEndpoint(fixture, {
+          reactionReplayEndpointLockBarrier: async () => {
+            if (!recoveryArmed) return;
+            reactionEntered = true;
+            await reactionGate.promise;
+          },
+        });
+      const restoreMocks: Array<() => void> = [];
+      let ordinaryDeliveryId: string | null = null;
+      let sweep: Promise<{ ok: true } | { ok: false; error: unknown }> | null =
+        null;
+      try {
+        const channel = makeThread({
+          channelId: "C-RECOVERY-JOIN",
+          id: "slack:C-RECOVERY-JOIN:7147.1",
+          name: "recovery-join",
+        });
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          thread: channel.thread,
+          message: makeMessage({
+            id: "7147.1",
+            text: "@maya prepare the recovery join fixture",
+            mentioned: true,
+          }),
+          trigger: "mention",
+        });
+        await qualifySetupRoundTrip(service, endpoint.id);
+        await service.test(endpoint.id, "owner-user");
+        const [conversation] = await service.listConversations(endpoint.id);
+        const providerRuntime = runtime.endpoints.get(endpoint.id);
+        if (!conversation || !providerRuntime || !callbacks.onReaction)
+          throw new Error("Expected the active Slack reaction fixture");
+
+        // Obtain a current-runtime inbound receipt and its real normalized
+        // delivery, then retain only the durable retry state needed here.
+        const inboundMessageId = "7147.3";
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          thread: channel.thread,
+          message: makeMessage({
+            id: inboundMessageId,
+            text: "Ready to retry",
+          }),
+          trigger: "subscribed_message",
+        });
+        const [inbound] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${inboundMessageId}`,
+            ),
+          );
+        const [receipt] = inbound
+          ? await db
+              .select()
+              .from(chatActions)
+              .where(
+                and(
+                  eq(chatActions.deliveryId, inbound.id),
+                  eq(chatActions.kind, "receipt_reaction"),
+                  sql`${chatActions.payload}->>'operation' = 'add'`,
+                ),
+              )
+          : [];
+        if (!inbound || !receipt)
+          throw new Error("Expected an inbound delivery and receipt action");
+
+        const targetMessageId = "7147.4";
+        providerRuntime.postResultIds.push(targetMessageId);
+        await service.publishBoardMessage(
+          endpoint.id,
+          conversation.id,
+          "The linked reaction target",
+          `recovery-join-${releaseOrder}`,
+          "owner-user",
+        );
+        const target = makeMessage({ id: targetMessageId, text: "" });
+        await callbacks.onReaction({
+          endpointId: endpoint.id,
+          provider: "slack",
+          event: {
+            adapter: {} as never,
+            added: true,
+            emoji: {
+              name: "thumbs_up",
+              toJSON: () => ":thumbs_up:",
+              toString: () => ":thumbs_up:",
+            },
+            message: target,
+            messageId: targetMessageId,
+            raw: { event_ts: "7147.45" },
+            rawEmoji: "+1",
+            thread: channel.thread,
+            threadId: channel.thread.id,
+            user: target.author,
+          },
+        });
+        const [reaction] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              eq(chatDeliveries.eventKind, "reaction_added"),
+            ),
+          );
+        if (!reaction) throw new Error("Expected the normalized reaction");
+        await db
+          .update(chatDeliveries)
+          .set({
+            conversationId: null,
+            state: "received",
+            attempts: 0,
+            processedAt: null,
+            nextAttemptAt: new Date(0),
+          })
+          .where(eq(chatDeliveries.id, reaction.id));
+        await db
+          .update(chatActions)
+          .set({ status: "received", result: null, createdAt: new Date(0) })
+          .where(eq(chatActions.id, receipt.id));
+        ordinaryDeliveryId = randomUUID();
+        const ordinaryEventId = `recovery-join-ordinary-${randomUUID()}`;
+        await db.insert(chatDeliveries).values({
+          ...inbound,
+          id: ordinaryDeliveryId,
+          providerEventId: ordinaryEventId,
+          deduplicationKey: ordinaryEventId,
+          normalizedEvent: {
+            ...inbound.normalizedEvent,
+            providerEventId: ordinaryEventId,
+            message: {
+              ...(inbound.normalizedEvent.message as Record<string, unknown>),
+              providerMessageId: "7147.5",
+            },
+          },
+          state: "received",
+          attempts: 0,
+          receivedAt: new Date(0),
+          processedAt: null,
+          nextAttemptAt: null,
+        });
+
+        const originalThread = providerRuntime.thread.bind(providerRuntime);
+        const recoveredReceipt = vi.fn(async () => {
+          actionEntered = true;
+          await actionGate.promise;
+        });
+        const threadSpy = vi
+          .spyOn(providerRuntime, "thread")
+          .mockImplementation((threadId) => {
+            const thread = originalThread(threadId);
+            const originalAddReaction = thread.adapter.addReaction;
+            thread.adapter.addReaction = async (...args) => {
+              if (
+                threadId === channel.thread.id &&
+                args[1] === inboundMessageId
+              )
+                await recoveredReceipt();
+              return originalAddReaction(...args);
+            };
+            return thread;
+          });
+        restoreMocks.push(() => threadSpy.mockRestore());
+
+        // Fail only the ordinary drain's lease acquisition, outside its
+        // per-message catch. Recovery's credential leases must keep working.
+        const sentinel = new Error("injected ordinary drain lease failure");
+        let ordinaryFailed = false;
+        const originalInsert = db.insert.bind(db);
+        const insertSpy = vi.spyOn(db, "insert").mockImplementation((table) => {
+          const builder = originalInsert(table);
+          if (table === chatEndpointLeases) {
+            const originalValues = builder.values.bind(builder);
+            builder.values = ((values: {
+              endpointId?: string;
+              leaseKey?: string;
+            }) => {
+              if (
+                !ordinaryFailed &&
+                values.endpointId === endpoint.id &&
+                values.leaseKey?.startsWith("inbound:")
+              ) {
+                ordinaryFailed = true;
+                throw sentinel;
+              }
+              return originalValues(values);
+            }) as typeof builder.values;
+          }
+          return builder;
+        });
+        restoreMocks.push(() => insertSpy.mockRestore());
+        const unchangedRows = async () =>
+          Promise.all([
+            db
+              .select({ id: issueComments.id })
+              .from(issueComments)
+              .where(eq(issueComments.companyId, fixture.companyId)),
+            db
+              .select({ id: issues.id })
+              .from(issues)
+              .where(eq(issues.companyId, fixture.companyId)),
+            db
+              .select({ id: heartbeatRuns.id })
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.companyId, fixture.companyId)),
+            db
+              .select({ id: chatPublications.id })
+              .from(chatPublications)
+              .where(eq(chatPublications.endpointId, endpoint.id)),
+          ]);
+        const baseline = await unchangedRows();
+        const wakeupCount = wakeup.mock.calls.length;
+        const postCount = providerRuntime.posts.length;
+        let settled = false;
+        recoveryArmed = true;
+        sweep = service.processPendingDeliveries().then(
+          () => {
+            settled = true;
+            return { ok: true as const };
+          },
+          (error: unknown) => {
+            settled = true;
+            return { ok: false as const, error };
+          },
+        );
+        await expect
+          .poll(() => ordinaryFailed && actionEntered && reactionEntered)
+          .toBe(true);
+        expect(settled).toBe(false);
+        const actionState = () =>
+          db
+            .select({ state: chatActions.status })
+            .from(chatActions)
+            .where(eq(chatActions.id, receipt.id))
+            .then((rows) => rows[0]?.state);
+        const reactionState = () =>
+          db
+            .select({ state: chatDeliveries.state })
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.id, reaction.id))
+            .then((rows) => rows[0]?.state);
+        if (releaseOrder === "action_first") {
+          actionGate.release();
+          await expect.poll(actionState).toBe("processed");
+        } else {
+          reactionGate.release();
+          await expect.poll(reactionState).toBe("processed");
+        }
+        expect(settled).toBe(false);
+        actionGate.release();
+        reactionGate.release();
+        const outcome = await sweep;
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) throw new Error("Expected the ordinary drain failure");
+        expect(outcome.error).toBe(sentinel);
+        expect(await actionState()).toBe("processed");
+        await expect(
+          db
+            .select()
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.id, reaction.id)),
+        ).resolves.toEqual([
+          expect.objectContaining({
+            conversationId: conversation.id,
+            state: "processed",
+            attempts: 1,
+          }),
+        ]);
+        await expect(
+          db
+            .select({ state: chatDeliveries.state })
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.id, ordinaryDeliveryId)),
+        ).resolves.toEqual([{ state: "received" }]);
+        expect(recoveredReceipt).toHaveBeenCalledTimes(1);
+        expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
+        expect(providerRuntime.posts).toHaveLength(postCount);
+        expect(await unchangedRows()).toEqual(baseline);
+        await expect(
+          db
+            .select({ id: chatEndpointLeases.id })
+            .from(chatEndpointLeases)
+            .where(eq(chatEndpointLeases.endpointId, endpoint.id)),
+        ).resolves.toEqual([]);
+      } finally {
+        actionGate.release();
+        reactionGate.release();
+        await sweep;
+        for (const restore of restoreMocks.reverse()) restore();
+        if (ordinaryDeliveryId)
+          await db
+            .delete(chatDeliveries)
+            .where(eq(chatDeliveries.id, ordinaryDeliveryId));
+        await service.shutdown();
+      }
+    },
+    20_000,
+  );
 
   it("does not deadlock reaction replay against publication link settlement", async () => {
     const fixture = await seedCompany();

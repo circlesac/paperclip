@@ -436,6 +436,30 @@ The full combined suite then passed **276/276** on the fresh migrated
 and all seven additions. Simulated provider failures in its log are intentional
 negative fixtures, not live-provider failures.
 
+### Recovery failure-path regression follow-up
+
+Two additional real-PostgreSQL fixtures now exercise ordinary inbound-drain
+failure while both action and reaction recovery are in flight. Each injects an
+error only at the fixture endpoint's inbound lease acquisition. One releases
+action recovery first; the other releases reaction recovery first. Both require
+the sweep to remain pending until the second recovery finishes, then reject
+with the exact original error. Durable reaction/action state completes once,
+without extra comments, tasks, runs, wakes, or publication sends; the ordinary
+delivery remains unprocessed and recovery leases are released.
+
+The focused run passed **2/2** on fresh
+`chat_adapters_test_20260907_reaction_join_01`; server TypeScript passed.
+The isolated mocked browser suite also passed **9/9** in 2.7 minutes, covering
+all five setup/management journeys and four Board batch-delivery/reload cases.
+Those browser cases use a throwaway instance on port 3199 and mocked providers,
+not the signed-in live provider sessions or the live instance on port 3103.
+
+The combined suite then passed **278/278** on fresh migrated database
+`chat_adapters_test_20260907_reaction_full_02`, in 79.68 seconds (71.62 seconds
+of tests). This includes both recovery-release orders and the prior seven
+reaction-link regressions. The current change is test-only; it does not add a
+new live-provider qualification or change the running server's production code.
+
 ## Snapshot 14: deployed; post-restart browser smoke remains unverified
 
 Loaded `2026.831.0+407.git.e6f52b4cc` at **20:44:52.362 UTC**. Health and
@@ -461,3 +485,22 @@ testing-tool limitation, not an established Slack or Paperclip product defect.
 Model-driven follow-ups still require restored Codex capacity; Teams still
 requires the eligible tenant/admin setup. The isolated server is left running,
 with the public webhook-only proxy and private Board boundary unchanged.
+
+## Frozen-install release gate
+
+The preserved lockfile is now a confirmed release blocker, not merely an
+unexecuted check. On September 7, the non-regenerating diagnostic
+`pnpm install --frozen-lockfile --lockfile-only --ignore-scripts --offline`
+exited with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`: the current overrides do not
+match the lockfile. It stopped before validating dependency and patch entries;
+source inspection also shows that the five pinned chat-adapter dependencies
+and their patches are absent from that lockfile. The diagnostic left the
+lockfile and working tree unchanged and did not replace the live server's
+installed modules.
+
+The installed, patched dependency tree used for the recorded tests is therefore
+not proof of a reproducible frozen installation from this branch. The existing
+instruction not to edit or commit `pnpm-lock.yaml` remains in force. No patch,
+override, or dependency was removed to make the check appear green. Release
+qualification needs a reconciled lockfile and a clean frozen-install retest
+after that constraint is resolved; the active local server is unaffected.
