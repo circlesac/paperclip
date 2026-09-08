@@ -29302,47 +29302,82 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
       status: "issued",
     });
-    await retryingWakeService.service.processPendingPublications(1_000);
-    expect(failingWakeup).toHaveBeenCalledTimes(1);
-    await expect(
-      db
-        .select({ status: chatActions.status, result: chatActions.result })
-        .from(chatActions)
-        .where(eq(chatActions.id, retryingWakeId)),
-    ).resolves.toEqual([
-      {
-        status: "issued",
-        result: { code: "interaction_wakeup_failed", attemptCount: 1 },
-      },
-    ]);
-    await retryingWakeService.service.processPendingPublications(1_000);
-    expect(failingWakeup).toHaveBeenCalledTimes(1);
-    for (let attempt = 2; attempt <= 5; attempt += 1) {
+    try {
+      await retryingWakeService.service.processPendingPublications(1_000);
+      expect(failingWakeup).toHaveBeenCalledTimes(1);
+      await expect(
+        db
+          .select({ status: chatActions.status, result: chatActions.result })
+          .from(chatActions)
+          .where(eq(chatActions.id, retryingWakeId)),
+      ).resolves.toEqual([
+        {
+          status: "issued",
+          result: { code: "interaction_wakeup_failed", attemptCount: 1 },
+        },
+      ]);
+      await retryingWakeService.service.processPendingPublications(1_000);
+      expect(failingWakeup).toHaveBeenCalledTimes(1);
+      for (let attempt = 2; attempt <= 5; attempt += 1) {
+        await db
+          .update(chatActions)
+          .set({ updatedAt: new Date(Date.now() - 31_000) })
+          .where(eq(chatActions.id, retryingWakeId));
+        await retryingWakeService.service.processPendingPublications(1_000);
+      }
+      expect(failingWakeup).toHaveBeenCalledTimes(5);
+      await expect(
+        db
+          .select({ status: chatActions.status, result: chatActions.result })
+          .from(chatActions)
+          .where(eq(chatActions.id, retryingWakeId)),
+      ).resolves.toEqual([
+        {
+          status: "issued",
+          result: { code: "interaction_wakeup_failed", attemptCount: 5 },
+        },
+      ]);
       await db
         .update(chatActions)
         .set({ updatedAt: new Date(Date.now() - 31_000) })
         .where(eq(chatActions.id, retryingWakeId));
       await retryingWakeService.service.processPendingPublications(1_000);
+      expect(failingWakeup).toHaveBeenCalledTimes(6);
+      await expect(
+        db
+          .select({ status: chatActions.status, result: chatActions.result })
+          .from(chatActions)
+          .where(eq(chatActions.id, retryingWakeId)),
+      ).resolves.toEqual([
+        {
+          status: "issued",
+          result: { code: "interaction_wakeup_failed", attemptCount: 6 },
+        },
+      ]);
+    } finally {
+      try {
+        await retryingWakeService.service.shutdown();
+      } finally {
+        // This intentionally retryable synthetic action must not become due
+        // during a later test's global drain. Remove only this fixture row;
+        // production shutdown must preserve durable retry work.
+        await db
+          .delete(chatActions)
+          .where(
+            and(
+              eq(chatActions.id, retryingWakeId),
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.kind, "interaction_wakeup"),
+            ),
+          );
+      }
     }
-    expect(failingWakeup).toHaveBeenCalledTimes(5);
     await expect(
       db
-        .select({ status: chatActions.status, result: chatActions.result })
+        .select({ id: chatActions.id })
         .from(chatActions)
         .where(eq(chatActions.id, retryingWakeId)),
-    ).resolves.toEqual([
-      {
-        status: "issued",
-        result: { code: "interaction_wakeup_failed", attemptCount: 5 },
-      },
-    ]);
-    await db
-      .update(chatActions)
-      .set({ updatedAt: new Date(Date.now() - 31_000) })
-      .where(eq(chatActions.id, retryingWakeId));
-    await retryingWakeService.service.processPendingPublications(1_000);
-    expect(failingWakeup).toHaveBeenCalledTimes(6);
-    await retryingWakeService.service.shutdown();
+    ).resolves.toEqual([]);
 
     const [deferredInteraction] = await db
       .insert(issueThreadInteractions)
