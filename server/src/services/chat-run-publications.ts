@@ -314,7 +314,9 @@ async function enqueueSafeNativeChatProgress(
       const result = await db.transaction(async (tx) => {
         // Keep the normal issue -> run order used by native finalization. The
         // publication insert takes an issue FK lock, so locking the run first
-        // would invert that order against a concurrent terminal commit.
+        // would invert that order against a concurrent terminal commit. A
+        // contended issue/run is optional progress, not a reason to hold other
+        // chats: skip it now and revisit it with a fresh cursor next sweep.
         const currentIssue = await tx
           .select({ id: issues.id })
           .from(issues)
@@ -324,7 +326,7 @@ async function enqueueSafeNativeChatProgress(
               eq(issues.companyId, row.companyId),
             ),
           )
-          .for("update")
+          .for("update", { skipLocked: true })
           .then((currentRows) => currentRows[0] ?? null);
         if (!currentIssue) return 0;
         // Native event admission serializes on the run row. Taking the same
@@ -342,7 +344,7 @@ async function enqueueSafeNativeChatProgress(
               eq(heartbeatRuns.status, "running"),
             ),
           )
-          .for("update")
+          .for("update", { skipLocked: true })
           .then((currentRows) => currentRows[0] ?? null);
         if (!currentRun) return 0;
 

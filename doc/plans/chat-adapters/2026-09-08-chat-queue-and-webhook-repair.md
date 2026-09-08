@@ -205,3 +205,63 @@ diagnostics, tested **6/6** without a real listener. They record only provider,
 timestamp, duration, status, outcome, and byte count; no bodies, headers,
 credentials, callback IDs, or URLs. The proxy was restarted with this diagnostic
 code, retaining the same webhook-only routing and public/private exposure.
+
+## Live restart and GitHub answer on `545c87c67`
+
+The clean committed server reached startup `ready` at 12:27:46.904 UTC. The
+assessment-lineage failure no longer prevents startup. A separate, nonfatal
+workspace-recovery warning still attempted to use a directory-only run token
+as an execution-workspace foreign key; its correction is described below.
+
+A fresh, unmentioned follow-up in the existing PR conversation was submitted
+at 12:28:39.398. User comment `5585134211` reached the webhook-only proxy at
+12:28:41.889 (202 in 67.749 ms) and was durably received at 12:28:42.602.
+Run `e12b49b9-5798-4700-8f01-e77b759f19e5` ran from 12:28:43.404 to
+12:28:57.439 using actual `codex_app_server`; its persisted native provider
+configuration is `gpt-5.6-luna`. It retained provider session
+`01a080dc-602e-7033-8c92-e417668c57fb`, returned an accepted yielded result,
+and published the actual answer `GH-LUNA-ANSWER-DELIVERED` at 12:28:58.566.
+Working feedback and the final each used one attempt and the same GitHub
+comment, `5585135215`. This is **19.168 seconds source-to-answer**, with
+working feedback after 5.507 seconds; it is one measured short-answer sample,
+not a latency percentile. The visible final was verified before clicking the
+normal setup test button. GitHub became `active` / `complete` at
+12:29:21.220 without editing provider permissions or exposing secrets.
+
+The Slack task-scoped reset has **not** happened. Its native browser
+confirmation stopped responding to the browser controls; the dialog API
+reported no active dialog while click, keyboard, and close operations timed
+out. The exact task-session row still references the failed recovery run.
+Fresh Discord and Telegram requests are only prepared drafts: attempts to
+submit them did not remove them from the composers or create inbound
+deliveries. They are not counted as live probes. No provider login or model
+substitution was used to work around the browser state.
+
+## Subsequent scoped corrections
+
+- Optional safe-progress projection skips contended issue/run rows and
+  rechecks them on a later sweep. Milestone production and publication
+  dispatch have independent coalesced, single-flight lanes, so a slow
+  projection cannot hold unrelated already-committed answers/questions.
+  Authorization, per-run phase limits, final precedence, and closed payloads
+  are unchanged. Red-before/green-after PostgreSQL contention tests and
+  independent review cover retry, intervening questions/finals/revocation,
+  and draining both lanes on shutdown. This does not claim every provider
+  lane is universally lock-free.
+- Workspace-finalization recovery uses an execution-workspace FK only when
+  the candidate resolves to a company-owned row. Directory-only tokens stay
+  nullable; prior-operation cwd recovery requires exact company/run/issue
+  binding. Tests cover a real owned workspace, a directory-only run token,
+  and rejection of a foreign workspace / mismatched prior issue.
+
+These two corrections await deployment. Root's combined coordinator and
+workspace-recovery check passed **16/16**; source TypeScript checks passed.
+The final full chat integration run passed **369/369** on fresh PostgreSQL
+in 68.90 seconds. Its preceding run had **368/369**: an existing assertion
+assumed unordered database rows matched insertion order, although both exact
+stale placeholders were correctly cancelled. The assertion now requires exact
+cardinality and both exact row contents without imposing an unspecified order;
+the isolated case and complete rerun passed. No production behavior was changed
+for that test correction.
+Long text-only generation still uses coarse working feedback rather than
+streaming raw deltas or private reasoning into external chat.

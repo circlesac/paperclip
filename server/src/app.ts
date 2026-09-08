@@ -264,6 +264,7 @@ export function shouldEnablePrivateHostnameGuard(opts: {
 type ChatReconciliationLane =
   | "provider runtimes"
   | "deliveries"
+  | "run milestones"
   | "publications"
   | "Slack file receipts"
   | "Slack session status";
@@ -276,6 +277,7 @@ type ChatReconciliationLane =
 export function createChatReconciliationCoordinator(input: {
   reconcileProviderRuntimes: () => Promise<unknown>;
   processPendingDeliveries: () => Promise<unknown>;
+  projectRunMilestones: () => Promise<number>;
   flushPublications: () => Promise<unknown>;
   processPendingSlackFileUploadReceipts: () => Promise<unknown>;
   processPendingSlackSessionSyncs: () => Promise<unknown>;
@@ -286,6 +288,16 @@ export function createChatReconciliationCoordinator(input: {
   const publicationReconciliation = createCoalescedAsyncTrigger({
     run: input.flushPublications,
     onError: (error) => input.onError("publications", error),
+  });
+  const milestoneReconciliation = createCoalescedAsyncTrigger({
+    run: async () => {
+      const inserted = await input.projectRunMilestones();
+      // Existing final/question publications never wait on this optional
+      // projection. Newly committed milestones get a bounded dispatch wake;
+      // an empty/contended pass does not create a self-sustaining loop.
+      if (inserted > 0) publicationReconciliation.notify();
+    },
+    onError: (error) => input.onError("run milestones", error),
   });
   const start = (
     lane: ChatReconciliationLane,
@@ -306,22 +318,28 @@ export function createChatReconciliationCoordinator(input: {
       if (stopped) return;
       start("provider runtimes", input.reconcileProviderRuntimes);
       start("deliveries", input.processPendingDeliveries);
+      milestoneReconciliation.poll();
       publicationReconciliation.poll();
       start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
       start("Slack session status", input.processPendingSlackSessionSyncs);
     },
     notifyPublications() {
+      milestoneReconciliation.notify();
       publicationReconciliation.notify();
     },
     stop() {
       stopped = true;
+      milestoneReconciliation.stop();
       publicationReconciliation.stop();
     },
     async drain() {
       await Promise.allSettled([
         ...inFlight.values(),
-        publicationReconciliation.drain(),
+        milestoneReconciliation.drain(),
       ]);
+      // Projecting the final batch can notify dispatch after an earlier drain
+      // would have returned. Join dispatch only after its producer has drained.
+      await publicationReconciliation.drain();
     },
   };
 }
@@ -1084,14 +1102,15 @@ export async function createApp(
     void flushPendingFeedbackExports();
   }
   const flushChatPublications = async () => {
-    await enqueueChatRunMilestones(db, {
-      publicBaseUrl: opts.authPublicBaseUrl,
-    });
     await chatChannels.schedulePendingPublications();
   };
   const chatReconciliation = createChatReconciliationCoordinator({
     reconcileProviderRuntimes: () => chatChannels.reconcileProviderRuntimes(),
     processPendingDeliveries: () => chatChannels.processPendingDeliveries(),
+    projectRunMilestones: () =>
+      enqueueChatRunMilestones(db, {
+        publicBaseUrl: opts.authPublicBaseUrl,
+      }),
     flushPublications: () => flushChatPublications(),
     processPendingSlackFileUploadReceipts: () =>
       chatChannels.processPendingSlackFileUploadReceipts(),

@@ -39236,10 +39236,273 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       fixture,
       messageId,
       providerRuntime,
+      runtime,
       service,
       thread,
     };
   }
+
+  it.each(["issue", "run"] as const)(
+    "skips a locked native progress %s while unrelated final and question publications deliver",
+    async (lockTarget) => {
+      const blocked = await safeNativeProgressFixture("telegram", "71");
+      const final = await safeNativeProgressFixture("telegram", "72");
+      const question = await safeNativeProgressFixture("telegram", "73");
+      const blockedRun = await blocked.createRun("contended progress");
+      const finalRun = await final.createRun("ready final");
+      const questionRun = await question.createRun("ready question");
+      await blocked.addEvent(blockedRun);
+      const finalComment = await addSelectedChatFinal({
+        agentId: final.fixture.assignedAgentId,
+        body: "The unrelated final is ready",
+        companyId: final.fixture.companyId,
+        issueId: final.conversation.issueId,
+        runId: finalRun.runId,
+      });
+      const interaction = await issueThreadInteractionService(db).create(
+        {
+          id: question.conversation.issueId,
+          companyId: question.fixture.companyId,
+        },
+        {
+          kind: "ask_user_questions",
+          continuationPolicy: "wake_assignee",
+          sourceRunId: questionRun.runId,
+          payload: {
+            version: 1,
+            prompt: "Choose a color",
+            questions: [
+              {
+                id: "color",
+                prompt: "Choose a color",
+                selectionMode: "single",
+                required: true,
+                options: [
+                  { id: "amber", label: "Amber" },
+                  { id: "cobalt", label: "Cobalt" },
+                ],
+              },
+            ],
+          },
+        },
+        { agentId: question.fixture.assignedAgentId },
+      );
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const acquired = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const holder = db.transaction(async (tx) => {
+        if (lockTarget === "issue") {
+          await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(eq(issues.id, blocked.conversation.issueId))
+            .for("update");
+        } else {
+          await tx
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, blockedRun.runId))
+            .for("update");
+        }
+        entered();
+        await held;
+      });
+      let flush: Promise<void> | undefined;
+      let flushError: unknown;
+      try {
+        try {
+          await acquired;
+          let finished = false;
+          flush = (async () => {
+            await enqueueChatRunMilestones(db, { since: new Date(0) });
+            await blocked.service.processPendingPublications(100);
+            finished = true;
+          })().catch((error) => {
+            flushError = error;
+            finished = true;
+          });
+          await vi.waitFor(() => expect(finished).toBe(true), {
+            timeout: 1_000,
+          });
+          if (flushError) throw flushError;
+          const ready = await db
+            .select()
+            .from(chatPublications)
+            .where(
+              or(
+                eq(chatPublications.commentId, finalComment.id),
+                eq(
+                  chatPublications.idempotencyKey,
+                  `interaction:${interaction.id}:${question.endpoint.id}`,
+                ),
+              ),
+            );
+          expect(ready).toHaveLength(2);
+          expect(
+            ready.every((publication) => publication.state === "published"),
+          ).toBe(true);
+          expect(
+            blocked.runtime.endpoints.get(final.endpoint.id)?.edits.at(-1)
+              ?.text,
+          ).toBe("The unrelated final is ready");
+          expect(
+            blocked.runtime.endpoints.get(question.endpoint.id)?.edits.at(-1)
+              ?.text,
+          ).toContain("Choose a color");
+          expect(blocked.providerRuntime.edits).toEqual([]);
+        } finally {
+          release();
+          await Promise.allSettled([holder, flush]);
+        }
+        await expect(
+          enqueueChatRunMilestones(db, { since: new Date(0) }),
+        ).resolves.toBe(1);
+        await blocked.service.processPendingPublications(100);
+        expect(blocked.providerRuntime.edits).toEqual([
+          expect.objectContaining({
+            messageId: "outbound-1",
+            text: "Maya is making progress…",
+          }),
+        ]);
+        await expect(
+          enqueueChatRunMilestones(db, { since: new Date(0) }),
+        ).resolves.toBe(0);
+      } finally {
+        await Promise.allSettled([
+          blocked.service.shutdown(),
+          final.service.shutdown(),
+          question.service.shutdown(),
+        ]);
+      }
+    },
+  );
+
+  it.each(["question", "final", "revoked"] as const)(
+    "reauthorizes skipped native progress after %s wins before retry",
+    async (winner) => {
+      const context = await safeNativeProgressFixture("telegram", "74");
+      const run = await context.createRun("progress that must remain current");
+      await context.addEvent(run);
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const acquired = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const holder = db.transaction(async (tx) => {
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(eq(issues.id, context.conversation.issueId))
+          .for("update");
+        entered();
+        await held;
+      });
+      try {
+        try {
+          await acquired;
+          await expect(
+            enqueueChatRunMilestones(db, { since: new Date(0) }),
+          ).resolves.toBe(0);
+        } finally {
+          release();
+          await holder;
+        }
+        if (winner === "question") {
+          await issueThreadInteractionService(db).create(
+            {
+              id: context.conversation.issueId,
+              companyId: context.fixture.companyId,
+            },
+            {
+              kind: "ask_user_questions",
+              continuationPolicy: "wake_assignee",
+              sourceRunId: run.runId,
+              payload: {
+                version: 1,
+                prompt: "Choose a color",
+                questions: [
+                  {
+                    id: "color",
+                    prompt: "Choose a color",
+                    selectionMode: "single",
+                    required: true,
+                    options: [
+                      { id: "amber", label: "Amber" },
+                      { id: "cobalt", label: "Cobalt" },
+                    ],
+                  },
+                ],
+              },
+            },
+            { agentId: context.fixture.assignedAgentId },
+          );
+        } else if (winner === "final") {
+          await addSelectedChatFinal({
+            agentId: context.fixture.assignedAgentId,
+            body: "Current selected final",
+            companyId: context.fixture.companyId,
+            issueId: context.conversation.issueId,
+            runId: run.runId,
+          });
+          await db
+            .update(heartbeatRuns)
+            .set({
+              status: "succeeded",
+              resultJson: {
+                presentationDecision: {
+                  chosenSource: "existing_issue_comment",
+                  commentAction: "none",
+                },
+              },
+            })
+            .where(eq(heartbeatRuns.id, run.runId));
+        } else {
+          await db
+            .update(chatEndpoints)
+            .set({ allowDirectMessages: false, updatedAt: new Date() })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        }
+        await enqueueChatRunMilestones(db, { since: new Date(0) });
+        await context.service.processPendingPublications(100);
+        expect(
+          context.providerRuntime.edits.map((edit) => edit.text),
+        ).not.toContain("Maya is making progress…");
+        const progress = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            like(
+              chatPublications.idempotencyKey,
+              `run:${run.runId}:working:${context.endpoint.id}:native:%`,
+            ),
+          );
+        expect(
+          progress.every((publication) => publication.state === "cancelled"),
+        ).toBe(true);
+        if (winner === "final")
+          expect(context.providerRuntime.edits.at(-1)?.text).toBe(
+            "Current selected final",
+          );
+        if (winner === "question")
+          expect(context.providerRuntime.edits.at(-1)?.text).toContain(
+            "Choose a color",
+          );
+        if (winner === "revoked")
+          expect(context.providerRuntime.edits).toEqual([]);
+      } finally {
+        release();
+        await Promise.allSettled([holder, context.service.shutdown()]);
+      }
+    },
+  );
 
   it("settles an interrupted native run once without overwriting its successor", async () => {
     const context = await safeNativeProgressFixture("telegram", "61");
@@ -39773,29 +40036,32 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       "Final response 2",
     ]);
     expect(endpointRuntime?.edits).toEqual([]);
-    await expect(
-      db
-        .select({
-          idempotencyKey: chatPublications.idempotencyKey,
-          redactedError: chatPublications.redactedError,
-          state: chatPublications.state,
-        })
-        .from(chatPublications)
-        .where(
-          inArray(
-            chatPublications.idempotencyKey,
-            runs.map(
-              (run) =>
-                `run:${run.runId}:${run.progressState}:${context.endpoint.id}`,
-            ),
+    const cancelledProgress = await db
+      .select({
+        idempotencyKey: chatPublications.idempotencyKey,
+        redactedError: chatPublications.redactedError,
+        state: chatPublications.state,
+      })
+      .from(chatPublications)
+      .where(
+        inArray(
+          chatPublications.idempotencyKey,
+          runs.map(
+            (run) =>
+              `run:${run.runId}:${run.progressState}:${context.endpoint.id}`,
           ),
         ),
-    ).resolves.toEqual(
-      runs.map((run) => ({
-        idempotencyKey: `run:${run.runId}:${run.progressState}:${context.endpoint.id}`,
-        redactedError: "Run reached a terminal state before progress delivery",
-        state: "cancelled",
-      })),
+      );
+    expect(cancelledProgress).toHaveLength(runs.length);
+    expect(cancelledProgress).toEqual(
+      expect.arrayContaining(
+        runs.map((run) => ({
+          idempotencyKey: `run:${run.runId}:${run.progressState}:${context.endpoint.id}`,
+          redactedError:
+            "Run reached a terminal state before progress delivery",
+          state: "cancelled",
+        })),
+      ),
     );
     await expect(
       db
