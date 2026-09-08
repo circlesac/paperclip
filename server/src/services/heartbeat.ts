@@ -11631,14 +11631,41 @@ export function heartbeatService(
   async function clearTaskSessions(
     companyId: string,
     agentId: string,
-    opts?: { taskKey?: string | null; adapterType?: string | null },
+    opts?: {
+      taskKey?: string | null;
+      adapterType?: string | null;
+      includeIssueAliases?: boolean;
+    },
   ) {
     const conditions = [
       eq(agentTaskSessions.companyId, companyId),
       eq(agentTaskSessions.agentId, agentId),
     ];
     if (opts?.taskKey) {
-      conditions.push(eq(agentTaskSessions.taskKey, opts.taskKey));
+      const exactTaskKey = eq(agentTaskSessions.taskKey, opts.taskKey);
+      if (opts.includeIssueAliases) {
+        const selectedIssue = isUuidLike(opts.taskKey)
+          ? eq(issues.id, opts.taskKey)
+          : eq(issues.identifier, opts.taskKey.toUpperCase());
+        // Operator task resets accept the UUID sent by run detail and the
+        // identifier used by some saved sessions. Resolve only from the current
+        // same-company issue row, in this DELETE's snapshot; arbitrary custom
+        // keys retain exact-match behavior and run/model context grants no alias.
+        conditions.push(
+          or(
+            exactTaskKey,
+            sql`exists (
+              select 1 from ${issues}
+              where ${issues.companyId} = ${companyId}
+                and ${selectedIssue}
+                and (${agentTaskSessions.taskKey} = ${issues.id}::text
+                  or ${agentTaskSessions.taskKey} = ${issues.identifier})
+            )`,
+          )!,
+        );
+      } else {
+        conditions.push(exactTaskKey);
+      }
     }
     if (opts?.adapterType) {
       conditions.push(eq(agentTaskSessions.adapterType, opts.adapterType));
@@ -27621,7 +27648,13 @@ export function heartbeatService(
       const clearedTaskSessions = await clearTaskSessions(
         agent.companyId,
         agent.id,
-        taskKey ? { taskKey, adapterType: agent.adapterType } : undefined,
+        taskKey
+          ? {
+              taskKey,
+              adapterType: agent.adapterType,
+              includeIssueAliases: true,
+            }
+          : undefined,
       );
       const runtimePatch: Partial<typeof agentRuntimeState.$inferInsert> = {
         sessionId: null,
