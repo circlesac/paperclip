@@ -17,9 +17,10 @@ use crate::codex_provider::{
     MAX_SETTLED_PROVIDER_TURN_IDS,
 };
 use crate::durable::{
-    create_private_temporary_file, current_unix_ms, open_private_regular_file, sanitize_value,
-    verify_private_directory, Command, CommandExecution, CommandExecutor, DurableRunnerConfig,
-    DurableRunnerError, EventPriority, OpenCodeLaunchProfile, PolledEvent,
+    create_private_temporary_file, current_unix_ms, open_private_regular_file,
+    sanitize_semantic_tool_input, sanitize_value, verify_private_directory, Command,
+    CommandExecution, CommandExecutor, DurableRunnerConfig, DurableRunnerError, EventPriority,
+    OpenCodeLaunchProfile, PolledEvent,
 };
 use crate::provider_bridge::{
     authorized_tool_catalog_digest, semantic_value_digest, AuthorizedToolSet, DurableReplayFilter,
@@ -188,9 +189,9 @@ fn semantic_correlation(identity: &ProviderEventIdentity) -> Value {
 fn semantic_input_event(
     identity: &ProviderEventIdentity,
     call: &PendingToolCall,
-) -> NormalizedProviderEvent {
-    let safe_input = sanitize_value(&call.input);
-    NormalizedProviderEvent {
+) -> Result<NormalizedProviderEvent, DurableRunnerError> {
+    let safe_input = sanitize_semantic_tool_input(&call.operation_id, &call.input)?;
+    Ok(NormalizedProviderEvent {
         event_type: "semantic_tool.input".to_owned(),
         priority: EventPriority::P0,
         payload: json!({
@@ -210,7 +211,7 @@ fn semantic_input_event(
                 "input": safe_input,
             },
         }),
-    }
+    })
 }
 
 fn semantic_result_event(
@@ -2839,7 +2840,7 @@ impl CodexCommandExecutor {
                 self.state
                     .as_mut()
                     .expect("Codex state remains available while accepting a tool call")
-                    .push_event(semantic_input_event(&identity, &call))?;
+                    .push_event(semantic_input_event(&identity, &call)?)?;
                 self.save_state()
             }
         }
@@ -4056,9 +4057,44 @@ mod tests {
             operation_id: "get_task_context".to_owned(),
             input: json!({"password": "do-not-persist", "safe": true}),
         };
-        let event = semantic_input_event(&identity, &call);
+        let event = semantic_input_event(&identity, &call).unwrap();
         let transmitted = &event.payload["semantic_tool"]["input"];
         assert_eq!(transmitted["password"], "[REDACTED]");
+        assert_eq!(
+            event.payload["semantic_tool"]["content"]["digest"],
+            semantic_value_digest(transmitted)
+        );
+    }
+
+    #[test]
+    fn semantic_finish_input_preserves_a_complete_long_redacted_summary() {
+        let identity = ProviderEventIdentity {
+            runner_instance_id: "runner-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            normalized_session_id: "session-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+        };
+        let summary = format!(
+            "token=do-not-persist {} Authorization: Bearer late-provider-secret COMPLETE-LONG-SUMMARY",
+            "A complete paragraph for the user. ".repeat(180)
+        );
+        assert!(summary.len() > 4_096);
+        let call = PendingToolCall {
+            call_id: "call-1".to_owned(),
+            operation_id: "paperclip_finish".to_owned(),
+            input: json!({"summary": summary}),
+        };
+
+        let event = semantic_input_event(&identity, &call).unwrap();
+        let transmitted = &event.payload["semantic_tool"]["input"];
+        let transmitted_summary = transmitted["summary"].as_str().unwrap();
+        assert!(transmitted_summary.starts_with("token=[REDACTED] "));
+        assert!(transmitted_summary.ends_with(" COMPLETE-LONG-SUMMARY"));
+        assert!(!transmitted_summary.contains("do-not-persist"));
+        assert!(!transmitted_summary.contains("late-provider-secret"));
+        assert!(transmitted_summary.contains("Authorization: Bearer [REDACTED]"));
+        assert!(!transmitted_summary.contains("…[truncated]"));
         assert_eq!(
             event.payload["semantic_tool"]["content"]["digest"],
             semantic_value_digest(transmitted)
@@ -4349,7 +4385,7 @@ mod tests {
                 input: json!({}),
             };
             state
-                .push_event(semantic_input_event(&identity, &call))
+                .push_event(semantic_input_event(&identity, &call).unwrap())
                 .unwrap();
             state
                 .push_event(semantic_result_event(

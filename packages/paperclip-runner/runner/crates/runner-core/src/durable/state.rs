@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::provider_bridge::{semantic_value_digest, MAX_COMPLETION_SUMMARY_CHARS};
+
 use super::{DurableRunnerConfig, DurableRunnerError, PROTOCOL, PROTOCOL_VERSION};
 
 const STATE_SCHEMA: &str = "paperclip.runner.durable.state.v1";
@@ -302,6 +304,7 @@ impl DurableState {
         payload: &Value,
     ) -> Result<bool, DurableRunnerError> {
         self.source_event_id_for_executor(executor_event_id)?;
+        validate_semantic_tool_input_digest(event_type, payload)?;
         let Some(existing) = self.executor_event_receipts.get(executor_event_id) else {
             return Ok(false);
         };
@@ -377,6 +380,7 @@ impl DurableState {
                 "durable event payload must be an object",
             ));
         }
+        validate_semantic_tool_input_digest(event_type.as_str(), &payload)?;
 
         let sanitized_payload = sanitize_value(&payload);
         if durable_semantics_changed_by_sanitization(&payload, &sanitized_payload) {
@@ -384,6 +388,8 @@ impl DurableState {
                 "durable identity or validation semantics contain credential-shaped material",
             ));
         }
+        let sanitized_payload =
+            finalize_semantic_tool_input_payload(event_type.as_str(), &payload, sanitized_payload)?;
 
         let source_seq = self.next_source_seq;
         let emitted_at = current_timestamp()?;
@@ -1249,6 +1255,114 @@ pub(crate) fn sanitize_value(value: &Value) -> Value {
     }
 }
 
+pub(crate) fn sanitize_semantic_tool_input(
+    operation_id: &str,
+    input: &Value,
+) -> Result<Value, DurableRunnerError> {
+    let mut sanitized = sanitize_value(input);
+    if !matches!(operation_id, "paperclip_finish" | "paperclip_block") {
+        return Ok(sanitized);
+    }
+    let Some(summary) = input.get("summary").and_then(Value::as_str) else {
+        return Ok(sanitized);
+    };
+    if summary.chars().count() > MAX_COMPLETION_SUMMARY_CHARS {
+        return Err(DurableRunnerError::invalid(
+            "semantic completion summary exceeds the 12,000 character limit",
+        ));
+    }
+    let Some(sanitized_input) = sanitized.as_object_mut() else {
+        return Ok(sanitized);
+    };
+    // Completion summary is the schema-bounded user-facing answer, not an
+    // untrusted diagnostic snippet. Preserve it in full while applying the
+    // same credential scrubber used by every durable string. All other fields
+    // retain the generic 4 KiB diagnostic bound.
+    sanitized_input.insert(
+        "summary".to_owned(),
+        Value::String(redact_sensitive_text_values(summary)),
+    );
+    Ok(sanitized)
+}
+
+fn finalize_semantic_tool_input_payload(
+    event_type: &str,
+    original: &Value,
+    mut sanitized: Value,
+) -> Result<Value, DurableRunnerError> {
+    if event_type != "semantic_tool.input" {
+        return Ok(sanitized);
+    }
+    let Some(original_tool) = original.get("semantic_tool") else {
+        return Ok(sanitized);
+    };
+    if original_tool.get("schema").and_then(Value::as_str) != Some("paperclip.prp.semantic_tool.v1")
+        || original_tool.get("schemaVersion").and_then(Value::as_u64) != Some(1)
+        || original_tool.get("phase").and_then(Value::as_str) != Some("input")
+    {
+        return Ok(sanitized);
+    }
+    let Some(operation_id) = original_tool.get("operationId").and_then(Value::as_str) else {
+        return Ok(sanitized);
+    };
+    let Some(original_input) = original_tool.get("input") else {
+        return Ok(sanitized);
+    };
+    let finalized_input = sanitize_semantic_tool_input(operation_id, original_input)?;
+    let Some(sanitized_tool) = sanitized
+        .get_mut("semantic_tool")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(sanitized);
+    };
+    let Some(content) = sanitized_tool
+        .get_mut("content")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(sanitized);
+    };
+    content.insert(
+        "digest".to_owned(),
+        Value::String(semantic_value_digest(&finalized_input)),
+    );
+    sanitized_tool.insert("input".to_owned(), finalized_input);
+    Ok(sanitized)
+}
+
+fn validate_semantic_tool_input_digest(
+    event_type: &str,
+    payload: &Value,
+) -> Result<(), DurableRunnerError> {
+    if event_type != "semantic_tool.input" {
+        return Ok(());
+    }
+    let Some(semantic_tool) = payload.get("semantic_tool") else {
+        return Ok(());
+    };
+    if semantic_tool.get("schema").and_then(Value::as_str) != Some("paperclip.prp.semantic_tool.v1")
+        || semantic_tool.get("schemaVersion").and_then(Value::as_u64) != Some(1)
+        || semantic_tool.get("phase").and_then(Value::as_str) != Some("input")
+    {
+        return Ok(());
+    }
+    let input = semantic_tool.get("input").ok_or_else(|| {
+        DurableRunnerError::invalid("semantic tool input event omitted its input")
+    })?;
+    let digest = semantic_tool
+        .get("content")
+        .and_then(|content| content.get("digest"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DurableRunnerError::invalid("semantic tool input event omitted its content digest")
+        })?;
+    if digest != semantic_value_digest(input) {
+        return Err(DurableRunnerError::invalid(
+            "semantic tool input content digest does not match its transmitted input",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn redact_text(input: &str) -> String {
     let (bounded, truncated) = if input.len() > 4096 {
         let boundary = input
@@ -2097,6 +2211,212 @@ mod tests {
             Some(&json!(
                 "OPENAI_API_KEY [REDACTED]; proxyAuthorization Basic [REDACTED]"
             ))
+        );
+    }
+
+    #[test]
+    fn semantic_finish_digest_covers_the_exact_finally_persisted_long_summary() {
+        let config = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&config);
+        let summary = format!(
+            "token=do-not-persist {} Authorization: Bearer late-provider-secret COMPLETE-DURABLE-SUMMARY",
+            "A complete paragraph for the user. ".repeat(180)
+        );
+        let input = json!({"summary": summary});
+        let once_sanitized_input =
+            sanitize_semantic_tool_input("paperclip_finish", &input).unwrap();
+        let payload = json!({
+            "semantic_tool": {
+                "schema": "paperclip.prp.semantic_tool.v1",
+                "schemaVersion": 1,
+                "phase": "input",
+                "operationId": "paperclip_finish",
+                "callId": "call-1",
+                "correlation": {
+                    "runId": "run_1",
+                    "normalizedSessionId": "session_1",
+                    "turnId": "turn_1",
+                    "itemId": "item_1",
+                },
+                "idempotencyKey": null,
+                "content": {
+                    "digest": crate::provider_bridge::semantic_value_digest(&once_sanitized_input),
+                    "redactionDisposition": "digest_only",
+                    "references": [],
+                },
+                "input": once_sanitized_input,
+            },
+        });
+
+        state
+            .enqueue_executor_event(
+                &config,
+                "provider-event-1".to_owned(),
+                "semantic_tool.input".to_owned(),
+                EventPriority::P0,
+                payload.clone(),
+            )
+            .unwrap();
+
+        let transmitted = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload/semantic_tool/input")
+            .unwrap();
+        let transmitted_summary = transmitted["summary"].as_str().unwrap();
+        assert!(transmitted_summary.starts_with("token=[REDACTED] "));
+        assert!(transmitted_summary.ends_with(" COMPLETE-DURABLE-SUMMARY"));
+        assert!(!transmitted_summary.contains("do-not-persist"));
+        assert!(!transmitted_summary.contains("late-provider-secret"));
+        assert!(transmitted_summary.contains("Authorization: Bearer [REDACTED]"));
+        assert!(!transmitted_summary.contains("…[truncated]"));
+        assert_eq!(
+            state.outbox[0]
+                .envelope
+                .pointer("/payload/payload/semantic_tool/content/digest"),
+            Some(&Value::String(
+                crate::provider_bridge::semantic_value_digest(transmitted)
+            ))
+        );
+        assert!(state
+            .has_executor_event_receipt(
+                "provider-event-1",
+                "semantic_tool.input",
+                EventPriority::P0,
+                &payload,
+            )
+            .unwrap());
+
+        let mut changed_tail = payload.clone();
+        changed_tail["semantic_tool"]["input"]["summary"] = Value::String(format!(
+            "token=[REDACTED] {} CHANGED-DURABLE-SUMMARY",
+            "A complete paragraph for the user. ".repeat(180)
+        ));
+        assert!(state
+            .has_executor_event_receipt(
+                "provider-event-1",
+                "semantic_tool.input",
+                EventPriority::P0,
+                &changed_tail,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("content digest does not match"));
+
+        let generic = sanitize_value(&json!({"summary": "B".repeat(5_000)}));
+        assert!(generic["summary"]
+            .as_str()
+            .unwrap()
+            .ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn semantic_summary_capacity_and_digest_resealing_fail_closed_outside_exact_finish_input() {
+        let mut small_frame = config(PathBuf::from("unused"));
+        small_frame.max_frame_bytes = 8_000;
+        let mut state = DurableState::new(&small_frame);
+        let long_input = json!({"summary": "C".repeat(12_000)});
+        let safe_input = sanitize_semantic_tool_input("paperclip_finish", &long_input).unwrap();
+        let exact_payload = json!({
+            "semantic_tool": {
+                "schema": "paperclip.prp.semantic_tool.v1",
+                "schemaVersion": 1,
+                "phase": "input",
+                "operationId": "paperclip_finish",
+                "content": {
+                    "digest": semantic_value_digest(&safe_input),
+                },
+                "input": safe_input,
+            },
+        });
+        assert!(state
+            .enqueue_event(
+                &small_frame,
+                "semantic_tool.input",
+                EventPriority::P0,
+                exact_payload,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("transport frame limit"));
+        assert!(sanitize_semantic_tool_input(
+            "paperclip_finish",
+            &json!({"summary": "C".repeat(MAX_COMPLETION_SUMMARY_CHARS + 1)}),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("12,000 character limit"));
+
+        let config = config(PathBuf::from("unused"));
+        let mut tampered_state = DurableState::new(&config);
+        let once_sanitized = sanitize_value(&json!({"summary": "D".repeat(5_000)}));
+        let original_digest = semantic_value_digest(&once_sanitized);
+        let tampered_schema_payload = json!({
+            "semantic_tool": {
+                "schema": "paperclip.prp.semantic_tool.tampered",
+                "phase": "input",
+                "operationId": "paperclip_finish",
+                "content": {"digest": original_digest.clone()},
+                "input": once_sanitized,
+            },
+        });
+        tampered_state
+            .enqueue_event(
+                &config,
+                "semantic_tool.input",
+                EventPriority::P0,
+                tampered_schema_payload,
+            )
+            .unwrap();
+        let transmitted = tampered_state.outbox[0]
+            .envelope
+            .pointer("/payload/payload/semantic_tool/input")
+            .unwrap();
+        assert!(transmitted["summary"]
+            .as_str()
+            .unwrap()
+            .ends_with("…[truncated]"));
+        assert_eq!(
+            tampered_state.outbox[0]
+                .envelope
+                .pointer("/payload/payload/semantic_tool/content/digest"),
+            Some(&Value::String(original_digest))
+        );
+
+        let mut generic_state = DurableState::new(&config);
+        let generic_once_sanitized = sanitize_value(&json!({
+            "query": "E".repeat(5_000),
+        }));
+        let generic_payload = json!({
+            "semantic_tool": {
+                "schema": "paperclip.prp.semantic_tool.v1",
+                "schemaVersion": 1,
+                "phase": "input",
+                "operationId": "search_context",
+                "content": {"digest": semantic_value_digest(&generic_once_sanitized)},
+                "input": generic_once_sanitized,
+            },
+        });
+        generic_state
+            .enqueue_event(
+                &config,
+                "semantic_tool.input",
+                EventPriority::P0,
+                generic_payload,
+            )
+            .unwrap();
+        let transmitted = generic_state.outbox[0]
+            .envelope
+            .pointer("/payload/payload/semantic_tool/input")
+            .unwrap();
+        assert!(transmitted["query"]
+            .as_str()
+            .unwrap()
+            .ends_with("…[truncated]"));
+        assert_eq!(
+            generic_state.outbox[0]
+                .envelope
+                .pointer("/payload/payload/semantic_tool/content/digest"),
+            Some(&Value::String(semantic_value_digest(transmitted)))
         );
     }
 
