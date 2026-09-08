@@ -254,7 +254,7 @@ substitution was used to work around the browser state.
   binding. Tests cover a real owned workspace, a directory-only run token,
   and rejection of a foreign workspace / mismatched prior issue.
 
-These two corrections await deployment. Root's combined coordinator and
+Root's combined coordinator and
 workspace-recovery check passed **16/16**; source TypeScript checks passed.
 The final full chat integration run passed **369/369** on fresh PostgreSQL
 in 68.90 seconds. Its preceding run had **368/369**: an existing assertion
@@ -265,3 +265,13 @@ the isolated case and complete rerun passed. No production behavior was changed
 for that test correction.
 Long text-only generation still uses coarse working feedback rather than
 streaming raw deltas or private reasoning into external chat.
+
+The clean `84a601459` deployment reached startup `ready` at 12:40:30.035 UTC,
+with the same staged `a0fd2789…` runner. Neither prior recovery error recurred.
+The retained failed Slack run's directory-only workspace check was recorded
+as a separate successful recovery operation with a null execution-workspace
+FK; its historical failed operation and run remain intact. No new external
+publication was created by this restart. Fresh post-deployment provider
+qualification and the Slack task-scoped reset remain pending the browser
+confirmation/input problem above. The server is available locally on 3103;
+the private/public Tailscale routing boundary is unchanged.
