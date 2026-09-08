@@ -33579,22 +33579,30 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(issueComments)
         .where(eq(issueComments.issueId, conversations[0]!.issueId)),
     ).resolves.toEqual([{ body: "investigate one retried command" }]);
-    const [action] = await db
-      .select()
-      .from(chatActions)
-      .where(
-        and(
-          eq(chatActions.endpointId, endpoint.id),
-          eq(chatActions.kind, "slash_task_start"),
-        ),
-      );
-    expect(action).toMatchObject({
-      kind: "slash_task_start",
-      status: "processed",
-      result: {
-        threadId: starterThreadId,
-        providerMessageId: "outbound-1",
-      },
+    // The wake callback runs before slash admission commits its terminal
+    // receipt. Observe that exact durable receipt before simulating an
+    // operator resolution, rather than racing the final admission write.
+    const [action] = await vi.waitFor(async () => {
+      const actions = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.kind, "slash_task_start"),
+          ),
+        );
+      expect(actions).toEqual([
+        expect.objectContaining({
+          kind: "slash_task_start",
+          status: "processed",
+          result: expect.objectContaining({
+            threadId: starterThreadId,
+            providerMessageId: "outbound-1",
+          }),
+        }),
+      ]);
+      return actions;
     });
 
     await db
