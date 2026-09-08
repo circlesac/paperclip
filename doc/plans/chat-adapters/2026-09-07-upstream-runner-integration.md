@@ -9,11 +9,13 @@ Those are historical samples, not measurements of the changes in this document.
 Teams still has no qualified live tenant. Terra has not been substituted.
 
 This checkpoint incorporates these code-only changes from the fetched
-`origin/master` revision `d8b95805314c70b13d9efce338cbc287c2afb4e1`:
+`origin/master` revision `297d8741f5f192c66abbec325b1e956cf0e5e667`:
 
 - `5bddff092041c1430d049ee2bb5f421df1957823`: guarded runner API fallback.
 - `1cc45086d3b2f2710d4e161b0dc9ad1d3662a9a8`: operation-time execution identity.
 - `d8b95805314c70b13d9efce338cbc287c2afb4e1`: recent-task ordering debounce.
+- `ff2457876`: initialize the runner's Rustls crypto provider before TLS.
+- `297d8741f`: resolve duplicate connections to the same GitHub account.
 
 The independent lockfile refresh
 `392ab26b1ede1634b947d1d539926052c79a2636` is deliberately not included:
@@ -1272,3 +1274,126 @@ budget. This is not a hard total admission deadline: storage and bounded DNS
 resolution have their own costs. Only canonical source-bound URLs and a
 bounded omission count survive restart; signed redirects remain ephemeral.
 This checkpoint still requires live deployment and provider qualification.
+
+### Deployed native progress, GitHub intake and private task links — 2026-09-08
+
+The pending deployment above was completed on `78a7e668e` at 09:18:46Z.
+The freshly rebuilt and staged release runner includes the Rustls startup
+fix. Health reports `2026.831.0+443.git.78a7e668e`, private exposure and
+ready authentication/recovery. The seven pre-existing recovery holds were
+not altered. The live server remains on port 3103; the public Funnel still
+terminates at the webhook-only proxy, not the Board.
+
+Code-only upstream reconciliation is now complete through fetched
+`297d8741f`: commits `b0b7dcd2f` and `78a7e668e` incorporate the Rustls and
+duplicate-GitHub-account changes. Conflict resolution preserves the chat
+branch's low-trust, taskless, malformed-task and current-capability denials
+as well as upstream's duplicate-grant cases. Root passed **44/44** credential
+cases, **2/2** launcher cases, **2/2** Rust startup cases and direct server
+TypeScript checking. An initial credential rerun exposed missing imports
+in the conflict resolution; those imports were restored before the successful
+rerun and commit. `pnpm-lock.yaml` retains the SHA256 recorded above; this
+does not close the frozen-install gate.
+
+The signed-in browser then exercised real Slack, Telegram and GitHub turns
+concurrently. Their run durations were **55.651s**, **33.111s** and
+**36.815s**, respectively; queue times were **9–12ms**. Each working message
+was edited in place through safe native phases and the final answer:
+
+| Provider | Single reused working/final message | Observed phases                                 |
+| -------- | ----------------------------------- | ----------------------------------------------- |
+| Slack    | `1788859193.862669`                 | working → making progress → using tools → final |
+| Telegram | `417200359:98`                      | working → making progress → final               |
+| GitHub   | `3956321476`                        | working → making progress → final               |
+
+Every publication attempt was one. Files use their separate existing
+delivery messages: two in Slack, one in Telegram and one GitHub fallback.
+Slack's “making progress” state was also witnessed directly before its
+final response. No raw reasoning, tool names, arguments or event payloads
+were projected into these provider messages.
+
+Slack run `f891e0fd-cfb1-4dc5-9b83-79845ec45508` delivered the newly created
+`cat-summary-0908.txt`. The real Slack preview contains “cobalt otter 47,”
+orange tabby fur with darker stripes, and pale green eyes with a white
+muzzle. The original image is visible both inline and at full size. Its
+retained filename still contains “telegram,” as explained above; it is this
+conversation's original uploaded file. The final prose still says “prepared
+for this response,” a wording weakness despite the visible successful files.
+The summary is 172 bytes (attachment
+`c08366b4-d921-495e-9f94-3c2422d282dc`, SHA256
+`150ad534f83b7562113eeafbcf9aab0ae4d6a9dff6a5e4539c52a41121224ec2`).
+The returned PNG is 2,088,249 bytes with the original SHA256
+`005f8dabdb19ef786c0e2e76695596d22c1d0bb53de374e0be209cc6d89851c9`.
+The final answer published at 09:20:49.361Z, summary at 09:20:51.102Z and
+image at 09:20:56.469Z, about 65.2 seconds after the request's Slack timestamp.
+
+Telegram run `ff689ddb-9011-42c6-9b09-b7931a6e6490` describes the original
+orange tabby's pale green eyes and white whiskers, then returns an actual
+photo visible in the conversation. It likewise uses cautious “prepared”
+wording. These samples establish working file delivery, not a guarantee
+that every model description or delivery phrase is polished.
+The returned JPEG is 221,327 bytes and retains its original SHA256
+`1d22f8c026abf16ff0dde087d6c46a3b4a41978cfb4cee62c62e159e5550ce8a`.
+The final answer published at 09:20:40.036Z and image at 09:20:41.274Z,
+36.889 seconds after the browser send action. Its reuse receipt is anchored
+to the original attachment and comment in this same conversation.
+
+GitHub's current message deliberately supplied two different attachments:
+the public Paperclip README's WebM and a newly uploaded non-sensitive text
+fixture in the private test repository. Run
+`809d3630-f9dc-4346-98f2-59f05e56fe2e` received only the public WebM:
+**video/webm, 2,658,275 bytes**, SHA256
+`8214cfb8604ffa39f2150044e56b652985e1f41481c67023ee92a7953296ebbf`.
+The exact current-comment omission is `download_unavailable: 1` for the
+private text fixture. No private file was stored, no older attachment was
+substituted, and the final provider response explicitly said that file was
+unavailable and not inspected. The inbound delivery processed once.
+The final answer published at 09:20:48.841Z and the file fallback at
+09:20:49.931Z, 45.471 seconds after the browser submit action.
+
+The returned WebM is saved as attachment
+`469d4c9a-25a3-48cd-8918-f18c84224f14`. Clicking GitHub's actual fallback
+link reached the private Tailscale Board and its correct CHA-10 task. The
+visible file control leads to the attachment content route, whose read-only
+HTTP check returned 200, `video/webm`, the same 2,658,275 bytes and the same
+SHA256. Public intake and the private task-link fallback are therefore
+live-qualified for this sample. No public image intake sample passed yet.
+Private GitHub intake remains unqualified/unavailable on this path; this
+is not a claim that all possible GitHub authentication approaches are
+inherently incapable of downloading it. Native App outbound attachment
+upload remains a separate platform limitation. No personal-token workaround
+or repository-visibility change was introduced.
+
+### Live current-answer timing verification — 2026-09-08
+
+Discord source run `0536fbbe-038b-4dd5-8c13-16b7508a4f05` asked the real
+Sunrise/Moonlight question. Interaction
+`9b65e988-95c0-4cd1-85c7-10696adb2d8e` was created at 09:20:01.035Z and
+resolved by the real Moonlight button at 09:21:19.289Z, deliberately leaving
+**78.254 seconds** of human-answer time. The provider card visibly changed
+to “Answered: Moonlight,” with no remaining choice buttons, followed by one
+final answer containing exactly `Moonlight`.
+The question's provider publication at 09:20:01.906Z makes the visible-card
+to-answer interval 77.383 seconds. The settled final published at
+09:21:36.768Z, **17.842 seconds after the browser click**. Both the question
+resolution and continuation final edited their respective existing messages;
+every publication attempt was one.
+
+Its one answer delivery had one attempt, zero errors and one fallback-wake
+target: continuation `3cfc11a2-33c1-4a76-9bec-27370fb49b11`. That run was
+created at 09:21:19.305Z, started at 09:21:19.314Z and finished at
+09:21:34.927Z: **15.613 seconds** of run wall time. The measured spans are
+`question_response.to_run_created` **16ms**, `heartbeat.queue` **9ms**,
+`task.prepare` **2.059s**, `agent.turn` **11.025s**, and
+`task.run.measured` **14.446s**. No `comment.to_run_created` span appears.
+The aggregate trace correctly excludes the earlier human wait; it is not
+represented as a 92-second current response. The aggregate span and the
+complete persisted run wall time have different terminal boundaries and are
+reported separately here.
+
+A closed-metadata audit of the actual Codex turn contexts confirms
+**`gpt-5.6-luna` for this continuation and all three new media runs**, not
+only an agent configuration value. Native Runner remains the driver; no
+Terra substitution occurred. This test-it-for-real pass materially shaped
+the changes: genuine provider controls, visible delivery and timing from
+the current answer were checked beyond the deterministic test results.
