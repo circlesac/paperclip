@@ -535,3 +535,53 @@ reviewed-attestation retry mitigates that startup window, but is not an atomic
 outbox. Reordering those writes naively would lose wakeups after a crash. A
 separate delivery-bound durable wake-intent design is being reviewed; no claim
 of full production readiness should omit this remaining race.
+
+### Live follow-up qualification on `9c2c65ed3` (September 8, 05:33 UTC)
+
+The server reported this exact clean revision after startup at 05:29:53 UTC.
+Maya's runtime settings still showed `paperclip_runner`, Codex, and
+`gpt-5.6-luna`; no fallback to Terra was made. The frozen native matrix passed
+**1,371/1,371**, 36 files, 161.29 seconds
+(`native-followup-root-tests-02.log`). Full chat integration passed
+**288/288** on isolated PostgreSQL (`frozen-chat-integration-0908-01.log`).
+The first native matrix had one restart-test timeout while a concurrent build
+replaced its runner binary; the unchanged isolated case and full restart file
+passed, followed by the successful frozen matrix. Do not rebuild runner
+artifacts while real-process tests or retained live processes depend on them.
+
+The live browser retest did **not** pass all journeys:
+
+- Telegram `TG-LUNA-HISTORY-FIX-0908`, run
+  `1b782683-55b1-4569-85ac-4f35fad63875`, proved the new reviewed-chat binding
+  worked without checkout or changing the existing governance gate. However,
+  `list_chat_attachments` returned an empty index. The existing photo had valid
+  lineage and bytes but a null original filename, which the historical reader
+  incorrectly excluded. The honest visible failure arrived after 57.25 seconds;
+  no file was returned. A safe filename fallback now uses the attachment UUID
+  and validated MIME extension, without changing bytes, hashes, or permissions.
+  List/read/reuse and reviewed-binding regression coverage passed **29/29**,
+  plus server typecheck (`unnamed-chat-attachment-02.log`).
+- Slack `SLACK-LUNA-WAIT-FIX-0908`, run
+  `3939c72d-0849-40ff-83b8-35ddd4f70728`, failed semantic completion and retried
+  before showing the failure message. The actual Codex discovery output exposed
+  `paperclip_finish(args: unknown)`: the new provider schema's conditional-only
+  root `allOf` hid the concrete argument fields. The model consequently guessed
+  incomplete arguments, including a continuation without its summary/key.
+  GitHub `GH-LUNA-WAIT-FIX-0908`, run
+  `ec29d6cd-fd66-40b3-a861-9a3a06028e44`, also exhausted semantic-result recovery.
+  The provider schema now keeps its concrete object root with an equivalent
+  direct `if`/`then`, preserving validation, and fingerprint v7 rotates stale
+  declarations. Schema/driver tests passed **23/23** and resume tests **31/31**.
+  Actual model-visible signature and live completion still require retesting.
+- The old Discord run `91cba10c-0fe2-4154-a831-a88cb5b4ee44` remained visibly
+  working after restart. Its retained process used the prior runner executable;
+  the newly built controller expected a different executable digest, rejected
+  authentication, then waited indefinitely while that PID remained alive.
+  This is not Luna generation latency. The existing durable lease does not
+  retain an authenticated historical executable digest, so relaxing the check
+  would be unsafe. Recovery must time out explicitly, preserve evidence, and
+  require ownership-safe recovery rather than silently launching duplicate work.
+
+These live failures remain separate from passing automated tests. They are
+included in the production-quality assessment, not hidden by successful run
+status or a generic working indicator.

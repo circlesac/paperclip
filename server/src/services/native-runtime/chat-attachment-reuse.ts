@@ -809,6 +809,31 @@ async function sourceLineageExists(
   return false;
 }
 
+const HISTORICAL_ATTACHMENT_FILE_EXTENSIONS: ReadonlyMap<string, string> =
+  new Map([
+    ["image/png", "png"],
+    ["image/jpeg", "jpg"],
+    ["image/jpg", "jpg"],
+    ["image/webp", "webp"],
+    ["image/gif", "gif"],
+    ["audio/mpeg", "mp3"],
+    ["audio/mp4", "m4a"],
+    ["audio/ogg", "ogg"],
+    ["audio/wav", "wav"],
+    ["audio/webm", "webm"],
+    ["video/mp4", "mp4"],
+    ["video/webm", "webm"],
+    ["video/quicktime", "mov"],
+    ["video/x-m4v", "m4v"],
+    ["application/pdf", "pdf"],
+    ["application/zip", "zip"],
+    ["application/json", "json"],
+    ["text/plain", "txt"],
+    ["text/markdown", "md"],
+    ["text/csv", "csv"],
+    ["text/html", "html"],
+  ]);
+
 async function loadSource(
   tx: Db,
   binding: ChatReuseBinding,
@@ -872,7 +897,6 @@ async function loadSource(
     .limit(1);
   if (
     !row ||
-    !row.filename ||
     row.byteSize < (allowEmpty ? 0 : 1) ||
     row.byteSize > MAX_ATTACHMENT_BYTES ||
     !isAllowedContentType(normalizeContentType(row.contentType)) ||
@@ -884,7 +908,12 @@ async function loadSource(
     sourceCommentId,
     attachmentId: row.attachmentId,
     parentCommentId: row.parentCommentId,
-    filename: row.filename,
+    // Provider photos/voice messages legitimately have no original filename.
+    // Derive display metadata from the already-validated MIME and opaque id;
+    // never infer a storage path or change the selected source bytes.
+    filename: row.filename?.trim()
+      ? row.filename
+      : `attachment-${row.attachmentId}.${HISTORICAL_ATTACHMENT_FILE_EXTENSIONS.get(normalizeContentType(row.contentType)) ?? "bin"}`,
     contentType: normalizeContentType(row.contentType),
     byteSize: row.byteSize,
     sha256: row.sha256,

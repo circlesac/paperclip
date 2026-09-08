@@ -821,6 +821,141 @@ describe("native same-conversation historical attachment reading", () => {
     }
   });
 
+  it.each([
+    {
+      originalFilename: null,
+      contentType: "image/png",
+      extension: "png",
+      body: Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==",
+        "base64",
+      ),
+    },
+    {
+      originalFilename: "",
+      contentType: "text/plain",
+      extension: "txt",
+      body: Buffer.from("unnamed historical text\n"),
+    },
+  ])(
+    "lists, reads and prepares exact unnamed $contentType bytes without widening publication scope",
+    async ({ originalFilename, contentType, extension, body }) => {
+      const stored = await storage.putFile({
+        companyId,
+        namespace: `issues/${issueId}`,
+        originalFilename,
+        contentType,
+        body,
+      });
+      const attachment = await issueService(db).createAttachment({
+        issueId,
+        issueCommentId: sourceCommentId,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+        originalFilename,
+        createdByUserId: userId,
+      });
+      const filename = `attachment-${attachment.id}.${extension}`;
+      const reader = scope();
+      const authority = new PaperclipRunnerToolAuthority(db, {
+        ...binding,
+        workspaceRoot,
+        executionTargetKind: "local",
+        storage,
+        chatAttachmentReadScope: reader,
+      });
+      const publicationsBefore = await db.select().from(chatPublications);
+      try {
+        const listed = await authority.execute({
+          tool: "list_chat_attachments",
+          callId: `list-${attachment.id}`,
+          arguments: {},
+        });
+        expect(listed).toMatchObject({
+          attachments: expect.arrayContaining([
+            expect.objectContaining({
+              attachmentId: attachment.id,
+              sourceCommentId,
+              filename,
+              contentType,
+              byteSize: body.length,
+              sha256: stored.sha256,
+              contentAccess: "metadata_only",
+            }),
+          ]),
+        });
+        const result = (await authority.execute({
+          tool: "read_chat_attachment",
+          callId: `read-${attachment.id}`,
+          arguments: { sourceCommentId, attachmentId: attachment.id },
+        })) as { workspaceRelativePath: string };
+        expect(result).toMatchObject({
+          filename,
+          contentType,
+          selectedForPublication: false,
+        });
+        expect(
+          await readFile(
+            path.join(workspaceRoot, result.workspaceRelativePath),
+          ),
+        ).toEqual(body);
+        const reused = (await authority.execute({
+          tool: "reuse_chat_attachment",
+          callId: `reuse-${attachment.id}`,
+          arguments: {
+            sourceCommentId,
+            attachmentId: attachment.id,
+            idempotencyKey: `unnamed-${attachment.id}`,
+            title: "Exact earlier attachment",
+          },
+        })) as { prepared: { attachmentId: string; sha256: string } };
+        expect(reused).toMatchObject({
+          disposition: "applied",
+          source: { attachmentId: attachment.id, commentId: sourceCommentId },
+          prepared: { sha256: stored.sha256 },
+        });
+        const [prepared] = await db
+          .select({
+            filename: assets.originalFilename,
+            objectKey: assets.objectKey,
+            contentType: assets.contentType,
+            sha256: assets.sha256,
+            originatingRunId: issueAttachments.originatingRunId,
+          })
+          .from(issueAttachments)
+          .innerJoin(assets, eq(assets.id, issueAttachments.assetId))
+          .where(eq(issueAttachments.id, reused.prepared.attachmentId));
+        expect(prepared).toMatchObject({
+          filename,
+          contentType,
+          sha256: stored.sha256,
+          originatingRunId: runId,
+        });
+        const object = await storage.getObject(companyId, prepared!.objectKey);
+        const chunks: Buffer[] = [];
+        for await (const chunk of object.stream)
+          chunks.push(Buffer.from(chunk));
+        expect(Buffer.concat(chunks)).toEqual(body);
+        expect(await db.select().from(chatPublications)).toEqual(
+          publicationsBefore,
+        );
+        // Lack of a filename does not make a private same-task asset lineaged.
+        await db
+          .update(issueAttachments)
+          .set({ issueCommentId: null })
+          .where(eq(issueAttachments.id, attachment.id));
+        await expect(
+          reader.read({ sourceCommentId, attachmentId: attachment.id }),
+        ).rejects.toThrow("source_denied");
+      } finally {
+        await reader.close();
+      }
+    },
+  );
+
   it("clears a file staged while cancellation is settling and never returns its path", async () => {
     const reader = scope();
     let ready!: () => void;

@@ -50,6 +50,28 @@ const MAX_QUEUED_PROVIDER_EVENTS: usize =
 const MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS: u8 = 3;
 const RECEIPT_LIMIT_INTERRUPT_TERMINAL_DEADLINE_MS: u64 = 2_000;
 const RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS: u64 = 30_000;
+const GENERIC_INVALID_TOOL_CALL_MESSAGE: &str = "Paperclip rejected this semantic tool call";
+
+fn invalid_tool_call_result(
+    call_id: String,
+    operation_id: String,
+    error: &ProviderBridgeError,
+) -> ToolResult {
+    ToolResult {
+        call_id,
+        operation_id,
+        result: json!({
+            "error": {
+                "code": "invalid_tool_call",
+                "message": error
+                    .safe_provider_message()
+                    .unwrap_or(GENERIC_INVALID_TOOL_CALL_MESSAGE),
+                "retryable": false,
+            },
+        }),
+        is_error: true,
+    }
+}
 
 fn receipt_limit_deadline_after(timeout_ms: u64) -> Result<u64, DurableRunnerError> {
     current_unix_ms()?.checked_add(timeout_ms).ok_or_else(|| {
@@ -2470,8 +2492,9 @@ impl CodexCommandExecutor {
         &mut self,
         call_id: String,
         operation_id: String,
-        reason: String,
+        error: ProviderBridgeError,
     ) -> Result<(), DurableRunnerError> {
+        let reason = error.to_string();
         let state = self
             .state
             .as_mut()
@@ -2494,18 +2517,7 @@ impl CodexCommandExecutor {
             state.push_event(event)?;
         }
         self.save_state()?;
-        let rejection = ToolResult {
-            call_id,
-            operation_id,
-            result: json!({
-                "error": {
-                    "code": "invalid_tool_call",
-                    "message": "Paperclip rejected this semantic tool call",
-                    "retryable": false,
-                },
-            }),
-            is_error: true,
-        };
+        let rejection = invalid_tool_call_result(call_id, operation_id, &error);
         self.provider
             .as_mut()
             .expect("provider remains present while rejecting its tool call")
@@ -2779,7 +2791,7 @@ impl CodexCommandExecutor {
                 if error.is_active_turn_receipt_limit() {
                     return self.stop_turn_at_tool_receipt_limit(call_id, operation_id);
                 }
-                return self.reject_tool_call(call_id, operation_id, error.to_string());
+                return self.reject_tool_call(call_id, operation_id, error);
             }
             Ok(ToolCallAdmission::Pending(call)) => {
                 self.state
@@ -3373,6 +3385,81 @@ mod tests {
         );
     }
     use super::*;
+
+    fn schema_rejection(operation_id: &str, input: Value) -> ToolResult {
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: operation_id.to_owned(),
+            version: 1,
+            description: "Test operation.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["requiredField"],
+                "properties": {"requiredField": {"type": "string"}},
+                "additionalProperties": false,
+            }),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        let error = bridge
+            .begin_call("schema-call".to_owned(), operation_id.to_owned(), input)
+            .unwrap_err();
+        invalid_tool_call_result("schema-call".to_owned(), operation_id.to_owned(), &error)
+    }
+
+    #[test]
+    fn invalid_tool_results_expose_only_reserved_static_schema_guidance() {
+        let finish_result = schema_rejection(
+            "paperclip_finish",
+            json!({"secretSubmittedValue": "must-not-appear"}),
+        );
+        assert_eq!(finish_result.result["error"]["code"], "invalid_tool_call");
+        assert_eq!(finish_result.result["error"]["retryable"], false);
+        let finish_message = finish_result.result["error"]["message"].as_str().unwrap();
+        assert!(finish_message
+            .contains("continuation must include kind=response_wake, summary, and idempotencyKey"));
+        assert!(finish_message.len() <= 512);
+        assert!(!finish_message.chars().any(char::is_control));
+        assert!(!finish_result.result.to_string().contains("must-not-appear"));
+
+        let block_result = schema_rejection("paperclip_block", json!({}));
+        let block_message = block_result.result["error"]["message"].as_str().unwrap();
+        assert!(block_message
+            .contains("blocker must include reasonCode, owner, unblockAction, and scope"));
+        assert!(block_message.len() <= 512);
+        assert!(!block_message.chars().any(char::is_control));
+
+        let ordinary_result = schema_rejection("get_task_context", json!({}));
+        assert_eq!(
+            ordinary_result.result["error"]["message"],
+            GENERIC_INVALID_TOOL_CALL_MESSAGE
+        );
+
+        let unauthorized_error = ProviderToolBridge::default()
+            .begin_call(
+                "unauthorized-call".to_owned(),
+                "paperclip_finish".to_owned(),
+                json!({}),
+            )
+            .unwrap_err();
+        let unauthorized_result = invalid_tool_call_result(
+            "unauthorized-call".to_owned(),
+            "paperclip_finish".to_owned(),
+            &unauthorized_error,
+        );
+        assert_eq!(
+            unauthorized_result.result["error"]["message"],
+            GENERIC_INVALID_TOOL_CALL_MESSAGE
+        );
+    }
 
     fn opencode_result_state() -> CodexProviderState {
         let mut state = CodexProviderState::new(

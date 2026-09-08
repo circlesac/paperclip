@@ -141,6 +141,8 @@ const artifactsSchema = {
 
 const responseWakeContinuationSchema = {
   type: "object",
+  description:
+    "Required when reportedWorkDisposition is yielded. Wait for the next response without scheduling work; include kind, summary, and a stable idempotencyKey.",
   additionalProperties: false,
   required: ["kind", "summary", "idempotencyKey"],
   properties: {
@@ -344,10 +346,12 @@ export const PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA = {
     attentionRequests: providerAttentionCompatibilitySchema,
     continuation: responseWakeContinuationSchema,
   },
-  allOf: [{
-    if: { properties: { reportedWorkDisposition: { const: "yielded" } }, required: ["reportedWorkDisposition"] },
-    then: { required: ["continuation"] },
-  }],
+  // Keep the provider-facing root a concrete object. Codex code-mode renders a
+  // root allOf containing only an if/then constraint as `args: unknown`, hiding
+  // every required field from the model. This equivalent direct conditional
+  // preserves validation without obscuring the object-shaped tool signature.
+  if: { properties: { reportedWorkDisposition: { const: "yielded" } }, required: ["reportedWorkDisposition"] },
+  then: { required: ["continuation"] },
 } as const;
 
 export const PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA = {

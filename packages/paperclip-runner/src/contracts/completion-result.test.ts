@@ -60,6 +60,36 @@ describe("provider-neutral completion result schema", () => {
     expect(providerValidate(providerResult)).toBe(true);
   });
 
+  it("exposes concrete completion fields while retaining response-wake validation", () => {
+    // The live Codex code-mode renderer reduced a conditional-only root allOf
+    // to `args: unknown`. Keep this tool object-shaped for provider discovery.
+    expect(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA.type).toBe("object");
+    expect(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA).not.toHaveProperty("allOf");
+    expect(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA.required).toEqual([
+      "reportedWorkDisposition", "summary", "completionClaim", "evidence", "verification",
+    ]);
+    expect(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA.properties.continuation.required)
+      .toEqual(["kind", "summary", "idempotencyKey"]);
+    const providerValidate = new Ajv2020({ allErrors: true, strict: false })
+      .compile(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA);
+    const yielded = {
+      ...structuredClone(baseResult),
+      reportedWorkDisposition: "yielded",
+      continuation: {
+        kind: "response_wake",
+        summary: "Wait for the next response.",
+        idempotencyKey: "response-wake-provider-1",
+      },
+    };
+    expect(providerValidate(yielded)).toBe(true);
+    expect(providerValidate({ ...yielded, continuation: undefined })).toBe(false);
+    expect(providerValidate({ ...yielded, continuation: { kind: "response_wake" } })).toBe(false);
+    expect(providerValidate({
+      ...yielded, continuation: { ...yielded.continuation, kind: "same_agent" },
+    })).toBe(false);
+    expect(providerValidate({ ...yielded, evidence: undefined })).toBe(false);
+  });
+
   it("admits known smaller-model aliases at the provider boundary for canonical normalization", () => {
     const providerValidate = new Ajv2020({ allErrors: true, strict: false })
       .compile(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA);
