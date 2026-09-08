@@ -1586,8 +1586,41 @@ fn redact_sensitive_text_values(input: &str) -> String {
                 && authorization_scheme_start + scheme.len() < bytes.len()
                 && bytes[authorization_scheme_start + scheme.len()].is_ascii_whitespace()
         });
+        // A determiner-led noun phrase ("a simple token system") is prose,
+        // not the diagnostic field/value pair "token opaque-value". Keep this
+        // exception exact: assignments, quoted/compound/CLI keys or values,
+        // and any credential-shaped bytes still use the ordinary scanners.
+        let is_token_system_noun_phrase = key == "token"
+            && !key_is_compound
+            && whitespace_start == start + key.len()
+            && !has_assignment_separator
+            && bytes[whitespace_start..separator]
+                .iter()
+                .all(|value| matches!(value, b' ' | b'\t'))
+            && normalized[separator..].starts_with("system")
+            && bytes.get(separator + "system".len()).is_none_or(|value| {
+                value.is_ascii_whitespace()
+                    || (matches!(value, b'.' | b',' | b';' | b')')
+                        && bytes
+                            .get(separator + "system".len() + 1)
+                            .is_none_or(|next| next.is_ascii_whitespace()))
+            })
+            && ["a ", "the ", "a simple ", "the simple "]
+                .iter()
+                .any(|prefix| {
+                    normalized[..start]
+                        .strip_suffix(prefix)
+                        .is_some_and(|before| {
+                            before.is_empty()
+                                || before
+                                    .as_bytes()
+                                    .last()
+                                    .is_some_and(|value| value.is_ascii_whitespace())
+                        })
+                });
         let has_whitespace_separator = separator > whitespace_start
-            && (key != "authorization" || key_is_compound || has_authorization_scheme);
+            && (key != "authorization" || key_is_compound || has_authorization_scheme)
+            && !is_token_system_noun_phrase;
         if !has_assignment_separator && !has_whitespace_separator {
             continue;
         }
@@ -2147,6 +2180,92 @@ mod tests {
             sanitized["nested"]["authorizationBoundary"],
             json!("[REDACTED]")
         );
+    }
+
+    #[test]
+    fn semantic_redaction_preserves_benign_token_system_prose() {
+        let prose = "Offer a simple token system so guests can exchange items even when their contributions differ in quantity.";
+        for text in [
+            prose,
+            "Use a token system.",
+            "Describe the token system clearly.",
+            "The simple token system is fair.",
+            "Use a simple TOKEN SYSTEM",
+        ] {
+            assert_eq!(redact_text(text), text);
+            assert_eq!(
+                sanitize_value(&json!({"summary": text})),
+                json!({"summary": text})
+            );
+        }
+        let config = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&config);
+        let command = command("command_token_prose", 1);
+        state.begin_command(&command).unwrap();
+        let result = json!({
+            "result": {"schema": "paperclip.prp.run_result.v1", "summary": prose},
+            "nested": {"token": "system", "diagnostic": "token=system"},
+        });
+        state.complete_command(&command, result).unwrap();
+        let completed = state.processed_commands.get(&command.command_id).unwrap();
+        assert_eq!(completed.result["result"]["summary"], json!(prose));
+        assert_eq!(completed.result["nested"]["token"], json!("[REDACTED]"));
+        assert_eq!(
+            completed.result["nested"]["diagnostic"],
+            json!("token=[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn token_system_prose_exception_preserves_credential_redaction() {
+        for (input, expected) in [
+            ("token system", "token [REDACTED]"),
+            (
+                "request failed token system",
+                "request failed token [REDACTED]",
+            ),
+            ("a token=system", "a token=[REDACTED]"),
+            ("a token:system", "a token:[REDACTED]"),
+            ("a token \"system\"", "a token \"[REDACTED]\""),
+            ("a token 'system'", "a token '[REDACTED]'"),
+            ("a \"token\" system", "a \"token\" [REDACTED]"),
+            ("a access_token system", "a access_token [REDACTED]"),
+            ("a --token system", "a --token [REDACTED]"),
+            ("a token system-secret", "a token [REDACTED]"),
+            ("a token system.signed-value", "a token [REDACTED]"),
+            ("a token system,secret", "a token [REDACTED],secret"),
+            ("a token system;secret", "a token [REDACTED];secret"),
+            ("a token system)secret", "a token [REDACTED])secret"),
+            ("a token system=secret", "a token [REDACTED]"),
+            ("a token system:secret", "a token [REDACTED]"),
+            ("a token secret-value", "a token [REDACTED]"),
+            ("a token\nsystem", "a token\n[REDACTED]"),
+            ("meta token system", "meta token [REDACTED]"),
+            (
+                "a token system; token=secret-value",
+                "a token system; token=[REDACTED]",
+            ),
+            (
+                "a token system; Bearer secret-value",
+                "a token system; Bearer [REDACTED]",
+            ),
+            (
+                "a token system; sk-abcdefghijklmnop",
+                "a token system; [REDACTED]",
+            ),
+            (
+                "a token system; ghp_abcdefghijklmnopqrstuvwxyz",
+                "a token system; [REDACTED]",
+            ),
+            (
+                "a token system; eyJabcdefghi.abcdefghijk.lmnopqrstuv",
+                "a token system; [REDACTED]",
+            ),
+        ] {
+            let redacted = redact_text(input);
+            assert_eq!(redacted, expected, "{input}");
+            assert_eq!(redact_text(&redacted), redacted);
+        }
     }
 
     #[test]
