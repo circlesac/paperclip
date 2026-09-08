@@ -37,6 +37,7 @@ import type {
   PrpStructuredRunResult,
 } from "../../vendor/paperclip-runner/index.js";
 import {
+  NativeSessionCleanupQuarantinedError,
   acpxRuntimeSessionDirectoryName,
   createNativeSessionBackend,
   createRunnerdCodexTransport,
@@ -2621,6 +2622,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
     sourceFailureCode === "native_current_wake_comments_unread" ||
     sourceFailureCode === "native_current_wake_comments_changed_after_read" ||
+    sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
     sourceFailureCode === "native_provider_usage_limit";
   const exhausted = permanentFailure || attempt >= 3;
@@ -2666,6 +2668,7 @@ export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
   | "native_provider_usage_limit"
+  | "native_session_cleanup_quarantined"
   | "native_adopted_runner_authentication_timeout"
   | "runner_remote_provider_artifact_incompatible"
   | "provider_process_exited"
@@ -2684,6 +2687,9 @@ export function nativeSessionFailureSourceCode(
   | "native_current_wake_comments_unread"
   | "native_current_wake_comments_changed_after_read"
   | "native_session_interrupted" {
+  if (error instanceof NativeSessionCleanupQuarantinedError) {
+    return "native_session_cleanup_quarantined";
+  }
   const message = error instanceof Error ? error.message : String(error);
   if (/native_adopted_runner_authentication_timeout/i.test(message)) {
     return "native_adopted_runner_authentication_timeout";
@@ -2744,6 +2750,9 @@ export function nativeSessionFailureSourceCode(
   }
   return "native_session_interrupted";
 }
+
+const NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE =
+  "Verify the prior session's retained process ownership and checkpoint before a controlled server restart and explicit task retry. Clearing a task session does not resolve this quarantine. Automatic retries are stopped.";
 
 const PROVIDER_DURABLE_EVENT_TYPES = new Set([
   "harness.ready",
@@ -4876,21 +4885,23 @@ async function executePaperclipNativeSessionWithinScope(
                 checkpointExists: recoveryEvidence.checkpointExists,
                 recoveryOwner: recoveryProjection.recoveryOwner,
                 nextAction:
-                  recoveryEvidence.recoveryMode === "ambiguous_state"
-                    ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
-                    : integrityFailure
-                      ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
-                      : sourceFailureCode === "native_provider_usage_limit"
-                        ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
-                        : sourceFailureCode ===
-                            "native_adopted_runner_authentication_timeout"
-                          ? "Inspect the existing runner's executable and authenticated connection. Its process and durable checkpoint are retained; do not launch a replacement until ownership is safely resolved."
-                          : exhausted
-                            ? "Inspect the persisted native session after its bounded resume budget was exhausted."
-                            : recoveryEvidence.recoveryMode ===
-                                "bootstrap_retry"
-                              ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
-                              : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
+                  sourceFailureCode === "native_session_cleanup_quarantined"
+                    ? NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE
+                    : recoveryEvidence.recoveryMode === "ambiguous_state"
+                      ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
+                      : integrityFailure
+                        ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
+                        : sourceFailureCode === "native_provider_usage_limit"
+                          ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
+                          : sourceFailureCode ===
+                              "native_adopted_runner_authentication_timeout"
+                            ? "Inspect the existing runner's executable and authenticated connection. Its process and durable checkpoint are retained; do not launch a replacement until ownership is safely resolved."
+                            : exhausted
+                              ? "Inspect the persisted native session after its bounded resume budget was exhausted."
+                              : recoveryEvidence.recoveryMode ===
+                                  "bootstrap_retry"
+                                ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
+                                : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
               },
               nextAttemptAt,
               recoveryHistory: sql`(
@@ -5000,20 +5011,22 @@ async function executePaperclipNativeSessionWithinScope(
                 recoveryEvidence.providerSessionEstablished,
             },
             nextAction:
-              recoveryEvidence.recoveryMode === "ambiguous_state"
-                ? "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session."
-                : integrityFailure
-                  ? "Inspect the persisted runner event collision and explicitly repair or replace the run; automatic retries are disabled."
-                  : sourceFailureCode === "native_provider_usage_limit"
-                    ? "Restore model provider usage capacity, then explicitly retry the task; automatic retries are stopped."
-                    : sourceFailureCode ===
-                        "native_adopted_runner_authentication_timeout"
-                      ? "Resolve the retained runner's authentication or executable compatibility before an explicit recovery; do not blindly restart, cancel, or replace its provider session."
-                      : exhausted
-                        ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
-                        : recoveryEvidence.recoveryMode === "bootstrap_retry"
-                          ? "Retry bootstrap on the same run without manufacturing a provider checkpoint."
-                          : "Resume the exact persisted native session on the same heartbeat run.",
+              sourceFailureCode === "native_session_cleanup_quarantined"
+                ? NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE
+                : recoveryEvidence.recoveryMode === "ambiguous_state"
+                  ? "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session."
+                  : integrityFailure
+                    ? "Inspect the persisted runner event collision and explicitly repair or replace the run; automatic retries are disabled."
+                    : sourceFailureCode === "native_provider_usage_limit"
+                      ? "Restore model provider usage capacity, then explicitly retry the task; automatic retries are stopped."
+                      : sourceFailureCode ===
+                          "native_adopted_runner_authentication_timeout"
+                        ? "Resolve the retained runner's authentication or executable compatibility before an explicit recovery; do not blindly restart, cancel, or replace its provider session."
+                        : exhausted
+                          ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
+                          : recoveryEvidence.recoveryMode === "bootstrap_retry"
+                            ? "Retry bootstrap on the same run without manufacturing a provider checkpoint."
+                            : "Resume the exact persisted native session on the same heartbeat run.",
             wakePolicy: nextAttemptAt
               ? {
                   kind: "resume_native_run",

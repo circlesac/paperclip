@@ -34,6 +34,7 @@ import type {
   DurableRecoveryCommittedEvent,
   DurableRecoveryIdentity,
 } from "../contracts/durable-recovery.js";
+import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
@@ -2950,9 +2951,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#controlPlaneRelease = null;
     }
     if (suspensionRequired && !runnerSuspended) {
-      throw new Error(
-        "provider_transport_failed: runner did not durably suspend before checkpoint",
-      );
+      throw new NativeSessionCloseUnrecoverableError();
     }
     if (this.#ownsRoot && !adoptedRunner) {
       rmSync(this.#root, { recursive: true, force: true });

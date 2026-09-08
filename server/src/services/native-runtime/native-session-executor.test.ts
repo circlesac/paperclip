@@ -24,6 +24,8 @@ import {
   type PrpEvent,
 } from "@paperclipai/paperclip-runner";
 import { createHash } from "node:crypto";
+import { NativeSessionCleanupQuarantinedError } from "../../vendor/paperclip-runner/index.js";
+import * as issueServiceModule from "../issues.js";
 import {
   createNativeHarnessBackupStamp,
   verifyNativeHarnessBackupStamp,
@@ -3873,6 +3875,100 @@ describe("native warm session supervision", () => {
 });
 
 describe("native session bounded recovery", () => {
+  it("makes only typed operator-required cleanup quarantine terminal on the first attempt", () => {
+    const code = nativeSessionFailureSourceCode(
+      new NativeSessionCleanupQuarantinedError(),
+    );
+    expect(code).toBe("native_session_cleanup_quarantined");
+    const disposition = nativeSessionFailureDisposition(1, new Date(), code);
+    expect(disposition).toEqual({
+      phase: "terminal_failure",
+      failureCode: code,
+      nextAttemptAt: null,
+    });
+    expect(
+      nativeSessionRecoveryProjection({ ...disposition, agentId: "agent" }),
+    ).toMatchObject({
+      recoveryOwner: { kind: "board" },
+      recoveryActionOwnerAgentId: null,
+    });
+  });
+
+  it.each([
+    new Error(
+      "native_session_cleanup_quarantined: prior session cleanup exceeded the admission grace",
+    ),
+    new Error(
+      "native_session_cleanup_quarantined: prior session cleanup remains incomplete",
+    ),
+    Object.assign(new Error("cleanup still running"), {
+      code: "native_session_cleanup_quarantined",
+      recovery: "operator_required",
+    }),
+  ])("keeps untyped cleanup failure retryable (%s)", (error) => {
+    const code = nativeSessionFailureSourceCode(error);
+    expect(code).toBe("native_session_interrupted");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toMatchObject({
+      phase: "retryable_failure",
+      nextAttemptAt: expect.any(Date),
+    });
+  });
+
+  it("persists actionable operator recovery without an automatic cleanup wake", async () => {
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> =
+      [];
+    const failure = new NativeSessionCleanupQuarantinedError();
+    state.execute.mockReset().mockRejectedValueOnce(failure);
+    state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+    const updateIssue = vi.fn(async () => null);
+    const service = vi
+      .spyOn(issueServiceModule, "issueService")
+      .mockReturnValue({ update: updateIssue } as unknown as ReturnType<
+        typeof issueServiceModule.issueService
+      >);
+    try {
+      await expect(
+        executePaperclipNativeSession({
+          db: leaseDb(execution, {}, {}, updates),
+          execution,
+          runnerInstanceId: "runner",
+        }),
+      ).rejects.toBe(failure);
+      expect(
+        updates.find(
+          (entry) =>
+            entry.table === nativeRunFinalizations &&
+            entry.values.phase === "terminal_failure",
+        )?.values,
+      ).toMatchObject({
+        failureCode: "native_session_cleanup_quarantined",
+        nextAttemptAt: null,
+        failureDetail: {
+          nextAction: expect.stringContaining(
+            "Clearing a task session does not resolve this quarantine",
+          ),
+        },
+      });
+      expect(state.upsertRecoveryAction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cause: "native_session_cleanup_quarantined",
+          ownerType: "board",
+          wakePolicy: null,
+          nextAction: expect.stringContaining(
+            "Clearing a task session does not resolve this quarantine",
+          ),
+        }),
+      );
+      expect(updateIssue).toHaveBeenCalledWith(
+        execution.binding.issueId,
+        { status: "in_review" },
+        expect.anything(),
+      );
+    } finally {
+      service.mockRestore();
+    }
+  });
+
   it.each(["persisted", "logging_failure", "recovery_write_failure"])(
     "signals an ownership hold instead of terminal teardown after authentication timeout (%s)",
     async (failureMode) => {

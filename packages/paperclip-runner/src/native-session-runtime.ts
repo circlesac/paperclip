@@ -18,6 +18,10 @@ import type {
 } from "./contracts/native-session-backend.js";
 import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
 import {
+  NativeSessionCloseUnrecoverableError,
+  NativeSessionCleanupQuarantinedError,
+} from "./contracts/native-session-backend.js";
+import {
   validatePrpStructuredRunResult,
   type PrpEvent,
   type PrpStructuredRunResult,
@@ -69,6 +73,7 @@ interface QuarantinedSessionCleanup {
   recovery: Promise<void> | null;
   recoveryMaxAttempts: number | null;
   timer: ReturnType<typeof setTimeout> | null;
+  operatorRecoveryRequired: boolean;
 }
 
 const quarantinedSessionCleanups = new Set<QuarantinedSessionCleanup>();
@@ -337,6 +342,10 @@ function retainUnadmittedSessionCleanup(
         await attempt;
         return;
       } catch (error) {
+        if (error instanceof NativeSessionCloseUnrecoverableError) {
+          quarantineSessionCleanup(session, cleanupDomain, true);
+          throw error;
+        }
         if (retryCount >= MAX_FAILED_SESSION_CLOSE_RETRIES) {
           quarantineSessionCleanup(session, cleanupDomain);
           throw error;
@@ -496,10 +505,17 @@ function retainFailedSessionCleanupOwner(
 function quarantineSessionCleanup(
   session: NativeSession,
   cleanupDomain: NativeSessionCleanupDomain,
+  operatorRecoveryRequired = false,
 ): void {
-  if (
-    [...quarantinedSessionCleanups].some((entry) => entry.session === session)
-  ) {
+  const existing = [...quarantinedSessionCleanups].find(
+    (entry) => entry.session === session,
+  );
+  if (existing) {
+    if (operatorRecoveryRequired) {
+      existing.operatorRecoveryRequired = true;
+      if (existing.timer) clearTimeout(existing.timer);
+      existing.timer = null;
+    }
     return;
   }
   const cleanup: QuarantinedSessionCleanup = {
@@ -510,8 +526,10 @@ function quarantineSessionCleanup(
     recovery: null,
     recoveryMaxAttempts: null,
     timer: null,
+    operatorRecoveryRequired,
   };
   quarantinedSessionCleanups.add(cleanup);
+  if (operatorRecoveryRequired) return;
   startQuarantinedSessionCleanupRecovery(
     cleanup,
     MAX_QUARANTINED_SESSION_CLOSE_RETRIES,
@@ -525,6 +543,7 @@ function startQuarantinedSessionCleanupRecovery(
   reason: string,
 ): Promise<void> {
   if (cleanup.recovery) return cleanup.recovery;
+  if (cleanup.operatorRecoveryRequired) return Promise.resolve();
   const remainingAttempts =
     MAX_QUARANTINED_SESSION_AUTOMATIC_CLOSE_ATTEMPTS -
     cleanup.automaticAttempts;
@@ -534,7 +553,8 @@ function startQuarantinedSessionCleanupRecovery(
     for (
       let attemptCount = 0;
       attemptCount < boundedMaxAttempts &&
-      quarantinedSessionCleanups.has(cleanup);
+      quarantinedSessionCleanups.has(cleanup) &&
+      !cleanup.operatorRecoveryRequired;
       attemptCount += 1
     ) {
       // The first retry starts immediately so an admission-triggered recovery
@@ -551,7 +571,10 @@ function startQuarantinedSessionCleanupRecovery(
       try {
         await attempt;
         quarantinedSessionCleanups.delete(cleanup);
-      } catch {
+      } catch (error) {
+        if (error instanceof NativeSessionCloseUnrecoverableError) {
+          cleanup.operatorRecoveryRequired = true;
+        }
         // Retain the quarantine after this finite, sequential retry batch.
       } finally {
         if (cleanup.attempt === attempt) cleanup.attempt = null;
@@ -579,6 +602,7 @@ function scheduleQuarantinedSessionCleanup(
 ): void {
   if (
     !quarantinedSessionCleanups.has(cleanup) ||
+    cleanup.operatorRecoveryRequired ||
     cleanup.recovery ||
     cleanup.attempt ||
     cleanup.timer ||
@@ -616,6 +640,14 @@ async function retryQuarantinedSessionCleanups(
   let observedOwnerPhases = 0;
   while (true) {
     signal?.throwIfAborted();
+    if (
+      [...quarantinedSessionCleanups].some(
+        (cleanup) =>
+          cleanup.domain === cleanupDomain && cleanup.operatorRecoveryRequired,
+      )
+    ) {
+      throw new NativeSessionCleanupQuarantinedError();
+    }
     const cleanupOwners = new Set<Promise<void>>(
       [...failedSessionCleanupOwners]
         .filter(([, domain]) => domain === cleanupDomain)
@@ -1703,6 +1735,10 @@ export async function executeNativeSession(
             await attempt;
             return;
           } catch (error) {
+            if (error instanceof NativeSessionCloseUnrecoverableError) {
+              quarantineSessionCleanup(session, cleanupDomain, true);
+              throw error;
+            }
             if (retryCount >= MAX_FAILED_SESSION_CLOSE_RETRIES) {
               quarantineSessionCleanup(session, cleanupDomain);
               throw error;
