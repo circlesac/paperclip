@@ -860,6 +860,7 @@ describe("agent issue mutation checkout ownership", () => {
       "I can respond here.",
       expect.any(Object),
       expect.any(Object),
+      expect.any(Object),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
@@ -880,6 +881,7 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       issueId,
       "I was not mentioned.",
+      expect.any(Object),
       expect.any(Object),
       expect.any(Object),
     );
@@ -1570,6 +1572,7 @@ describe("agent issue mutation checkout ownership", () => {
       "progress update",
       expect.any(Object),
       expect.any(Object),
+      expect.any(Object),
     );
     expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
     expect(mockWorkProductService.update).toHaveBeenCalledWith("product-1", { title: "Updated product" });
@@ -2164,6 +2167,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.addComment).toHaveBeenCalledWith(
         issueId,
         "Watchdog finding",
+        expect.any(Object),
         expect.any(Object),
         expect.any(Object),
       );
