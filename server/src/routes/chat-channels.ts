@@ -25,6 +25,7 @@ import {
   type ChatChannelServiceOptions,
 } from "../services/chat-channels.js";
 import { accessService } from "../services/access.js";
+import { recordChatWebhookStage } from "../services/chat-webhook-diagnostics.js";
 import {
   createInviteRateLimiter,
   type InviteRateLimiter,
@@ -449,6 +450,7 @@ export function chatWebhookRoutes(
       maxRequests: CHAT_WEBHOOK_RATE_LIMIT_MAX_REQUESTS,
     });
   router.post("/api/chat-webhooks/:publicId/:provider", async (req, res) => {
+    recordChatWebhookStage("handler_started");
     // Provider signatures are intentionally verified inside Chat SDK, but an
     // attacker should not receive an unbounded cryptographic/JSON-processing
     // budget. `req.ip` follows Express's configured trusted-proxy boundary;
@@ -472,6 +474,7 @@ export function chatWebhookRoutes(
       provider,
       standardRequest(req),
     );
+    recordChatWebhookStage("response_ready");
     await writeStandardResponse(response, res);
   });
   return router;

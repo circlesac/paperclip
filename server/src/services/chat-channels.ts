@@ -28,6 +28,10 @@ import {
   type SQL,
 } from "drizzle-orm";
 import { alias, type AnyPgColumn } from "drizzle-orm/pg-core";
+import {
+  recordChatWebhookReceipt,
+  recordChatWebhookStage,
+} from "./chat-webhook-diagnostics.js";
 import type { Db } from "@paperclipai/db";
 import {
   createDurableChatWakeupRequest,
@@ -6926,6 +6930,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             runtimeVersions.delete(endpoint.id);
             await runtime.removeEndpoint(endpoint.id);
           }
+          recordChatWebhookStage("runtime_initializing", record.endpoint.id);
           const credentials = await resolveCredentials(record.endpoint);
           instance = await runtime.replaceEndpoint({
             companyId: record.endpoint.companyId,
@@ -10050,6 +10055,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         provisionalTeamsSetupReply,
       };
     });
+    if (!admittedDeliveryId && admission?.candidate) {
+      recordChatWebhookReceipt(
+        endpoint.id,
+        admission.candidate.id,
+        "message_delivery",
+        providerSentAt,
+      );
+    }
     if (admission?.accepting) {
       // Persist the latest authenticated Teams reply route under a fresh
       // runtime/credential fence. The helper holds the endpoint's NO KEY
@@ -19643,6 +19656,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       (endpoint.status === "revoked" && !recoveringRevokedGitHubInstallation)
     )
       throw notFound("Chat endpoint not found");
+    recordChatWebhookStage("endpoint_resolved", endpoint.id);
     // A pause is a durable ingress fence. Providers generally retry non-2xx
     // webhooks, so acknowledge late callbacks without recreating a runtime or
     // admitting any Paperclip mutation.
@@ -19665,6 +19679,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return new Response("Invalid signature", { status: 401 });
       if (staged.kind === "ignored")
         return new Response("ignored", { status: 200 });
+      recordChatWebhookReceipt(endpoint.id, staged.actionId, "github_ingress");
 
       if (options.deferWebhookProcessing === true) {
         scheduleMessageProcessing(async () => {
@@ -19923,6 +19938,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const slackCallbackInspection =
       provider === "slack" ? request.clone() : null;
     const githubInspection = provider === "github" ? request.clone() : null;
+    recordChatWebhookStage("runtime_requested");
     const runtimePromise = runtimeFor(endpoint);
     let endpointRuntime: ChatSdkEndpointRuntime;
     if (githubResponseDeadlineAt !== null) {
@@ -19954,6 +19970,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     } else {
       endpointRuntime = await runtimePromise;
     }
+    recordChatWebhookStage("runtime_ready");
     const runtimeContext = runtimeContexts.get(endpointRuntime as object);
     if (!runtimeContext) {
       throw conflict("Chat endpoint runtime is not current", {
