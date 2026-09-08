@@ -7,6 +7,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -82,9 +83,10 @@ it.each([
   { alreadyEnded: false, appendFailure: false },
   { alreadyEnded: true, appendFailure: false },
   { alreadyEnded: true, appendFailure: true },
+  { alreadyEnded: true, appendFailure: false, bareCodex: true },
 ])(
-  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure)",
-  async ({ alreadyEnded, appendFailure }) => {
+  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex)",
+  async ({ alreadyEnded, appendFailure, bareCodex }) => {
     const fixtureRunner = defaultCapabilityRunnerdBinary();
     const directory = await mkdtemp(join(tmpdir(), "runnerd-maintenance-"));
     const original = join(directory, "original");
@@ -92,6 +94,22 @@ it.each([
     const activated = join(directory, "activated");
     const home = join(directory, "source-home");
     await mkdir(home);
+    const fakeCodex = resolve(
+      import.meta.dirname,
+      "../../runner/target/debug/fake-codex-app-server",
+    );
+    const bin = join(directory, "provider-bin");
+    if (bareCodex) {
+      await mkdir(bin);
+      await symlink(fakeCodex, join(bin, "codex"));
+      await writeFile(
+        join(home, "auth.json"),
+        JSON.stringify({ OPENAI_API_KEY: "fixture-only-not-a-secret" }),
+      );
+    }
+    const environment = bareCodex
+      ? { PATH: bin, HOME: home, CODEX_HOME: home }
+      : undefined;
     const calls = join(directory, "calls.log");
     const identity = {
       runnerInstanceId: "runner-maintenance",
@@ -103,10 +121,8 @@ it.each([
     };
     const bundle = createCapabilityRunnerdCodexTransport({
       runnerBinary: fixtureRunner,
-      codexCommand: resolve(
-        import.meta.dirname,
-        "../../runner/target/debug/fake-codex-app-server",
-      ),
+      codexCommand: bareCodex ? "codex" : fakeCodex,
+      environment,
       codexArgs: [
         "--state-file",
         join(directory, "fake.json"),
@@ -264,7 +280,8 @@ it.each([
         originalRunnerPid: runnerPid,
         originalProviderPid: providerPid,
         runnerBinary: fixtureRunner,
-        sourceCodexHome: home,
+        sourceCodexHome: bareCodex ? undefined : home,
+        environment,
         authorize,
         appendEvent,
       };
@@ -542,6 +559,11 @@ it.each([
           );
         },
       );
+      if (bareCodex) {
+        expect(
+          await readFile(join(copy, "codex-home/auth.json"), "utf8"),
+        ).toBe(await readFile(join(home, "auth.json"), "utf8"));
+      }
       expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(false);
       await rename(copy, activated);
       expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(true);

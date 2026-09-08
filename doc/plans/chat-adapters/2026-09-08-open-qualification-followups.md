@@ -32,6 +32,15 @@ original snapshot, clear history, or manually move this failed copy. James owns
 the bounded environment fix and a proof-driven continuation of this exact
 no-launch maintenance failure. The original Telegram/GitHub requests stay intact.
 
+The environment correction is verified independently: **200/200** executor
+tests, four staged-runner maintenance cases (including bare executable discovery
+and source login-home lookup), and server/runner typechecks pass. It does not
+admit the historical failed copy. That copy's pending failed terminal receipt
+and missing maintenance-runner exit evidence require separate producer/ownership
+work. Do not treat a simple process search or the still-live server PID as exit
+proof. Future attempts need durable per-epoch spawn/exit receipts; cold terminal
+reconciliation must not launch a provider or silently claim it was cleaned up.
+
 The Codex already-ended-on-resume shutdown repair (`4bc52cdbe`) passed
 the full provider target (69 passed, one deliberate subprocess helper ignored).
 Its active/ended/no-authority regressions retain exact process-exit and

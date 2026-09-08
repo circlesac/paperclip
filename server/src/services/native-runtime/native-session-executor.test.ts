@@ -2561,6 +2561,14 @@ describe("retained native cleanup activation", () => {
         releaseCommit();
       }
       const outcome = await pendingOutcome;
+      if (mode === "settled") {
+        const cleanupEnvironment = state.cleanup.mock.calls[0]![0].environment;
+        expect(cleanupEnvironment).toEqual(
+          buildNativeProviderEnvironment({}, process.env, execution.workspace.cwd),
+        );
+        expect(cleanupEnvironment).not.toHaveProperty("OPENAI_API_KEY");
+        expect(cleanupEnvironment).not.toHaveProperty("CODEX_API_KEY");
+      }
       const ineligible = [
         "live_owner",
         "foreign_event",

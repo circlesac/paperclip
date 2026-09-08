@@ -2256,6 +2256,13 @@ export async function reconcileRetainedNativeSessionCleanup(
       providerSessionId: owned.providerSessionId,
       originalRunnerPid: owned.run.processPid!,
       originalProviderPid: owned.providerPid,
+      // The control-only provider resume still needs normal host discovery
+      // and auth-file lookup. Inherit only the existing host allowlist.
+      environment: buildNativeProviderEnvironment(
+        {},
+        process.env,
+        owned.execution.workspace.cwd,
+      ),
       authorize,
       appendEvent: async (event) => {
         await appendRetainedNativeCleanupEvent(db, {

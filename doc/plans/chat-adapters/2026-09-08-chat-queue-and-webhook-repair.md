@@ -2485,3 +2485,21 @@ file authorization after relink/regrant. Verified provider source invalidation
 must be distinguished from permission to admit new edited content. That next
 slice remains in progress. No new live Slack file-edit journey was performed
 while the Mac is locked, and server 60 still runs the preceding checkpoint.
+
+### Maintenance environment regression
+
+The cleanup caller now uses the existing native host-environment allowlist for
+executable and source-login discovery, with the retained workspace bound by the
+server. It does not inherit arbitrary host secrets or introduce a new provider
+identity. The executor regression failed before the fix; the final full executor
+suite passed **200/200**. Four real staged-runner maintenance cases passed,
+including a bare `codex` executable available only through the supplied `PATH`
+and isolated `CODEX_HOME` auth-file discovery. Server and runner typechecks pass.
+
+This small correction does not make the already-attempted live copy retryable.
+That copy retains a failed pending terminal-delivery fence and lacks durable
+evidence for the maintenance runner's exit. A cold terminal-reconciliation path
+currently tries to restore a provider merely to shut it down; correcting that
+producer behavior and recording future per-epoch owner retirement are separate
+work. The original failed copy remains `operator_required`; neither its history
+nor its commands are reset, and no repeat live attempt has been submitted.
