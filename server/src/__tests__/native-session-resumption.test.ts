@@ -777,6 +777,10 @@ describe("P6-25 persisted reaper-to-finalization recovery", () => {
       nativePhaseUpdatedAt: new Date("2026-08-09T04:00:00.000Z"),
       contextSnapshot: { issueId, taskId: issueId, skipIssueComment: true },
     });
+    await db
+      .update(issues)
+      .set({ executionRunId: runId })
+      .where(eq(issues.id, issueId));
     await db.insert(nativeRunFinalizations).values({
       runId,
       companyId,
