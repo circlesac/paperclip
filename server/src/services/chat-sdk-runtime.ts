@@ -1,5 +1,6 @@
 import {
   createGitHubAdapter,
+  type GitHubAdapter,
   type GitHubAdapterConfig,
 } from "@chat-adapter/github";
 import {
@@ -50,10 +51,13 @@ import {
 import type { StateAdapter } from "chat";
 import {
   githubAttachmentLocator,
+  githubAttachmentCommentFetch,
+  isGitHubAttachmentCommentRequest,
   githubPublicAttachmentsFromMessage,
   rehydrateGitHubPublicAttachment,
   validateGitHubAttachmentLocator,
   type GitHubPublicAttachmentLocator,
+  type GitHubAttachmentCommentRequest,
 } from "./chat-github-attachments.js";
 import {
   createPaperclipChatSdkState,
@@ -1482,6 +1486,7 @@ export class ChatSdkEndpointRuntime {
   private readonly microsoftTeamsTenantId: string | null;
   private readonly discordGuildId: string | null;
   private readonly discordGatewayEnabled: boolean;
+  private readonly githubAttachmentAppAuthority: boolean;
   private discordGatewayAbort: AbortController | null = null;
   private discordGatewayTask: Promise<void> | null = null;
   private discordGatewayFatal = false;
@@ -1491,6 +1496,12 @@ export class ChatSdkEndpointRuntime {
     this.endpointId = options.endpointId;
     this.provider = options.providerConfig.provider;
     this.sdkAdapterKey = adapterKey(this.provider);
+    this.githubAttachmentAppAuthority =
+      options.providerConfig.provider === "github" &&
+      "appId" in options.providerConfig.credentials &&
+      Boolean(options.providerConfig.credentials.installationId) &&
+      (!options.providerConfig.credentials.apiUrl ||
+        options.providerConfig.credentials.apiUrl === "https://api.github.com");
     this.microsoftTeamsTenantId =
       options.providerConfig.provider === "microsoft-teams"
         ? options.providerConfig.credentials.appTenantId
@@ -1924,6 +1935,38 @@ export class ChatSdkEndpointRuntime {
     attachment: Attachment,
   ): ChatSdkAttachmentRecoveryDescriptor | null {
     return createAttachmentRecoveryDescriptor(this.provider, attachment);
+  }
+
+  /** Called only after current inbound admission; installation App authority only. */
+  async resolveGitHubAttachmentComment(
+    request: GitHubAttachmentCommentRequest,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    if (!this.githubAttachmentAppAuthority) return null;
+    if (!isGitHubAttachmentCommentRequest(request)) return null;
+    try {
+      signal.throwIfAborted();
+      const result = await (this.adapter as GitHubAdapter).octokit.request(
+        `GET ${request.url}`,
+        {
+          headers: {
+            accept: request.accept,
+            "x-github-api-version": "2022-11-28",
+          },
+          request: {
+            signal,
+            redirect: "manual",
+            fetch: githubAttachmentCommentFetch(request, signal),
+          },
+        },
+      );
+      signal.throwIfAborted();
+      return result.data;
+    } catch {
+      // Octokit errors can carry request headers or authenticated HTML. Neither
+      // belongs in adapter logs, durable ingress, nor agent-visible results.
+      return null;
+    }
   }
 
   /**

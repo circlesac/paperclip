@@ -1,14 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Message } from "chat";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   canonicalGitHubAttachmentUrl,
+  githubAttachmentCommentRequest,
+  githubAttachmentCommentFetch,
   githubAttachmentLocator,
   githubAttachmentLimitOmissions,
   githubPublicAttachmentsFromMessage,
   prepareGitHubPublicAttachment,
   rehydrateGitHubPublicAttachment,
   restoreGitHubAttachmentLimitOmissions,
+  resolveGitHubCommentAttachmentTarget,
 } from "./chat-github-attachments.js";
+import { createChatSdkEndpointRuntime } from "./chat-sdk-runtime.js";
 import { guardedRemoteHttpFetch } from "./remote-http-fetch.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 
@@ -50,6 +55,365 @@ afterEach(() => {
   vi.restoreAllMocks();
   request.mockReset();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+const signedImageUrl =
+  "https://private-user-images.githubusercontent.com/123/456-11111111-2222-3333-4444-555555555555.png?jwt=header.payload.signature";
+function canonicalComment(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 4242,
+    url: "https://api.github.com/repos/paperclipai/chat-e2e/issues/comments/4242",
+    issue_url: "https://api.github.com/repos/paperclipai/chat-e2e/issues/42",
+    body: (message().raw as { comment: { body: string } }).comment.body,
+    body_html: `<p><a href="${imageUrl}"><img src="${signedImageUrl}"></a><a href="${fileUrl}">proof</a></p>`,
+    ...overrides,
+  };
+}
+
+describe("GitHub exact-comment private image resolution", () => {
+  it.each([
+    { version: 2 },
+    { sourceBodySha256: "a".repeat(64) },
+    { version: 3, sourceBodySha256: "a".repeat(64) },
+    { version: 2, sourceBodySha256: "invalid" },
+  ])("does not upgrade malformed legacy descriptors %j", (extra) => {
+    const {
+      version: _version,
+      sourceBodySha256: _hash,
+      ...legacy
+    } = githubAttachmentLocator(attachment())!;
+    expect(
+      rehydrateGitHubPublicAttachment(
+        { ...legacy, ...extra },
+        { threadId, messageId: "4242" },
+      ),
+    ).toBeNull();
+  });
+  it("uses an exact source/body-bound canonical rendering after restart without persisting signed targets", async () => {
+    const original = attachment();
+    const saved = JSON.parse(JSON.stringify(githubAttachmentLocator(original)));
+    const recovered = rehydrateGitHubPublicAttachment(saved, {
+      threadId,
+      messageId: "4242",
+    })!;
+    const resolve = vi.fn(async () => canonicalComment());
+    request.mockResolvedValueOnce(new Response("private", { status: 404 }));
+    request.mockResolvedValueOnce(
+      new Response(png, { headers: { "content-type": "image/png" } }),
+    );
+    const prepared = await prepareGitHubPublicAttachment(
+      recovered,
+      undefined,
+      resolve,
+    );
+    expect(await prepared.fetchData!()).toEqual(png);
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(
+      {
+        url: canonicalComment().url,
+        accept: "application/vnd.github.full+json",
+      },
+      expect.any(AbortSignal),
+    );
+    expect(String(request.mock.calls[1]![0])).toBe(signedImageUrl);
+    for (const [, init] of request.mock.calls) {
+      expect(init.credentials).toBe("omit");
+      expect(new Headers(init.headers).has("authorization")).toBe(false);
+      expect(new Headers(init.headers).has("cookie")).toBe(false);
+    }
+    expect(JSON.stringify(saved)).not.toContain("jwt");
+    expect(JSON.stringify(prepared)).not.toContain("jwt");
+    expect(githubAttachmentLocator(recovered)).toEqual(saved);
+  });
+  it("keeps old anonymous descriptors readable without granting canonical App reads", async () => {
+    const original = githubAttachmentLocator(attachment())!;
+    const { version: _version, sourceBodySha256: _hash, ...legacy } = original;
+    const recovered = rehydrateGitHubPublicAttachment(legacy, {
+      threadId,
+      messageId: "4242",
+    })!;
+    const resolve = vi.fn();
+    request.mockResolvedValueOnce(new Response("private", { status: 404 }));
+    await expect(
+      prepareGitHubPublicAttachment(recovered, undefined, resolve),
+    ).rejects.toMatchObject({ code: "github_attachment_not_public" });
+    expect(resolve).not.toHaveBeenCalled();
+    request.mockResolvedValueOnce(
+      new Response(png, { headers: { "content-type": "image/png" } }),
+    );
+    expect(
+      await (
+        await prepareGitHubPublicAttachment(recovered)
+      ).fetchData!(),
+    ).toEqual(png);
+  });
+  it.each([
+    { id: 4243 },
+    { body: "edited body" },
+    { issue_url: "https://api.github.com/repos/other/repo/issues/42" },
+    {
+      url: "https://api.github.com/repos/paperclipai/chat-e2e/issues/comments/4243",
+    },
+    {
+      body_html: `<a href="${imageUrl}"><img src="${signedImageUrl}"><img src="${signedImageUrl}"></a>`,
+    },
+    {
+      body_html: `<a href="${imageUrl}"><img src="${signedImageUrl}"></a><a href="${imageUrl}"><img src="${signedImageUrl}"></a>`,
+    },
+    { body_html: `<a href="${fileUrl}"><img src="${signedImageUrl}"></a>` },
+    {
+      body_html: `<a href="${imageUrl}"><img src="https://127.0.0.1/x?jwt=secret"></a>`,
+    },
+    {
+      body_html: `<a href="${imageUrl}"><img src="${signedImageUrl.replace("11111111", "99999999")}"></a>`,
+    },
+    {
+      body_html: `<a href="${imageUrl}"><img src="${signedImageUrl}&amp;token=extra"></a>`,
+    },
+  ])("denies mismatched or ambiguous canonical response %j", (override) => {
+    expect(
+      resolveGitHubCommentAttachmentTarget(
+        attachment(),
+        canonicalComment(override),
+      ),
+    ).toBeNull();
+    expect(request).not.toHaveBeenCalled();
+  });
+  it("does not treat a private generic-file anchor as downloadable", async () => {
+    const resolve = vi.fn(async () => canonicalComment());
+    request.mockResolvedValue(new Response("private", { status: 404 }));
+    await expect(
+      prepareGitHubPublicAttachment(fileAttachment(), undefined, resolve),
+    ).rejects.toMatchObject({ code: "github_attachment_not_public" });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+  it("uses the documented review-comment media type and exact review-root binding", () => {
+    const value = message({
+      threadId: "github:paperclipai/chat-e2e:42:rc:4000",
+    });
+    const raw = value.raw as Record<string, unknown>;
+    raw.type = "review_comment";
+    (raw.comment as Record<string, unknown>).in_reply_to_id = 4000;
+    const image = githubPublicAttachmentsFromMessage(value)[0]!;
+    const requestDescriptor = githubAttachmentCommentRequest(image)!;
+    expect(requestDescriptor).toEqual({
+      url: "https://api.github.com/repos/paperclipai/chat-e2e/pulls/comments/4242",
+      accept: "application/vnd.github-commitcomment.full+json",
+    });
+    const response = canonicalComment({
+      url: requestDescriptor.url,
+      pull_request_url:
+        "https://api.github.com/repos/paperclipai/chat-e2e/pulls/42",
+      in_reply_to_id: 4000,
+    });
+    expect(resolveGitHubCommentAttachmentTarget(image, response)?.href).toBe(
+      signedImageUrl,
+    );
+    expect(
+      resolveGitHubCommentAttachmentTarget(image, {
+        ...response,
+        in_reply_to_id: 3999,
+      }),
+    ).toBeNull();
+  });
+  it("closes the authenticated fetch to one API route and never follows its redirects", async () => {
+    const expected = githubAttachmentCommentRequest(attachment())!;
+    const fetch = githubAttachmentCommentFetch(
+      expected,
+      new AbortController().signal,
+    );
+    for (const url of [
+      signedImageUrl,
+      expected.url + "?token=secret",
+      expected.url.replace("4242", "4243"),
+    ])
+      await expect(fetch(url, { method: "GET" })).rejects.toMatchObject({
+        code: "github_attachment_source_mismatch",
+      });
+    expect(request).not.toHaveBeenCalled();
+    const forged = { ...expected, url: "https://evil.invalid/attachment" };
+    await expect(
+      githubAttachmentCommentFetch(forged, new AbortController().signal)(
+        forged.url,
+        {
+          method: "GET",
+          headers: { accept: forged.accept, authorization: "token test-only" },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "github_attachment_source_mismatch" });
+    expect(request).not.toHaveBeenCalled();
+    request.mockResolvedValue(
+      new Response(null, {
+        status: 302,
+        headers: { location: signedImageUrl },
+      }),
+    );
+    await expect(
+      fetch(expected.url, {
+        method: "GET",
+        headers: { accept: expected.accept, authorization: "token test-only" },
+      }),
+    ).rejects.toMatchObject({ code: "github_attachment_not_public" });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0]![1]).toMatchObject({
+      redirect: "manual",
+      credentials: "omit",
+    });
+  });
+  it("bounds authenticated HTML response bytes and redacts provider errors", async () => {
+    const expected = githubAttachmentCommentRequest(attachment())!;
+    request.mockResolvedValue(
+      new Response("x", {
+        headers: {
+          "content-type": "application/json",
+          "content-length": "1048577",
+        },
+      }),
+    );
+    await expect(
+      githubAttachmentCommentFetch(expected, new AbortController().signal)(
+        expected.url,
+        { method: "GET", headers: { accept: expected.accept } },
+      ),
+    ).rejects.toMatchObject({ message: "github_attachment_not_public" });
+    request.mockResolvedValue(new Response("private", { status: 404 }));
+    await expect(
+      prepareGitHubPublicAttachment(attachment(), undefined, async () => {
+        throw new Error(signedImageUrl);
+      }),
+    ).rejects.toMatchObject({ message: "github_attachment_download_failed" });
+  });
+  it("actual SDK App auth sends installation credentials only to fixed canonical comment API", async () => {
+    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+      .privateKey.export({ type: "pkcs8", format: "pem" })
+      .toString();
+    const providerFetch = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        Response.json(
+          {
+            token: "ghs-test-only",
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+            permissions: { issues: "read" },
+            repository_selection: "selected",
+          },
+          { status: 201 },
+        ),
+    );
+    vi.stubGlobal("fetch", providerFetch);
+    request.mockResolvedValue(Response.json(canonicalComment()));
+    const runtime = createChatSdkEndpointRuntime({
+      companyId: "company-test",
+      endpointId: "endpoint-test",
+      logger: "silent",
+      callbacks: { onMessage() {} },
+      persistence: {
+        async compareAndSet() {
+          return true;
+        },
+        async deleteIfVersion() {
+          return true;
+        },
+        async read() {
+          return null;
+        },
+      },
+      providerConfig: {
+        provider: "github",
+        userName: "maya",
+        credentials: {
+          appId: "123",
+          installationId: 2468,
+          botUserId: 999,
+          privateKey,
+          webhookSecret: "test-only",
+        },
+      },
+    });
+    try {
+      const result = await runtime.resolveGitHubAttachmentComment(
+        githubAttachmentCommentRequest(attachment())!,
+        new AbortController().signal,
+      );
+      expect(result).toEqual(canonicalComment());
+      expect(providerFetch).toHaveBeenCalledTimes(1);
+      expect(String(providerFetch.mock.calls[0]?.[0])).toBe(
+        "https://api.github.com/app/installations/2468/access_tokens",
+      );
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(String(request.mock.calls[0]![0])).toBe(canonicalComment().url);
+      expect(
+        new Headers(request.mock.calls[0]![1].headers).get("authorization"),
+      ).toBe("token ghs-test-only");
+    } finally {
+      await runtime.shutdown();
+    }
+  });
+  it.each(["personal_token", "custom_host", "missing_installation"])(
+    "does not resolve private attachments with %s authority",
+    async (mode) => {
+      const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+        .privateKey.export({ type: "pkcs8", format: "pem" })
+        .toString();
+      const providerFetch = vi.fn();
+      vi.stubGlobal("fetch", providerFetch);
+      const createRuntime = () =>
+        createChatSdkEndpointRuntime({
+          companyId: "company-test",
+          endpointId: "endpoint-test",
+          logger: "silent",
+          callbacks: { onMessage() {} },
+          persistence: {
+            async compareAndSet() {
+              return true;
+            },
+            async deleteIfVersion() {
+              return true;
+            },
+            async read() {
+              return null;
+            },
+          },
+          providerConfig: {
+            provider: "github",
+            userName: "maya",
+            credentials:
+              mode === "personal_token"
+                ? { token: "test-only-pat", webhookSecret: "test-only" }
+                : {
+                    appId: "123",
+                    privateKey,
+                    webhookSecret: "test-only",
+                    botUserId: 999,
+                    ...(mode === "missing_installation"
+                      ? {}
+                      : {
+                          installationId: 2468,
+                          apiUrl: "https://github.enterprise.invalid",
+                        }),
+                  },
+          },
+        });
+      if (mode === "missing_installation") {
+        expect(createRuntime).toThrow("Installation ID required");
+        expect(providerFetch).not.toHaveBeenCalled();
+        expect(request).not.toHaveBeenCalled();
+        return;
+      }
+      const runtime = createRuntime();
+      try {
+        expect(
+          await runtime.resolveGitHubAttachmentComment(
+            githubAttachmentCommentRequest(attachment())!,
+            new AbortController().signal,
+          ),
+        ).toBeNull();
+        expect(providerFetch).not.toHaveBeenCalled();
+        expect(request).not.toHaveBeenCalled();
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
 });
 
 describe("public GitHub attachment extraction", () => {
@@ -63,6 +427,10 @@ describe("public GitHub attachment extraction", () => {
       url: imageUrl,
       sourceThreadId: threadId,
       sourceMessageId: "4242",
+      version: 2,
+      sourceBodySha256: createHash("sha256")
+        .update((message().raw as { comment: { body: string } }).comment.body)
+        .digest("hex"),
     });
     expect(request).not.toHaveBeenCalled();
   });

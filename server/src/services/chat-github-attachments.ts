@@ -1,4 +1,6 @@
 import type { Attachment, Message } from "chat";
+import { createHash } from "node:crypto";
+import { JSDOM } from "jsdom";
 import {
   isAllowedContentType,
   MAX_ATTACHMENT_BYTES,
@@ -42,6 +44,35 @@ export interface GitHubPublicAttachmentLocator {
   url: string;
   sourceThreadId: string;
   sourceMessageId: string;
+  /** Old four-field descriptors remain anonymous-only. */
+  version?: 2;
+  sourceBodySha256?: string;
+}
+
+export interface GitHubAttachmentCommentRequest {
+  url: string;
+  accept: string;
+}
+export type GitHubAttachmentCommentResolver = (
+  request: GitHubAttachmentCommentRequest,
+  signal: AbortSignal,
+) => Promise<unknown>;
+
+export function isGitHubAttachmentCommentRequest(
+  request: GitHubAttachmentCommentRequest,
+): boolean {
+  const match =
+    /^https:\/\/api\.github\.com\/repos\/[a-z0-9][a-z0-9-]{0,38}\/([a-z0-9_.-]{1,100})\/(issues|pulls)\/comments\/[1-9][0-9]{0,24}$/i.exec(
+      request.url,
+    );
+  return Boolean(
+    match &&
+    ![".", ".."].includes(match[1]!) &&
+    request.accept ===
+      (match[2] === "pulls"
+        ? "application/vnd.github-commitcomment.full+json"
+        : "application/vnd.github.full+json"),
+  );
 }
 
 const handles = new WeakMap<Attachment, GitHubPublicAttachmentLocator>();
@@ -129,8 +160,14 @@ export function validateGitHubAttachmentLocator(
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
   if (
-    Object.keys(row).sort().join(",") !==
-      "kind,sourceMessageId,sourceThreadId,url" ||
+    ![
+      "kind,sourceMessageId,sourceThreadId,url",
+      "kind,sourceBodySha256,sourceMessageId,sourceThreadId,url,version",
+    ].includes(Object.keys(row).sort().join(",")) ||
+    (("version" in row || "sourceBodySha256" in row) &&
+      (row.version !== 2 ||
+        typeof row.sourceBodySha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(row.sourceBodySha256))) ||
     row.kind !== "github_public_attachment" ||
     !validThread(row.sourceThreadId) ||
     typeof row.sourceMessageId !== "string" ||
@@ -144,6 +181,12 @@ export function validateGitHubAttachmentLocator(
         url,
         sourceThreadId: row.sourceThreadId,
         sourceMessageId: row.sourceMessageId,
+        ...(row.version === 2
+          ? {
+              version: 2 as const,
+              sourceBodySha256: row.sourceBodySha256 as string,
+            }
+          : {}),
       }
     : null;
 }
@@ -272,6 +315,9 @@ export function githubPublicAttachmentsFromMessage(
     message,
     Math.max(0, urls.size - MAX_ATTACHMENTS),
   );
+  const sourceBodySha256 = createHash("sha256")
+    .update(comment.body)
+    .digest("hex");
   return [...urls]
     .slice(0, MAX_ATTACHMENTS)
     .map((url) =>
@@ -281,6 +327,8 @@ export function githubPublicAttachmentsFromMessage(
           url,
           sourceThreadId: message.threadId,
           sourceMessageId: message.id,
+          version: 2,
+          sourceBodySha256,
         },
         { threadId: message.threadId, messageId: message.id },
       )!,
@@ -309,6 +357,197 @@ function allowedRedirect(value: string, original: string): URL | null {
   }
 }
 
+/** Exact documented comment route; no caller-supplied API origin or query. */
+export function githubAttachmentCommentRequest(
+  attachment: Attachment,
+): GitHubAttachmentCommentRequest | null {
+  const locator = handles.get(attachment);
+  if (locator?.version !== 2 || !locator.sourceBodySha256) return null;
+  const thread =
+    /^github:([^/:]+)\/([^:]+):(?:(issue):)?([1-9][0-9]*)(?::rc:([1-9][0-9]*))?$/i.exec(
+      locator.sourceThreadId,
+    );
+  if (
+    !thread ||
+    !/^[a-z0-9][a-z0-9-]{0,38}$/i.test(thread[1]!) ||
+    !/^[a-z0-9_.-]{1,100}$/i.test(thread[2]!) ||
+    [".", ".."].includes(thread[2]!)
+  )
+    return null;
+  return {
+    url: `https://api.github.com/repos/${thread[1]}/${thread[2]}/${thread[5] ? "pulls" : "issues"}/comments/${locator.sourceMessageId}`,
+    accept: thread[5]
+      ? "application/vnd.github-commitcomment.full+json"
+      : "application/vnd.github.full+json",
+  };
+}
+
+const MAX_COMMENT_RESPONSE_BYTES = 1_048_576;
+
+/** Octokit's authenticated request may go only to this one fixed API route. */
+export function githubAttachmentCommentFetch(
+  expected: GitHubAttachmentCommentRequest,
+  signal: AbortSignal,
+): typeof fetch {
+  return async (input, init) => {
+    if (
+      !isGitHubAttachmentCommentRequest(expected) ||
+      typeof input !== "string" ||
+      input !== expected.url ||
+      init?.method !== "GET"
+    )
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_source_mismatch",
+      );
+    signal.throwIfAborted();
+    const headers = new Headers(init.headers);
+    if (headers.get("accept") !== expected.accept || headers.has("cookie"))
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_source_mismatch",
+      );
+    const response = await guardedRemoteHttpFetch(
+      expected.url,
+      {
+        ...init,
+        method: "GET",
+        headers,
+        credentials: "omit",
+        redirect: "manual",
+        signal,
+      },
+      {
+        allowPrivateNetwork: false,
+        connectTimeoutMs: 5000,
+        responseTimeoutMs: DOWNLOAD_TIMEOUT_MS,
+        error: () =>
+          new GitHubAttachmentUnavailableError(
+            "github_attachment_download_failed",
+          ),
+      },
+    );
+    if (
+      response.status !== 200 ||
+      !response.body ||
+      !/^application\/json(?:;|$)/i.test(
+        response.headers.get("content-type") ?? "",
+      ) ||
+      Number(response.headers.get("content-length") ?? 0) >
+        MAX_COMMENT_RESPONSE_BYTES
+    ) {
+      await response.body?.cancel();
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_not_public",
+      );
+    }
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    const cancel = () => {
+      void reader.cancel().catch(() => undefined);
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      for (;;) {
+        signal.throwIfAborted();
+        const next = await reader.read();
+        signal.throwIfAborted();
+        if (next.done) break;
+        size += next.value.byteLength;
+        if (size > MAX_COMMENT_RESPONSE_BYTES)
+          throw new GitHubAttachmentUnavailableError(
+            "github_attachment_too_large",
+          );
+        chunks.push(next.value);
+      }
+    } finally {
+      signal.removeEventListener("abort", cancel);
+      await reader.cancel().catch(() => undefined);
+    }
+    return new Response(Buffer.concat(chunks), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+}
+
+/**
+ * The authenticated rendering is evidence only for this exact unchanged source.
+ * We support GitHub's image anchor mapping, not arbitrary HTML URL extraction.
+ * No signed URL is returned to the model or added to durable descriptors.
+ */
+export function resolveGitHubCommentAttachmentTarget(
+  attachment: Attachment,
+  value: unknown,
+): URL | null {
+  const locator = handles.get(attachment);
+  const request = githubAttachmentCommentRequest(attachment);
+  if (
+    !locator ||
+    !request ||
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  )
+    return null;
+  const row = value as Record<string, unknown>;
+  const thread =
+    /^github:([^:]+):(?:(issue):)?([1-9][0-9]*)(?::rc:([1-9][0-9]*))?$/i.exec(
+      locator.sourceThreadId,
+    )!;
+  if (
+    String(row.id) !== locator.sourceMessageId ||
+    typeof row.url !== "string" ||
+    row.url.toLowerCase() !== request.url.toLowerCase() ||
+    typeof row.body !== "string" ||
+    row.body.length > 200_000 ||
+    createHash("sha256").update(row.body).digest("hex") !==
+      locator.sourceBodySha256 ||
+    typeof row.body_html !== "string" ||
+    row.body_html.length > 600_000
+  )
+    return null;
+  if (thread[4]) {
+    if (
+      row.pull_request_url !==
+        `https://api.github.com/repos/${thread[1]}/pulls/${thread[3]}` ||
+      String(row.in_reply_to_id ?? row.id) !== thread[4]
+    )
+      return null;
+  } else if (
+    row.issue_url !==
+    `https://api.github.com/repos/${thread[1]}/issues/${thread[3]}`
+  )
+    return null;
+  const assetId = /\/assets\/([a-f0-9-]+)$/i.exec(locator.url)?.[1];
+  // Generic private files have no documented signed-download representation.
+  if (!assetId) return null;
+  const fragment = JSDOM.fragment(row.body_html);
+  const candidates: URL[] = [];
+  for (const anchor of fragment.querySelectorAll("a[href]")) {
+    if (anchor.getAttribute("href") !== locator.url) continue;
+    const images = anchor.querySelectorAll("img[src]");
+    if (images.length !== 1) return null;
+    const src = images[0]!.getAttribute("src")!;
+    const target = allowedRedirect(src, locator.url);
+    if (
+      !target ||
+      target.hostname !== "private-user-images.githubusercontent.com" ||
+      !new RegExp(
+        `^/[1-9][0-9]*/[1-9][0-9]*-${assetId}\\.(?:png|jpe?g|gif|webp)$`,
+        "i",
+      ).test(target.pathname) ||
+      [...target.searchParams.keys()].join(",") !== "jwt" ||
+      !/^[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+$/i.test(
+        target.searchParams.get("jwt") ?? "",
+      ) ||
+      row.body.includes(src)
+    )
+      return null;
+    candidates.push(target);
+  }
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
 function imageSignatureMatches(body: Buffer, mime: string): boolean {
   if (mime === "image/png")
     return body
@@ -326,10 +565,11 @@ function imageSignatureMatches(body: Buffer, mime: string): boolean {
   return !mime.startsWith("image/");
 }
 
-/** No provider identity is ever forwarded: this is public download, not an App-token fallback. */
+/** Download hosts never receive provider credentials, including after canonical resolution. */
 export async function prepareGitHubPublicAttachment(
   attachment: Attachment,
   batchSignal?: AbortSignal,
+  resolveComment?: GitHubAttachmentCommentResolver,
 ): Promise<Attachment> {
   const locator = handles.get(attachment);
   if (!locator)
@@ -342,6 +582,7 @@ export async function prepareGitHubPublicAttachment(
     : downloadSignal;
   try {
     let url = new URL(locator.url);
+    let resolvedCanonicalComment = false;
     for (let redirects = 0; redirects <= 3; redirects++) {
       signal.throwIfAborted();
       const response = await guardedRemoteHttpFetch(
@@ -386,8 +627,27 @@ export async function prepareGitHubPublicAttachment(
         response.status === 401 ||
         response.status === 403 ||
         response.status === 404
-      )
+      ) {
+        const commentRequest = githubAttachmentCommentRequest(attachment);
+        if (!resolvedCanonicalComment && resolveComment && commentRequest) {
+          await response.body?.cancel();
+          resolvedCanonicalComment = true;
+          signal.throwIfAborted();
+          const canonical = await resolveComment(commentRequest, signal);
+          signal.throwIfAborted();
+          const target = resolveGitHubCommentAttachmentTarget(
+            attachment,
+            canonical,
+          );
+          if (!target)
+            throw new GitHubAttachmentUnavailableError(
+              "github_attachment_not_public",
+            );
+          url = target;
+          continue;
+        }
         return await rejectResponse("github_attachment_not_public");
+      }
       if (response.status !== 200 || !response.body)
         return await rejectResponse("github_attachment_invalid_response");
       const mimeType = normalizeUploadAttachmentContentType({

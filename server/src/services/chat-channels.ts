@@ -8448,6 +8448,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   async function ingestAttachments(input: {
     endpoint: EndpointRow;
+    endpointRuntime: ChatSdkEndpointRuntime;
+    deliveryId: string;
     issueId: string;
     issueCommentId: string;
     attachments: Attachment[];
@@ -8515,6 +8517,115 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       existingByFingerprint.set(fingerprint, ids);
     }
     const storedIds: string[] = [];
+    const withGitHubAuthorization = async <T>(
+      work: (tx: DbTransaction) => Promise<T>,
+    ): Promise<T> => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await db.transaction(async (tx) => {
+            const action = await tx
+              .select()
+              .from(chatActions)
+              .where(
+                and(
+                  eq(chatActions.companyId, input.endpoint.companyId),
+                  eq(chatActions.endpointId, input.endpoint.id),
+                  eq(chatActions.deliveryId, input.deliveryId),
+                  eq(chatActions.kind, "inbound_wakeup"),
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0]);
+            if (
+              !action ||
+              !["preparing", "issued", "processing", "processed"].includes(
+                action.status,
+              ) ||
+              action.payload.issueId !== input.issueId ||
+              action.payload.commentId !== input.issueCommentId
+            )
+              throw forbidden(
+                "The attachment's current chat admission is unavailable",
+                { code: "chat_action_authorization_changed" },
+              );
+            const current = await authorizeInboundWakeup(tx, action);
+            // Delivery settlement/replay can update these receipts without
+            // taking the issue lock. Lock in delivery -> action order only
+            // after policy authorization; NOWAIT breaks cross-worker lock
+            // inversions and the outer loop retries the whole transaction.
+            const lockedDelivery = await tx
+              .select()
+              .from(chatDeliveries)
+              .where(
+                and(
+                  eq(chatDeliveries.companyId, input.endpoint.companyId),
+                  eq(chatDeliveries.id, input.deliveryId),
+                ),
+              )
+              .for("update", { noWait: true })
+              .limit(1)
+              .then((rows) => rows[0]);
+            const lockedAction = await tx
+              .select()
+              .from(chatActions)
+              .where(
+                and(
+                  eq(chatActions.companyId, input.endpoint.companyId),
+                  eq(chatActions.id, action.id),
+                ),
+              )
+              .for("update", { noWait: true })
+              .limit(1)
+              .then((rows) => rows[0]);
+            const scopeKeys = [
+              "version",
+              "issueId",
+              "commentId",
+              "agentId",
+              "sessionGeneration",
+              "requestedByActorType",
+              "requestedByActorId",
+            ] as const;
+            if (
+              current.delivery.state !== "processing" ||
+              !lockedDelivery ||
+              !lockedAction ||
+              lockedDelivery.state !== "processing" ||
+              lockedDelivery.endpointId !== action.endpointId ||
+              lockedDelivery.conversationId !== action.conversationId ||
+              lockedDelivery.principalId !== action.principalId ||
+              lockedDelivery.attempts !== current.delivery.attempts ||
+              JSON.stringify(lifecycleRuntimeFence(lockedDelivery)) !==
+                JSON.stringify(lifecycleRuntimeFence(current.delivery)) ||
+              lockedAction.endpointId !== action.endpointId ||
+              lockedAction.deliveryId !== action.deliveryId ||
+              lockedAction.conversationId !== action.conversationId ||
+              lockedAction.principalId !== action.principalId ||
+              lockedAction.kind !== "inbound_wakeup" ||
+              !["preparing", "issued", "processing", "processed"].includes(
+                lockedAction.status,
+              ) ||
+              scopeKeys.some(
+                (key) => lockedAction.payload[key] !== action.payload[key],
+              )
+            )
+              throw forbidden(
+                "The attachment's current chat admission is unavailable",
+                { code: "chat_action_authorization_changed" },
+              );
+            return await work(tx);
+          });
+        } catch (error) {
+          if (!isExternalChatWaitAuthorizationContention(error) || attempt >= 4)
+            throw error;
+          // Retry the complete short transaction; no network/storage work or
+          // backoff occurs while governance rows are locked.
+          await new Promise((resolve) =>
+            setTimeout(resolve, 20 * (attempt + 1)),
+          );
+        }
+      }
+    };
     // One shared deadline bounds the sequential batch; an expired batch never
     // starts another GitHub request. Other providers retain their own policy.
     const githubBatchSignal =
@@ -8527,9 +8638,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // Resolve public bytes only here, after durable comment admission, and
         // then apply the same storage/type policy as every native attachment.
         if (input.endpoint.provider === "github") {
+          await withGitHubAuthorization(async () => {});
           attachment = await prepareGitHubPublicAttachment(
             attachment,
             githubBatchSignal,
+            async (request, signal) => {
+              await withGitHubAuthorization(async () => {});
+              return (
+                (await input.endpointRuntime.resolveGitHubAttachmentComment?.(
+                  request,
+                  signal,
+                )) ?? null
+              );
+            },
           );
         }
         if (
@@ -8576,6 +8697,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ]);
         const existingIds = existingByFingerprint.get(fingerprint);
         const existingId = existingIds?.shift();
+        if (input.endpoint.provider === "github") {
+          // Revoke during either API resolution or the anonymous byte download
+          // must prevent storage and attachment registration for that input.
+          await withGitHubAuthorization(async () => {});
+        }
         if (existingId) {
           storedIds.push(existingId);
           continue;
@@ -8587,7 +8713,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           contentType,
           body,
         });
-        const row = await issuesSvc.createAttachment({
+        const registration = {
           issueId: input.issueId,
           issueCommentId: input.issueCommentId,
           provider: stored.provider,
@@ -8597,9 +8723,32 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           sha256: stored.sha256,
           originalFilename: stored.originalFilename,
           createdByUserId: input.actorUserId,
-        });
+        };
+        let row;
+        try {
+          row =
+            input.endpoint.provider === "github"
+              ? await withGitHubAuthorization((tx) =>
+                  issueService(tx as unknown as Db).createAttachment(
+                    registration,
+                  ),
+                )
+              : await issuesSvc.createAttachment(registration);
+        } catch (error) {
+          // An explicit authorization denial happens before registration. Do
+          // not delete on ambiguous database errors which may have committed.
+          if (
+            input.endpoint.provider === "github" &&
+            isExternalActionAuthorizationChange(error)
+          )
+            await options.storage
+              .deleteObject(input.endpoint.companyId, stored.objectKey)
+              .catch(() => undefined);
+          throw error;
+        }
         storedIds.push(row.id);
       } catch (error) {
+        if (isExternalActionAuthorizationChange(error)) throw error;
         // Use the closed current-input omission vocabulary consumed by native
         // prompts; provider-specific diagnostics remain redacted log codes.
         omit(
@@ -10302,6 +10451,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // missing from this exact inbound comment.
         const attachmentResult = await ingestAttachments({
           endpoint,
+          endpointRuntime,
+          deliveryId: activeDelivery.id,
           issueId: rebound.issueId,
           issueCommentId: inboundCommentId,
           attachments: nativeInboundAttachments,
@@ -11232,6 +11383,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const { actorUserId, comment, conversation, issue } = taskMutation;
       const attachmentResult = await ingestAttachments({
         endpoint,
+        endpointRuntime,
+        deliveryId: activeDelivery.id,
         issueId: conversation.issueId,
         issueCommentId: comment.id,
         attachments: nativeInboundAttachments,
@@ -23711,20 +23864,58 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
     const runId = runIdFromMilestonePublication(publication);
     if (!runId) return null;
-    const run = await db
-      .select({
-        status: heartbeatRuns.status,
-        errorCode: heartbeatRuns.errorCode,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.id, runId),
-          eq(heartbeatRuns.companyId, publication.companyId),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${publication.issueId}`,
-        ),
-      )
-      .then((rows) => rows[0] ?? null);
+    const run = await db.transaction(async (tx) => {
+      // Use native finalization's issue -> run lock order. If terminalization
+      // won, the current status suppresses this obsolete provider update. If
+      // this short authorization snapshot wins, the progress was still true
+      // at its durable send boundary and the later final remains authoritative.
+      const currentIssue = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.id, publication.issueId),
+            eq(issues.companyId, publication.companyId),
+          ),
+        )
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!currentIssue) return null;
+      return tx
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, runId),
+            eq(heartbeatRuns.companyId, publication.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${publication.issueId}`,
+          ),
+        )
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+    });
+    const baseProgressKey = `run:${runId}:${progress}:${publication.endpointId}`;
+    const nativeProgressPrefix = `run:${runId}:working:${publication.endpointId}:native:`;
+    const isTerminalizableProgress =
+      (progress === "queued" || progress === "working") &&
+      (publication.idempotencyKey === baseProgressKey ||
+        publication.idempotencyKey.startsWith(nativeProgressPrefix));
+    if (
+      isTerminalizableProgress &&
+      run &&
+      [
+        "succeeded",
+        "interrupted",
+        "failed",
+        "cancelled",
+        "timed_out",
+      ].includes(run.status)
+    ) {
+      return "Run reached a terminal state before progress delivery";
+    }
     // Match only the closed ownership-attention projection. Historical progress
     // without an extant run retains its existing delivery semantics.
     const ownershipBlocked =
