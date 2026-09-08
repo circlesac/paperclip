@@ -268,12 +268,14 @@ function hasYieldedSemanticResult(resultJson: Record<string, unknown>) {
 function readAcceptedExternalChatResponseWakeSummary(
   resultJson: Record<string, unknown>,
   reviewPresentationAuthorized = false,
+  committedResponseAuthorized = false,
 ) {
   const nativeResult = record(resultJson.nativeResult);
   const continuation = record(nativeResult.continuation);
   if (
     resultJson.finalizationPhase !== "committed" ||
-    (resultJson.finalizationReasonCode !== "external_chat_response_waiting" &&
+    (!committedResponseAuthorized &&
+      resultJson.finalizationReasonCode !== "external_chat_response_waiting" &&
       !(
         reviewPresentationAuthorized &&
         resultJson.finalizationReasonCode === "governed_response_waiting"
@@ -358,6 +360,9 @@ export function resolveHeartbeatRunResponse(input: {
   existingComment?: { id: string; body?: string | null } | null;
   preferFinalResponseOverExistingComment?: boolean;
   externalChatResponseWakeSummaryAuthorized?: boolean;
+  /** Server-only proof of the exact accepted response after durable status
+   * finalization. Never read this capability from provider/context JSON. */
+  externalChatCommittedResponseWakeSummaryAuthorized?: boolean;
   externalChatReviewResponseSummaryAuthorized?: boolean;
   finalAgentMessage?: {
     text: string;
@@ -453,6 +458,7 @@ export function resolveHeartbeatRunResponse(input: {
           ? readAcceptedExternalChatResponseWakeSummary(
               resultJson,
               input.externalChatReviewResponseSummaryAuthorized === true,
+              input.externalChatCommittedResponseWakeSummaryAuthorized === true,
             )
           : null;
       if (responseWakeSummary) {

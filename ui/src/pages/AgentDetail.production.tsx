@@ -3312,34 +3312,15 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
   });
 
   const canRetryRun = run.status === "failed" || run.status === "timed_out";
-  const retryPayload = useMemo(() => {
-    const payload: Record<string, unknown> = {};
-    const context = asRecord(run.contextSnapshot);
-    if (!context) return payload;
-    const issueId = asNonEmptyString(context.issueId);
-    const taskId = asNonEmptyString(context.taskId);
-    const taskKey = asNonEmptyString(context.taskKey);
-    if (issueId) payload.issueId = issueId;
-    if (taskId) payload.taskId = taskId;
-    if (taskKey) payload.taskKey = taskKey;
-    return payload;
-  }, [run.contextSnapshot]);
   const retryRun = useMutation({
     mutationFn: async () => {
-      const result = await agentsApi.wakeup(run.agentId, {
-        source: "on_demand",
-        triggerDetail: "manual",
-        reason: "retry_failed_run",
-        payload: retryPayload,
-      }, run.companyId);
-      if (!("id" in result)) {
-        throw new Error(result.message ?? "Retry was skipped.");
-      }
-      return result;
+      return agentsApi.retryFailedRun(run.agentId, run.id, run.companyId);
     },
     onSuccess: (newRun) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId, run.agentId) });
-      navigate(`/agents/${agentRouteId}/runs/${newRun.id}`);
+      if (newRun.runId)
+        navigate(`/agents/${agentRouteId}/runs/${newRun.runId}`);
+      else if (newRun.issueId) navigate(`/issues/${newRun.issueId}`);
     },
   });
 

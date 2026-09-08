@@ -20,6 +20,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import type { ChatChannelService } from "../services/chat-channels.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -3422,6 +3423,10 @@ export function issueRoutes(
   db: Db,
   storage: StorageService,
   opts: {
+    chatRunRetries?: Pick<
+      ChatChannelService,
+      "prepareFailedChatRunRetry" | "processFailedChatRunRetry"
+    >;
     feedbackExportService?: {
       flushPendingFeedbackTraces(input?: {
         companyId?: string;
@@ -9037,10 +9042,8 @@ export function issueRoutes(
           { source: "recovery_action_resolution" },
         );
 
+        let chatRetry: { actionId: string; issueId: string } | null = null;
         if (outcome === "restored" && sourceIssueStatus === "todo") {
-          // This route restores generic issue execution, not an exact admitted
-          // chat request. Refuse before changing either record: the post-commit
-          // wake is best-effort and cannot roll back a misleading restoration.
           const [chatBinding] = await tx
             .select({ id: chatConversations.id })
             .from(chatConversations)
@@ -9052,9 +9055,32 @@ export function issueRoutes(
             )
             .limit(1);
           if (chatBinding) {
-            throw conflict(
-              "Restoring this task needs the exact failed chat request and current access. Send the request again in the current connected conversation; this recovery action has not been resolved.",
-              { code: "chat_recovery_requires_authorized_context" },
+            // Admit the exact server-owned recovery evidence before resolving
+            // either record. The durable worker, not a best-effort generic wake,
+            // owns execution after commit and rechecks current chat access.
+            const failedRunId = activeRecoveryAction.evidence?.runId;
+            if (
+              !opts.chatRunRetries ||
+              req.actor.type !== "board" ||
+              !req.actor.userId ||
+              typeof failedRunId !== "string" ||
+              !isUuidLike(failedRunId) ||
+              !lockedIssue.assigneeAgentId
+            ) {
+              throw conflict(
+                "Restoring this task needs the exact failed chat request and current access. Send the request again in the current connected conversation; this recovery action has not been resolved.",
+                { code: "chat_recovery_requires_authorized_context" },
+              );
+            }
+            chatRetry = await opts.chatRunRetries.prepareFailedChatRunRetry(
+              tx,
+              {
+                companyId: lockedIssue.companyId,
+                issueId: lockedIssue.id,
+                agentId: lockedIssue.assigneeAgentId,
+                failedRunId,
+                initiatedByUserId: req.actor.userId,
+              },
             );
           }
         }
@@ -9218,7 +9244,7 @@ export function issueRoutes(
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
 
-        return { issue, recoveryAction };
+        return { issue, recoveryAction, chatRetry };
       });
       for (const publication of postCommitActivityPublications)
         publishActivity(publication);
@@ -9269,7 +9295,20 @@ export function issueRoutes(
         },
       });
 
-      if (
+      if (result.chatRetry) {
+        // The intent is committed with recovery resolution. A lost immediate
+        // dispatch response cannot erase it; the durable sweep will continue.
+        try {
+          await opts.chatRunRetries!.processFailedChatRunRetry(
+            result.chatRetry.actionId,
+          );
+        } catch {
+          logger.warn(
+            { retryActionId: result.chatRetry.actionId },
+            "chat recovery retry dispatch deferred to durable worker",
+          );
+        }
+      } else if (
         sourceIssueStatus === "todo" &&
         result.issue.assigneeAgentId &&
         (existing.status !== result.issue.status ||

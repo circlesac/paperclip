@@ -270,6 +270,14 @@ export interface AgentWakeupSkipped {
 
 export type AgentWakeupResponse = HeartbeatRun | AgentWakeupSkipped;
 
+/** A durable chat retry can be accepted before a scheduler run exists. */
+export interface ChatFailedRunRetryResponse {
+  actionId: string;
+  issueId: string;
+  runId: string | null;
+  status: "queued" | "deferred" | "running" | "succeeded" | "failed" | "cancelled";
+}
+
 export interface HeartbeatRunEvent {
   id: number;
   companyId: string;

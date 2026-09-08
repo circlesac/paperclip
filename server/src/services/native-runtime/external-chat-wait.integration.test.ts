@@ -21,6 +21,7 @@ import {
   companies,
   companyMemberships,
   completionContracts,
+  closeRegisteredClients,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -71,12 +72,17 @@ import { createStorageService } from "../../storage/service.js";
 import { subscribeAllCompanyLiveEvents } from "../live-events.js";
 
 describe("native external-chat response wait", () => {
+  const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
   let temporary: Awaited<
     ReturnType<typeof startEmbeddedPostgresTestDatabase>
   > | null = null;
   let db: ReturnType<typeof createDb>;
 
   beforeAll(async () => {
+    if (externalTestDatabaseUrl) {
+      db = createDb(externalTestDatabaseUrl);
+      return;
+    }
     temporary = await startEmbeddedPostgresTestDatabase(
       "native-external-chat-wait-",
     );
@@ -85,6 +91,8 @@ describe("native external-chat response wait", () => {
 
   afterAll(async () => {
     await temporary?.cleanup();
+    if (externalTestDatabaseUrl)
+      await closeRegisteredClients(externalTestDatabaseUrl);
   });
 
   async function seedWaitTurn(
@@ -113,7 +121,9 @@ describe("native external-chat response wait", () => {
     const applicationId = randomUUID();
     const connectionId = randomUUID();
     const contractSha256 = `external-chat-wait-${randomUUID()}`;
-    const issuePrefix = `W${randomUUID().replaceAll("-", "").slice(0, 5).toUpperCase()}`;
+    // Keep prefix uniqueness as strong as the company's primary key. A five-
+    // digit random prefix can collide within this fixture-heavy suite.
+    const issuePrefix = `W${companyId.replaceAll("-", "").toUpperCase()}`;
 
     await db.insert(companies).values({
       id: companyId,
@@ -1218,6 +1228,135 @@ describe("native external-chat response wait", () => {
       await rm(root, { recursive: true, force: true });
     }
   }
+
+  it.each(
+    (["direct", "answered_question"] as const).flatMap((source) =>
+      (["error", "paused", "terminated", "pending_approval"] as const).map(
+        (status) => ({ source, status }),
+      ),
+    ),
+  )(
+    "uses current invokability for pre-start reviewed GitHub $source with agent $status",
+    async ({ source, status }) => {
+      const fixture =
+        source === "direct"
+          ? await seedWaitTurn("github")
+          : await seedGitHubBoardAnsweredTurn();
+      if (source === "direct") await seedPriorCompletionReview(fixture);
+      // A previous run's failure projects `error` onto the agent. The next
+      // already-claimed turn attests before execution-start changes it to
+      // `running`; this does not grant permission to clear an operator gate.
+      await db
+        .update(agents)
+        .set({
+          status,
+          errorReason: status === "error" ? "Prior run failed" : null,
+        })
+        .where(eq(agents.id, fixture.agentId));
+      const [run] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId));
+      const [issue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, fixture.issueId));
+      const gates = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.issueId, fixture.issueId));
+      expect(issue).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: fixture.agentId,
+        executionRunId: fixture.runId,
+      });
+      expect(gates.some((gate) => gate.status === "pending")).toBe(true);
+      const context = structuredClone(run!.contextSnapshot!);
+      const onQuestionResponseAttested = vi.fn();
+      await expect(
+        attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: context,
+          onQuestionResponseAttested,
+        }),
+      ).resolves.toBe(status === "error");
+      expect(onQuestionResponseAttested).toHaveBeenCalledTimes(
+        status === "error" && source === "answered_question" ? 1 : 0,
+      );
+      // Attestation proves the current exact binding without checking out,
+      // approving, retiring, or otherwise rewriting any durable authority.
+      expect(
+        await db.select().from(issues).where(eq(issues.id, fixture.issueId)),
+      ).toEqual([issue]);
+      expect(
+        await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, fixture.runId)),
+      ).toEqual([run]);
+      expect(
+        await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.issueId, fixture.issueId)),
+      ).toEqual(gates);
+      expect(
+        await db
+          .select({ status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, fixture.agentId)),
+      ).toEqual([{ status }]);
+    },
+  );
+
+  it.each([
+    "execution_owner",
+    "identity_revoked",
+    "retired_conversation",
+    "wrong_comment",
+  ] as const)(
+    "does not treat an invokable errored agent as reviewed-chat authority after %s",
+    async (change) => {
+      const fixture = await seedWaitTurn("github");
+      await seedPriorCompletionReview(fixture);
+      await db
+        .update(agents)
+        .set({ status: "error" })
+        .where(eq(agents.id, fixture.agentId));
+      const [run] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId));
+      const context = structuredClone(run!.contextSnapshot!);
+      if (change === "execution_owner")
+        await db
+          .update(issues)
+          .set({ executionRunId: null })
+          .where(eq(issues.id, fixture.issueId));
+      if (change === "identity_revoked")
+        await db
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.endpointId, fixture.endpointId));
+      if (change === "retired_conversation")
+        await db
+          .update(chatConversations)
+          .set({ state: "completed" })
+          .where(eq(chatConversations.id, fixture.conversationId));
+      if (change === "wrong_comment") {
+        context.wakeCommentId = randomUUID();
+        context.wakeCommentIds = [context.wakeCommentId];
+      }
+      await expect(
+        attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: context,
+        }),
+      ).resolves.toBe(false);
+    },
+  );
 
   it("attests a genuine Slack mixed-question modal answer for its native continuation", async () => {
     const fixture = await seedAnsweredChatTurn("slack", undefined, "form");

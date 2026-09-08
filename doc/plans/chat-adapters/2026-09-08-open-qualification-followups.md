@@ -5,7 +5,7 @@ are fixed or moved into permanent verification documentation.** It is not a
 release-completion claim. Completed work and historical failures are recorded
 in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md).
 
-## Current work: exact failed-chat retry and source-file lifecycle
+## Current work: exact chat retry, accepted answers and session recovery
 
 Base `63c8b5d8d` is pushed. All 24 CI jobs, quality, and Greptile's explicit
 500-file review passed; PR #13038 still requires CODEOWNER approval and is not
@@ -18,18 +18,18 @@ which now has **432 files**. Written plans and production icons remain; archive
 links preserve the exact historical images. The focused UI contract suite
 passed. The retry changes below remain uncommitted and are not in that cleanup.
 
-The next implementation is a positive, server-authorized retry of an ordinary
-failed chat run. Board entry points must send the selected failed run ID, not
-copy mutable task/comment context. Persist a distinct idempotent retry intent,
-prove the complete original admitted comment batch and actor, recheck current
+The exact failed-run retry implementation now uses the selected failed run ID,
+not mutable client task/comment context. It persists a distinct idempotent retry
+intent, proves the original admitted comment batch and actor, rechecks current
 source/access at enqueue, deferred promotion, execution and publication, and
-disable coalescing for that exact retry. Recovery-card resolution and retry
-intent creation must commit atomically. Never re-arm an original delivery or
-clear native integrity/quarantine evidence. Accepted/uncertain results, old
-conversation generations and unsupported interaction lineage remain refused.
-James owns chat service/admission/integration; Epicurus owns scheduler fences;
-Boole owns route regressions; root owns contracts/UI and live qualification.
-This is work in progress, not a verified retry feature yet.
+disables coalescing for that exact retry. Recovery-card resolution and retry
+intent creation commit atomically. Original deliveries are never re-armed;
+native integrity/quarantine evidence remains intact. Accepted/uncertain results,
+old conversation generations and unsupported interaction lineage are refused.
+Fresh combined integration passed 498/498; the deterministic browser suite
+passed 21/21 on a separate throwaway instance (no provider network calls).
+An ordinary positive native retry still requires live qualification after the
+physical-session recovery below; fixtures are not a substitute for that result.
 
 Slack source-edit invalidation passed live on server 58: the disposable file
 reply `1788900766.028899` was edited through Slack, then native Luna was asked
@@ -50,14 +50,15 @@ seconds before A finished, started 32ms after A finished, then failed with
 The original inputs and accepted-result/quarantine evidence must be preserved;
 do not rerun accepted A, clear quarantine, or mint a new session to hide this.
 
-Epicurus is reproducing control-command starvation behind a durable provider
-event batch and repairing shutdown ordering without weakening checkpoint
-proof. James is finishing exact retry eligibility, including read-only physical
-owner validation. Boole is adding actual rendered retry regressions to the
-existing deterministic browser suite. Root is checking the real recovery UX
-and maintaining evidence. Server 58 remains running on the earlier production
-server/native bytes; UI HMR includes current UI edits. Do not restart until
-native forensics are captured and the source/binary repair is verified.
+Control-command starvation behind durable provider output was repaired in
+`b810d60be` without weakening checkpoint proof. James now owns the missing
+exact-authority, control-only session cleanup implementation and its tests.
+Epicurus owns accepted-response finalization; Boole traced the reviewed GitHub
+admission failure; root owns integration, UI and live qualification. Server 58
+still runs the earlier server code; UI HMR includes current UI edits and future
+native launches will use the rebuilt binary. Do not restart merely to erase
+the in-memory quarantine. Verify the retained physical state and use a tested
+recovery operation first.
 
 Fresh read-only inspection found A automatically became `succeeded`/`committed`
 at 21:06:16.107 without another provider attempt, but its accepted summary was
@@ -94,6 +95,27 @@ Boole is investigating the second message's reviewed-binding failure.
 Do not clear quarantine, reset a task, or restart solely to erase the in-memory
 gate. The accepted Telegram answer can be presented independently, but that
 does not prove its provider session is safe to reuse.
+
+The GitHub binding failure was a separate pre-start invokability mismatch:
+attestation denied an agent in `error` status even though the canonical
+invocation policy permits it. The narrow fix uses that canonical policy and
+keeps every source, owner, identity, conversation and approval check. Both
+direct-input and answered-question regressions failed before the fix; the full
+external-chat-wait suite passed 142/142 afterward. Paused, terminated and
+pending-approval agents remain denied. The original B request is intact and
+must be retried through exact-source recovery, not replaced with a new comment.
+
+The broader 142-case suite also caught a real finalizer regression: clean,
+already-materialized successful runs were being rewritten on reconciliation.
+The conditional projection now leaves them untouched. Diagnostic recovery
+captures current locked-row error fields rather than stale pre-lock values;
+two forced interleavings reproduced loss of the newer diagnostic before that
+repair. These corrections preserve the accepted answer, later task status,
+existing JSON evidence and telemetry deduplication. Final native coverage passed
+31/31. Root reran the 23 accepted-response cases on another fresh database after
+the last diagnostic-capture refinement: 23/23 passed, 475 unrelated cases
+intentionally filtered. The retry/presentation slice is checkpointed separately
+from unfinished session maintenance; no live server restart has deployed it yet.
 
 ## Earlier work: Discord restart repair and final landing gates
 

@@ -3305,20 +3305,13 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
   }, [run.contextSnapshot]);
   const retryRun = useMutation({
     mutationFn: async () => {
-      const result = await agentsApi.wakeup(run.agentId, {
-        source: "on_demand",
-        triggerDetail: "manual",
-        reason: "retry_failed_run",
-        payload: retryPayload,
-      }, run.companyId);
-      if (!("id" in result)) {
-        throw new Error(result.message ?? "Retry was skipped.");
-      }
-      return result;
+      return agentsApi.retryFailedRun(run.agentId, run.id, run.companyId);
     },
     onSuccess: (newRun) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(run.companyId, run.agentId) });
-      navigate(`/agents/${agentRouteId}/runs/${newRun.id}`);
+      if (newRun.runId)
+        navigate(`/agents/${agentRouteId}/runs/${newRun.runId}`);
+      else if (newRun.issueId) navigate(`/issues/${newRun.issueId}`);
     },
   });
 

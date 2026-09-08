@@ -219,6 +219,17 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents exact failed-run selection and durable accepted retry responses", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    const wake = res.body.paths["/api/agents/{id}/wakeup"].post;
+    expect(
+      wake.requestBody.content["application/json"].schema.properties
+        .failedRunId,
+    ).toMatchObject({ type: "string", format: "uuid" });
+    expect(wake.responses["202"]).toBeDefined();
+    expect(wake.responses["409"]).toBeDefined();
+    expect(wake.description).toContain("durable queued/deferred receipt");
+  });
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 

@@ -877,6 +877,7 @@ export type { CostEvent, CostSummary, IssueCostSummary, CostByAgent, CostByProvi
 export type { FinanceEvent, FinanceSummary, FinanceByBiller, FinanceByKind } from "./finance.js";
 export type {
   AgentWakeupResponse,
+  ChatFailedRunRetryResponse,
   AgentWakeupSkipped,
   GitWorktreeBranchAncestryVerdict,
   GitWorktreeBranchIncoherenceEvidence,

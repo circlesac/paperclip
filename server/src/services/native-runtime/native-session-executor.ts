@@ -10,6 +10,7 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  opendirSync,
   readFileSync,
   readdirSync,
   readlinkSync,
@@ -1525,6 +1526,170 @@ type PriorRunnerdStateVerification =
   | "scope_mismatch"
   | "terminal_state_indeterminate"
   | "unavailable";
+
+/** Read-only admission evidence for an explicit retry of a terminal failed
+ * run. Never migrate/archive state, release an owner, or contact a provider.
+ * Normal executor admission independently verifies the state again. */
+export function nativeFailedRunRetryStateIsSafe(input: {
+  execution: unknown;
+  companyId: string;
+  issueId: string;
+  agentId: string;
+  runId: string;
+  nativeSessionId: string;
+  runnerInstanceId: string;
+  providerSessionId: string | null;
+  processPid: number | null;
+  processGroupId: number | null;
+  recoveryMode: "bootstrap_retry" | "exact_checkpoint_resume";
+  allowVerifiedBackup: boolean;
+}): boolean {
+  try {
+    const execution = parseNativeExecutionInput(input.execution);
+    if (
+      execution.binding.companyId !== input.companyId ||
+      execution.binding.issueId !== input.issueId ||
+      execution.binding.agentId !== input.agentId ||
+      execution.binding.runId !== input.runId ||
+      nativeSessionKey(execution) !== input.nativeSessionId ||
+      !input.runnerInstanceId
+    )
+      return false;
+    const scope = nativeSessionScopeKey(execution);
+    if (
+      executingRunnerdSessionScopes.has(scope) ||
+      initializingSessionToolAuthorities.has(scope) ||
+      warmNativeSessions.has(scope)
+    )
+      return false;
+    for (const [id, group] of [
+      [input.processPid, false],
+      [input.processGroupId, true],
+    ] as const) {
+      if (id === null) continue;
+      if (!Number.isSafeInteger(id) || id <= 0) return false;
+      try {
+        process.kill(group ? -id : id, 0);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+      }
+    }
+    const root = scopedRunnerdStateRoot(execution);
+    if (!lstatSync(root, { throwIfNoEntry: false })) {
+      if (
+        input.recoveryMode !== "bootstrap_retry" ||
+        lstatSync(legacyRunnerdStateRoot(execution), {
+          throwIfNoEntry: false,
+        }) ||
+        lstatSync(legacyCompanyRunnerdStateRoot(execution), {
+          throwIfNoEntry: false,
+        })
+      )
+        return false;
+      // A missing root after quarantine is not proof of a clean bootstrap.
+      const quarantine = resolve(runnerdStateBase(), "quarantine");
+      if (lstatSync(quarantine, { throwIfNoEntry: false })) {
+        if (!isSafeNativeStateDirectory(quarantine)) return false;
+        const directory = opendirSync(quarantine);
+        try {
+          const prefixes = [
+            root,
+            legacyRunnerdStateRoot(execution),
+            legacyCompanyRunnerdStateRoot(execution),
+          ].map((path) => `${basename(path)}.`);
+          for (let count = 0; ; count++) {
+            const entry = directory.readSync();
+            if (!entry) break;
+            if (
+              count >= 4096 ||
+              prefixes.some((prefix) => entry.name.startsWith(prefix))
+            )
+              return false;
+          }
+        } finally {
+          directory.closeSync();
+        }
+      }
+      return true;
+    }
+    const identity = readRunnerdDurableIdentity(root);
+    if (
+      !durableIdentityMatchesSession(identity, execution) ||
+      !durableIdentityMatchesExecution(identity, execution) ||
+      identity.runnerInstanceId !== input.runnerInstanceId
+    )
+      return false;
+    let stateRoot = root;
+    const direct = runnerdAuthorityLifecycle(root, identity);
+    if (direct === "absent" && input.allowVerifiedBackup) {
+      const backup = verifyNativeHarnessBackup({
+        root,
+        execution,
+        runnerInstanceId: input.runnerInstanceId,
+      });
+      if (!backup) return false;
+      stateRoot = backup.root;
+    }
+    if (runnerdAuthorityLifecycle(stateRoot, identity) !== "suspended")
+      return false;
+    const runnerState = record(
+      JSON.parse(
+        readBoundedNativeFile(
+          resolve(stateRoot, "runner", "runner-state.json"),
+          NATIVE_RUNNER_STATE_MAX_BYTES,
+          "runner_state_too_large",
+        ).toString("utf8"),
+      ),
+    );
+    if (
+      runnerState.schema !== RUNNERD_STATE_SCHEMA ||
+      runnerState.lifecycle !== "suspended" ||
+      runnerState.runId !== identity.runId ||
+      runnerState.runnerInstanceId !== identity.runnerInstanceId ||
+      runnerState.normalizedSessionId !== identity.normalizedSessionId ||
+      runnerState.environmentLeaseId !== identity.environmentLeaseId ||
+      !Array.isArray(runnerState.outbox) ||
+      runnerState.outbox.length !== 0
+    )
+      return false;
+    const providerFile = resolve(
+      stateRoot,
+      "runner",
+      runnerProviderStateFilename(execution),
+    );
+    if (input.recoveryMode === "bootstrap_retry") return false;
+    const providerState = record(
+      JSON.parse(
+        readBoundedNativeFile(
+          providerFile,
+          NATIVE_RUNNER_STATE_MAX_BYTES,
+          "runner_provider_state_too_large",
+        ).toString("utf8"),
+      ),
+    );
+    if (
+      !Array.isArray(providerState.pendingEvents) ||
+      providerState.pendingEvents.length !== 0 ||
+      !Array.isArray(providerState.queuedEvents) ||
+      providerState.queuedEvents.length !== 0 ||
+      Object.keys(record(record(providerState.toolBridge).pending)).length !==
+        0 ||
+      providerState.activeProviderResultFingerprint != null
+    )
+      return false;
+    const providerIdentity = providerSessionIdentityFromDurableProviderState({
+      execution,
+      providerState,
+    });
+    return (
+      !!input.providerSessionId &&
+      providerIdentity.providerSessionId === input.providerSessionId
+    );
+  } catch {
+    return false;
+  }
+}
 
 async function verifyPriorRunnerdStateForSessionScope(input: {
   db: Db;

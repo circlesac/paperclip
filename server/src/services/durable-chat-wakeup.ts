@@ -1,6 +1,163 @@
 import { createHash } from "node:crypto";
-import type { Db } from "@paperclipai/db";
-import { sql, type SQLWrapper } from "drizzle-orm";
+import { chatActions, type Db } from "@paperclipai/db";
+import { eq, sql, type SQLWrapper } from "drizzle-orm";
+import { HttpError } from "../errors.js";
+
+export interface CommittedChatResponseAuthorizationInput {
+  companyId: string;
+  issueId: string;
+  agentId: string;
+  runId: string;
+  resultId: string;
+}
+
+type CommittedChatResponseAuthority = (
+  tx: Db,
+  input: CommittedChatResponseAuthorizationInput,
+) => Promise<void>;
+
+const committedChatResponseAuthorities = new WeakMap<
+  Db,
+  CommittedChatResponseAuthority
+>();
+
+export class CommittedChatResponseAuthorizationError extends HttpError {
+  constructor() {
+    super(
+      409,
+      "The accepted chat response is no longer authorized for this conversation.",
+      {
+        code: "chat_committed_response_not_authorized",
+      },
+    );
+    this.name = "CommittedChatResponseAuthorizationError";
+  }
+}
+
+/** Separate, server-only authority for presenting an already accepted result.
+ * This grants no permission to execute or repair the provider session. */
+export function registerCommittedChatResponseAuthority(
+  db: Db,
+  authority: CommittedChatResponseAuthority,
+): () => void {
+  committedChatResponseAuthorities.set(db, authority);
+  return () => {
+    if (committedChatResponseAuthorities.get(db) === authority) {
+      committedChatResponseAuthorities.delete(db);
+    }
+  };
+}
+
+export async function authorizeCommittedChatResponse(
+  db: Db,
+  tx: Db,
+  input: CommittedChatResponseAuthorizationInput,
+): Promise<void> {
+  const authority = committedChatResponseAuthorities.get(db);
+  if (!authority) throw new CommittedChatResponseAuthorizationError();
+  await authority(tx, input);
+}
+
+export interface FailedChatRunRetryAuthorizationInput {
+  phase: "admission" | "promotion" | "execution";
+  wakeupRequestId: string | null;
+  companyId: string;
+  agentId: string;
+  issueId: string | null;
+  runId?: string;
+  contextSnapshot: Record<string, unknown>;
+}
+
+type FailedChatRunRetryAuthority = (
+  tx: Db,
+  input: FailedChatRunRetryAuthorizationInput & {
+    wakeupRequestId: string;
+    issueId: string;
+  },
+) => Promise<void>;
+
+const failedChatRunRetryAuthorities = new WeakMap<
+  Db,
+  FailedChatRunRetryAuthority
+>();
+
+export class FailedChatRunRetryAuthorizationError extends HttpError {
+  constructor() {
+    super(
+      409,
+      "The exact failed chat request is no longer authorized. Send a new request in the current connected conversation.",
+      {
+        code: "chat_failed_run_retry_not_authorized",
+      },
+    );
+    this.name = "FailedChatRunRetryAuthorizationError";
+  }
+}
+
+/** The live chat service supplies the authority; serialized wake hints never do. */
+export function registerFailedChatRunRetryAuthority(
+  db: Db,
+  authority: FailedChatRunRetryAuthority,
+): () => void {
+  failedChatRunRetryAuthorities.set(db, authority);
+  return () => {
+    if (failedChatRunRetryAuthorities.get(db) === authority) {
+      failedChatRunRetryAuthorities.delete(db);
+    }
+  };
+}
+
+/** Re-discover retry provenance from the durable action, including after restart
+ * or when an untrusted caller strips the serialized retry selector. */
+export async function authorizeFailedChatRunRetryWake(
+  db: Db,
+  tx: Db,
+  input: FailedChatRunRetryAuthorizationInput,
+): Promise<boolean> {
+  const action = input.wakeupRequestId
+    ? await tx
+        .select({ companyId: chatActions.companyId, kind: chatActions.kind })
+        .from(chatActions)
+        .where(eq(chatActions.id, input.wakeupRequestId))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+    : null;
+  if (action?.kind !== "failed_run_retry") {
+    if (Object.hasOwn(input.contextSnapshot, "chatFailedRunRetry")) {
+      throw new FailedChatRunRetryAuthorizationError();
+    }
+    return false;
+  }
+  const authority = failedChatRunRetryAuthorities.get(db);
+  const selector = input.contextSnapshot.chatFailedRunRetry;
+  if (
+    !authority ||
+    action.companyId !== input.companyId ||
+    !input.issueId ||
+    !input.wakeupRequestId ||
+    !selector ||
+    typeof selector !== "object" ||
+    Array.isArray(selector) ||
+    (selector as Record<string, unknown>).version !== 1 ||
+    (selector as Record<string, unknown>).actionId !== input.wakeupRequestId ||
+    typeof (selector as Record<string, unknown>).failedRunId !== "string" ||
+    !(selector as Record<string, unknown>).failedRunId ||
+    (selector as Record<string, unknown>).failedRunId !==
+      input.contextSnapshot.retryOfRunId ||
+    input.contextSnapshot.forceFreshSession === true ||
+    ["resumeFromRunId", "resumeSessionParams", "resumeSessionDisplayId"].some(
+      (key) => Object.hasOwn(input.contextSnapshot, key),
+    )
+  ) {
+    throw new FailedChatRunRetryAuthorizationError();
+  }
+  await authority(tx, {
+    ...input,
+    issueId: input.issueId,
+    wakeupRequestId: input.wakeupRequestId,
+  });
+  return true;
+}
 
 /** Prevent automatic recovery from treating committed-but-unadmitted input as
  * an ordinary stranded task. A receipt is historical admission evidence even
@@ -50,6 +207,7 @@ export interface DurableChatWakeupRequest {
   readonly requestedByActorId: string;
   readonly requestedAt: Date;
   readonly idempotencyKey: string;
+  readonly failedRunRetry?: { readonly failedRunId: string };
   readonly authorize: (tx: Db) => Promise<void>;
 }
 
@@ -71,7 +229,13 @@ export function createDurableChatWakeupRequest(
       ]),
     )
     .digest("hex")}`;
-  const request = Object.freeze({ ...input, idempotencyKey });
+  const request = Object.freeze({
+    ...input,
+    ...(input.failedRunRetry
+      ? { failedRunRetry: Object.freeze({ ...input.failedRunRetry }) }
+      : {}),
+    idempotencyKey,
+  });
   trustedRequests.add(request);
   return request;
 }

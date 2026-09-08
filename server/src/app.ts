@@ -699,6 +699,7 @@ export async function createApp(
   });
   api.use(
     agentRoutes(db, {
+      chatRunRetries: chatChannels,
       pluginWorkerManager: workerManager,
       deploymentMode: opts.deploymentMode,
       confidentialProxyAllowlist: setupTokenLoginProxyAllowlist,
@@ -799,6 +800,7 @@ export async function createApp(
   // route prefixes, so this dependency does not change issue-route precedence.
   api.use(
     issueRoutes(db, opts.storageService, {
+      chatRunRetries: chatChannels,
       feedbackExportService: opts.feedbackExportService,
       pluginWorkerManager: workerManager,
       approveToolActionRequest: (input) =>

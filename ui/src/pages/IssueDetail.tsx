@@ -1536,22 +1536,20 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     mutationFn: async (runId: string) => {
       const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
       if (!failedRun) throw new Error("Failed run is no longer available.");
-      const result = await agentsApi.wakeup(
+      return agentsApi.retryFailedRun(
         failedRun.agentId,
-        {
-          source: "on_demand",
-          triggerDetail: "manual",
-          reason: "retry_failed_run",
-          payload: { issueId },
-        },
+        failedRun.runId,
         companyId,
       );
-      if (!("id" in result)) {
-        throw new Error(result.message ?? "Retry was skipped.");
-      }
-      return result;
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
+      if (!result.runId) {
+        pushToast({
+          title: "Retry queued",
+          body: "The exact request will retry when this task is ready.",
+          tone: "success",
+        });
+      }
       queryClient.invalidateQueries({
         queryKey: queryKeys.issues.runs(issueId),
       });

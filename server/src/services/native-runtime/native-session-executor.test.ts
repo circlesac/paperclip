@@ -217,6 +217,7 @@ import {
   NativeSessionSteeringError,
   assertRemoteRunnerBuildMetadata,
   nativeSessionFailureDisposition,
+  nativeFailedRunRetryStateIsSafe,
   nativeProviderUsageLimitFromEvent,
   nativeSessionFailureSourceCode,
   nativeSessionRecoveryProjection,
@@ -2084,6 +2085,148 @@ const execution = {
   interactionResponses: [],
   credentialBindings: [],
 } as NativeExecutionInputV1;
+
+describe("explicit failed native retry physical evidence", () => {
+  it.each([
+    "suspended",
+    "ready",
+    "wrong_run",
+    "wrong_runner",
+    "wrong_thread",
+    "active_provider",
+    "ambiguous_provider",
+    "live_pid",
+    "symlink",
+    "bootstrap",
+    "quarantined_bootstrap",
+    "unacknowledged_output",
+    "pending_provider_event",
+    "pending_tool",
+    "unselected_result",
+  ])("observes %s without mutating the retained root", async (kind) => {
+    const stateBase = await mkdtemp(
+      join(tmpdir(), "paperclip-failed-retry-state-"),
+    );
+    const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
+    const canonical = (value: unknown): string =>
+      value && typeof value === "object" && !Array.isArray(value)
+        ? `{${Object.entries(value)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
+            .join(",")}}`
+        : JSON.stringify(value);
+    const key = createHash("sha256")
+      .update(
+        canonical({
+          schema: "paperclip.native-session-scope.v2",
+          companyId: execution.binding.companyId,
+          agentId: execution.binding.agentId,
+          workspace: {
+            kind: "managed",
+            executionWorkspaceId: execution.binding.executionWorkspaceId,
+          },
+          provider: {
+            driverKind: execution.session.driverKind,
+            identity: { kind: "codex" },
+          },
+          normalizedSessionId: execution.session.normalizedSessionId,
+        }),
+      )
+      .digest("hex");
+    const root = join(stateBase, key);
+    const bootstrap = kind.includes("bootstrap");
+    try {
+      const identity = {
+        runId: execution.binding.runId,
+        runnerInstanceId: "runner-retry",
+        environmentLeaseId: "lease-retry",
+        normalizedSessionId: execution.session.normalizedSessionId,
+      };
+      if (!bootstrap) {
+        await mkdir(join(root, "control-plane"), { recursive: true });
+        await mkdir(join(root, "runner"), { recursive: true });
+        await writeFile(
+          join(root, "control-plane", "control-plane-state.json"),
+          JSON.stringify(durableControlPlaneState(identity)),
+        );
+        const runnerPath = join(root, "runner", "runner-state.json");
+        const runner = {
+          ...durableRunnerState(
+            {
+              ...identity,
+              ...(kind === "wrong_run" ? { runId: "another-run" } : {}),
+            },
+            kind === "ready" ? "ready" : "suspended",
+          ),
+          outbox: kind === "unacknowledged_output" ? [{}] : [],
+        };
+        if (kind === "symlink") {
+          await writeFile(
+            join(stateBase, "outside-state.json"),
+            JSON.stringify(runner),
+          );
+          await symlink(join(stateBase, "outside-state.json"), runnerPath);
+        } else await writeFile(runnerPath, JSON.stringify(runner));
+        await writeFile(
+          join(root, "runner", "codex-provider-state.json"),
+          JSON.stringify({
+            schema: "paperclip.runner.codex-provider-state.v1",
+            lifecycle: "prepared",
+            threadId: "exact-thread",
+            activeProviderTurnId:
+              kind === "active_provider" ? "old-turn" : null,
+            ambiguousTurnStartPending: kind === "ambiguous_provider",
+            config: { provider: "codex", driver: "codex_app_server" },
+            pendingEvents: kind === "pending_provider_event" ? [{}] : [],
+            queuedEvents: [],
+            toolBridge: {
+              pending: kind === "pending_tool" ? { call: {} } : {},
+            },
+            activeProviderResultFingerprint:
+              kind === "unselected_result" ? "sha256:uncommitted-result" : null,
+          }),
+        );
+      } else if (kind === "quarantined_bootstrap") {
+        await mkdir(
+          join(
+            stateBase,
+            "quarantine",
+            `${key}.identity_indeterminate.retained`,
+          ),
+          { recursive: true },
+        );
+      }
+      const before = await readdir(stateBase);
+      expect(
+        nativeFailedRunRetryStateIsSafe({
+          execution,
+          ...execution.binding,
+          nativeSessionId: execution.session.normalizedSessionId!,
+          runnerInstanceId:
+            kind === "wrong_runner" ? "another-runner" : "runner-retry",
+          processPid: kind === "live_pid" ? process.pid : null,
+          providerSessionId:
+            kind === "wrong_thread" ? "different-thread" : "exact-thread",
+          processGroupId: null,
+          recoveryMode: bootstrap
+            ? "bootstrap_retry"
+            : "exact_checkpoint_resume",
+          allowVerifiedBackup: false,
+        }),
+      ).toBe(kind === "suspended" || kind === "bootstrap");
+      expect(await readdir(stateBase)).toEqual(before);
+      if (!bootstrap)
+        expect(
+          await access(join(root, "control-plane", "control-plane-state.json")),
+        ).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await rm(stateBase, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("provider plan synchronization", () => {
   it("prefers the provider's completed Markdown when it is available", () => {

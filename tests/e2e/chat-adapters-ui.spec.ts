@@ -2122,3 +2122,223 @@ test.describe("Board send delivery refresh", () => {
     });
   }
 });
+
+test.describe("Exact failed chat run retry", () => {
+  let seed: Seed;
+  let issue: { id: string; identifier: string; title: string };
+
+  const failedRunId = "11111111-aaaa-4aaa-8aaa-111111111111";
+  const actionId = "22222222-bbbb-4bbb-8bbb-222222222222";
+  const denial =
+    "This chat source is no longer authorized. Open the task to review its current channel access before retrying.";
+
+  test.beforeAll(async ({ request }) => {
+    seed = await seedCompanyAndAgent(request);
+    issue = await json<typeof issue>(
+      await request.post(`/api/companies/${seed.companyId}/issues`, {
+        data: { title: "Exact chat retry destination", status: "backlog" },
+      }),
+      "create exact-retry task",
+    );
+  });
+
+  for (const surface of ["agent run", "Inbox", "Legacy Inbox"] as const) {
+    for (const outcome of ["queued", "deferred", "denied"] as const) {
+      test(`${surface}: selected run ${outcome} preserves exact retry authority and truthful feedback`, async ({
+        page,
+      }, testInfo) => {
+        const now = Date.now();
+        const run = {
+          id: failedRunId,
+          companyId: seed.companyId,
+          agentId: seed.agentId,
+          status: "failed",
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          startedAt: new Date(now - 60_000).toISOString(),
+          finishedAt: new Date(now - 30_000).toISOString(),
+          createdAt: new Date(now - 60_000).toISOString(),
+          updatedAt: new Date(now - 30_000).toISOString(),
+          error: "The fixture provider turn failed.",
+          errorCode: "adapter_failed",
+          exitCode: 1,
+          signal: null,
+          responsibleUserId: null,
+          runtimeMode: "native",
+          driverKind: "codex_app_server",
+          nativeIssueId: issue.id,
+          usageJson: null,
+          resultJson: null,
+          sessionIdBefore: null,
+          sessionIdAfter: null,
+          logStore: null,
+          logRef: null,
+          logBytes: 0,
+          retryOfRunId: null,
+          scheduledRetryAt: null,
+          scheduledRetryAttempt: 0,
+          scheduledRetryReason: null,
+          contextSnapshot: {
+            source: "chat:slack",
+            issueId: issue.id,
+            taskId: "33333333-cccc-4ccc-8ccc-333333333333",
+            taskKey: "untrusted-copy-of-another-task",
+            wakeCommentId: "44444444-dddd-4ddd-8ddd-444444444444",
+            wakeCommentIds: ["44444444-dddd-4ddd-8ddd-444444444444"],
+            chatFailedRunRetry: { actionId: "untrusted-client-action" },
+          },
+        };
+        const requests: Array<{
+          companyId: string | null;
+          body: Record<string, unknown>;
+        }> = [];
+        const destinations: string[] = [];
+        page.on("framenavigated", (frame) => {
+          if (frame === page.mainFrame()) destinations.push(frame.url());
+        });
+        await page.route("**/api/**", async (route) => {
+          const url = new URL(route.request().url());
+          const pathname = url.pathname;
+          if (pathname === "/api/instance/settings/experimental") {
+            await fulfill(route, {
+              enableChatConnectors: true,
+              enableStreamlinedUi: surface !== "Legacy Inbox",
+            });
+            return;
+          }
+          if (pathname === `/api/companies/${seed.companyId}/heartbeat-runs`) {
+            await fulfill(route, [run]);
+            return;
+          }
+          if (pathname === `/api/heartbeat-runs/${failedRunId}`) {
+            await fulfill(route, run);
+            return;
+          }
+          if (
+            pathname === `/api/heartbeat-runs/${failedRunId}/events` ||
+            pathname ===
+              `/api/heartbeat-runs/${failedRunId}/workspace-operations` ||
+            pathname === `/api/companies/${seed.companyId}/provider-traces`
+          ) {
+            await fulfill(route, []);
+            return;
+          }
+          if (pathname === `/api/heartbeat-runs/${failedRunId}/issues`) {
+            await fulfill(route, [
+              {
+                issueId: issue.id,
+                identifier: issue.identifier,
+                title: issue.title,
+                status: "backlog",
+                priority: "medium",
+              },
+            ]);
+            return;
+          }
+          if (pathname === `/api/heartbeat-runs/${failedRunId}/log`) {
+            await fulfill(route, {
+              runId: failedRunId,
+              content: "",
+              nextOffset: 0,
+            });
+            return;
+          }
+          if (pathname === `/api/agents/${seed.agentId}/wakeup`) {
+            expect(route.request().method()).toBe("POST");
+            requests.push({
+              companyId: url.searchParams.get("companyId"),
+              body: bodyOf(route),
+            });
+            if (outcome === "denied") {
+              await fulfill(
+                route,
+                {
+                  error: denial,
+                  details: { code: "chat_failed_run_retry_source_denied" },
+                },
+                409,
+              );
+            } else {
+              // The durable action exists, but no run has been admitted yet.
+              await fulfill(
+                route,
+                { actionId, issueId: issue.id, runId: null, status: outcome },
+                202,
+              );
+            }
+            return;
+          }
+          await route.continue();
+        });
+
+        const startPath =
+          surface === "agent run"
+            ? `/${seed.prefix}/agents/${seed.agentId}/runs/${failedRunId}`
+            : `/${seed.prefix}/inbox/all`;
+        await page.goto(startPath);
+        const retry = page
+          .getByRole("button", { name: "Retry", exact: true })
+          .filter({ visible: true });
+        await expect(retry).toHaveCount(1);
+        await retry.click();
+        await expect.poll(() => requests.length).toBe(1);
+        expect(requests[0]).toEqual({
+          companyId: seed.companyId,
+          body: {
+            source: "on_demand",
+            triggerDetail: "manual",
+            reason: "retry_failed_run",
+            failedRunId,
+          },
+        });
+        if (outcome === "denied") {
+          await expect(page.getByText(denial, { exact: true })).toBeVisible();
+          if (surface !== "agent run") {
+            await expect(
+              page.getByText("Run retry failed", { exact: true }),
+            ).toBeVisible();
+            const toast = page.getByRole("listitem").filter({
+              has: page.getByText("Run retry failed", { exact: true }),
+            });
+            // Visibility alone accepts opacity:0 during the toast entrance.
+            // The operator must actually be able to read the denial.
+            await expect(toast).toHaveCSS("opacity", "1");
+            await expect(toast).toBeInViewport();
+          }
+          // Agent routes canonicalize the UUID to its human-readable URL key.
+          // The selected failed run must remain unchanged across that redirect.
+          await expect(page).toHaveURL(
+            surface === "agent run"
+              ? new RegExp(
+                  `/${seed.prefix}/agents/(${seed.agentId}|maya)/runs/${failedRunId}$`,
+                )
+              : new RegExp(`${startPath}$`),
+          );
+          await expect(retry).toBeEnabled();
+          await testInfo.attach(`${surface}-retry-denied`, {
+            body: await page.screenshot(),
+            contentType: "image/png",
+          });
+        } else {
+          await expect(page).toHaveURL(
+            new RegExp(
+              `/${seed.prefix}/issues/(${issue.id}|${issue.identifier})$`,
+            ),
+          );
+          await expect(
+            page.getByText(issue.title, { exact: true }).first(),
+          ).toBeVisible();
+          await expect(
+            page.getByText("Run retry failed", { exact: true }),
+          ).toHaveCount(0);
+        }
+        expect(requests).toHaveLength(1);
+        expect(
+          destinations.some((url) =>
+            /\/runs\/(null|undefined)(?:[/?#]|$)/.test(url),
+          ),
+        ).toBe(false);
+      });
+    }
+  }
+});

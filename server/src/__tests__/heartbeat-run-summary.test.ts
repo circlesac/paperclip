@@ -700,6 +700,51 @@ describe("resolveHeartbeatRunResponse", () => {
     }
   });
 
+  it("requires separate server authority to present a committed response after a preserved task status", () => {
+    const resultJson = {
+      finalizationPhase: "committed",
+      finalizationReasonCode: "prior_status_terminal_preserved",
+      externalChatCommittedResponseWakeSummaryAuthorized: true,
+      nativeResult: {
+        schema: "paperclip.run_result.v1",
+        reportedWorkDisposition: "yielded",
+        summary: "Exact accepted public response",
+        continuation: {
+          kind: "response_wake",
+          summary: "Wait for the next reply",
+          idempotencyKey: "same-response",
+        },
+      },
+      finalResponse: { final: true, text: "PRIVATE provider narration" },
+    };
+    const resolve = (authority: boolean, value = resultJson) =>
+      resolveHeartbeatRunResponse({
+        resultJson: value,
+        preferFinalResponseOverExistingComment: true,
+        externalChatResponseWakeSummaryAuthorized: true,
+        externalChatCommittedResponseWakeSummaryAuthorized: authority,
+      });
+    expect(resolve(false).text).toBeNull();
+    expect(resolve(true).text).toBe("Exact accepted public response");
+    expect(
+      resolve(true, { ...resultJson, finalizationPhase: "retryable_failure" })
+        .text,
+    ).toBeNull();
+    expect(
+      resolve(true, {
+        ...resultJson,
+        nativeResult: {
+          ...resultJson.nativeResult,
+          continuation: {
+            ...resultJson.nativeResult.continuation,
+            kind: "interaction",
+          },
+        },
+      }).text,
+    ).toBeNull();
+    expect(resolve(true).decision.chosenSource).toBe("semantic_result_summary");
+  });
+
   it("keeps ordinary comment precedence unchanged", () => {
     expect(
       resolveHeartbeatRunResponse({

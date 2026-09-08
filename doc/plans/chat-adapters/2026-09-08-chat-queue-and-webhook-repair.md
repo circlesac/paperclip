@@ -2097,3 +2097,58 @@ Paperclip. Two exact-copy regressions failed against the old projection;
 the final milestone/task-link/safe-projection cohort passed **43/43**. This
 copy change is not deployed or visually retested yet, and it is not the
 session recovery implementation itself.
+
+### Exact retry and accepted-answer recovery checkpoint
+
+Board Retry now sends only the selected failed run ID and derives the task,
+original admitted comment batch and actor on the server. A separate durable
+retry intent deduplicates repeated clicks and lost responses. The original
+delivery is not re-armed, deferred work is not silently coalesced, and current
+source/access checks repeat at admission, promotion, execution and publication.
+Recovery-card resolution and intent creation share one transaction. Every
+retry entry point handles an accepted queue receipt without inventing a run ID.
+Native ordinary retries require proof of a safely released old owner;
+integrity, quarantine, uncertain delivery and unsupported lineage stay closed.
+
+Accepted native `yielded` / `response_wake` answers now have a separate
+presentation recovery path. It verifies the committed result and its canonical
+digest, exact source batch and current conversation authority, then creates the
+comment, publication and selection marker atomically. It updates an existing
+same-run failure notice, never resurrects a selected/deleted response, never
+reruns provider work and does not erase quarantine or alter later review state.
+Source and access revocation are checked again before provider dispatch.
+
+The live GitHub B investigation also found a genuine invokability mismatch:
+pre-start reviewed-chat attestation rejected `agents.status = error`, even
+though canonical invocation permits recovery from that status. The helper now
+uses the canonical policy while preserving exact owner/source, identity and
+approval checks. Direct and answered-question positives were red before the
+fix; paused, terminated and pending-approval agents still fail authorization.
+The full external-chat-wait suite passed **142/142**. Its first full run also
+caught an unrelated 20-bit random fixture-prefix collision; prefixes now derive
+injectively from each company UUID, without changing production behavior.
+
+Wider finalizer testing caught and fixed two regressions during this work.
+Already-materialized clean successful runs must not acquire a new timestamp on
+every sweep. When recovering stale failure metadata, diagnostics must come from
+the current locked row, not a pre-lock snapshot. Both absent-to-new and
+old-to-new concurrent error interleavings failed before the latter fix. Final
+native finalizer/recovery/telemetry coverage passed **31/31**, including no
+duplicate telemetry, no unnecessary writes and retained ownership guards.
+
+Root's fresh full chat integration runs passed **498/498** twice; the second
+includes the no-rewrite repair and precedes only the separately tested
+current-row diagnostic refinement. Root then reran all 23 accepted-response
+cases on another fresh database after that last refinement: **23/23** passed,
+with 475 unrelated tests intentionally filtered. The exact route/API/UI contract cohort
+passed **195/195** on an unchanged rerun after one unexplained socket hang-up.
+The real throwaway-browser suite passed **21/21**, with zero retries or skips,
+using mocked provider HTTP, not live provider accounts. Shared/server/UI
+typechecks, normal runner build/contract checks and UI token gates passed.
+
+These tests qualify the implementation boundaries, not the failed live
+Telegram/GitHub journeys. The accepted Telegram answer has not yet been
+delivered through the new recovery path. Its old session must be settled using
+the separate exact-authority maintenance operation before retrying the original
+queued document or GitHub B. No live quarantine or source data was rewritten to
+produce a passing fixture result.

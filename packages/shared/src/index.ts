@@ -1232,6 +1232,7 @@ export type {
   FinanceByBiller,
   FinanceByKind,
   AgentWakeupResponse,
+  ChatFailedRunRetryResponse,
   AgentWakeupSkipped,
   GitWorktreeBranchAncestryVerdict,
   GitWorktreeBranchIncoherenceEvidence,

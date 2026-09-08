@@ -18,6 +18,7 @@ import {
   finalizeNativeRun,
   recordNativeFinalizationFailure,
   repairCommittedNativeReviewResponse,
+  repairCommittedNativeChatResponse,
 } from "./native-run-finalizer.js";
 import {
   commitNativeStatusDecision,
@@ -517,6 +518,14 @@ export async function reconcileNativeFinalizations(
           )).limit(1).then((entries) => entries[0] ?? null)
         : null;
       const currentDecisionJson = record(currentDecision?.decisionJson);
+      if (row.coordinatorPhase === "committed") {
+        // A later decision can supersede this run's task status, but cannot
+        // erase its accepted, still-authorized response. Repair presentation
+        // before the status-only early return below, without rerunning work.
+        await repairCommittedNativeChatResponse(db, {
+          companyId: row.companyId, issueId: row.issueId, runId: row.runId,
+        });
+      }
       if (
         row.coordinatorPhase === "committed" &&
         row.decisionId &&

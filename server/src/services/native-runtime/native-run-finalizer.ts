@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   approvals,
   completionContracts,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueApprovals,
   issueThreadInteractions,
   issues,
@@ -39,6 +40,15 @@ import {
   restoreNativeChatReviewPresentationInTransaction,
 } from "./native-chat-review-presentation.js";
 import { logger } from "../../middleware/logger.js";
+import {
+  CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
+  resolveHeartbeatRunResponse,
+} from "../heartbeat-run-summary.js";
+import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
+import {
+  authorizeCommittedChatResponse,
+  CommittedChatResponseAuthorizationError,
+} from "../durable-chat-wakeup.js";
 import {
   isNativeRunnerOwnershipHeld,
   nativeRunnerOwnershipNotHeldCondition,
@@ -441,29 +451,77 @@ async function projectCommittedRun(input: {
   coordinator: typeof nativeRunFinalizations.$inferSelect;
 }) {
   if (!input.coordinator.resultId) return;
-  const resultRow = await input.db.select({ resultJson: nativeRunResults.resultJson })
-    .from(nativeRunResults).where(and(
-      eq(nativeRunResults.id, input.coordinator.resultId),
-      eq(nativeRunResults.runId, input.run.id),
-      eq(nativeRunResults.companyId, input.run.companyId),
-    )).limit(1).then((rows) => rows[0] ?? null);
-  const terminalState = record(record(resultRow?.resultJson).terminal).runTerminalState;
+  const resultRow = await input.db
+    .select({ resultJson: nativeRunResults.resultJson })
+    .from(nativeRunResults)
+    .where(
+      and(
+        eq(nativeRunResults.id, input.coordinator.resultId),
+        eq(nativeRunResults.runId, input.run.id),
+        eq(nativeRunResults.companyId, input.run.companyId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  const terminalState = record(
+    record(resultRow?.resultJson).terminal,
+  ).runTerminalState;
   if (!["succeeded", "failed", "cancelled"].includes(String(terminalState))) {
     throw new Error("native_finalization_invalid");
   }
   const now = new Date();
-  const [updatedRun] = await input.db.update(heartbeatRuns).set({
-    status: projectNativeTerminalRunStatus(terminalState as "succeeded" | "failed" | "cancelled"),
-    finishedAt: input.run.finishedAt ?? now,
-    nativePhase: "committed",
-    nativePhaseUpdatedAt: now,
-    updatedAt: now,
-  }).where(and(
-    eq(heartbeatRuns.id, input.run.id),
-    eq(heartbeatRuns.runtimeMode, "native"),
-    inArray(heartbeatRuns.status, ["queued", "running", "failed"]),
-    nativeRunnerOwnershipNotHeldCondition(),
-  )).returning();
+  const [updatedRun] = await input.db
+    .update(heartbeatRuns)
+    .set({
+      status: projectNativeTerminalRunStatus(
+        terminalState as "succeeded" | "failed" | "cancelled",
+      ),
+      finishedAt: input.run.finishedAt ?? now,
+      nativePhase: "committed",
+      nativePhaseUpdatedAt: now,
+      ...(terminalState === "succeeded"
+        ? {
+            error: null,
+            errorCode: null,
+            // Capture the row being updated, not the earlier admission read:
+            // cleanup may have recorded a new diagnostic in the meantime.
+            // Other result metadata and all physical-owner evidence stay put.
+            resultJson: sql`case
+              when ${heartbeatRuns.error} is not null or ${heartbeatRuns.errorCode} is not null
+              then coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object(
+                'recoveredExecutionFailure', jsonb_build_object(
+                  'schema', 'paperclip.recovered_execution_failure.v1',
+                  'errorCode', ${heartbeatRuns.errorCode},
+                  'error', ${heartbeatRuns.error},
+                  'observedAt', ${heartbeatRuns.updatedAt}
+                )
+              )
+              else ${heartbeatRuns.resultJson}
+            end`,
+          }
+        : {}),
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(heartbeatRuns.id, input.run.id),
+        eq(heartbeatRuns.runtimeMode, "native"),
+        or(
+          inArray(heartbeatRuns.status, ["queued", "running", "failed"]),
+          and(
+            eq(heartbeatRuns.status, "succeeded"),
+            or(
+              isNotNull(heartbeatRuns.error),
+              isNotNull(heartbeatRuns.errorCode),
+              isNull(heartbeatRuns.finishedAt),
+              sql`${heartbeatRuns.nativePhase} is distinct from 'committed'`,
+            ),
+          ),
+        ),
+        nativeRunnerOwnershipNotHeldCondition(),
+      ),
+    )
+    .returning();
   // The WHERE clause above allows "failed" as a source status, so a run that
   // failed before its coordinator committed can still pick up the committed
   // terminal state. A later reconciliation replay can enter this same path
@@ -535,6 +593,258 @@ async function materializeCommittedReviewResponse(db: Db, runId: string) {
       "Committed chat review response is awaiting presentation retry",
     );
   }
+}
+
+async function acceptedResponseDigestMatches(
+  db: Db,
+  run: typeof heartbeatRuns.$inferSelect,
+  accepted: typeof nativeRunResults.$inferSelect,
+): Promise<boolean> {
+  const envelope = record(accepted.resultJson);
+  const canonical = {
+    result: envelope.result,
+    terminal: envelope.terminal,
+    turnId: accepted.turnId,
+  };
+  const fingerprint = nativeSha256({
+    runId: run.id,
+    completionContractSha256: run.completionContractSha256,
+    canonicalSha256: accepted.canonicalSha256,
+  });
+  // The durable coordinator stores this canonical shape directly. The older
+  // ControlPlanePort also hashes its exact binding, which must be rebuilt from
+  // persisted run identity and the actual authenticated control-plane journal.
+  if (
+    `sha256:${nativeSha256(canonical)}` === accepted.canonicalSha256 &&
+    `sha256:${fingerprint}` === accepted.serverFingerprint
+  )
+    return true;
+  if (accepted.serverFingerprint !== fingerprint) return false;
+  const sources = await db
+    .selectDistinct({ sourceInstanceId: heartbeatRunEvents.sourceInstanceId })
+    .from(heartbeatRunEvents)
+    .where(
+      and(
+        eq(heartbeatRunEvents.companyId, run.companyId),
+        eq(heartbeatRunEvents.runId, run.id),
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind' = 'control_plane'`,
+      ),
+    )
+    .limit(17);
+  if (sources.length > 16) return false;
+  return sources.some(
+    ({ sourceInstanceId }) =>
+      typeof sourceInstanceId === "string" &&
+      nativeSha256({
+        binding: {
+          companyId: run.companyId,
+          issueId: run.nativeIssueId,
+          runId: run.id,
+          agentId: run.agentId,
+          sessionId: run.nativeSessionId,
+          completionContractId: run.completionContractId,
+          completionContractSha256: run.completionContractSha256,
+          sourceInstanceId: run.runnerInstanceId,
+          controlPlaneSourceInstanceId: sourceInstanceId,
+        },
+        ...canonical,
+      }) === accepted.canonicalSha256,
+  );
+}
+
+/** Recover only the already accepted answer. Neither issue disposition nor
+ * provider state is repaired here; an unsafe native session stays quarantined. */
+export async function repairCommittedNativeChatResponse(
+  db: Db,
+  input: { companyId: string; issueId: string; runId: string },
+): Promise<boolean> {
+  let agentId: string | null = null;
+  let materialized = false;
+  try {
+    materialized = await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      const [issue] = await tx
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.id, input.issueId),
+            eq(issues.companyId, input.companyId),
+          ),
+        )
+        .for("update");
+      if (!issue) return false;
+      const [run] = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, input.runId),
+            eq(heartbeatRuns.companyId, input.companyId),
+            eq(heartbeatRuns.nativeIssueId, input.issueId),
+            eq(heartbeatRuns.runtimeMode, "native"),
+          ),
+        )
+        .for("update");
+      if (
+        !run ||
+        isNativeRunnerOwnershipHeld(run) ||
+        !["succeeded", "failed", "timed_out"].includes(run.status) ||
+        !run.finishedAt
+      )
+        return false;
+      // An existing selected answer, including a subsequently deleted one, must
+      // never be replaced or resurrected by a background presentation repair.
+      if (
+        typeof record(record(run.resultJson).presentationDecision).commentId ===
+        "string"
+      )
+        return false;
+      const [coordinator] = await tx
+        .select()
+        .from(nativeRunFinalizations)
+        .where(
+          and(
+            eq(nativeRunFinalizations.runId, run.id),
+            eq(nativeRunFinalizations.companyId, input.companyId),
+            eq(nativeRunFinalizations.issueId, input.issueId),
+            eq(nativeRunFinalizations.phase, "committed"),
+            isNull(nativeRunFinalizations.leaseOwner),
+          ),
+        )
+        .for("update");
+      if (
+        !coordinator?.resultId ||
+        !coordinator.decisionId ||
+        !coordinator.assessmentId
+      )
+        return false;
+      const [accepted] = await tx
+        .select()
+        .from(nativeRunResults)
+        .where(
+          and(
+            eq(nativeRunResults.id, coordinator.resultId),
+            eq(nativeRunResults.runId, run.id),
+            eq(nativeRunResults.companyId, input.companyId),
+            eq(nativeRunResults.issueId, input.issueId),
+            eq(
+              nativeRunResults.completionContractId,
+              run.completionContractId!,
+            ),
+            eq(nativeRunResults.schemaStatus, "accepted"),
+          ),
+        )
+        .for("share");
+      const [decision] = await tx
+        .select()
+        .from(statusDecisions)
+        .where(
+          and(
+            eq(statusDecisions.id, coordinator.decisionId),
+            eq(statusDecisions.runId, run.id),
+            eq(statusDecisions.companyId, input.companyId),
+            eq(statusDecisions.issueId, input.issueId),
+            eq(statusDecisions.assessmentId, coordinator.assessmentId),
+          ),
+        )
+        .for("share");
+      const envelope = record(accepted?.resultJson);
+      const result = record(envelope.result);
+      const terminal = record(envelope.terminal);
+      if (
+        !accepted ||
+        !decision ||
+        result.schema !== "paperclip.run_result.v1" ||
+        result.reportedWorkDisposition !== "yielded" ||
+        record(result.continuation).kind !== "response_wake" ||
+        !Array.isArray(result.attentionRequests) ||
+        result.attentionRequests.length > 0 ||
+        terminal.runTerminalState !== "succeeded" ||
+        terminal.turnTerminalState !== "completed" ||
+        terminal.reportedWorkDisposition !== "yielded" ||
+        !(await acceptedResponseDigestMatches(tx, run, accepted))
+      )
+        return false;
+      // Existing governed-review responses have their own stricter gate-bound
+      // presentation contract, including selected attachments. Do not bypass it.
+      if (record(decision.decisionJson).externalChatReviewPresentation)
+        return false;
+      await authorizeCommittedChatResponse(db, tx, {
+        ...input,
+        agentId: run.agentId,
+        resultId: accepted.id,
+      });
+      if (
+        (await resolveChatRunPresentationAuthorizationReason(tx, input)) !==
+        CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
+      )
+        return false;
+      const resolved = resolveHeartbeatRunResponse({
+        resultJson: {
+          nativeResult: result,
+          finalizationPhase: "committed",
+          finalizationReasonCode: decision.reasonCode,
+        },
+        preferFinalResponseOverExistingComment: true,
+        externalChatResponseWakeSummaryAuthorized: true,
+        externalChatCommittedResponseWakeSummaryAuthorized: true,
+      });
+      if (!resolved.text || resolved.decision.commentAction !== "create")
+        return false;
+      const comment = await issueService(db).addComment(
+        input.issueId,
+        resolved.text,
+        { agentId: run.agentId, runId: run.id },
+        { authorizationReason: CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON },
+        tx,
+      );
+      const presentationDecision = {
+        ...resolved.decision,
+        commentId: comment.id,
+        reasonCodes: [
+          ...resolved.decision.reasonCodes,
+          "committed_response_recovered",
+        ],
+      };
+      await tx
+        .update(heartbeatRuns)
+        .set({
+          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify(
+            {
+              presentationDecision,
+              nativeCommittedChatResponse: {
+                schema: "paperclip.native_committed_chat_response.v1",
+                resultId: accepted.id,
+                canonicalSha256: accepted.canonicalSha256,
+                decisionId: decision.id,
+              },
+            },
+          )}::jsonb`,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, run.id));
+      await projectCommittedRun({ db: tx, run, coordinator });
+      agentId = run.agentId;
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof CommittedChatResponseAuthorizationError) return false;
+    // Keep transient failures visible and retryable without reclassifying the
+    // committed run or acknowledging a publication that never committed.
+    logger.warn(
+      { runId: input.runId, error },
+      "Committed chat response is awaiting presentation retry",
+    );
+    return false;
+  }
+  if (materialized && agentId)
+    publishChatPublicationCommitSignal({
+      ...input,
+      agentId,
+      eventType: "run.presentation.resolved",
+    });
+  return materialized;
 }
 
 /** Presentation recovery is independent from re-arbitrating issue status. */
@@ -613,6 +923,9 @@ export async function finalizeNativeRun(input: {
       await projectCommittedRun({ db: input.db, run, coordinator });
     if (input.projectRunStatus && !presentationAlreadyMaterialized)
       await materializeCommittedReviewResponse(input.db, input.runId);
+    if (input.projectRunStatus) await repairCommittedNativeChatResponse(input.db, {
+      companyId: run.companyId, issueId: coordinator.issueId, runId: run.id,
+    });
     return coordinator;
   }
   const [resultRow, contractRow] = await Promise.all([
@@ -805,6 +1118,9 @@ export async function finalizeNativeRun(input: {
         await emitAgentTaskRun(input.db, updatedRun);
       }
       if (input.projectRunStatus) await materializeCommittedReviewResponse(input.db, input.runId);
+      if (input.projectRunStatus && finalizationPhase === "committed") await repairCommittedNativeChatResponse(input.db, {
+        companyId: run.companyId, issueId: coordinator.issueId, runId: run.id,
+      });
       return { ...coordinator, phase: finalizationPhase, assessmentId: assessmentRow.id, decisionId: committed.decision.id };
     } catch (error) {
       if (error instanceof NativeStatusRaceError && attempt < 2) {

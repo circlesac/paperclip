@@ -2,6 +2,8 @@ import { initializeRunIdentity } from "./run-identity.js";
 import {
   assertDurableChatWakeupReceipt,
   assertDurableChatWakeupRequest,
+  authorizeFailedChatRunRetryWake,
+  FailedChatRunRetryAuthorizationError,
   unadmittedChatWakeupCondition,
   type DurableChatWakeupRequest,
 } from "./durable-chat-wakeup.js";
@@ -69,6 +71,7 @@ import {
   activityLog,
   approvals,
   assets,
+  chatActions,
   chatConversations,
   chatDeliveries,
   chatEndpoints,
@@ -707,6 +710,7 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
   "low_trust_boundary_mismatch",
   "low_trust_requires_sandbox_environment",
   "low_trust_runtime_services_denied",
+  "chat_failed_run_retry_not_authorized",
 ]);
 // Error codes that mark a pre-dispatch setup failure. The adapter process never
 // started, so no agent could post an issue comment. The setup catch writes one
@@ -719,6 +723,13 @@ const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
 ]);
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
+  if (
+    error instanceof HttpError &&
+    error.status === 409 &&
+    parseObject(error.details).code === "chat_failed_run_retry_not_authorized"
+  ) {
+    return "chat_failed_run_retry_not_authorized";
+  }
   if (!(error instanceof HttpError) || error.status !== 422) return null;
   const code = readNonEmptyString(parseObject(error.details).code);
   return code && NON_RETRYABLE_PREFLIGHT_FAILURE_CODES.has(code) ? code : null;
@@ -7219,9 +7230,10 @@ export async function attestReviewedExternalChatRun(input: {
           issue.executionRunId !== input.runId ||
           run.status !== "running" ||
           (run.nativeIssueId !== null && run.nativeIssueId !== input.issueId) ||
-          ["paused", "terminated", "pending_approval", "error"].includes(
-            actor.status,
-          )
+          // This attestation precedes execution-start's transition to running.
+          // A prior run's error projection is invokable, unlike an operator
+          // pause, termination, or pending approval; all binding checks remain.
+          DIRECT_NON_INVOKABLE_STATUSES.has(actor.status)
         )
           return false;
         const admittedContext = parseObject(run.contextSnapshot);
@@ -18226,6 +18238,19 @@ export function heartbeatService(
 
       const runtime = await ensureRuntimeState(agent);
       const context = parseObject(run.contextSnapshot);
+      const authorizeFailedChatRetryExecution = () =>
+        db.transaction((tx) =>
+          authorizeFailedChatRunRetryWake(db, tx as unknown as Db, {
+            phase: "execution",
+            wakeupRequestId: run.wakeupRequestId,
+            companyId: run.companyId,
+            agentId: run.agentId,
+            issueId: readNonEmptyString(context.issueId),
+            runId: run.id,
+            contextSnapshot: context,
+          }),
+        );
+      const isFailedChatRunRetry = await authorizeFailedChatRetryExecution();
       // Never adopt a chat-execution attestation supplied in a wake payload.
       // Reviewed chat turns rebuild it from the current durable owner below.
       delete context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
@@ -20097,6 +20122,9 @@ export function heartbeatService(
       ): Promise<
         { dispatched: true; resultPromise: Promise<T> } | { dispatched: false }
       > => {
+        // Recheck after workspace/credential preparation, immediately before the
+        // provider handoff. Never hold validation locks while adapter code runs.
+        await authorizeFailedChatRetryExecution();
         if (
           !issueId ||
           !isResolvedInteractionContinuationWakeContext(context)
@@ -20846,29 +20874,30 @@ export function heartbeatService(
           // recovery existed. Only an entirely unused replacement row may
           // inherit its source checkpoint; any process/provider evidence on the
           // replacement makes the ownership ambiguous and therefore ineligible.
-          const legacyRetrySource = run.retryOfRunId
-            ? await db
-                .select({
-                  id: heartbeatRuns.id,
-                  companyId: heartbeatRuns.companyId,
-                  agentId: heartbeatRuns.agentId,
-                  runnerInstanceId: heartbeatRuns.runnerInstanceId,
-                  nativeSessionId: heartbeatRuns.nativeSessionId,
-                  runnerProfileJson: heartbeatRuns.runnerProfileJson,
-                  runtimeMode: heartbeatRuns.runtimeMode,
-                  status: heartbeatRuns.status,
-                })
-                .from(heartbeatRuns)
-                .where(
-                  and(
-                    eq(heartbeatRuns.id, run.retryOfRunId),
-                    eq(heartbeatRuns.companyId, agent.companyId),
-                    eq(heartbeatRuns.agentId, agent.id),
-                  ),
-                )
-                .limit(1)
-                .then((rows) => rows[0] ?? null)
-            : null;
+          const legacyRetrySource =
+            run.retryOfRunId && !isFailedChatRunRetry
+              ? await db
+                  .select({
+                    id: heartbeatRuns.id,
+                    companyId: heartbeatRuns.companyId,
+                    agentId: heartbeatRuns.agentId,
+                    runnerInstanceId: heartbeatRuns.runnerInstanceId,
+                    nativeSessionId: heartbeatRuns.nativeSessionId,
+                    runnerProfileJson: heartbeatRuns.runnerProfileJson,
+                    runtimeMode: heartbeatRuns.runtimeMode,
+                    status: heartbeatRuns.status,
+                  })
+                  .from(heartbeatRuns)
+                  .where(
+                    and(
+                      eq(heartbeatRuns.id, run.retryOfRunId),
+                      eq(heartbeatRuns.companyId, agent.companyId),
+                      eq(heartbeatRuns.agentId, agent.id),
+                    ),
+                  )
+                  .limit(1)
+                  .then((rows) => rows[0] ?? null)
+              : null;
           const nativeBootstrapHasProviderEvidence =
             legacyRetrySource ||
             run.nativeSessionId ||
@@ -22895,6 +22924,7 @@ export function heartbeatService(
         const failureErrorCode =
           workspaceValidationFailure?.code ??
           configurationIncompleteFailure?.code ??
+          nonRetryablePreflightFailureCode(err) ??
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
           "adapter_failed";
@@ -23042,7 +23072,9 @@ export function heartbeatService(
 
         await finalizeAgentStatus(agent.id, "failed", message, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-          keepIdleOnFailure: isWorkspaceSyncConflictFailure(message),
+          keepIdleOnFailure:
+            Boolean(nonRetryablePreflightFailureCode(err)) ||
+            isWorkspaceSyncConflictFailure(message),
         });
       }
     } catch (outerErr) {
@@ -23595,10 +23627,57 @@ export function heartbeatService(
 
         if (!deferred) break;
 
+        let deferredFailedChatRetry: boolean;
+        const exactRetryContext = parseObject(
+          parseObject(deferred.payload)[DEFERRED_WAKE_CONTEXT_KEY],
+        );
+        try {
+          deferredFailedChatRetry = await authorizeFailedChatRunRetryWake(
+            db,
+            tx as unknown as Db,
+            {
+              phase: "promotion",
+              wakeupRequestId: deferred.id,
+              companyId: issue.companyId,
+              agentId: deferred.agentId,
+              issueId: issue.id,
+              contextSnapshot: exactRetryContext,
+            },
+          );
+        } catch (error) {
+          // Proven denial retires this receipt only. Transient database failures
+          // still roll back and retry; they must not discard authorized work.
+          if (
+            !(error instanceof FailedChatRunRetryAuthorizationError) &&
+            !(
+              error instanceof HttpError &&
+              error.status >= 400 &&
+              error.status < 500
+            )
+          )
+            throw error;
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error:
+                "The exact failed chat request is no longer authorized. Send a new request in the current connected conversation.",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(agentWakeupRequests.id, deferred.id),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              ),
+            );
+          continue;
+        }
+
         const queuedCommentIds = queuedCommentIdsFromWakePayload(
           deferred.payload,
         );
-        if (queuedCommentIds.length > 0) {
+        if (!deferredFailedChatRetry && queuedCommentIds.length > 0) {
           const queuedCommentRows = await tx
             .select({
               id: issueComments.id,
@@ -23815,6 +23894,7 @@ export function heartbeatService(
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
+          !deferredFailedChatRetry &&
           deferredCommentIds.length > 0 &&
           !deferredCommentWakeIsSelfAuthored &&
           (issue.status === "done" || issue.status === "cancelled") &&
@@ -23933,6 +24013,9 @@ export function heartbeatService(
             triggerDetail: promotedTriggerDetail,
             status: "queued",
             wakeupRequestId: deferred.id,
+            retryOfRunId: deferredFailedChatRetry
+              ? readNonEmptyString(promotedContextSnapshot.retryOfRunId)
+              : null,
             contextSnapshot: promotedContextSnapshot,
             responsibleUserId: promotedResponsibleUserId,
             sessionIdBefore: sessionBefore,
@@ -24200,7 +24283,27 @@ export function heartbeatService(
         };
       }
 
+      // A durable chat wake (original or explicit retry) grants one attempt at
+      // its admitted source. Failure cannot authorize generic continuation of
+      // the issue description without that source or its current authority.
+      // Separately admitted deferred messages have already been promoted above.
+      const failedChatRequestOwner = run.wakeupRequestId
+        ? await tx
+            .select({ id: chatActions.id })
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.id, run.wakeupRequestId),
+                eq(chatActions.companyId, run.companyId),
+                inArray(chatActions.kind, ["inbound_wakeup", "failed_run_retry"]),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+        : null;
       const shouldBlockImmediately =
+        Boolean(failedChatRequestOwner) ||
+        run.errorCode === "chat_failed_run_retry_not_authorized" ||
         !recoveryAgentInvokable ||
         !recoveryAgent ||
         isWorkspaceValidationFailedRun(run) ||
@@ -24446,6 +24549,15 @@ export function heartbeatService(
         requestedByActorId: opts.requestedByActorId,
       });
       opts = { ...opts, idempotencyKey: durableRequest.idempotencyKey };
+    }
+    if (
+      Object.hasOwn(enrichedContextSnapshot, "chatFailedRunRetry") &&
+      !durableRequest?.failedRunRetry
+    ) {
+      throw new FailedChatRunRetryAuthorizationError();
+    }
+    if (durableRequest?.failedRunRetry) {
+      opts = { ...opts, allowRunCoalescing: false };
     }
     const durableReceiptFields = durableRequest
       ? { id: durableRequest.id, requestedAt: durableRequest.requestedAt }
@@ -24835,6 +24947,26 @@ export function heartbeatService(
         );
         if (durableReceipt)
           return { kind: "durable" as const, receipt: durableReceipt };
+        const failedChatRetry = await authorizeFailedChatRunRetryWake(
+          db,
+          tx as unknown as Db,
+          {
+            phase: "admission",
+            wakeupRequestId: durableRequest?.id ?? null,
+            companyId: agent.companyId,
+            agentId,
+            issueId,
+            contextSnapshot: enrichedContextSnapshot,
+          },
+        );
+        if (
+          failedChatRetry !== Boolean(durableRequest?.failedRunRetry) ||
+          (failedChatRetry &&
+            durableRequest?.failedRunRetry?.failedRunId !==
+              readNonEmptyString(enrichedContextSnapshot.retryOfRunId))
+        ) {
+          throw new FailedChatRunRetryAuthorizationError();
+        }
         if (durableRequest) {
           if (issueId !== durableRequest.issueId)
             throw new Error("chat_inbound_wakeup_binding_denied");
@@ -25827,6 +25959,9 @@ export function heartbeatService(
             status: "queued",
             responsibleUserId: await resolveQueuedResponsibleUserId(),
             wakeupRequestId: wakeupRequest.id,
+            retryOfRunId: failedChatRetry
+              ? durableRequest!.failedRunRetry!.failedRunId
+              : null,
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
