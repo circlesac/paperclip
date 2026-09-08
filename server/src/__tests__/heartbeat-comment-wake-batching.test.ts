@@ -6,7 +6,17 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   agentWakeupRequests,
+  chatActions,
+  chatConversations,
+  chatDeliveries,
+  chatEndpointResources,
+  chatEndpoints,
+  chatExternalPrincipals,
+  chatIdentityLinks,
+  chatMessageLinks,
+  chatPublications,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -14,6 +24,8 @@ import {
   issueThreadInteractions,
   issues,
   nativeRunFinalizations,
+  toolApplications,
+  toolConnections,
 } from "@paperclipai/db";
 import { runningProcesses } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.ts";
@@ -1796,226 +1808,440 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
-  it("cancels a parked native chat source so its dedicated answer continuation actually dispatches", async () => {
-    const gateway = await createControlledGatewayServer();
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const issueId = randomUUID();
-    const sourceRunId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    const heartbeat = heartbeatService(db);
+  it.each(["linked", "revoked"] as const)(
+    "cancels a parked native chat source and authorizes its dedicated answer continuation (%s)",
+    async (identityStatus) => {
+      const gateway = await createControlledGatewayServer();
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const sourceRunId = randomUUID();
+      const userId = `linked-slack-user-${randomUUID()}`;
+      const endpointId = randomUUID();
+      const conversationId = randomUUID();
+      const principalId = randomUUID();
+      const deliveryId = randomUUID();
+      const applicationId = randomUUID();
+      const connectionId = randomUUID();
+      const resourceId = randomUUID();
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      const heartbeat = heartbeatService(db);
 
-    try {
-      await db.insert(companies).values({
-        id: companyId,
-        name: "Paperclip",
-        issuePrefix,
-        requireBoardApprovalForNewAgents: false,
-        defaultResponsibleUserId: "responsible-user",
-      });
-      await db.insert(agents).values({
-        id: agentId,
-        companyId,
-        name: "Local CLI Agent",
-        role: "engineer",
-        status: "running",
-        adapterType: "openclaw_gateway",
-        adapterConfig: {
-          url: gateway.url,
-          headers: { "x-openclaw-token": "gateway-token" },
-          payloadTemplate: { message: "wake now" },
-          waitTimeoutMs: 2_000,
-        },
-        runtimeConfig: {},
-        permissions: {},
-      });
-      await db.insert(issues).values({
-        id: issueId,
-        companyId,
-        title: "Continue an answered Slack question",
-        status: "in_progress",
-        priority: "medium",
-        responsibleUserId: "responsible-user",
-        assigneeAgentId: agentId,
-        issueNumber: 1,
-        identifier: `${issuePrefix}-1`,
-      });
-      const sourceComment = await db
-        .insert(issueComments)
-        .values({
+      try {
+        await db.insert(companies).values({
+          id: companyId,
+          name: "Paperclip",
+          issuePrefix,
+          requireBoardApprovalForNewAgents: false,
+          defaultResponsibleUserId: "responsible-user",
+        });
+        await db.insert(agents).values({
+          id: agentId,
+          companyId,
+          name: "Local CLI Agent",
+          role: "engineer",
+          status: "running",
+          adapterType: "openclaw_gateway",
+          adapterConfig: {
+            url: gateway.url,
+            headers: { "x-openclaw-token": "gateway-token" },
+            payloadTemplate: { message: "wake now" },
+            waitTimeoutMs: 2_000,
+          },
+          runtimeConfig: {},
+          permissions: {},
+        });
+        await db.insert(issues).values({
+          id: issueId,
+          companyId,
+          title: "Continue an answered Slack question",
+          status: "in_progress",
+          priority: "medium",
+          responsibleUserId: "responsible-user",
+          assigneeAgentId: agentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        });
+        const sourceComment = await db
+          .insert(issueComments)
+          .values({
+            companyId,
+            issueId,
+            authorType: "user",
+            authorUserId: userId,
+            body: "Build the release and preserve this full source instruction.",
+          })
+          .returning()
+          .then((rows) => rows[0]!);
+        // Model an admitted, linked Slack source, not just an untrusted source
+        // string. The real dispatch attestor must reconstruct this durable chain.
+        await db.insert(toolApplications).values({
+          id: applicationId,
+          companyId,
+          applicationKey: `chat:slack:${endpointId}`,
+          name: "Slack question",
+          type: "chat",
+          status: "active",
+        });
+        await db.insert(toolConnections).values({
+          id: connectionId,
+          companyId,
+          applicationId,
+          name: "Slack question",
+          uid: `chat-slack-${endpointId}`,
+          connectionPurpose: "channel",
+          transport: "chat_sdk",
+          status: "active",
+          enabled: true,
+        });
+        await db.insert(chatEndpoints).values({
+          id: endpointId,
+          companyId,
+          connectionId,
+          provider: "slack",
+          publicId: randomUUID(),
+          assignedAgentId: agentId,
+          status: "active",
+          providerAccountId: "slack-workspace",
+          allowDirectMessages: true,
+          allowUnlinkedPeople: false,
+        });
+        await db.insert(chatEndpointResources).values({
+          id: resourceId,
+          companyId,
+          endpointId,
+          type: "direct_message",
+          providerResourceId: "slack-person",
+          label: "Slack direct message",
+          availability: "available",
+          enabled: true,
+        });
+        await db.insert(chatConversations).values({
+          id: conversationId,
+          companyId,
+          endpointId,
+          resourceId,
+          issueId,
+          externalConversationId: "slack-person",
+          externalThreadId: "slack:slack-person:1",
+          externalLabel: "Slack direct message",
+          sessionGeneration: 1,
+          isDirectMessage: true,
+          state: "active",
+        });
+        await db.insert(chatExternalPrincipals).values({
+          id: principalId,
+          companyId,
+          provider: "slack",
+          providerAccountId: "slack-workspace",
+          externalId: "slack-person",
+          kind: "user",
+        });
+        await db.insert(chatIdentityLinks).values({
+          companyId,
+          endpointId,
+          principalId,
+          paperclipUserId: userId,
+          status: "linked",
+        });
+        await db.insert(companyMemberships).values({
+          companyId,
+          principalType: "user",
+          principalId: userId,
+          status: "active",
+          membershipRole: "member",
+        });
+        await db.insert(chatDeliveries).values({
+          id: deliveryId,
+          companyId,
+          endpointId,
+          conversationId,
+          principalId,
+          providerEventId: "slack-source-message",
+          deduplicationKey: "slack-source-message",
+          eventKind: "message",
+          normalizedEvent: {},
+          state: "processed",
+          attempts: 1,
+          processedAt: new Date(),
+        });
+        await db.insert(chatMessageLinks).values({
+          companyId,
+          endpointId,
+          conversationId,
+          deliveryId,
+          commentId: sourceComment.id,
+          providerMessageId: "slack-source-message",
+          direction: "inbound",
+        });
+        await db.insert(heartbeatRuns).values({
+          id: sourceRunId,
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          status: "running",
+          runtimeMode: "native",
+          nativeIssueId: issueId,
+          driverKind: "codex",
+          startedAt: new Date(),
+          contextSnapshot: {
+            issueId,
+            taskId: issueId,
+            source: "chat:slack",
+            commentId: sourceComment.id,
+            wakeCommentId: sourceComment.id,
+            wakeCommentIds: [sourceComment.id],
+            paperclipHarnessCheckedOut: true,
+            paperclipWake: {
+              externalChatProvider: "slack",
+              checkedOutByHarness: true,
+              issue: { id: issueId, workMode: "standard" },
+              commentIds: [sourceComment.id],
+            },
+          },
+        });
+        await db.insert(nativeRunFinalizations).values({
+          runId: sourceRunId,
           companyId,
           issueId,
-          authorUserId: "external-slack-user",
-          body: "Build the release and preserve this full source instruction.",
-        })
-        .returning()
-        .then((rows) => rows[0]!);
-      await db.insert(heartbeatRuns).values({
-        id: sourceRunId,
-        companyId,
-        agentId,
-        invocationSource: "assignment",
-        triggerDetail: "system",
-        status: "running",
-        runtimeMode: "native",
-        nativeIssueId: issueId,
-        driverKind: "codex",
-        startedAt: new Date(),
-        contextSnapshot: {
-          issueId,
-          taskId: issueId,
-          source: "chat:slack",
-          commentId: sourceComment.id,
-          wakeCommentId: sourceComment.id,
-          wakeCommentIds: [sourceComment.id],
-        },
-      });
-      await db.insert(nativeRunFinalizations).values({
-        runId: sourceRunId,
-        companyId,
-        issueId,
-        phase: "observed",
-      });
-      await db
-        .update(issues)
-        .set({
-          checkoutRunId: sourceRunId,
-          executionRunId: sourceRunId,
-          executionAgentNameKey: "localcliagent",
-          executionLockedAt: new Date(),
-        })
-        .where(eq(issues.id, issueId));
+          phase: "observed",
+        });
+        await db
+          .update(issues)
+          .set({
+            checkoutRunId: sourceRunId,
+            executionRunId: sourceRunId,
+            executionAgentNameKey: "localcliagent",
+            executionLockedAt: new Date(),
+          })
+          .where(eq(issues.id, issueId));
 
-      const interactions = issueThreadInteractionService(db);
-      const pending = await interactions.create(
-        { id: issueId, companyId },
-        {
-          kind: "ask_user_questions",
-          continuationPolicy: "wake_assignee",
-          sourceRunId,
-          sourceCommentId: sourceComment.id,
+        const interactions = issueThreadInteractionService(db);
+        const pending = await interactions.create(
+          { id: issueId, companyId },
+          {
+            kind: "ask_user_questions",
+            continuationPolicy: "wake_assignee",
+            sourceRunId,
+            sourceCommentId: sourceComment.id,
+            payload: {
+              version: 1,
+              questions: [
+                {
+                  id: "release",
+                  prompt: "Continue the release?",
+                  selectionMode: "single",
+                  required: true,
+                  options: [{ id: "yes", label: "Yes" }],
+                },
+              ],
+            },
+          },
+          { agentId, runId: sourceRunId },
+        );
+        const answered = await interactions.answerQuestions(
+          { id: issueId, companyId, status: "in_progress" },
+          pending.id,
+          { answers: [{ questionId: "release", optionIds: ["yes"] }] },
+          { userId },
+        );
+        const publicationId = randomUUID();
+        await db.insert(chatPublications).values({
+          id: publicationId,
+          companyId,
+          endpointId,
+          conversationId,
+          issueId,
+          state: "published",
+          idempotencyKey: `question:${answered.id}`,
+          providerMessageId: "slack-question-card",
+          publishedAt: new Date(),
+          payload: {
+            text: "Continue the release?",
+            interactionId: answered.id,
+          },
+        });
+        await db.insert(chatActions).values({
+          companyId,
+          endpointId,
+          conversationId,
+          principalId,
+          kind: "question_answer",
+          status: "processed",
+          providerActionId: `answer:${answered.id}`,
           payload: {
             version: 1,
-            questions: [
-              {
-                id: "release",
-                prompt: "Continue the release?",
-                selectionMode: "single",
-                required: true,
-                options: [{ id: "yes", label: "Yes" }],
-              },
-            ],
+            interactionId: answered.id,
+            publicationId,
+            questionId: "release",
+            optionId: "yes",
           },
-        },
-        { agentId, runId: sourceRunId },
-      );
-      const answered = await interactions.answerQuestions(
-        { id: issueId, companyId, status: "in_progress" },
-        pending.id,
-        { answers: [{ questionId: "release", optionIds: ["yes"] }] },
-        { userId: "linked-slack-user" },
-      );
-      let nativeResolverCalls = 0;
-      const outcome = await questionResponseDeliveryService(db, {
-        heartbeat,
-        resolveNativeQuestion: async () => {
-          nativeResolverCalls += 1;
-          return "queued";
-        },
-      }).deliver(answered.id);
-
-      expect(nativeResolverCalls).toBe(0);
-      expect(outcome).toMatchObject({
-        status: "fallback_queued",
-        mode: "wake_fallback",
-      });
-      await expect(
-        db
-          .select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, sourceRunId)),
-      ).resolves.toEqual([{ status: "cancelled" }]);
-
-      let continuationRunId: string | null = null;
-      await waitFor(async () => {
-        continuationRunId = await db
-          .select({ runId: agentWakeupRequests.runId })
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              eq(agentWakeupRequests.companyId, companyId),
-              eq(
-                agentWakeupRequests.idempotencyKey,
-                `question-response:${answered.id}`,
+          result: { interactionId: answered.id, interactionStatus: "answered" },
+        });
+        if (identityStatus === "revoked") {
+          await db
+            .update(chatIdentityLinks)
+            .set({ status: "revoked" })
+            .where(
+              and(
+                eq(chatIdentityLinks.companyId, companyId),
+                eq(chatIdentityLinks.principalId, principalId),
               ),
-            ),
-          )
-          .then((rows) => rows[0]?.runId ?? null);
-        return continuationRunId !== null;
-      }, 30_000);
-      expect(continuationRunId).not.toBe(sourceRunId);
-      await waitFor(() => gateway.getAgentPayloads().length === 1, 30_000);
-      const continuationRun = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, continuationRunId!))
-        .then((rows) => rows[0] ?? null);
-      expect(continuationRun).toMatchObject({
-        status: "running",
-        contextSnapshot: expect.objectContaining({
-          interactionId: answered.id,
-          sourceRunId,
-          sourceCommentId: sourceComment.id,
-          externalChatContinuation: true,
-          wakeCommentId: sourceComment.id,
-          wakeCommentIds: [sourceComment.id],
-        }),
-      });
-      expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
-        "preserve this full source instruction",
-      );
-      expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
-        "Preserve and obey the original source comment's formatting and exact-output constraints literally.",
-      );
-      expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
-        "Do not narrate answer receipt, interaction IDs, Paperclip workflow, delegation, task status, or closure",
-      );
+            );
+        }
+        let nativeResolverCalls = 0;
+        const outcome = await questionResponseDeliveryService(db, {
+          heartbeat,
+          resolveNativeQuestion: async () => {
+            nativeResolverCalls += 1;
+            return "queued";
+          },
+        }).deliver(answered.id);
 
-      gateway.releaseFirstWait();
-      await waitFor(async () => {
-        const run = await db
-          .select({ status: heartbeatRuns.status })
+        expect(nativeResolverCalls).toBe(0);
+        expect(outcome).toMatchObject({
+          status: "fallback_queued",
+          mode: "wake_fallback",
+        });
+        await expect(
+          db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, sourceRunId)),
+        ).resolves.toEqual([{ status: "cancelled" }]);
+
+        let continuationRunId: string | null = null;
+        await waitFor(async () => {
+          continuationRunId = await db
+            .select({ runId: agentWakeupRequests.runId })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, companyId),
+                eq(
+                  agentWakeupRequests.idempotencyKey,
+                  `question-response:${answered.id}`,
+                ),
+              ),
+            )
+            .then((rows) => rows[0]?.runId ?? null);
+          return continuationRunId !== null;
+        }, 30_000);
+        expect(continuationRunId).not.toBe(sourceRunId);
+        if (identityStatus === "revoked") {
+          await heartbeat.drainActiveRunExecutions();
+          const [deniedRun] = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, continuationRunId!));
+          expect(deniedRun).toMatchObject({
+            status: "failed",
+            error: "reviewed_chat_execution_binding_not_authorized",
+            contextSnapshot: expect.objectContaining({
+              interactionId: answered.id,
+              sourceRunId,
+            }),
+          });
+          expect(deniedRun?.contextSnapshot).not.toHaveProperty(
+            "paperclipExternalChatQuestionResponse",
+          );
+          expect(gateway.getAgentPayloads()).toHaveLength(0);
+          return;
+        }
+        await waitFor(() => gateway.getAgentPayloads().length === 1, 30_000);
+        const continuationRun = await db
+          .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, continuationRunId!))
           .then((rows) => rows[0] ?? null);
-        return run?.status === "succeeded";
-      }, 30_000);
-      await waitFor(async () =>
-        db
-          .select({ executionRunId: issues.executionRunId })
-          .from(issues)
-          .where(eq(issues.id, issueId))
-          .then((rows) => rows[0]?.executionRunId === null),
-      );
-      await expect(
-        db
-          .select({ status: issueQuestionResponseDeliveries.status })
-          .from(issueQuestionResponseDeliveries)
-          .where(
-            eq(issueQuestionResponseDeliveries.interactionId, answered.id),
-          ),
-      ).resolves.toEqual([{ status: "fallback_queued" }]);
-      await expect(
-        db
-          .select({ status: issueThreadInteractions.status })
-          .from(issueThreadInteractions)
-          .where(eq(issueThreadInteractions.id, answered.id)),
-      ).resolves.toEqual([{ status: "answered" }]);
-    } finally {
-      gateway.releaseFirstWait();
-      await gateway.close();
-    }
-  }, 120_000);
+        expect(continuationRun).toMatchObject({
+          status: "running",
+          contextSnapshot: expect.objectContaining({
+            interactionId: answered.id,
+            sourceRunId,
+            sourceCommentId: sourceComment.id,
+            externalChatContinuation: true,
+            wakeCommentId: sourceComment.id,
+            wakeCommentIds: [sourceComment.id],
+            paperclipExternalChatExecutionBound: true,
+            paperclipExternalChatQuestionResponse: expect.objectContaining({
+              schema: "paperclip.external_chat_question_response.v1",
+              interactionId: answered.id,
+              sourceRunId,
+              sourceCommentId: sourceComment.id,
+              endpointId,
+              conversationId,
+            }),
+          }),
+        });
+        expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
+          "preserve this full source instruction",
+        );
+        expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
+          "Preserve the original request's exact-output constraints literally.",
+        );
+        expect(String(gateway.getAgentPayloads()[0]?.message ?? "")).toContain(
+          "Do not narrate Paperclip workflow, checkout, status, or completion bookkeeping.",
+        );
+        const continuationWake = parseWakePayloadFromMessage(
+          gateway.getAgentPayloads()[0]?.message,
+        );
+        expect(continuationWake).toMatchObject({
+          externalChatProvider: "slack",
+          externalChatExecutionBound: true,
+          externalChatQuestionResponse: expect.objectContaining({
+            interactionId: answered.id,
+            sourceRunId,
+            endpointId,
+            conversationId,
+          }),
+          questionResponse: {
+            interactionId: answered.id,
+            summaryMarkdown:
+              "Resolved questions and answers:\n- Continue the release?: Yes",
+            truncated: false,
+          },
+        });
+
+        gateway.releaseFirstWait();
+        await waitFor(async () => {
+          const run = await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, continuationRunId!))
+            .then((rows) => rows[0] ?? null);
+          return run?.status === "succeeded";
+        }, 30_000);
+        await waitFor(async () =>
+          db
+            .select({ executionRunId: issues.executionRunId })
+            .from(issues)
+            .where(eq(issues.id, issueId))
+            .then((rows) => rows[0]?.executionRunId === null),
+        );
+        await expect(
+          db
+            .select({ status: issueQuestionResponseDeliveries.status })
+            .from(issueQuestionResponseDeliveries)
+            .where(
+              eq(issueQuestionResponseDeliveries.interactionId, answered.id),
+            ),
+        ).resolves.toEqual([{ status: "fallback_queued" }]);
+        await expect(
+          db
+            .select({ status: issueThreadInteractions.status })
+            .from(issueThreadInteractions)
+            .where(eq(issueThreadInteractions.id, answered.id)),
+        ).resolves.toEqual([{ status: "answered" }]);
+      } finally {
+        gateway.releaseFirstWait();
+        await heartbeat.drainActiveRunExecutions();
+        await gateway.close();
+      }
+    },
+    120_000,
+  );
 
   it("still reopens a finished issue when a deferred batch mixes self-authored and human comments", async () => {
     const gateway = await createControlledGatewayServer();
