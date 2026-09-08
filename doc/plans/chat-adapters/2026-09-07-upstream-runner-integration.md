@@ -1786,3 +1786,45 @@ real PostgreSQL row visibility from a separate connection, payload exclusion,
 replay behavior, and throwing-listener callback continuity. No full-file
 formatting churn, lockfile edit, raw trace broadcast, or authority relaxation
 was retained.
+
+### Final clean-build live pass — 2026-09-08
+
+The private live server now runs clean `cad8ccd07` on loopback port 3103
+with the rebuilt runner above. Health is ready; historical recovery holds
+remain unchanged. The fresh full chat integration suite passed **325/325**
+after the final bridge changes. The earlier isolated browser suite passed
+**9/9**; no claim of a passing broad workspace build/test gate is added.
+
+Discord's request at 10:43:19.563Z created native run
+`82828c7c-75dd-4c8b-9d3c-0b359d3ac265` on the existing CHA-4. Its
+cadence-selected safe `item.completed` event, sequence 54, committed at
+10:43:43.035Z; the progress publication was created at 43.119Z (**84ms**)
+and published at 43.584Z (**549ms** after the event). The browser showed
+“making progress” on existing message `1546833317133942784`, then the final
+verification phrase “cobalt otter 47” on that same message at 46.456Z.
+There was one final comment, publication, and outbound link, with attempt one.
+This sample's end-to-end time was **26.893s**. The timestamps measure the
+committed event through publication, not an isolated provider-network span.
+
+In parallel, Telegram's request at 10:43:28.534Z created
+`7bb24611-d4c2-43e4-a186-30711e7f476b` on the existing CHA-24. One native
+Maple/Cedar question was delivered on `417200359:109` at 38.428Z,
+**9.894s** after the request. The actual Cedar button was clicked once at
+54.737Z; one durable answer delivery woke continuation
+`8667469d-2eef-472e-a73f-8aa4b0b4aaf0`. The question became “Answered:
+Cedar,” and working message `417200359:110` became exactly “Cedar” at
+10:44:12.521Z, **17.784s** after the click. The final publication's own
+created-to-published interval was 1.289s, so sub-second delivery is not
+claimed universally. All associated publications were attempt one, without
+duplicate questions or final comments. The short question turn did not need
+a separate cadence-limited progress phase.
+
+Actual rollout contexts for all three clean-build runs confirm
+`gpt-5.6-luna` and `codex_app_server`. All four active provider endpoints
+(Slack, Discord, Telegram, GitHub) remain assigned to Maya's
+`paperclip_runner` / Luna configuration. Terra was not substituted.
+GitHub's App delivery settings still show the six-digit Confirm access gate;
+the pending private-image delivery is not declared qualified. Teams Developer
+Portal still shows its Microsoft sign-in gate. These provider gates and the
+separately documented latency benchmark remain explicit; this is not a
+blanket production-ready sign-off for all five providers.
