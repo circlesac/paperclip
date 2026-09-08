@@ -16584,12 +16584,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         loaded.payload,
       );
     }
+    const interaction = (
+      await issueThreadInteractionService(db).listForIssue(conversation.issueId)
+    ).find((candidate) => candidate.id === loaded.interactionId);
+    const isExactProcessedReplay = (
+      current: Awaited<ReturnType<typeof loadChatQuestionFormSubmissionToken>>,
+    ) =>
+      interaction?.companyId === record.endpoint.companyId &&
+      interaction.issueId === conversation.issueId &&
+      interaction.kind === "ask_user_questions" &&
+      interaction.status === "answered" &&
+      interaction.resolvedByUserId === principal.userId &&
+      current?.status === "processed" &&
+      current.actionRowId === loaded.actionRowId &&
+      current.conversationId === conversation.id &&
+      current.publicationId === originalPublication.id &&
+      current.interactionId === loaded.interactionId &&
+      current.principalId === principal.principal.id &&
+      current.result?.code === "question_form_answered" &&
+      current.result?.interactionId === loaded.interactionId;
     if (loaded.status === "processed") {
-      if (
-        loaded.principalId !== principal.principal.id ||
-        loaded.result?.code !== "question_form_answered" ||
-        loaded.result?.interactionId !== loaded.interactionId
-      ) {
+      if (!isExactProcessedReplay(loaded)) {
         return deny(
           "chat_modal_replay_not_authorized",
           {
@@ -16609,9 +16624,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       }
       return { action: "clear" };
     }
-    const interaction = (
-      await issueThreadInteractionService(db).listForIssue(conversation.issueId)
-    ).find((candidate) => candidate.id === loaded.interactionId);
     if (
       !interaction ||
       interaction.companyId !== record.endpoint.companyId ||
@@ -16619,6 +16631,50 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       interaction.kind !== "ask_user_questions" ||
       interaction.status !== "pending"
     ) {
+      // Another callback can commit the same token between the initial token
+      // read and this interaction read. Only its exact processed receipt may
+      // acknowledge the stale snapshot; an answer by another token or actor
+      // does not authorize this form. Recheck current policy under its locks.
+      let processedReplay = false;
+      if (
+        interaction?.companyId === record.endpoint.companyId &&
+        interaction.issueId === conversation.issueId &&
+        interaction.kind === "ask_user_questions" &&
+        interaction.status === "answered"
+      ) {
+        try {
+          processedReplay = await db.transaction(async (tx) => {
+            await requireCurrentExternalActionAuthorization(tx, {
+              conversationId: conversation.id,
+              endpointId: record.endpoint.id,
+              expectedUserId: principal.userId!,
+              principalId: principal.principal.id,
+              runtimeContext,
+            });
+            return isExactProcessedReplay(
+              await loadChatQuestionFormSubmissionToken(tx, {
+                callbackId: event.event.callbackId,
+                companyId: record.endpoint.companyId,
+                endpointId: record.endpoint.id,
+                includeProcessed: true,
+              }),
+            );
+          });
+        } catch (error) {
+          if (!isExternalActionAuthorizationChange(error)) throw error;
+        }
+      }
+      if (processedReplay) {
+        if (event.event.relatedThread) {
+          await recordCurrentMicrosoftTeamsRoute(
+            record.endpoint,
+            runtimeContext,
+            event.event.relatedThread.id,
+            event.event.raw,
+          );
+        }
+        return { action: "clear" };
+      }
       return deny(
         "chat_modal_interaction_not_pending",
         {

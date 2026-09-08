@@ -83,6 +83,7 @@ import { issueService } from "../services/issues.js";
 import { logActivity } from "../services/activity-log.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
+import * as chatQuestionForms from "../services/chat-question-forms.js";
 import type { StorageService } from "../storage/types.js";
 import {
   TELEGRAM_CALLBACK_DATA_LIMIT_BYTES,
@@ -27073,20 +27074,70 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ),
         );
 
-      await expect(
-        Promise.all([
-          callbacks.onModalSubmit(
-            validSubmit as Parameters<
-              NonNullable<typeof callbacks.onModalSubmit>
-            >[0],
-          ),
-          callbacks.onModalSubmit(
-            validSubmit as Parameters<
-              NonNullable<typeof callbacks.onModalSubmit>
-            >[0],
-          ),
-        ]),
-      ).resolves.toEqual([{ action: "clear" }, { action: "clear" }]);
+      // Both callbacks load the issued token. Hold the duplicate until the
+      // first callback commits its answer, exercising stale preflight state
+      // rather than relying on database latency to produce the race.
+      const originalLoadToken =
+        chatQuestionForms.loadChatQuestionFormSubmissionToken;
+      let issuedReplayToken: Awaited<ReturnType<typeof originalLoadToken>> =
+        null;
+      let tokenLoads = 0;
+      let releaseFirstSubmit!: () => void;
+      let releaseReplaySubmit!: () => void;
+      const firstSubmitReleased = new Promise<void>((resolve) => {
+        releaseFirstSubmit = resolve;
+      });
+      const replaySubmitReleased = new Promise<void>((resolve) => {
+        releaseReplaySubmit = resolve;
+      });
+      const tokenLoadSpy = vi
+        .spyOn(chatQuestionForms, "loadChatQuestionFormSubmissionToken")
+        .mockImplementation(async (...args) => {
+          const loaded = await originalLoadToken(...args);
+          if (args[1].callbackId === modal.callbackId && tokenLoads < 2) {
+            const ordinal = ++tokenLoads;
+            expect(loaded?.status).toBe("issued");
+            issuedReplayToken = loaded;
+            await (ordinal === 1 ? firstSubmitReleased : replaySubmitReleased);
+          }
+          return loaded;
+        });
+      const firstSubmit = callbacks.onModalSubmit(
+        validSubmit as Parameters<
+          NonNullable<typeof callbacks.onModalSubmit>
+        >[0],
+      );
+      const replaySubmit = callbacks.onModalSubmit(
+        validSubmit as Parameters<
+          NonNullable<typeof callbacks.onModalSubmit>
+        >[0],
+      );
+      // Observe rejections immediately; finally joins both callbacks even when
+      // the red assertion fails, so no held callback can leak into another test.
+      const submissionsSettled = Promise.allSettled([
+        firstSubmit,
+        replaySubmit,
+      ]);
+      try {
+        await vi.waitFor(() => expect(tokenLoads).toBe(2));
+        releaseFirstSubmit();
+        await vi.waitFor(async () => {
+          const [current] = await db
+            .select({ status: issueThreadInteractions.status })
+            .from(issueThreadInteractions)
+            .where(eq(issueThreadInteractions.id, interaction.id));
+          expect(current?.status).toBe("answered");
+        });
+        releaseReplaySubmit();
+        await expect(Promise.all([firstSubmit, replaySubmit])).resolves.toEqual(
+          [{ action: "clear" }, { action: "clear" }],
+        );
+      } finally {
+        releaseFirstSubmit();
+        releaseReplaySubmit();
+        await submissionsSettled;
+        tokenLoadSpy.mockRestore();
+      }
       expect(teamsRouteCount()).toBeGreaterThanOrEqual(
         routeCountAfterValidOpen + (provider === "microsoft-teams" ? 1 : 0),
       );
@@ -27149,6 +27200,130 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           >[0],
         ),
       ).resolves.toEqual({ action: "clear" });
+      if (!issuedReplayToken) throw new Error("Expected captured issued token");
+      const staleReplay = async () => {
+        const staleLoadSpy = vi
+          .spyOn(chatQuestionForms, "loadChatQuestionFormSubmissionToken")
+          .mockResolvedValueOnce(issuedReplayToken);
+        try {
+          return await callbacks.onModalSubmit!(
+            validSubmit as Parameters<
+              NonNullable<typeof callbacks.onModalSubmit>
+            >[0],
+          );
+        } finally {
+          staleLoadSpy.mockRestore();
+        }
+      };
+      const [processedToken] = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, endpoint.id),
+            eq(chatActions.providerActionId, modal.callbackId),
+          ),
+        );
+      expect(processedToken?.status).toBe("processed");
+      // A terminal interaction alone cannot authorize stale-token recovery.
+      // The exact processed receipt and its original resolving user must match.
+      await db
+        .update(chatActions)
+        .set({
+          result: {
+            code: "question_form_answered",
+            interactionId: randomUUID(),
+          },
+        })
+        .where(eq(chatActions.id, processedToken.id));
+      await expect(staleReplay()).resolves.toEqual(deniedSubmitResponse);
+      await db
+        .update(chatActions)
+        .set({ result: processedToken.result })
+        .where(eq(chatActions.id, processedToken.id));
+      await db
+        .update(companyMemberships)
+        .set({ membershipRole: "viewer" })
+        .where(
+          and(
+            eq(companyMemberships.companyId, fixture.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, linkedUserId),
+          ),
+        );
+      await expect(staleReplay()).resolves.toEqual(deniedSubmitResponse);
+      await db
+        .update(companyMemberships)
+        .set({ membershipRole: "operator" })
+        .where(
+          and(
+            eq(companyMemberships.companyId, fixture.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, linkedUserId),
+          ),
+        );
+      await db
+        .update(chatIdentityLinks)
+        .set({ status: "revoked" })
+        .where(
+          and(
+            eq(chatIdentityLinks.endpointId, endpoint.id),
+            eq(chatIdentityLinks.principalId, principal.id),
+          ),
+        );
+      await expect(staleReplay()).resolves.toEqual(deniedSubmitResponse);
+      await db
+        .update(chatIdentityLinks)
+        .set({ status: "linked" })
+        .where(
+          and(
+            eq(chatIdentityLinks.endpointId, endpoint.id),
+            eq(chatIdentityLinks.principalId, principal.id),
+          ),
+        );
+      const relinkedUserId = `modal-relinked-user-${randomUUID()}`;
+      await db.insert(authUsers).values({
+        id: relinkedUserId,
+        name: "Different Modal User",
+        email: `${relinkedUserId}@example.com`,
+        emailVerified: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(companyMemberships).values({
+        companyId: fixture.companyId,
+        principalType: "user",
+        principalId: relinkedUserId,
+        status: "active",
+        membershipRole: "operator",
+      });
+      await db
+        .update(chatIdentityLinks)
+        .set({ paperclipUserId: relinkedUserId })
+        .where(
+          and(
+            eq(chatIdentityLinks.endpointId, endpoint.id),
+            eq(chatIdentityLinks.principalId, principal.id),
+          ),
+        );
+      await expect(staleReplay()).resolves.toEqual(deniedSubmitResponse);
+      await expect(
+        callbacks.onModalSubmit(
+          validSubmit as Parameters<
+            NonNullable<typeof callbacks.onModalSubmit>
+          >[0],
+        ),
+      ).resolves.toEqual(deniedSubmitResponse);
+      await db
+        .update(chatIdentityLinks)
+        .set({ paperclipUserId: linkedUserId })
+        .where(
+          and(
+            eq(chatIdentityLinks.endpointId, endpoint.id),
+            eq(chatIdentityLinks.principalId, principal.id),
+          ),
+        );
+      await expect(staleReplay()).resolves.toEqual({ action: "clear" });
       expect(
         await db
           .select()
