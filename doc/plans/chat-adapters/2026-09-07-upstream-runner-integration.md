@@ -1006,3 +1006,53 @@ direct-chat comment. Questions created by an already resumed answer turn and
 multi-comment source batches are deliberately not covered; arbitrary sequential
 question chains remain a release gap. Live requalification of the repaired
 answer, Discord controls and wording is still required at this checkpoint.
+
+### Live native answer repair passes (September 8, 08:06–08:10 UTC)
+
+The clean `bb7531a4a` process reports that version from `/api/health`. Root's full
+native runtime suite passed **1,305/1,305** across 33 files in 86.90s before
+restarting the idle live server; the verified webhook proxy was left running.
+
+- Telegram source `06225db3-09bb-4dfe-bb77-150146497b8a` created the clickable
+  question in 10.072s. One Amber click settled interaction
+  `600c46ba-26dc-4c7a-a495-1d6247d00e0c`. Continuation
+  `b0aa2657-2541-405d-b2bc-be1c553dc2f4` took 14.412s and visibly returned exactly
+  **Amber** at `417200359:86` (08:07:24.682). The answer keyboard disappeared.
+- Discord source `431d7909-fc69-49b6-9077-08cd033681a5` created its question in
+  25.738s. One Cobalt click settled interaction
+  `02a31169-ebfe-4fcb-b21f-1e2141b07f7a`. Continuation
+  `03b4aee5-a6b5-4f59-b580-6a232ba26934` took 16.460s and visibly returned exactly
+  **Cobalt** at `1546794131576197221` (08:07:57.437). The settled card had no
+  choice buttons. Publication `40787c5c-d413-46b2-ad90-d21f209c7476` encountered
+  one definite pre-provider policy-lock retry, then updated the same work
+  message once; it was not an ambiguous delivery or duplicate response.
+
+Both answer deliveries had one attempt and zero errors; both continuations have
+persisted answer attestation and authorized presentation. The separate original
+human reviews remain pending with no resolution timestamp. An independent check
+of actual Codex `turn_context.model` events confirms `gpt-5.6-luna` in all four
+source/continuation runs, not merely in the agent's configured model.
+
+The Telegram answer run page shows **PAPERCLIP RUNNER openai / gpt-5.6-luna**,
+the canonical **Amber** result and 51 events. Its Runner Inspector works with
+raw provider capture **off**, exposing canonical events and persisted
+presentation decisions privately in Paperclip. External chats received the
+selected answer, not private reasoning or tool events.
+
+The stronger wording instruction still did **not** fully pass the live media
+retest: Telegram `71c44d92-9026-436e-ad03-384a44494e7e` (30.960s) retained
+prepared/waiting boilerplate; Discord `1a7341d9-4f54-43ec-a868-050c3dfcb91d`
+(70.375s) still added an unconfirmed-delivery caveat. Their original files were
+visibly delivered once, all on publication attempt one: Telegram image
+`417200359:89`, Discord note `1546794573777604631` and PNG
+`1546794580345749514`. Transport passes; model wording remains a quality gap.
+
+The independent earlier-file latency audit attributes the Discord/Telegram
+25.017s difference mostly to provider/model time between additional inspection
+and reuse steps, not scheduling. Explicit provider-start queue was 117–162ms.
+Discord's 63.188s run comprised 1.934s startup, 51.378s provider/model residual,
+4.231s preceding tools, 0.194s finish tool and 5.451s settlement. That settlement
+includes the deliberate five-second semantic-result grace before controlled
+provider cancellation; reducing it requires a separate correctness proof for
+durable suffixes and session suspension. These overlapping runs are one workload
+sample, not a controlled model benchmark or proof about the earlier 98s outlier.
