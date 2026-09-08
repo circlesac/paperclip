@@ -259,23 +259,17 @@ describe("chat connector UI contract", () => {
     expect(setup).not.toContain('title: "Connection failed"');
   });
 
-  it("keeps the current GitHub review artifact on the shipped customer-owned App path", () => {
+  it("keeps GitHub setup on the shipped customer-owned App path", () => {
     const setup = source("./ChatEndpointSetup.tsx");
-    const viewer = source("../../../../../doc/plans/chat-adapters/index.html");
     const generator = source(
       "../../../../../doc/plans/chat-adapters/generate-wireframes-v8.mjs",
     );
     const setupData = source(
       "../../../../../doc/plans/chat-adapters/setup-wireframe-data-v8.mjs",
     );
-    const setupWireframe = source(
-      "../../../../../doc/plans/chat-adapters/wireframes-v8/16-github-create.svg",
-    );
-
-    expect(viewer).toContain("Create or connect a GitHub App");
-    expect(viewer).toContain("Generate webhook secret");
-    expect(setupWireframe).toContain("GitHub App ID");
-    expect(setupWireframe).toContain("Private key (PEM)");
+    expect(setup).toContain("Generate webhook secret");
+    expect(setup).toContain("GitHub App ID");
+    expect(setup).toContain("Private key (PEM)");
     expect(setup).toContain("Choose .pem file");
     expect(setup).toContain("Choose GitHub App private key file");
     expect(setup).toContain("readGitHubPrivateKeyFile");
@@ -285,12 +279,6 @@ describe("chat connector UI contract", () => {
     expect(setup).toContain('type="password"');
     expect(setup).toContain("event.clipboardData.getData(\"text\")");
     expect(setup).not.toContain("WebkitTextSecurity");
-    expect(viewer).toContain("Metadata read");
-    expect(viewer).toContain("Pull request review comment events");
-    expect(viewer).not.toContain('id="s45"');
-    expect(viewer).not.toContain('id="s47"');
-    expect(viewer).not.toContain("Posts Paperclip's App Manifest to GitHub");
-    expect(viewer).not.toContain("credential-free App Manifest path");
     expect(generator).toContain("./setup-wireframe-data-v8.mjs");
     expect(generator).not.toContain("./setup-wireframe-data-v6.mjs");
     expect(setupData).not.toContain('primary: "Create in GitHub"');

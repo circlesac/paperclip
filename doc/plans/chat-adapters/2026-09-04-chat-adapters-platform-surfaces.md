@@ -4,8 +4,7 @@
 **Date:** 2026-09-04
 **Paperclip base:** `origin/master` at `8430bd897f01dd4b91e0970efffb71b97e5a2685`
 **Chat SDK snapshot:** `51322dde8f4aafd8a7fc7a20cbfd7ae45cafaa5c`
-**Viewer:** `index.html` in this directory
-**Generated wires:** 35 four-provider surfaces in `wireframes-v8/`; Discord is the current implementation addendum below
+**Historical viewer and generated wireframes:** [Git archive](./wireframes-archive.md); images are excluded from the PR. Discord is the current implementation addendum below.
 **Current UI companion:** `2026-09-04-chat-adapters-ui-surfaces-v8.md`
 **Minimum setup specification:** `2026-09-04-chat-adapters-minimum-setup-v6.md`
 **Live browser acceptance:** `2026-09-04-chat-adapters-browser-e2e-runbook.md`
@@ -216,7 +215,7 @@ Allowed-user lists belong to Access. Task boundaries, BotFather privacy, deliver
 
 ## 7. Wireframe annotations
 
-The numbered red dashed marks are review annotations only, not proposed UI. The historical v8 viewer contains 14 minimum setup phases plus four provider management tabs; it contains no interaction-walkthrough pages. Every annotation and button consequence has an exact matching explanation beside the desktop/mobile pair in `index.html` and in `2026-09-04-chat-adapters-ui-surfaces-v8.md`; its historical setup source data lives in `setup-wireframe-data-v6.mjs` and its historical management source data in `management-wireframe-data-v8.mjs`. The five-provider implementation addenda and live browser runbook are the current product and acceptance sources.
+The numbered red dashed marks in the archived images are review annotations only, not proposed UI. The historical v8 viewer contains 14 minimum setup phases plus four provider management tabs; it contains no interaction-walkthrough pages. Annotation and button-consequence explanations remain in `2026-09-04-chat-adapters-ui-surfaces-v8.md`; its historical setup source data lives in `setup-wireframe-data-v6.mjs` and its historical management source data in `management-wireframe-data-v8.mjs`. The five-provider implementation addenda and live browser runbook are the current product and acceptance sources.
 
 ## 8. Implementation acceptance points exposed by the wires
 

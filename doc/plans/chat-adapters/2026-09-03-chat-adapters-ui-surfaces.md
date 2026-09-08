@@ -3,7 +3,7 @@
 **Status:** historical v1 requirements inventory; current product flow is `2026-09-04-chat-adapters-ui-surfaces-v8.md`. Managed-install and helper-first concepts below are not shipped requirements.
 **Date:** 2026-09-03
 **Paperclip base:** `origin/master` at `8430bd897f01dd4b91e0970efffb71b97e5a2685` (refreshed from earlier planning references through `d593463ab6394cd356bf27448ea28bad8cccf4ec`)
-**Current wireframe viewer:** `index.html` in this directory renders the v5 step-rail package. The 19-screen inventory below is retained as architecture-coverage history, not the proposed onboarding flow.
+**Historical wireframes:** see the [Git archive](./wireframes-archive.md). The 19-screen inventory below is retained as architecture-coverage history, not the proposed onboarding flow. Generated images are excluded from the PR.
 **Archived wireframes:** [v1 SVG snapshot](https://github.com/paperclipai/paperclip/tree/1c4a45f0ef7d627aa98e4f3ae3116d4507386d1a/doc/plans/chat-adapters/wireframes) ([archive and regeneration notes](./wireframes-archive.md))
 
 ## 1. Information architecture

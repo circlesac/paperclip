@@ -2,8 +2,7 @@
 
 Date: 2026-09-04
 Original planning base: `d593463ab6394cd356bf27448ea28bad8cccf4ec`; release qualification records the exact tested revision separately.
-Review viewer: [`index.html`](./index.html)
-Wireframes: [`wireframes-v8/`](./wireframes-v8/)
+Historical viewer and wireframes: [Git archive](./wireframes-archive.md); generated images are excluded from the PR.
 
 ## Permission model
 

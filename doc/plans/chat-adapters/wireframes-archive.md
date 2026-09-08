@@ -1,6 +1,11 @@
 # Historical chat-adapter wireframes
 
-The current review viewer and its 67 SVGs remain in [`wireframes-v8/`](./wireframes-v8/). The 455 generated v1-v7 SVGs were removed from the working tree for release review size; their exact contents remain available in the [pre-prune archive commit](https://github.com/paperclipai/paperclip/tree/1c4a45f0ef7d627aa98e4f3ae3116d4507386d1a/doc/plans/chat-adapters).
+All generated wireframe images and their HTML gallery are excluded from the PR.
+The final 67 v8 SVGs and gallery remain recoverable in the
+[pre-removal archive](https://github.com/paperclipai/paperclip/tree/63c8b5d8d0671d9f0676a8f4b0d0ac52d0353884/doc/plans/chat-adapters).
+The 455 generated v1-v7 SVGs were removed earlier; their exact contents remain
+available in the [pre-prune archive commit](https://github.com/paperclipai/paperclip/tree/1c4a45f0ef7d627aa98e4f3ae3116d4507386d1a/doc/plans/chat-adapters).
+Written plans, implementation, tests, and production provider icons remain.
 
 The superseded [v2 design note](https://github.com/paperclipai/paperclip/blob/e72a504800c0945993736574fb3cb3bf81dd5157/doc/plans/chat-adapters/2026-09-04-chat-adapters-ui-surfaces-v2.md), [v3 design note](https://github.com/paperclipai/paperclip/blob/9668530e14d42f715fa5778c5e14bfe0fed2a018/doc/plans/chat-adapters/2026-09-04-chat-adapters-ui-surfaces-v3.md) and [v4 design note](https://github.com/paperclipai/paperclip/blob/9668530e14d42f715fa5778c5e14bfe0fed2a018/doc/plans/chat-adapters/2026-09-04-chat-adapters-ui-surfaces-v4.md) are also archived in Git history. This retains their exact decisions while keeping the combined implementation and upstream compatibility fixes within the 500-file review limit. Current designs and live qualification records remain in the working tree; the historical regeneration inputs remain in the archive below.
 
