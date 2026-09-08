@@ -1159,3 +1159,127 @@ response guard; this closes the driver layer too. No further admission-fence
 blocker was found. Build/deployment of this final small defense is pending;
 server 48 still contains the preceding verified driver source. The broad run
 started before this follow-up and is not exact-final-head proof for this hunk.
+
+### Final driver deployment and live file qualification
+
+At head `aaa74597f`, CI **34255076310** passed all lanes and Greptile scored
+**5/5** with no outstanding finding. Master remained `be6bb768b`; the review
+diff remained **497 files**, with no lockfile delta. A subsequent test-only
+fixture cleanup and this evidence record require renewed final-head gates.
+
+The final runner TypeScript build passed and isolated server **49** restarted
+at **17:23:07.133 UTC**; health and startup recovery were ready at
+**17:23:10.159 UTC**. The previous process had zero active or queued heartbeats
+and drained without interrupting runs. The signed native binary stayed at the
+same SHA-256; no Rust restaging was needed. The server loaded the final
+malformed-response guard, with only test-fixture edits dirty at startup.
+
+Root repeated the disabled-experiment journey on server 48 after the
+accessible-company merge: **Settings → Experimental → Chat connectors off →
+Connectors → GitHub → Connect**. Chat-only providers and existing chat
+connections disappeared, but GitHub opened its production tool account setup
+directly, without the chat/tool choice. Root canceled that setup without
+creating a connection, restored the experiment through the UI, and verified
+all four active connections. The expected company remained selected and no
+error banner appeared. This covers the final company-navigation merge, not
+every viewport or transition timing.
+
+New signed-in browser file checks on server 48 used native Codex app-server
+with persisted **`gpt-5.6-luna`**, low reasoning:
+
+| Journey                                            | Native execution | Submission to useful result |
+| -------------------------------------------------- | ---------------- | --------------------------- |
+| New GitHub private main-conversation image         | 20.846 s         | 26.303 s                    |
+| New GitHub generic private file, truthful omission | 15.912 s         | 21.116 s                    |
+| Slack exact original-file return                   | 42.115 s         | 46.266 s                    |
+| Telegram exact original-file return                | 49.995 s         | 54.863 s                    |
+
+The GitHub repository remained private, with unchanged App permissions. The
+new image imported with exact fixture bytes and the response accurately
+described it. The generic text-file request received one current-input
+`download_unavailable` omission, zero imported/generated attachments, and a
+truthful unavailable answer rather than values invented from an earlier file.
+The separate [private attachment authority record](2026-09-08-github-private-attachment-authority.md)
+documents that narrow boundary and source/body binding.
+
+For Slack and Telegram, root uploaded the same new synthetic text fixture,
+asked for its content and exact original file, saw the correct values and a
+native downloadable reply, and **downloaded each provider-returned copy using
+the real browser UI**. Source, stored inbound blob, originating-run output
+blob, and both downloaded copies are **152 bytes**, SHA-256
+`e5ea1c89ad69c0ae9dffea0599c730e5d284816dbcd9dae44746c7a29f790293`.
+All copies were independently rehashed. Telegram's download-event observer
+timed out, but the new OS download existed and matched; root did not resend
+or click again. This observer failure was not a delivery failure.
+
+Each final publication used one attempt. Slack's accepted upload receipt was
+processed once. Working and final text reused the same provider message;
+file attachments appeared separately without a duplicate final or a lingering
+working state. Scoped current delivery/action/wake/run/event/result/comment/
+publication checks found no signed-query or credential leakage. These are
+ordinary file handoffs, **not** proof of the specific attachment-reuse tool,
+provider latency percentiles, or every restart/revocation case.
+
+Functionally, the new Slack and Telegram files were useful end to end: visible
+content matched and the downloaded files were usable. Their native execution
+still accounted for most of the 46–55-second wait. The GitHub image path also
+worked; generic private files remain a real provider limitation with truthful
+feedback, not universal file support. Teams and renewed Discord browser
+qualification remain separately blocked by their documented access gates.
+
+Server 49 then passed `FINAL-GUARD-SMOKE-0908` in the existing Slack thread:
+the exact requested final arrived in **17.297 seconds**, including **15.244
+seconds** of native Luna execution. One working/final message was updated,
+with one attempt each and no lingering working state. A fresh GitHub private
+**inline review-thread** image also passed in **31.028 seconds**, including
+**23.822 seconds** native execution. The stored bytes matched the new upload,
+the exact review-root/source-body/current-comment binding held, and the
+correct visible reply stayed in that review thread after refresh. This
+qualifies the review-image path separately from the main-conversation case;
+it does not replace changed/deleted-source or interrupted-download testing.
+
+### Slow-suite Slack receipt fixture isolation
+
+The latest broad local `pnpm test:run` stopped in general server at **8,207
+passed / 30 skipped / two failed**. Both failures were strict worker-count
+assertions in the Slack receipt cases, not a demonstrated duplicate live send.
+The later workspace and serialized groups were not executed by that command.
+
+An independent deterministic reproduction identified the causal chain. The
+earlier rate-limit classifier fixture left its endpoint active and its
+publication scheduled five seconds into the future. A later service's global
+drain legitimately claimed that different endpoint's retry and its own upload,
+returning two instead of one. The failed assertion then left an unprocessed
+receipt, which the next test counted instead of zero. Advancing only Date by
+six seconds reproduced both failures on a fresh database in **1.85 seconds**.
+The same-attempt ownership guard itself remained intact.
+
+The test-only fix wraps the classifier and four related receipt fixtures in
+failure-safe teardown: stop their exact service, then pause only that fixture's
+still-active endpoint. Publication/receipt audit rows and all strict counts,
+retry-deadline and competing-owner assertions are preserved. An adjacent
+fixture that intentionally retained a two-second retry receipt receives the
+same cleanup. The deadline-crossing regression stays in the test; bounded
+failure-only diagnostics report at most 20 synthetic rows. No production
+worker or provider retry behavior changes.
+
+The focused causal cohort passed **8/8**, server no-emit TypeScript checks
+passed, and the repaired full integration file passed **390/390** on fresh
+PostgreSQL database `_06` in **102.93 seconds** (113.74 seconds total).
+The only subsequent behavior-neutral edit caps diagnostics on the failure path;
+the separate classifier/receipt confirmation passed **10/10** on final bytes.
+The original
+failed broad invocation remains failed, not retroactively green.
+
+Separate continuation groups passed UI **5,614/5,614**, the nine remaining
+workspace-B projects **2,170 passed / 19 skipped**, and the complete DB project
+with one worker **122 passed / six skipped**. The original workspace-A CLI
+portion had **477 passes / two bootstrap failures**; captured PostgreSQL stderr
+confirms shared-memory exhaustion. Workspace B had stopped at DB with **89
+passes / 38 skips / one bootstrap failure**. A CLI rerun accidentally used
+noncanonical `/tmp` and hit 14 path guards; correcting the wrapper yielded
+**478 passes / one source/target database bootstrap failure**, not a complete
+CLI pass. Host usage remained 30 of 32 shared-memory segments. No positively
+identified database from these completed test roots remained to clean up.
+Global IPC limits, unknown segments and unrelated databases were untouched.
+The documented serialized group is continuing once separately.

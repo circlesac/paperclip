@@ -106,4 +106,62 @@ URLs and the same private-host/path/UUID/JWT checks. No additional host or
 credential authority was added. Contract and PostgreSQL restart tests cover
 both accepted forms, credential-free bytes, mixed/duplicate rejection, and
 unchanged current-access/revocation checks. Successful live byte intake and
-agent inspection must still be qualified after deployment.
+agent inspection were still unqualified at that diagnostic checkpoint.
+
+### Live main-conversation image and generic-file check
+
+At **17:12:44.815 UTC**, root used the signed-in GitHub browser to upload a
+new image into the existing authorized test PR's main conversation. The
+repository was visually confirmed **Private** and its visibility and App
+permissions were not changed. `PRIVATE-IMAGE-LANDING-0908` asked the agent to
+inspect only that newly attached image, without suggesting its visual content.
+
+The current-input attachment imported as PNG, **2,111,878 bytes**, SHA-256
+`7693966f6c2b4aaebf9e46359f715fdaede021346bcd926078bb331b1dddc3c1`.
+An independent read-only audit rehashed the stored blob and verified the exact
+comment/body/asset locator and wake-comment binding. The source-body hash
+matches GitHub's CRLF normalization, not a rendered-page reconstruction.
+The native `gpt-5.6-luna` run took **20.846 seconds** and recorded two artifact
+view events. The final response accurately described the orange tabby, pale
+green eyes, and indoor background; root inspected the rendered reply and image.
+The final arrived **26.303 seconds** after submission. Working and final
+operations each used one attempt and updated the same provider comment.
+
+At **17:14:02.540 UTC**, `PRIVATE-FILE-LANDING-0908` uploaded a fresh synthetic
+private text file. The prompt did not reveal its shape, color, or count.
+The current-input action recorded exactly one `download_unavailable` omission,
+zero imported or generated attachments, and no image-view event. Luna
+truthfully reported that this exact new file was unavailable and did not
+invent or reuse values. Its final arrived in **21.116 seconds**.
+
+Scoped delivery, action, wake, run, event, result, comment and publication
+checks found no persisted signed URL/JWT query or provider-rendered HTML.
+Original query-free author `<img>` syntax is not provider-rendered HTML.
+This is a scoped persistence audit, not a whole-database or browser-log claim.
+
+These checks used server 48 and qualify the private **main-conversation**
+image path and honest generic-file omission. Generic private files and native
+outbound uploads remain unsupported.
+
+### Live review-comment image after restart
+
+On server 49, root replied to the existing authorized inline review thread,
+uploaded the fixture again as a **new provider asset**, and submitted
+`PRIVATE-REVIEW-IMAGE-LANDING-0908` at **17:25:14.894 UTC**. The final reply
+arrived in that same review thread at **17:25:45.922 UTC**, **31.028 seconds**
+later. The native Luna run used **23.822 seconds** and correctly described
+the cat, pale green eyes, pink chair and plant. The rendered response persisted
+after a normal browser refresh; the task and conversation remained open.
+
+Independent diagnostics verified the exact new review comment, original review
+root, current Paperclip comment, source-body digest, and new asset UUID. The
+stored attachment again rehashed to the **2,111,878-byte** fixture SHA above.
+The supplied source matches the locator digest after GitHub CRLF normalization.
+There was one wake-associated run, no omission, two artifact-view events, and
+one attempt per working/final publication, both targeting the same provider
+review comment. Scoped persistence checks again found no signed-target/JWT or
+provider-rendered response HTML, and no internal identifier in the final text.
+
+This extends live proof to new private images in **both** main conversations
+and review threads on the deployed authority implementation. It is not a
+changed/deleted-source test or an interrupted-download/revocation stress test.

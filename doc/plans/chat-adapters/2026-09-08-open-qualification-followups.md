@@ -10,19 +10,19 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
-  merged. Keep one PR: published head `5aa2ac46c` is **497 files**, below 500.
-  CI `34252696878` passed every lane. Greptile reviewed this exact head at
-  **5/5** with no outstanding finding. A subsequently reproduced early-turn
+  merged. Keep one PR: published head `aaa74597f` is **497 files**, below 500.
+  CI `34255076310` passed every lane. Greptile reviewed this exact head at
+  **5/5** with no outstanding finding. A reproduced early-turn
   semantic-call race is fixed in `46a946aae`. Master `be6bb768b`
   (accessible-company navigation) is incorporated in `49de75691`; the diff
   remains **497 files** with no lockfile delta. Renew final-head gates after
-  pushing these changes and the qualification record.
+  pushing the pending test-fixture cleanup and qualification record.
   A final direct-driver malformed-response edge is also fixed: clear the
   optimistic turn before rejecting a response without `turn.id`. Its
   deterministic repro went red to green; **178/178** focused driver tests
   (including 17 integrity/composition cases) and runner no-emit typecheck pass.
   The native transport already rejects this malformed response; the additional
-  driver defense still needs build/deployment after the current broad run.
+  driver defense was compiled and deployed on server 49 after the broad run.
 - The default-off **Experimental > Chat connectors** setting is implemented.
   Production GitHub tools remain visible and open directly without the
   chat/tool choice when disabled. Default-off and enabled browser flows passed.
@@ -73,10 +73,13 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current deployed state and evidence
 
-The live server was restarted at **17:03:55.700 UTC**, log
-`.paperclip-runtime/chat-adapters-live/server-experimental-landing-48.log`.
-It runs merged head `49de75691`, including the turn-admission patch and
-accessible-company navigation. The restart had zero active/queued runs.
+The live server was restarted at **17:23:07.133 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-49.log`.
+It runs production head `aaa74597f`, including the final malformed-response
+guard, turn-admission patch and accessible-company navigation. The only dirty
+source at startup was the integration-test cleanup. The restart had zero
+active/queued runs; startup recovery became ready at **17:23:10.159 UTC**.
+Only runner TypeScript was rebuilt; the signed runner binary is unchanged.
 The same native production code on server 47 passed Slack/GitHub/Telegram
 continuation smoke checks, returning exact answers in **14.741 / 18.018 /
 15.940 seconds**, on the
@@ -159,11 +162,49 @@ switch to Terra. The signed/staged runner SHA-256 is
   workspace typecheck/build and a fresh chat integration **390/390** pass.
   Do not substitute a timing delay or weaken the old-owner/archive/result
   assertions. Failure-only fixture logs remain bounded and contain synthetic
-  fixture state only. A new complete `pnpm test:run` started after the final
-  admission build in `admission-workspace-tests-final-0908.log`; it is not yet
-  complete. It began before the small accessible-company master merge and
+  fixture state only. The next complete `pnpm test:run` stopped in general
+  server with **8,207 passed / 30 skipped / two failed**, in
+  `admission-workspace-tests-final-0908.log`. It began before the small
+  accessible-company master merge and
   final malformed-response defense; those changes have separate 288-test
   compatibility/typecheck/build and 178-test driver/typecheck proof.
+  The two failures are now reproduced deterministically: an earlier active
+  Slack rate-limit fixture retained a publication due after five seconds.
+  A later global drain claimed it alongside the intended receipt fixture;
+  that first failed assertion left a receipt which contaminated the next test.
+  Advancing only Date by six seconds reproduces both strict-count failures.
+  The repair is exact fixture teardown, not relaxed counts or a production
+  worker change. The repaired full integration file passed **390/390** on
+  fresh database `_06` in **102.93 seconds**. The only subsequent test edit
+  caps failure-only diagnostics at 20 synthetic rows; final-byte focused
+  confirmation passed **10/10** affected classifier/receipt cases.
+- Continuing workspace groups separately: UI **5,614/5,614**; nine remaining
+  workspace-B projects **2,170 passed / 19 skipped**; full DB project with
+  one worker **122 passed / six skipped**. The original workspace-A command
+  had **477 CLI passes / two failures**, and workspace-B stopped at DB with
+  **89 passes / 38 skips / one failure**. Captured PostgreSQL stderr now
+  confirms host shared-memory exhaustion for the CLI bootstrap failures.
+  A separate CLI retry initially used noncanonical `/tmp` and failed 14 path
+  guards; that invocation was an agent harness mistake, not a code regression.
+  The corrected canonical single-worker run finished **478 passed / one
+  failed**: a source/target embedded-PostgreSQL bootstrap still could not
+  start with the host at 30 of 32 shared-memory segments. No global setting
+  or unrelated process was changed. The serialized server group is running
+  once under the documented wrapper; do not repeatedly retry unchanged limits.
+  These failed command results remain failed; serial reruns are separate
+  evidence. Do not change global IPC limits or stop unrelated databases.
+- New server-48 live file checks passed on native Luna: a new GitHub private
+  main-conversation image imported exact fixture bytes and was inspected in
+  **26.303 seconds**; a new generic private text file was truthfully reported
+  unavailable in **21.116 seconds**, without substituting an older attachment.
+  Slack and Telegram returned a new 152-byte text file in **46.266 / 54.863
+  seconds**. Root downloaded the provider-returned copies through each real
+  browser UI; both match the source SHA-256 byte-for-byte. This proves ordinary
+  file handoff, not the attachment-reuse tool or every restart/revocation case.
+  Server 49 then passed a new private GitHub **review-thread** image in
+  **31.028 seconds**, with exact new source/root/body/asset and stored-byte
+  matching. A post-restart Slack continuation returned its exact answer in
+  **17.297 seconds**. Both used native Luna and one attempt per publication.
 
 ## Remaining work
 
@@ -171,7 +212,7 @@ switch to Terra. The signed/staged runner SHA-256 is
    description, then obtain green CI and Greptile review. The final fresh chat
    rerun is **390/390**; fix any new CI findings without weakening assertions.
    Leave checklist items unchecked while their evidence is missing.
-2. **Finish and deploy permanent protocol-fault feedback.** The original
+2. **Protocol-fault follow-through.** The original
    authenticated digest mismatch can leave “using tools” visible until the
    900-second deadline. Commit `d886f52c0` adds the typed, latched fault
    after exact authentication/correlation/sequence checks; bad events cannot
@@ -188,8 +229,9 @@ switch to Terra. The signed/staged runner SHA-256 is
    controller-to-driver/runtime negative-path composition passed; its combined
    cohort is **132/132**, using a synthetic process launcher and persistence
    port. Full workspace typecheck/build and **10/10** deterministic browser
-   tests pass. The production patch is deployed and reviewed at 5/5; broad
-   local tests and final CI remain pending.
+   tests pass. The production patch is deployed and reviewed at 5/5; exact-head
+   CI passed at `aaa74597f`. Renew those gates for the test-only cleanup and
+   preserve the broad local failure/environment qualifications above.
    Safe external copy directs users to an admin without exposing protocol
    details. No fabricated corruption may be injected into a live provider root.
 3. **Damaged-session recovery.** Telegram `CHA-24` run

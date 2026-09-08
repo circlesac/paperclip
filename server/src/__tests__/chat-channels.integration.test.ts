@@ -1135,6 +1135,28 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     return { objects, putFile, storage };
   }
 
+  async function retirePublicationFixture(
+    service: ChatChannelService,
+    endpointId: string,
+  ) {
+    try {
+      await service.shutdown();
+    } finally {
+      // Workers scan the shared fixture database. Local shutdown alone leaves
+      // future retries/receipts eligible for the next test's service. Preserve
+      // their asserted audit state, but retire this endpoint after assertions.
+      await db
+        .update(chatEndpoints)
+        .set({ status: "paused" })
+        .where(
+          and(
+            eq(chatEndpoints.id, endpointId),
+            eq(chatEndpoints.status, "active"),
+          ),
+        );
+    }
+  }
+
   async function recordSlackUrlVerification(
     service: ChatChannelService,
     publicId: string,
@@ -25191,81 +25213,85 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const fixture = await seedCompany();
       const { callbacks, endpoint, runtime, service } =
         await configuredSlackEndpoint(fixture);
-      const channelId = `C-PUBLICATION-ERROR-${randomUUID().slice(0, 8)}`;
-      const channel = makeThread({
-        channelId,
-        id: `slack:${channelId}:4200.1`,
-        name: "publication-errors",
-      });
-      await deliverMessage({
-        callbacks,
-        endpointId: endpoint.id,
-        thread: channel.thread,
-        message: makeMessage({
-          id: "4200.1",
-          text: "@maya exercise provider failure handling",
-          mentioned: true,
-        }),
-        trigger: "mention",
-      });
-      await qualifySetupRoundTrip(service, endpoint.id);
-      await service.test(endpoint.id, "owner-user");
-      const [conversation] = await db
-        .select()
-        .from(chatConversations)
-        .where(eq(chatConversations.endpointId, endpoint.id));
-      const comment = await issueService(db).addComment(
-        conversation.issueId,
-        "Safe provider response",
-        { userId: "owner-user" },
-        { authorType: "user" },
-      );
-      const providerRuntime = runtime.endpoints.get(endpoint.id);
-      if (!providerRuntime) throw new Error("Expected provider runtime");
-      providerRuntime.postError = error;
-      const beforeAttempt = Date.now();
-      await service.publishComment(endpoint.id, conversation.id, comment.id);
-
-      const [publication] = await db
-        .select()
-        .from(chatPublications)
-        .where(eq(chatPublications.commentId, comment.id));
-      expect(publication).toMatchObject({
-        state: expectedPublicationState,
-        attempts: 1,
-        redactedError: error.message,
-      });
-      if (expectedPublicationState === "retry") {
-        expect(publication.nextAttemptAt?.getTime()).toBeGreaterThanOrEqual(
-          beforeAttempt + 4_500,
-        );
-      } else {
-        expect(publication.nextAttemptAt).toBeNull();
-      }
-      await expect(service.get(endpoint.id)).resolves.toMatchObject({
-        status: expectedEndpointStatus,
-      });
-      const [storedConversation] = await db
-        .select()
-        .from(chatConversations)
-        .where(eq(chatConversations.id, conversation.id));
-      expect(storedConversation.state).toBe(expectedConversationState);
-      const [resource] = await db
-        .select()
-        .from(chatEndpointResources)
-        .where(eq(chatEndpointResources.id, conversation.resourceId!));
-      expect(resource.availability).toBe(expectedResourceAvailability);
-      if (expectedEndpointStatus === "attention") {
-        expect(runtime.endpoints.has(endpoint.id)).toBe(false);
-        const [connection] = await db
-          .select()
-          .from(toolConnections)
-          .where(eq(toolConnections.id, endpoint.connectionId));
-        expect(connection).toMatchObject({
-          status: "disabled",
-          enabled: false,
-          healthStatus: "degraded",
+      try {
+        const channelId = `C-PUBLICATION-ERROR-${randomUUID().slice(0, 8)}`;
+        const channel = makeThread({
+          channelId,
+          id: `slack:${channelId}:4200.1`,
+          name: "publication-errors",
         });
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          thread: channel.thread,
+          message: makeMessage({
+            id: "4200.1",
+            text: "@maya exercise provider failure handling",
+            mentioned: true,
+          }),
+          trigger: "mention",
+        });
+        await qualifySetupRoundTrip(service, endpoint.id);
+        await service.test(endpoint.id, "owner-user");
+        const [conversation] = await db
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.endpointId, endpoint.id));
+        const comment = await issueService(db).addComment(
+          conversation.issueId,
+          "Safe provider response",
+          { userId: "owner-user" },
+          { authorType: "user" },
+        );
+        const providerRuntime = runtime.endpoints.get(endpoint.id);
+        if (!providerRuntime) throw new Error("Expected provider runtime");
+        providerRuntime.postError = error;
+        const beforeAttempt = Date.now();
+        await service.publishComment(endpoint.id, conversation.id, comment.id);
+
+        const [publication] = await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, comment.id));
+        expect(publication).toMatchObject({
+          state: expectedPublicationState,
+          attempts: 1,
+          redactedError: error.message,
+        });
+        if (expectedPublicationState === "retry") {
+          expect(publication.nextAttemptAt?.getTime()).toBeGreaterThanOrEqual(
+            beforeAttempt + 4_500,
+          );
+        } else {
+          expect(publication.nextAttemptAt).toBeNull();
+        }
+        await expect(service.get(endpoint.id)).resolves.toMatchObject({
+          status: expectedEndpointStatus,
+        });
+        const [storedConversation] = await db
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.id, conversation.id));
+        expect(storedConversation.state).toBe(expectedConversationState);
+        const [resource] = await db
+          .select()
+          .from(chatEndpointResources)
+          .where(eq(chatEndpointResources.id, conversation.resourceId!));
+        expect(resource.availability).toBe(expectedResourceAvailability);
+        if (expectedEndpointStatus === "attention") {
+          expect(runtime.endpoints.has(endpoint.id)).toBe(false);
+          const [connection] = await db
+            .select()
+            .from(toolConnections)
+            .where(eq(toolConnections.id, endpoint.connectionId));
+          expect(connection).toMatchObject({
+            status: "disabled",
+            enabled: false,
+            healthStatus: "degraded",
+          });
+        }
+      } finally {
+        await retirePublicationFixture(service, endpoint.id);
       }
     },
   );
@@ -31022,7 +31048,31 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "connection closed after Slack accepted the upload",
       );
 
-      await expect(service.processPendingPublications()).resolves.toBe(1);
+      // Cross the earlier rate-limit fixture's five-second retry deadline.
+      // A retired fixture must not be adopted by this global worker, even on
+      // a slower full-suite run. This changes Date only, not transport timers.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(Date.now() + 6_000));
+      const processingStartedAt = new Date();
+      const processed = await service.processPendingPublications();
+      const extraPublicationDiagnostics =
+        processed === 1
+          ? undefined
+          : await db
+              .select({
+                id: chatPublications.id,
+                endpointId: chatPublications.endpointId,
+                key: chatPublications.idempotencyKey,
+                state: chatPublications.state,
+                attempts: chatPublications.attempts,
+                nextAttemptAt: chatPublications.nextAttemptAt,
+              })
+              .from(chatPublications)
+              .where(
+                sql`${chatPublications.updatedAt} >= ${processingStartedAt.toISOString()}::timestamptz`,
+              )
+              .limit(20);
+      expect(processed, JSON.stringify(extraPublicationDiagnostics)).toBe(1);
       expect(providerRuntime.slackFilePublicationAttempts).toBe(1);
       await expect(
         db
@@ -31289,7 +31339,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         service.processPendingSlackFileUploadReceipts(1),
       ).resolves.toBe(0);
     } finally {
-      await service.shutdown();
+      vi.useRealTimers();
+      await retirePublicationFixture(service, endpoint.id);
     }
   });
 
@@ -31408,7 +31459,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).resolves.toEqual([{ status: "processed" }]);
     } finally {
       releasePost();
-      await service.shutdown();
+      await retirePublicationFixture(service, endpoint.id);
     }
   });
 
@@ -31529,7 +31580,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ]);
       expect(providerRuntime.slackFilePublicationAttempts).toBe(1);
     } finally {
-      await service.shutdown();
+      await retirePublicationFixture(service, endpoint.id);
     }
   });
 
@@ -31608,7 +31659,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(providerRuntime.slackFileReceiptLookups).toHaveLength(1);
     } finally {
       releaseLookup();
-      await service.shutdown();
+      await retirePublicationFixture(service, endpoint.id);
     }
   });
 
