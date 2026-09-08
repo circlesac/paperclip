@@ -1526,3 +1526,43 @@ sample. These observations do not show queue starvation; most measured time
 is inside the native model/tool turn. They support keeping Luna for the
 current test pass, not a claim that every request meets a latency target or
 that Terra would necessarily be faster. No model/effort change was made.
+
+### Live canonical-format evidence and remaining delivery gate
+
+The real diagnostic comment `3956635669` produced delivery
+`7ce03dae-cf9d-42f4-988a-e2a276f6f58b` on `8b9a29ccc`. At 09:57:09Z,
+the genuine installation-App path emitted only the closed code
+`github_attachment_canonical_signed_anchor_only`. This establishes that the
+exact unchanged App-readable comment—not merely the signed-in browser—uses
+the same-UUID signed-anchor/image representation. No response HTML or signed
+URL was copied into diagnostics or the connector's durable input.
+
+Commit `27c6dc4f8` accepts that precise representation alongside the original
+anchor form. The link must equal its sole image source, both must satisfy
+the same fixed-host/path/UUID/JWT checks, and original/signed candidates share
+one ambiguity count. Source-body, comment/repository/review-root, current
+principal/admission, storage, and credential-free download fences remain.
+Independent security review found no blocker. Verification: **318/318** full
+chat integration tests, **202/202** focused SDK/attachment/egress tests
+(including **96** helper/runtime tests), **11/11** targeted real PostgreSQL
+intake/restart/revocation cases, and server typecheck passed. These counts
+overlap and must not be added into a fictitious unique-test total.
+
+The live server is running clean `27c6dc4f8`, private and recovery-ready.
+The final repeat was submitted at 10:02:47.933Z as
+[review comment 3956680939](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/pull/3#discussion_r3956680939).
+It remains visible after a browser reload, but no corresponding Paperclip
+delivery or run has arrived during this check. Tailscale's public 8443/10000
+webhook proxy is reachable; Board 443 remains tailnet-only. The provider's
+[status page](https://www.githubstatus.com/) reports webhooks operational;
+that does not rule out a delivery-specific failure. GitHub App settings
+currently require a fresh six-digit authenticator code before its recent
+delivery history can be inspected. The Confirm access page is open. No
+duplicate provider message, forged webhook, receipt rewrite, or inferred
+successful image import was substituted. **Live private-image byte
+qualification is still pending**, despite the tested format fix.
+
+All work is pushed on `codex/chat-adapters`; the lockfile is unchanged.
+An additional fetch confirms `origin/master` remains `297d8741f5f192c66abbec325b1e956cf0e5e667`.
+The temporary keep-awake process expired; the live server and restricted
+webhook proxy remain running.
