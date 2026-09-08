@@ -15,6 +15,9 @@ const mockChatEndpointsApi = vi.hoisted(() => ({
   getPublicationBatchStatus: vi.fn(),
 }));
 const pushToastMock = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useChatConnectorsEnabled", () => ({
+  useChatConnectorsEnabled: () => ({ enabled: true, loaded: true }),
+}));
 
 vi.mock("@/api/chatEndpoints", () => ({
   chatEndpointsApi: mockChatEndpointsApi,

@@ -16,12 +16,13 @@ import {
 } from "lucide-react";
 import type { ToolApplication, ToolConnection } from "@paperclipai/shared";
 import {
-  appSupportsCatalogSetup,
   getAppDefinitionForUrl,
   getAppStoreDefinition,
   isToolConnectionAttentionHealth,
 } from "@paperclipai/shared";
 import { useNavigate } from "@/lib/router";
+import { useChatConnectorsEnabled } from "@/hooks/useChatConnectorsEnabled";
+import { appCopyFor } from "@/lib/app-gallery-copy";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useToast } from "@/context/ToastContext";
@@ -67,6 +68,7 @@ import {
 import {
   appSourceConnectHref,
   appSourceResumeHref,
+  appSupportsToolCatalogSetup,
 } from "./app-connect-policy";
 import { composioChildParentConnectionId } from "./composio-services";
 import {
@@ -138,7 +140,7 @@ function chatConnectHref(
 function connectHrefFor(entry: AppGalleryDisplayEntry): string | null {
   const slug = appDefinitionSlug(entry);
   const definition = getAppStoreDefinition(slug);
-  return appSupportsCatalogSetup(definition)
+  return appSupportsToolCatalogSetup(definition)
     ? appSourceConnectHref(slug)
     : null;
 }
@@ -202,6 +204,7 @@ function rowRank(row: ConnectorRowModel): number {
 
 function connectorAction(
   row: ConnectorRowModel,
+  chatConnectorsEnabled: boolean,
   agentId?: string | null,
 ): {
   label: string;
@@ -209,11 +212,13 @@ function connectorAction(
   title?: string;
 } {
   const applicationId = row.applications[0]?.id ?? null;
-  const chatHref = chatConnectHref(
-    row.slug,
-    row.entry ? connectHrefFor(row.entry) : null,
-    agentId,
-  );
+  const chatHref = chatConnectorsEnabled
+    ? chatConnectHref(
+        row.slug,
+        row.entry ? connectHrefFor(row.entry) : null,
+        agentId,
+      )
+    : null;
   if (row.connections.length > 0 || row.chatEndpoints.length > 0) {
     if (chatHref) return { label: "Add connection", href: chatHref };
     if (row.entry && applicationId) {
@@ -269,6 +274,7 @@ export function Browse() {
   const queryClient = useQueryClient();
   const { pushToast } = useToast();
   const { selectedCompanyId } = useCompany();
+  const { enabled: chatConnectorsEnabled } = useChatConnectorsEnabled();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [query, setQuery] = useState("");
   const [connectionToRemove, setConnectionToRemove] =
@@ -297,7 +303,7 @@ export function Browse() {
   const chatEndpointsQuery = useQuery({
     queryKey: queryKeys.chatEndpoints.list(selectedCompanyId ?? "__none__"),
     queryFn: () => chatEndpointsApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId,
+    enabled: !!selectedCompanyId && chatConnectorsEnabled,
   });
   const userDirectoryQuery = useQuery({
     queryKey: queryKeys.access.companyUserDirectory(
@@ -339,7 +345,16 @@ export function Browse() {
       }),
   });
 
-  const gallery = (galleryQuery.data?.apps ?? []) as AppGalleryDisplayEntry[];
+  const gallery = (
+    (galleryQuery.data?.apps ?? []) as AppGalleryDisplayEntry[]
+  ).filter((entry) => {
+    const definition = getAppStoreDefinition(appDefinitionSlug(entry));
+    return (
+      chatConnectorsEnabled ||
+      !definition?.methods.some((method) => method.transport === "chat_sdk") ||
+      appSupportsToolCatalogSetup(definition)
+    );
+  });
   const userProfileById = useMemo(
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
     [userDirectoryQuery.data],
@@ -353,7 +368,12 @@ export function Browse() {
     );
     const activeApplications = (
       applicationsQuery.data?.applications ?? []
-    ).filter((application) => application.status !== "archived");
+    ).filter(
+      (application) =>
+        application.status !== "archived" &&
+        (chatConnectorsEnabled ||
+          (application.type !== "chat" && application.metadata?.purpose !== "channel")),
+    );
     const connectionsByApplicationId = new Map<string, ToolConnection[]>();
     for (const connection of activeConnections) {
       connectionsByApplicationId.set(connection.applicationId, [
@@ -378,7 +398,10 @@ export function Browse() {
         key: `gallery:${slug}`,
         slug,
         name: appDefinitionName(entry),
-        description: appDefinitionDescription(entry),
+        description:
+          !chatConnectorsEnabled && chatProviderForSlug(slug)
+            ? appCopyFor(slug).tagline
+            : appDefinitionDescription(entry),
         brandKey: slug,
         logoUrl: appDefinitionLogoUrl(entry),
         darkLogoUrl: appDefinitionDarkLogoUrl(entry),
@@ -419,7 +442,7 @@ export function Browse() {
           "Chat with agents from Telegram direct messages, groups, and topics.",
       },
     ] as const;
-    for (const item of nativeChatProviders) {
+    for (const item of chatConnectorsEnabled ? nativeChatProviders : []) {
       if (
         [...rowsBySlug.values()].some(
           (row) => chatProviderForSlug(row.slug) === item.provider,
@@ -498,7 +521,7 @@ export function Browse() {
       });
     }
 
-    for (const endpoint of chatEndpointsQuery.data ?? []) {
+    for (const endpoint of chatConnectorsEnabled ? chatEndpointsQuery.data ?? [] : []) {
       let target = [...rowsBySlug.values()].find(
         (row) => chatProviderForSlug(row.slug) === endpoint.provider,
       );
@@ -548,6 +571,7 @@ export function Browse() {
   }, [
     applicationsQuery.data,
     chatEndpointsQuery.data,
+    chatConnectorsEnabled,
     connectionsQuery.data,
     gallery,
   ]);
@@ -582,12 +606,12 @@ export function Browse() {
     galleryQuery.isLoading ||
     applicationsQuery.isLoading ||
     connectionsQuery.isLoading ||
-    chatEndpointsQuery.isLoading;
+    (chatConnectorsEnabled && chatEndpointsQuery.isLoading);
   const loadFailed =
     galleryQuery.isError ||
     applicationsQuery.isError ||
     connectionsQuery.isError ||
-    chatEndpointsQuery.isError;
+    (chatConnectorsEnabled && chatEndpointsQuery.isError);
   const nothingMatches = visibleRows.length === 0 && !showCustomConnector;
 
   return (
@@ -624,7 +648,7 @@ export function Browse() {
               void galleryQuery.refetch();
               void applicationsQuery.refetch();
               void connectionsQuery.refetch();
-              void chatEndpointsQuery.refetch();
+              if (chatConnectorsEnabled) void chatEndpointsQuery.refetch();
             }}
           >
             Try again
@@ -654,6 +678,7 @@ export function Browse() {
               onNavigate={navigate}
               onRequestRemove={setConnectionToRemove}
               preselectedAgentId={preselectedChatAgentId}
+              chatConnectorsEnabled={chatConnectorsEnabled}
             />
           ))}
           {showCustomConnector ? (
@@ -716,6 +741,7 @@ function ConnectorCard({
   onNavigate,
   onRequestRemove,
   preselectedAgentId,
+  chatConnectorsEnabled,
 }: {
   row: ConnectorRowModel;
   allConnections: ToolConnection[];
@@ -723,8 +749,9 @@ function ConnectorCard({
   onNavigate: (href: string) => void;
   onRequestRemove: (target: ConnectionRemovalTarget) => void;
   preselectedAgentId?: string | null;
+  chatConnectorsEnabled: boolean;
 }) {
-  const action = connectorAction(row, preselectedAgentId);
+  const action = connectorAction(row, chatConnectorsEnabled, preselectedAgentId);
   return (
     <div
       role="listitem"

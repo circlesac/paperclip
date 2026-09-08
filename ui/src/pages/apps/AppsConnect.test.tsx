@@ -3,7 +3,7 @@
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { CONNECTABLE_APP_DEFINITIONS } from "@paperclipai/shared";
+import { CONNECTABLE_APP_DEFINITIONS, getAppStoreDefinition } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
 import { queryKeys } from "@/lib/queryKeys";
@@ -11,6 +11,8 @@ import { ConnectionSetupFlow } from "@/features/connections/ConnectionSetupFlow"
 import { AppsConnect } from "./AppsConnect";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
+const experimentalMock = vi.hoisted(() => vi.fn());
+vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: experimentalMock } }));
 const listApplicationsMock = vi.hoisted(() => vi.fn());
 const listConnectionsMock = vi.hoisted(() => vi.fn());
 const connectAppMock = vi.hoisted(() => vi.fn());
@@ -203,6 +205,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    experimentalMock.mockResolvedValue({ enableChatConnectors: false });
     window.sessionStorage.clear();
     mockCompany.value = {
       selectedCompanyId: "company-1",
@@ -344,6 +347,16 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(radioContaining("Just agents I pick")).toBeTruthy();
     expect(radioContaining("Any agent")?.getAttribute("aria-checked")).toBe("true");
     expect(container.textContent).not.toContain("Does it need a key?");
+  });
+
+  it.each([false, true])("gates chat-only cards in the embedded tool gallery without hiding GitHub (%s)", async (enabled) => {
+    experimentalMock.mockResolvedValue({ enableChatConnectors: enabled });
+    listGalleryMock.mockResolvedValue({ apps: [GITHUB, getAppStoreDefinition("discord"), getAppStoreDefinition("telegram")] });
+    await render();
+    expect(container.textContent).toContain("GitHub");
+    expect(container.textContent?.includes("Discord")).toBe(enabled);
+    expect(container.textContent?.includes("Telegram")).toBe(enabled);
+    expect(container.textContent).not.toContain("Chat with an agent");
   });
 
   // -------------------------------------------------------------------------

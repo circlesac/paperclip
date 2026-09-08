@@ -228,6 +228,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       // Apps graduated from Experimental. Ignore historical off values while
       // continuing to accept the compatibility key in stored settings.
       enableApps: true,
+      enableChatConnectors: parsed.data.enableChatConnectors ?? false,
       enablePipelines: parsed.data.enablePipelines ?? false,
       enableCases: parsed.data.enableCases ?? false,
       enableConferenceRoomChat: parsed.data.enableConferenceRoomChat ?? false,
@@ -265,6 +266,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableStreamlinedLeftNavigation: true,
     enableStreamlinedUi: true,
     enableApps: true,
+    enableChatConnectors: false,
     enablePipelines: false,
     enableCases: false,
     enableConferenceRoomChat: false,

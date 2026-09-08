@@ -5,6 +5,8 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Browse } from "./Browse";
+import { getAppStoreDefinition } from "@paperclipai/shared";
+import { queryKeys } from "@/lib/queryKeys";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
 const listApplicationsMock = vi.hoisted(() => vi.fn());
@@ -14,6 +16,10 @@ const archiveConnectionMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const navigateMock = vi.hoisted(() => vi.fn());
 const setBreadcrumbsMock = vi.hoisted(() => vi.fn());
+const experimentalMock = vi.hoisted(() => vi.fn());
+const chatListMock = vi.hoisted(() => vi.fn());
+vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: experimentalMock } }));
+vi.mock("@/api/chatEndpoints", () => ({ chatEndpointsApi: { list: chatListMock } }));
 
 vi.mock("@/api/tools", () => ({
   toolsApi: {
@@ -128,6 +134,8 @@ describe("Connectors landing page", () => {
   let root: ReturnType<typeof createRoot>;
 
   beforeEach(() => {
+    experimentalMock.mockResolvedValue({ enableChatConnectors: true });
+    chatListMock.mockResolvedValue([]);
     listGalleryMock.mockResolvedValue({
       apps: [
         galleryEntry({
@@ -179,7 +187,43 @@ describe("Connectors landing page", () => {
       );
     });
     await flushReact();
+    return client;
   }
+
+  it("defaults to tools-only GitHub and hides chat-only catalog and existing chat accounts", async () => {
+    experimentalMock.mockResolvedValue({});
+    listGalleryMock.mockResolvedValue({ apps: ["github", "discord", "telegram", "microsoft-teams"].map(getAppStoreDefinition) });
+    listApplicationsMock.mockResolvedValue({ applications: [application({
+      id: "chat-app", type: "chat", name: "Private bot", applicationKey: "chat:github:endpoint-1", metadata: { purpose: "channel" },
+    })] });
+    await renderBrowse();
+    expect(chatListMock).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-app-slug="github"]')).not.toBeNull();
+    for (const slug of ["discord", "telegram", "microsoft-teams", "slack"]) {
+      expect(container.querySelector(`[data-app-slug="${slug}"]`)).toBeNull();
+    }
+    expect(container.textContent).not.toContain("Private bot");
+    expect(container.textContent).not.toContain("Chat with agents");
+    await act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Connect GitHub"]')!.click());
+    expect(navigateMock).toHaveBeenLastCalledWith("/apps/connect?source=github");
+  });
+
+  it("restores the GitHub intent chooser when enabled and hides cached chat rows immediately when disabled", async () => {
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("github")] });
+    chatListMock.mockResolvedValue([{ id: "endpoint-1", provider: "github", status: "active", assignedAgentName: "Chat agent", botLabel: "Chat bot", assignedAgentId: "agent-1" }]);
+    const client = await renderBrowse();
+    expect(chatListMock).toHaveBeenCalledWith("company-1");
+    expect(container.querySelector('[data-app-slug="telegram"]')).not.toBeNull();
+    await act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Add connection GitHub"]')!.click());
+    expect(navigateMock).toHaveBeenLastCalledWith("/apps/chat/connect?provider=github&toolHref=%2Fapps%2Fconnect%3Fsource%3Dgithub");
+    await act(() => { client.setQueryData(queryKeys.instance.experimentalSettings, { enableChatConnectors: false }); });
+    await flushReact();
+    expect(container.querySelector('[data-app-slug="telegram"]')).toBeNull();
+    expect(container.textContent).not.toContain("Chat agent");
+    expect(container.querySelector('a[href*="/apps/chat/"]')).toBeNull();
+    await act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Connect GitHub"]')!.click());
+    expect(navigateMock).toHaveBeenLastCalledWith("/apps/connect?source=github");
+  });
 
   it("renders one connector list with the requested header and no gallery sections", async () => {
     await renderBrowse();

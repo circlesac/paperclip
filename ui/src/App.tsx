@@ -70,6 +70,8 @@ import { AppsConnect } from "./pages/apps/AppsConnect";
 import { ChatEndpointSetup } from "./pages/apps/chat/ChatEndpointSetup";
 import { ChatEndpointDetail } from "./pages/apps/chat/ChatEndpointDetail";
 import { ChatIdentityConfirm } from "./pages/apps/chat/ChatIdentityConfirm";
+import { ChatConnectorsExperimentalGate } from "./components/ChatConnectorsExperimentalGate";
+import { useChatConnectorsEnabled } from "./hooks/useChatConnectorsEnabled";
 import { canEnterAppsConnect } from "./pages/apps/app-connect-policy";
 import { AppsReview } from "./pages/apps/AppsReview";
 import { AppDetail } from "./pages/apps/AppDetail";
@@ -201,9 +203,15 @@ function boardRoutes(streamlinedUiEnabled: boolean) {
         element={<AppsConnectEntryRoute credentialSource="vercel_connect" />}
       />
       <Route path="apps/connect" element={<AppsConnectEntryRoute />} />
-      <Route path="apps/chat/connect" element={<ChatEndpointSetup />} />
-      <Route path="apps/chat/:endpointId" element={<Navigate to="settings" replace />} />
-      <Route path="apps/chat/:endpointId/:tab" element={<ChatEndpointDetail />} />
+      <Route path="apps/chat/connect" element={
+        <ChatConnectorsExperimentalGate><ChatEndpointSetup /></ChatConnectorsExperimentalGate>
+      } />
+      <Route path="apps/chat/:endpointId" element={
+        <ChatConnectorsExperimentalGate><Navigate to="settings" replace /></ChatConnectorsExperimentalGate>
+      } />
+      <Route path="apps/chat/:endpointId/:tab" element={
+        <ChatConnectorsExperimentalGate><ChatEndpointDetail /></ChatConnectorsExperimentalGate>
+      } />
       <Route path="apps/connect/:appKey" element={<Navigate to="/apps" replace />} />
       <Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />
       <Route path="apps/review" element={<AppsReview />} />
@@ -435,7 +443,8 @@ function AppsConnectEntryRoute({
 } = {}) {
   const location = useLocation();
   const searchParams = new URLSearchParams(location.search);
-  return canEnterAppsConnect(searchParams)
+  const { enabled: chatConnectorsEnabled } = useChatConnectorsEnabled();
+  return canEnterAppsConnect(searchParams, { chatConnectorsEnabled })
     ? <AppsConnect credentialSource={credentialSource} />
     : <Navigate to="/apps" replace />;
 }
@@ -742,7 +751,9 @@ export function App() {
         <Route path="cli-auth/:id" element={<CliAuthPage />} />
         <Route path="invite/:token" element={<InviteLandingPage />} />
         <Route element={streamlinedUiLoaded ? <CloudAccessGate /> : <PaperclipLoading />}>
-          <Route path="chat-identity/confirm" element={<ChatIdentityConfirm />} />
+          <Route path="chat-identity/confirm" element={
+            <ChatConnectorsExperimentalGate><ChatIdentityConfirm /></ChatConnectorsExperimentalGate>
+          } />
         </Route>
         <Route path="tests/perf/long-thread" element={<IssueChatLongThreadPerf />} />
         <Route path="ux-lab/bootstrap-setup" element={<BootstrapSetupUxLab />} />

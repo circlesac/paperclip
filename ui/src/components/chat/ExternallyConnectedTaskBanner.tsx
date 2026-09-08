@@ -17,6 +17,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/context/ToastContext";
 import { Link } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
+import { useChatConnectorsEnabled } from "@/hooks/useChatConnectorsEnabled";
 import {
   boardSendDraftKey,
   clearBoardSendDraft,
@@ -78,12 +79,16 @@ const publicationFeedback: Record<ChatPublicationState, PublicationFeedback> = {
 };
 
 export function useIssueChatBinding(companyId: string, issueId: string) {
+  const { enabled } = useChatConnectorsEnabled();
   const query = useQuery({
     queryKey: ["issue-chat-binding", companyId, issueId],
     queryFn: () => chatEndpointsApi.getIssueBinding(issueId),
-    enabled: Boolean(companyId && issueId),
+    enabled: enabled && Boolean(companyId && issueId),
   });
-  return { binding: query.data ?? null, isLoading: query.isLoading };
+  return {
+    binding: enabled ? query.data ?? null : null,
+    isLoading: enabled && query.isLoading,
+  };
 }
 
 type ConnectedTaskProps = {
