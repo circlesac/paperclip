@@ -1838,3 +1838,129 @@ recall: its run-scoped provider record contains exactly one successful
 `fd40030afb62b83181a2a46dde8220e8defecfa0b4328e380c30b1899ccdce24`.
 No raw tool arguments, contents, reasoning, or credentials were copied into
 this evidence record or external progress messages.
+
+### Acceptance audit and live modal failure — 2026-09-08
+
+The post-bridge deterministic browser suite passed **9/9** again on the
+isolated test instance. A coverage audit still found live-open requirements:
+GitHub's new private-image intake, Discord buffered Gateway takeover,
+Slack's form/modal journey, Telegram token/flood-control recovery, and all
+Teams tenant-backed journeys. The frozen-install/lockfile release gate remains
+separate. Earlier live successes do not constitute a complete same-build
+production sign-off.
+
+A new text-only GitHub PR-level sentinel was submitted once at
+10:53:53.004Z and is visible as comment `5584024357` on the disposable PR #3.
+It did not reach Paperclip; the endpoint's last event remained
+09:57:08.687Z. The earlier inline private-image comment `3956680939` likewise
+remains without ingress. This distinguishes the current callback gap from an
+image-decoding failure. Both fixtures were preserved without blind retries.
+GitHub's App settings still require Confirm access; no available code was
+entered or inferred. Tailscale's public 8443/10000 routes and the local
+webhook-only proxy were verified running; port 443 remains tailnet-only.
+
+The Slack form request at 10:54:25.293Z exercised actual Runner/Codex Luna,
+not a synthetic interaction. Source run `8f019518-0a88-475c-a907-79ab28954ec0`
+resumed provider session `01a08037-0bb4-7b72-a4ae-2a724f876dbd`; its actual
+rollout turn context records `gpt-5.6-luna`. The working message
+`1788864868.004959` became a native Respond card at 10:54:38.533Z, **13.240s**
+after the request. Respond opened a Slack modal with a Maple/Cedar selector
+and a free-text field. Empty submission showed required-field errors without
+answering. Cedar plus the unique label `cobalt lantern 82` was submitted once
+at 10:55:17.242Z.
+
+The answer committed, but continuation failed before the provider started:
+interaction `d2028e5b-033c-4227-bfba-d85410ac9942`, wake request
+`5c3559c0-7456-4df2-854d-ea7766d48025`, and failed run
+`3672ff28-51c0-495b-be42-cbf1307d5c27` identify the exact failure.
+The error was `reviewed_chat_execution_binding_not_authorized`; the provider
+then showed a misleading stopped-turn message at 10:55:19.066Z. This is a
+Paperclip modal-answer authorization defect, not Luna generation latency or
+a provider permission requirement. Button answers used a recognized durable
+action kind, while modal answers used an unrecognized form-submit kind.
+The original failed evidence is retained while that proof path is repaired.
+
+Separately, commit `ffbef0b53` makes multi-field/free-text answer settlement
+surface-neutral ("Answered.") without echoing private free text. Its actual
+PostgreSQL publication suite passed **12/12**. Commit `019f37a27` preserves
+bounded Teams channel/group file-reference metadata and exact-current-comment
+unavailable-file warnings through immediate, deferred, restart, and
+post-comment retry paths. It passed **9/9** focused PostgreSQL cases and
+**5/5** current-wake-comment tests. It adds no download capability, URL/token
+persistence, Graph permission, or claim of live Teams qualification.
+The subsequent fresh full chat integration suite passed **333/333** (69.18s).
+The failed Slack question is also visible on the real Paperclip task: both
+answers are retained, followed by `setup_failed`. Its durable answer-delivery
+row remains `fallback_queued` against that failed run; no database edit,
+automatic historical answer replay, or false recovery claim was used.
+
+Commit `a6ae8703d` repairs the exact modal-answer authority path, with
+**109/109** native-wait/publication tests, **32/32** control-plane/progress
+tests, root server typecheck, and an independent **25/25** security cohort.
+The live server restarted on that committed TypeScript source at 11:03:09Z;
+the health stamp was explicitly dirty because isolated runner benchmark/code
+and this evidence document were still in progress. Its actual staged Rust
+binary remained the previously verified `e33d464c…` build.
+
+The fresh Slack request at 11:03:27.333Z created source run
+`2e622c5d-7eca-49ac-9f3e-bcb066e9f1a3` and modal interaction
+`d3ade486-58f3-4fa4-b01d-b1df3ae6b8cd`. The first Respond attempt produced
+no observed server callback or durable modal-open attempt; after confirming
+the form was still unanswered and no modal was open, one new click at
+11:04:40.274Z successfully opened it. No cause is inferred for the first
+provider/browser-side missed action.
+
+Maple plus `amber compass 93` was submitted once at 11:05:06.304Z. The
+answer committed at 06.732Z and correctly started native continuation
+`6d2b552d-38f9-4a5b-821f-22ab210618d3` at 06.759Z. The provider displayed
+the corrected neutral "Answered." status and a working message. This closes
+the prior authorization failure, but the **whole journey still failed**:
+Luna asked the same two questions again as interaction
+`535d8574-9916-4d96-8e84-d5c30ae48142` instead of returning the requested
+answer. The continuation completed at 11:05:27.131Z on a fresh provider
+session `01a080b1-7be1-7711-9a15-e36e0c017bc9`.
+
+Closed inspection confirms actual `gpt-5.6-luna`, both canonical answers,
+and the bridge-generated answered-question summary in the actual model input.
+The database interaction's nullable summary was not the cause: materialization
+correctly supplied its fallback. The follow-up investigation therefore targets
+the competing presentation of the old form request and the current answers,
+not missing data, permission broadening, or a model substitution.
+
+Commit `a5477215e` adds bounded provider acknowledgments after per-event
+durable saves. The isolated, fake-provider burst benchmark records a
+512-delta median visible tail of 18.658s before and 13.745s after, with
+exact ordering, replay, and close-identity checks. This is not a live model
+latency claim; the methodology and remaining close tail are recorded in
+`2026-09-08-runner-output-burst-benchmark.md`. The production release binary
+was then rebuilt and staged with SHA-256
+`af19f64dfdf7e2e4efb5b41275e26cd873338315207c36fd4d108bdb69bae3c1`.
+Its real Rust/TypeScript Codex transport regression suite passed **85/85**
+(36.20s) before any subsequent live provider request. The staged digest is
+distinct from the isolated benchmark candidate; neither identity is inferred
+from the Git revision alone.
+
+The answered-question framing repair places canonical answers before only
+their exact source request; genuinely new/coalesced comments keep a separate
+unresolved heading. The outer Codex task envelope also names the resolved
+question IDs, with JSON-escaped identifiers and a fail-closed canonical result
+guard. Cancelled, malformed, pending, empty, and non-question envelopes do not
+gain that instruction. Completion criteria and their digest are unchanged.
+Root checks passed **119/119** wake/native-input tests, **160/160** native
+input/executor tests, **20/20** runner context/contract tests, and both server
+and runner source typechecks; overlapping cases are not summed as unique
+coverage. Independent review and equivalent focused checks found no remaining
+blocker. Live retesting is recorded separately below, not inferred from these
+tests.
+
+The parallel native-progress audit found that interrupted runs were missing
+from terminal milestone selection. Commit `239cced90` now settles the exact
+run's working message once, while retaining an already selected final and
+leaving successor-run messages independent. It passed **14/14** focused
+PostgreSQL cases, **58/58** unit cases, server typecheck, and the subsequent
+root full chat integration suite, **336/336** (64.53s). Raw errors, summaries,
+tool arguments, and reasoning remain excluded from external progress. The
+six fixed progress phases use a 20-second cadence; a short Luna turn may
+correctly show working followed directly by its final answer. Pre-run FIFO
+waiting still has a receipt reaction rather than a separate queued-next
+message. Teams progress remains without tenant-backed live qualification.

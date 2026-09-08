@@ -1608,9 +1608,12 @@ describe("renderPaperclipWakePrompt", () => {
       summaryMarkdown: "Color: Cobalt",
       truncated: false,
     },
+    commentIds: [externalQuestionMarker.sourceCommentId],
+    latestCommentId: externalQuestionMarker.sourceCommentId,
     comments: [
       {
         ...ordinaryExternalChatWake.comments[0],
+        id: externalQuestionMarker.sourceCommentId,
         body: "Ask for a color, then reply with exactly COLOR-<chosen color>.",
       },
     ],
@@ -1640,6 +1643,13 @@ describe("renderPaperclipWakePrompt", () => {
         expect(prompt).toContain("Color: Cobalt");
         expect(prompt).toContain("COLOR-<chosen color>");
         expect(prompt).toContain(
+          "Original request for context (only the answered questions listed above are resolved):",
+        );
+        expect(prompt.indexOf("Color: Cobalt")).toBeLessThan(
+          prompt.indexOf("Ask for a color"),
+        );
+        expect(prompt).not.toContain("New comments in order:");
+        expect(prompt).toContain(
           "This answer resolves only the named question, not a separate approval or completion review.",
         );
         expect(prompt).toContain(
@@ -1650,6 +1660,40 @@ describe("renderPaperclipWakePrompt", () => {
       }
     },
   );
+
+  it("keeps newer comments outside the resolved-question background", () => {
+    const newerComment = {
+      ...ordinaryExternalChatWake.comments[0],
+      id: "comment-2",
+      body: "Also answer this genuinely new follow-up.",
+    };
+    const wake = {
+      ...externalQuestionWake,
+      commentIds: [externalQuestionMarker.sourceCommentId, newerComment.id],
+      latestCommentId: newerComment.id,
+      comments: [...externalQuestionWake.comments, newerComment],
+      commentWindow: {
+        requestedCount: 2,
+        includedCount: 2,
+        missingCount: 0,
+      },
+    };
+
+    const prompt = renderPaperclipWakePrompt(wake);
+    expect(isPaperclipExternalChatQuestionResponseTurn(wake)).toBe(true);
+    expect(prompt).toContain(
+      "Original request for context (only the answered questions listed above are resolved):",
+    );
+    expect(prompt).toContain(
+      "Other new comments in order (not resolved by the answer above):",
+    );
+    expect(prompt.indexOf("Color: Cobalt")).toBeLessThan(
+      prompt.indexOf("Ask for a color"),
+    );
+    expect(prompt.indexOf("Ask for a color")).toBeLessThan(
+      prompt.indexOf("Also answer this genuinely new follow-up."),
+    );
+  });
 
   it("does not grant the native chat answer prompt to malformed or unbound answer metadata", () => {
     const invalid = [

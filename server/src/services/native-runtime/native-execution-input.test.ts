@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import type { AskUserQuestionsInteraction } from "@paperclipai/shared";
 
+import { formatDurableQuestionResponseSummary } from "../question-response-delivery.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
@@ -110,7 +112,101 @@ describe("native execution input external-chat framing", () => {
       expect(input.task.prompt).toContain('interactionKind="questions"');
       expect(input.task.prompt).toContain("one question at a time");
       expect(input.task.prompt).toContain("Never fabricate answer URLs");
+      expect(input.task.prompt.indexOf("Choose a color: Amber")).toBeLessThan(
+        input.task.prompt.indexOf(
+          "Ask for a color, then tell me the selected color.",
+        ),
+      );
       expect(wakePayload).not.toHaveProperty("questionResponse");
+
+      const mixedModalSummary = formatDurableQuestionResponseSummary({
+        id: interactionId,
+        kind: "ask_user_questions",
+        status: "answered",
+        sourceRunId,
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "environment",
+              prompt: "Choose an environment",
+              selectionMode: "single",
+              options: [
+                { id: "maple", label: "Maple" },
+                { id: "cedar", label: "Cedar" },
+              ],
+            },
+            {
+              id: "label",
+              prompt: "Enter the verification label",
+              selectionMode: "single",
+              options: [
+                {
+                  id: "custom",
+                  label: "Custom label",
+                  freeText: true,
+                },
+              ],
+            },
+          ],
+        },
+        result: {
+          version: 1,
+          answers: [
+            { questionId: "environment", optionIds: ["maple"] },
+            {
+              questionId: "label",
+              optionIds: [],
+              otherText: "amber compass 93",
+            },
+          ],
+          summaryMarkdown: null,
+        },
+      } as unknown as AskUserQuestionsInteraction);
+      const mixedModal = buildNativeExecutionInput({
+        ...args,
+        wakePayload: {
+          ...wakePayload,
+          comments: [
+            {
+              ...wakePayload.comments[0],
+              body: "Ask a NEW environment and verification-label question.",
+            },
+          ],
+        },
+        interactionResponses: [
+          {
+            interactionId,
+            kind: "ask_user_questions",
+            response: {
+              status: "answered",
+              result: {
+                version: 1,
+                answers: [
+                  { questionId: "environment", optionIds: ["maple"] },
+                  {
+                    questionId: "label",
+                    optionIds: [],
+                    otherText: "amber compass 93",
+                  },
+                ],
+                summaryMarkdown: mixedModalSummary,
+              },
+            },
+          },
+        ],
+      });
+      expect(mixedModalSummary).toContain("Maple");
+      expect(mixedModalSummary).toContain("amber compass 93");
+      expect(mixedModal.task.prompt.indexOf("Maple")).toBeLessThan(
+        mixedModal.task.prompt.indexOf("Ask a NEW environment"),
+      );
+      expect(mixedModal.task.prompt.indexOf("amber compass 93")).toBeLessThan(
+        mixedModal.task.prompt.indexOf("Ask a NEW environment"),
+      );
+      expect(mixedModal.task.prompt).toContain(
+        "only the answered questions listed above are resolved",
+      );
       const unbound = buildNativeExecutionInput({
         ...args,
         interactionResponses: [
