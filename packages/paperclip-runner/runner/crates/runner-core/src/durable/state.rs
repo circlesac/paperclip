@@ -1586,41 +1586,71 @@ fn redact_sensitive_text_values(input: &str) -> String {
                 && authorization_scheme_start + scheme.len() < bytes.len()
                 && bytes[authorization_scheme_start + scheme.len()].is_ascii_whitespace()
         });
-        // A determiner-led noun phrase ("a simple token system") is prose,
-        // not the diagnostic field/value pair "token opaque-value". Keep this
+        // A small closed set of grammatical noun/count phrases is prose, not
+        // the diagnostic field/value pair "token opaque-value". Keep this
         // exception exact: assignments, quoted/compound/CLI keys or values,
-        // and any credential-shaped bytes still use the ordinary scanners.
-        let is_token_system_noun_phrase = key == "token"
+        // and arbitrary words after token still use the ordinary scanners.
+        let token_phrase_has_lead = |lead: &str| {
+            normalized[..start]
+                .strip_suffix(lead)
+                .is_some_and(|before| {
+                    before.is_empty()
+                        || before
+                            .as_bytes()
+                            .last()
+                            .is_some_and(|value| value.is_ascii_whitespace())
+                })
+        };
+        let token_phrase_has_tail = |tail: &str| {
+            normalized[separator..].starts_with(tail)
+                && bytes.get(separator + tail.len()).is_none_or(|value| {
+                    value.is_ascii_whitespace()
+                        || (matches!(value, b'.' | b',' | b';' | b')')
+                            && bytes
+                                .get(separator + tail.len() + 1)
+                                .is_none_or(|next| next.is_ascii_whitespace()))
+                })
+        };
+        let is_benign_token_noun_phrase = key == "token"
             && !key_is_compound
             && whitespace_start == start + key.len()
             && !has_assignment_separator
             && bytes[whitespace_start..separator]
                 .iter()
                 .all(|value| matches!(value, b' ' | b'\t'))
-            && normalized[separator..].starts_with("system")
-            && bytes.get(separator + "system".len()).is_none_or(|value| {
-                value.is_ascii_whitespace()
-                    || (matches!(value, b'.' | b',' | b';' | b')')
-                        && bytes
-                            .get(separator + "system".len() + 1)
-                            .is_none_or(|next| next.is_ascii_whitespace()))
-            })
-            && ["a ", "the ", "a simple ", "the simple "]
+            && ((token_phrase_has_tail("system")
+                && [
+                    "a ",
+                    "the ",
+                    "a simple ",
+                    "the simple ",
+                    "a balanced ",
+                    "the balanced ",
+                ]
                 .iter()
-                .any(|prefix| {
-                    normalized[..start]
-                        .strip_suffix(prefix)
-                        .is_some_and(|before| {
-                            before.is_empty()
-                                || before
-                                    .as_bytes()
-                                    .last()
-                                    .is_some_and(|value| value.is_ascii_whitespace())
-                        })
-                });
+                .any(|lead| token_phrase_has_lead(lead)))
+                || (token_phrase_has_tail("economy")
+                    && ["a balanced ", "the balanced "]
+                        .iter()
+                        .any(|lead| token_phrase_has_lead(lead)))
+                || (["for", "per"]
+                    .iter()
+                    .any(|tail| token_phrase_has_tail(tail))
+                    && [
+                        "one ",
+                        "two ",
+                        "first ",
+                        "second ",
+                        "each ",
+                        "another ",
+                        "additional ",
+                    ]
+                    .iter()
+                    .any(|lead| token_phrase_has_lead(lead)))
+                || (token_phrase_has_tail("can equal") && token_phrase_has_lead("one ")));
         let has_whitespace_separator = separator > whitespace_start
             && (key != "authorization" || key_is_compound || has_authorization_scheme)
-            && !is_token_system_noun_phrase;
+            && !is_benign_token_noun_phrase;
         if !has_assignment_separator && !has_whitespace_separator {
             continue;
         }
@@ -2185,12 +2215,17 @@ mod tests {
     #[test]
     fn semantic_redaction_preserves_benign_token_system_prose() {
         let prose = "Offer a simple token system so guests can exchange items even when their contributions differ in quantity.";
+        let game_prose = "Use a balanced token economy. Award one token for each accepted game, with an optional second token for especially large or complex games.";
         for text in [
             prose,
+            game_prose,
             "Use a token system.",
             "Describe the token system clearly.",
             "The simple token system is fair.",
             "Use a simple TOKEN SYSTEM",
+            "Use a balanced token system.",
+            "One token can equal one standard game.",
+            "Award one token per accepted game.",
         ] {
             assert_eq!(redact_text(text), text);
             assert_eq!(
@@ -2203,12 +2238,12 @@ mod tests {
         let command = command("command_token_prose", 1);
         state.begin_command(&command).unwrap();
         let result = json!({
-            "result": {"schema": "paperclip.prp.run_result.v1", "summary": prose},
+            "result": {"schema": "paperclip.prp.run_result.v1", "summary": game_prose},
             "nested": {"token": "system", "diagnostic": "token=system"},
         });
         state.complete_command(&command, result).unwrap();
         let completed = state.processed_commands.get(&command.command_id).unwrap();
-        assert_eq!(completed.result["result"]["summary"], json!(prose));
+        assert_eq!(completed.result["result"]["summary"], json!(game_prose));
         assert_eq!(completed.result["nested"]["token"], json!("[REDACTED]"));
         assert_eq!(
             completed.result["nested"]["diagnostic"],
@@ -2239,6 +2274,39 @@ mod tests {
             ("a token system=secret", "a token [REDACTED]"),
             ("a token system:secret", "a token [REDACTED]"),
             ("a token secret-value", "a token [REDACTED]"),
+            (
+                "a balanced token economy-secret",
+                "a balanced token [REDACTED]",
+            ),
+            (
+                "a balanced token system-secret",
+                "a balanced token [REDACTED]",
+            ),
+            (
+                "a balanced token ghp_abcdefghijklmnopqrstuvwxyz",
+                "a balanced token [REDACTED]",
+            ),
+            ("one token bearer-secret", "one token [REDACTED]"),
+            (
+                "second token sk-abcdefghijklmnop",
+                "second token [REDACTED]",
+            ),
+            ("one token for-secret", "one token [REDACTED]"),
+            ("second token per.secret", "second token [REDACTED]"),
+            ("one token can rotate", "one token [REDACTED] rotate"),
+            ("one token can-equal-secret", "one token [REDACTED]"),
+            (
+                "one token can equal-secret",
+                "one token [REDACTED] equal-secret",
+            ),
+            ("one token can=secret-value", "one token [REDACTED]"),
+            ("stone token for", "stone token [REDACTED]"),
+            ("one-time token for", "one-time token [REDACTED]"),
+            ("one access_token for", "one access_token [REDACTED]"),
+            ("one --token can equal", "one --token [REDACTED] equal"),
+            ("one \"token\" can equal", "one \"token\" [REDACTED] equal"),
+            ("one token \"for\"", "one token \"[REDACTED]\""),
+            ("one token for=secret", "one token [REDACTED]"),
             ("a token\nsystem", "a token\n[REDACTED]"),
             ("meta token system", "meta token [REDACTED]"),
             (
