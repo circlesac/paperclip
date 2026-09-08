@@ -2691,7 +2691,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (
       shuttingDown ||
       ownership.stopping ||
-      discordGatewayOwnerships.get(ownership.endpointId) !== ownership
+      discordGatewayOwnerships.get(ownership.endpointId) !== ownership ||
+      ownership.context.discordGatewayOwned !== true ||
+      ownership.context.endpointRuntime === undefined ||
+      runtime.get(ownership.endpointId) !== ownership.context.endpointRuntime
     ) {
       return false;
     }
@@ -2715,14 +2718,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
     return db.transaction(async (tx) => {
       const now = new Date();
-      // A delayed renewal may not resurrect an already-expired token. Once
-      // the local deadline passes, callbacks fail closed and a standby is
-      // allowed to reclaim the row.
-      if (ownership.expiresAt.getTime() <= now.getTime()) return false;
       const current = await runtimeCallbackEndpoint(
         tx,
         ownership.endpointId,
-        ownership.context,
+        {
+          credentialFingerprint: ownership.context.credentialFingerprint,
+          generation: ownership.context.generation,
+        },
         ["verifying", "active", "attention"],
       );
       if (!current || current.provider !== "discord") return false;
@@ -2739,7 +2741,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             eq(chatEndpointLeases.endpointId, ownership.endpointId),
             eq(chatEndpointLeases.leaseKey, ownership.leaseKey),
             eq(chatEndpointLeases.token, ownership.token),
-            gt(chatEndpointLeases.expiresAt, now),
           ),
         )
         .returning({ id: chatEndpointLeases.id });
@@ -2749,34 +2750,71 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     });
   }
 
+  function refreshDiscordGatewayOwnership(
+    ownership: DiscordGatewayOwnership,
+  ): Promise<void> {
+    if (ownership.renewal) return ownership.renewal;
+    ownership.renewal = renewDiscordGatewayOwnership(ownership)
+      .then((owned) => {
+        if (owned) return;
+        logger.warn(
+          { endpointId: ownership.endpointId },
+          "lost Discord Gateway ownership; stopping the local listener",
+        );
+        // A Gateway lifecycle callback can be the caller that discovers the
+        // lost token. Fence it synchronously, but do not make that callback
+        // await the Gateway task whose adapter notification may be waiting on
+        // the callback itself. The tracked stop task is joined at shutdown.
+        void stopDiscordGatewayOwnership(ownership);
+      })
+      .catch((error) => {
+        logger.warn(
+          {
+            endpointId: ownership.endpointId,
+            error: redactError(error),
+          },
+          "Discord Gateway ownership renewal failed; stopping the local listener",
+        );
+        void stopDiscordGatewayOwnership(ownership);
+      })
+      .finally(() => {
+        ownership.renewal = null;
+      });
+    return ownership.renewal;
+  }
+
+  async function ensureDiscordGatewayRuntimeIsCurrent(
+    endpointId: string,
+    context: RuntimeContext,
+  ): Promise<boolean> {
+    const ownership = discordGatewayOwnerships.get(endpointId);
+    if (
+      !ownership ||
+      ownership.stopping ||
+      ownership.context !== context ||
+      context.discordGatewayOwned !== true ||
+      context.endpointRuntime === undefined ||
+      runtime.get(endpointId) !== context.endpointRuntime
+    ) {
+      return false;
+    }
+    if (ownership.expiresAt.getTime() <= Date.now()) {
+      // A host can resume after the local TTL while its durable token is still
+      // authoritative. Reclaim that exact token before accepting buffered
+      // callbacks. A standby takeover changes the token, so the CAS fails and
+      // the old listener remains fenced.
+      await refreshDiscordGatewayOwnership(ownership);
+    }
+    return discordGatewayRuntimeIsCurrent(endpointId, context);
+  }
+
   function startDiscordGatewayLeaseRenewal(
     ownership: DiscordGatewayOwnership,
   ): void {
     ownership.renewTimer = setInterval(
       () => {
         if (ownership.renewal || ownership.stopping) return;
-        ownership.renewal = renewDiscordGatewayOwnership(ownership)
-          .then(async (owned) => {
-            if (owned) return;
-            logger.warn(
-              { endpointId: ownership.endpointId },
-              "lost Discord Gateway ownership; stopping the local listener",
-            );
-            await stopDiscordGatewayOwnership(ownership);
-          })
-          .catch(async (error) => {
-            logger.warn(
-              {
-                endpointId: ownership.endpointId,
-                error: redactError(error),
-              },
-              "Discord Gateway ownership renewal failed; stopping the local listener",
-            );
-            await stopDiscordGatewayOwnership(ownership);
-          })
-          .finally(() => {
-            ownership.renewal = null;
-          });
+        void refreshDiscordGatewayOwnership(ownership);
       },
       options.discordGatewayLeaseRenewalIntervalMs ??
         (options.discordGatewayLeaseTtlMs ?? DISCORD_GATEWAY_LEASE_TTL_MS) / 3,
@@ -4748,6 +4786,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     allowedStatuses: EndpointRow["status"][],
   ) {
     const record = await endpointRecord(endpointId);
+    if (
+      record?.endpoint.provider === "discord" &&
+      !(await ensureDiscordGatewayRuntimeIsCurrent(endpointId, context))
+    ) {
+      return null;
+    }
     return record &&
       allowedStatuses.includes(record.endpoint.status) &&
       runtimeGeneration(record.endpoint.setup) === context.generation &&
@@ -4838,7 +4882,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     callback: DiscordGatewayCallbackEvent,
     context: RuntimeContext,
   ): Promise<void> {
-    if (!discordGatewayRuntimeIsCurrent(callback.endpointId, context)) return;
+    if (
+      !(await ensureDiscordGatewayRuntimeIsCurrent(
+        callback.endpointId,
+        context,
+      ))
+    )
+      return;
     if (callback.sequence <= (context.discordGatewaySequence ?? 0)) return;
     context.discordGatewaySequence = callback.sequence;
     await options.discordGatewayEventBarrier?.(callback);
@@ -8634,7 +8684,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     event: DiscordRootMentionAdmissionEvent,
     context: RuntimeContext,
   ): Promise<boolean> {
-    if (!discordGatewayRuntimeIsCurrent(configuredEndpoint.id, context)) {
+    if (
+      !(await ensureDiscordGatewayRuntimeIsCurrent(
+        configuredEndpoint.id,
+        context,
+      ))
+    ) {
       return false;
     }
     return withCredentialMutationLease(
@@ -8864,7 +8919,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
         await options.discordRootThreadTransportBarrier?.();
         await credentialLease.assertOwned();
-        if (!discordGatewayRuntimeIsCurrent(configuredEndpoint.id, context)) {
+        if (
+          !(await ensureDiscordGatewayRuntimeIsCurrent(
+            configuredEndpoint.id,
+            context,
+          ))
+        ) {
           return false;
         }
         try {
@@ -11449,7 +11509,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (
       event.provider === "discord" &&
       (!runtimeContext ||
-        !discordGatewayRuntimeIsCurrent(event.endpointId, runtimeContext))
+        !(await ensureDiscordGatewayRuntimeIsCurrent(
+          event.endpointId,
+          runtimeContext,
+        )))
     ) {
       return;
     }
@@ -12186,7 +12249,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   ) {
     if (
       event.provider === "discord" &&
-      !discordGatewayRuntimeIsCurrent(event.endpointId, runtimeContext)
+      !(await ensureDiscordGatewayRuntimeIsCurrent(
+        event.endpointId,
+        runtimeContext,
+      ))
     ) {
       return;
     }
@@ -12224,7 +12290,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   ) {
     if (
       event.provider === "discord" &&
-      !discordGatewayRuntimeIsCurrent(event.endpointId, runtimeContext)
+      !(await ensureDiscordGatewayRuntimeIsCurrent(
+        event.endpointId,
+        runtimeContext,
+      ))
     ) {
       return;
     }

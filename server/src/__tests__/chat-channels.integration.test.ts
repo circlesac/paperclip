@@ -6588,6 +6588,150 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toEqual([]);
   });
 
+  it("recovers buffered Discord messages and reactions after an unreclaimed host-pause lease expiry", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredDiscordEndpoint(fixture, {
+        discordGatewayLeaseRenewalIntervalMs: 60_000,
+        discordGatewayLeaseTtlMs: 200,
+      });
+    const ownedRuntime = runtime.endpoints.get(endpoint.id);
+    if (!ownedRuntime)
+      throw new Error("Expected Discord Gateway owner runtime");
+    const [leaseBeforePause] = await db
+      .select({ token: chatEndpointLeases.token })
+      .from(chatEndpointLeases)
+      .where(
+        and(
+          eq(chatEndpointLeases.endpointId, endpoint.id),
+          eq(chatEndpointLeases.leaseKey, "discord_gateway_runtime"),
+        ),
+      );
+    if (!leaseBeforePause) throw new Error("Expected Discord Gateway lease");
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const messageId = "555555555555555601";
+    const channel = makeThread({
+      channelId: "333333333333333333",
+      id: `discord:1457808928258658549:333333333333333333:${messageId}`,
+      name: "discord-host-pause",
+    });
+    const message = makeMessage({
+      id: messageId,
+      mentioned: true,
+      text: "@maya retain this buffered Discord turn",
+      userId: "444444444444444444",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message,
+      trigger: "mention",
+    });
+
+    await expect(
+      db
+        .select({ state: chatDeliveries.state })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(
+              chatDeliveries.providerEventId,
+              `${channel.thread.id}:${messageId}`,
+            ),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
+    expect(runtime.endpoints.get(endpoint.id)).toBe(ownedRuntime);
+    expect(ownedRuntime.shutdown).not.toHaveBeenCalled();
+    await expect(
+      db
+        .select({ token: chatEndpointLeases.token })
+        .from(chatEndpointLeases)
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, endpoint.id),
+            eq(chatEndpointLeases.leaseKey, "discord_gateway_runtime"),
+          ),
+        ),
+    ).resolves.toEqual([{ token: leaseBeforePause.token }]);
+
+    await qualifySetupRoundTrip(service, endpoint.id, message.author.userId);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction) {
+      throw new Error("Expected Discord reaction callback");
+    }
+    const commentCountBefore = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.companyId, fixture.companyId))
+      .then((rows) => rows.length);
+    const wakeupCountBefore = wakeup.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const emoji = {
+      name: "thumbsup",
+      toJSON: () => "👍",
+      toString: () => "👍",
+    };
+    const reaction = {
+      endpointId: endpoint.id,
+      provider: "discord" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji,
+        message,
+        messageId,
+        raw: {
+          channel_id: "333333333333333333",
+          emoji: { id: null, name: "👍" },
+          gateway_dispatch: {
+            eventType: "MESSAGE_REACTION_ADD",
+            sequence: 801,
+            sessionFingerprint: "c".repeat(24),
+            shardId: 0,
+          },
+          guild_id: "1457808928258658549",
+          message_id: messageId,
+          user_id: message.author.userId,
+        },
+        rawEmoji: "👍",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: message.author,
+      },
+    };
+    await callbacks.onReaction(reaction);
+    await callbacks.onReaction(reaction);
+
+    await expect(
+      db
+        .select({ state: chatDeliveries.state })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+            sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${messageId}`,
+          ),
+        ),
+    ).resolves.toEqual([{ state: "processed" }]);
+    expect(
+      await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.companyId, fixture.companyId))
+        .then((rows) => rows.length),
+    ).toBe(commentCountBefore);
+    expect(wakeup).toHaveBeenCalledTimes(wakeupCountBefore);
+    expect(runtime.endpoints.get(endpoint.id)).toBe(ownedRuntime);
+    expect(ownedRuntime.shutdown).not.toHaveBeenCalled();
+    await service.shutdown();
+  });
+
   it("stops a Discord Gateway on lease loss and lets a standby take over", async () => {
     const fixture = await seedCompany();
     const applicationId = uniqueDiscordApplicationId();
@@ -6596,12 +6740,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       applicationId,
       guildId,
     ) as typeof globalThis.fetch;
-    let renew = true;
     const ownerRuntime = new FakeChatSdkRuntime();
     const owner = createService(ownerRuntime, providerFetch, {
-      discordGatewayLeaseRenewalIntervalMs: 5,
-      discordGatewayLeaseTtlMs: 500,
-      renewDiscordGatewayLease: async () => renew,
+      discordGatewayLeaseRenewalIntervalMs: 60_000,
+      discordGatewayLeaseTtlMs: 200,
     });
     const endpoint = await owner.service.create(
       fixture.companyId,
@@ -6623,15 +6765,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const staleRuntime = ownerRuntime.endpoints.get(endpoint.id);
     const staleAdmission = ownerRuntime.configurations.get(endpoint.id)
       ?.callbacks.onDiscordRootMentionAdmission;
-    if (!staleAdmission) throw new Error("Expected Discord admission callback");
+    const staleCallbacks = ownerRuntime.configurations.get(
+      endpoint.id,
+    )?.callbacks;
+    if (!staleAdmission || !staleCallbacks)
+      throw new Error("Expected Discord admission callbacks");
 
     const standbyRuntime = new FakeChatSdkRuntime();
     const standby = createService(standbyRuntime, providerFetch);
-    renew = false;
-    await vi.waitFor(() =>
-      expect(ownerRuntime.endpoints.has(endpoint.id)).toBe(false),
-    );
-    expect(staleRuntime?.shutdown).toHaveBeenCalledOnce();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const reconciled = await standby.service.reconcileProviderRuntimes();
+    expect(reconciled).toMatchObject({ ownedElsewhere: 0, failed: 0 });
+    expect(reconciled.local).toBe(reconciled.eligible);
+    expect(reconciled.local).toBeGreaterThanOrEqual(1);
+    expect(
+      standbyRuntime.configurations.get(endpoint.id)?.enableDiscordGateway,
+    ).toBe(true);
     await expect(
       staleAdmission({
         channelId: "333333333333333333",
@@ -6642,13 +6791,55 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         userId: "444444444444444444",
       }),
     ).resolves.toBe(false);
-    const reconciled = await standby.service.reconcileProviderRuntimes();
-    expect(reconciled).toMatchObject({ ownedElsewhere: 0, failed: 0 });
-    expect(reconciled.local).toBe(reconciled.eligible);
-    expect(reconciled.local).toBeGreaterThanOrEqual(1);
-    expect(
-      standbyRuntime.configurations.get(endpoint.id)?.enableDiscordGateway,
-    ).toBe(true);
+    expect(staleRuntime?.shutdown).toHaveBeenCalledOnce();
+
+    const freshCallbacks = standbyRuntime.configurations.get(
+      endpoint.id,
+    )?.callbacks;
+    if (!freshCallbacks)
+      throw new Error("Expected standby Discord admission callbacks");
+    const messageId = "555555555555555602";
+    const channel = makeThread({
+      channelId: "333333333333333333",
+      id: `discord:${guildId}:333333333333333333:${messageId}`,
+      name: "discord-standby-takeover",
+    });
+    const message = makeMessage({
+      id: messageId,
+      mentioned: true,
+      text: "@maya accept this once after Gateway takeover",
+      userId: "444444444444444444",
+    });
+    await deliverMessage({
+      callbacks: staleCallbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message,
+      trigger: "mention",
+    });
+    await deliverMessage({
+      callbacks: freshCallbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message,
+      trigger: "mention",
+    });
+    await expect(
+      db
+        .select({ id: chatDeliveries.id })
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(
+              chatDeliveries.providerEventId,
+              `${channel.thread.id}:${messageId}`,
+            ),
+          ),
+        ),
+    ).resolves.toHaveLength(1);
     await Promise.all([owner.service.shutdown(), standby.service.shutdown()]);
   });
 
@@ -31460,6 +31651,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toEqual([
       { providerEventId: `${starterThreadId}:${syntheticMessageId}` },
     ]);
+
+    // Admission creates a durable inbound receipt after this worker's delivery
+    // batch was selected. Drain it with its own fixture before another test's
+    // global worker observes that otherwise-valid pending message.
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: null, updatedAt: new Date() })
+      .where(eq(chatDeliveries.endpointId, endpoint.id));
+    await service.processPendingDeliveries(1_000);
+    await expect(
+      db
+        .select({ state: chatDeliveries.state })
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id)),
+    ).resolves.toEqual([{ state: "processed" }]);
   });
 
   it("rechecks linked authority and channel reach before admitting a provider-confirmed Slack task", async () => {

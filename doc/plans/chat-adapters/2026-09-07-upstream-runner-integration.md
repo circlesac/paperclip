@@ -177,3 +177,81 @@ push qualification needs two authorized users/accounts and a disposable repo.
 New Slack delayed-upload receipt recovery, native overflow/history resend and
 GitHub line-specific review replies still need the live passes described in the
 existing qualification notes. This checkpoint is not a production-ready claim.
+
+## Live Luna recheck after capacity returned (September 7, 22:42 CDT onward)
+
+The capacity and browser-input gates above are historical: the account now
+reports available Codex capacity and signed-in in-app browser input works again.
+No usage reset was consumed, no credits were purchased, and no alternate model
+was substituted. The server still reports `2026.831.0+413.git.26b6df7c1` during
+these tests. All runs below use native `codex_app_server` with `gpt-5.6-luna`.
+
+| Live journey                  | Observed outcome                                        | Native run                             | Submit to final provider acknowledgement |
+| ----------------------------- | ------------------------------------------------------- | -------------------------------------- | ---------------------------------------- |
+| New Slack root mention        | One task/thread; visible `SLACK-LUNA-READY`             | `5483fa21-0127-4625-8fcc-58e985943b2c` | about 14 s                               |
+| Telegram DM                   | Visible `TELEGRAM-LUNA-READY`                           | `8568dad8-2653-47de-95ed-7c8290e7fe06` | about 13 s                               |
+| Existing GitHub issue #2      | Visible `GITHUB-LUNA-READY` in bot comment `5578817993` | `594094cd-cddb-4cc7-a85e-edc08bde086b` | about 20 s                               |
+| Existing Discord CHA-4 thread | Failure message, not a successful reply                 | `3dd32648-3d07-4616-a845-98625fce020f` | failed before provider startup           |
+
+The latency endpoint is the final publication's `published_at`, not the earlier
+working-placeholder message timestamp. Native execution alone took 11.3 s,
+10.6 s and 14.3 s respectively. This small, awake-host sample is not a latency
+SLO or a production load benchmark.
+
+Slack's root is `1788838921.759279` in channel `C0BUT55N9RV`:
+[live Slack thread](https://papercliplabs.slack.com/archives/C0BUT55N9RV/p1788838921759279).
+[GitHub reply](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/issues/2#issuecomment-5578817993).
+
+Ten Slack follow-ups (`BURST-LUNA-0907-01` through `-10`) were sent through that
+thread's actual composer in 4.3 s. All ten became distinct durable inbound
+comments on one task. Luna acknowledged `01` once in run
+`6cf15c58-55db-4b95-b7c2-bdbefdb8b394`, then `02` through `10` once each and in
+order in run `2cb0ac3c-3ad9-4cec-8a40-555a84d7db6d`. The second run started 41 ms
+after the first finished; the native current-wake reader appears in its durable
+events. Final Slack text was inspected in the real browser. Both runs resumed
+the provider session. No queue marker was omitted or duplicated. The second
+batch's final publication was acknowledged at 03:51:07.023 UTC, roughly 36 s
+after the last submitted marker, including the first run's remaining work.
+
+The Discord failure is a real checkpoint-selection defect, not a transport or
+quota success: a pre-bootstrap retry reused normalized session
+`5e8168d9-e0ce-4c4b-8b4c-2da16e862880` without the saved checkpoint, then attempted
+fresh startup against an older suspended run's durable directory. The strict PRP
+identity guard rejected it. The directory and prior checkpoint were retained;
+no live DB state or provider history was deleted to force a green result.
+This finding requires a code fix and live retest before Discord sign-off.
+
+A fresh Telegram photo was uploaded through the signed-in browser at 22:55 CDT.
+Luna run `d4c0c338-ac12-4ce3-956e-577d8e6c1008` inspected the image, correctly
+described the orange tabby, and returned an actual visible photo attachment.
+The native turn took 52.4 s. A subsequent history-only resend request failed the
+user journey: the completed DM task rolled over to a new generation, and run
+`a9261539-3a93-4e1f-b45f-d9741216de65` truthfully reported no attachments in its
+new task. The request had explicitly asked to keep the previous task in progress.
+The separate attachment-history capability is not signed off by the successful
+current-message round-trip; task continuity needs investigation without widening
+attachment access across unrelated tasks or identities.
+
+Functional text/queue outcomes are good in the exercised Slack, GitHub and
+Telegram paths; experience quality is not yet signed off across all providers.
+Teams tenant setup, GitHub inline-review live delivery, Discord recovery and
+remaining attachment failure/recovery journeys are still explicit gaps.
+
+### Discord host-pause admission hardening
+
+The gateway can renew an expired local deadline only by an atomic compare-and-
+swap on its exact durable token after current endpoint/credential checks. A
+resumed callback establishes that authority before consuming a buffered message
+or reaction. An actual standby takeover still fences and stops the old listener.
+Callback-triggered teardown fences synchronously but does not await the gateway
+task that may itself be awaiting that callback; shutdown joins the tracked stop.
+
+Both targeted host-pause/takeover regressions pass after the final change
+(`discord-host-pause-regressions-03.log`). Full chat integration passes **283/283**
+on a fresh embedded PostgreSQL fixture (`discord-host-pause-full-03.log`). The
+first two full attempts each exposed the same adjacent Slack test-cleanup issue:
+an intentionally deferred valid receipt outlived its fixture. That test now
+drains its own receipt after clearing the test-only due time, without weakening
+the subsequent linked-authority/reach assertions. The cleanup pair separately
+passed **2/2**. Direct server TypeScript checking also passed for the gateway fix.
+These are deterministic admission proofs, not a live forced-host-sleep claim.
