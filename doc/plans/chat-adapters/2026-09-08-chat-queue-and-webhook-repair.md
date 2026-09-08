@@ -67,3 +67,71 @@ The lockfile SHA256 remains
 Master ancestry/frozen-install reconciliation and the previously documented
 whole-workspace build/test gate remain open. This checkpoint does not declare
 all providers production-qualified.
+
+## Live qualification on `1f28e0da9`
+
+The clean committed server started at 11:51:10 UTC on September 8, with the
+same staged runner and Luna configuration. No server pause or restart occurred
+during these probes.
+
+### GitHub callback repaired; answer withheld (failed chat test)
+
+The normal reconnect UI reused saved credentials. The App webhook sync was
+audited at 11:51:29.306 (started) and 11:51:29.453 (completed); reconnect finished
+at 11:51:29.961. Historical signed-ping evidence remained unchanged. No new
+login, private key, repository permission, or installation was required.
+
+The browser-created PR comment `5584695046` arrived at 11:51:59.660. Run
+`f5260e73-6b0b-4a31-9098-192db2d455be` used `codex_app_server`, ran from
+11:52:00.458 to 11:52:16.909, and produced the exact final summary
+`GH-RECONNECTED-LUNA`. However, finalization recorded
+`external_chat_response_wait_authorization_lost`, created no answer comment,
+and GitHub showed only “Maya E2E completed this turn.” Both transport
+publications succeeded on their first attempt against comment `5584695856`.
+This proves restored ingress, not a successful setup round trip. The endpoint
+remains in its legitimate reconnect test state; it was not manually activated.
+The bound-conversation authorization helper required endpoint status `active`,
+although normal setup admits test traffic while `verifying`. This creates a
+setup/finalization cycle. A narrowly scoped current-generation test-window
+exception is being implemented; it must retain current actor/reach checks and
+reject stale deliveries across reconnect.
+
+### Slack upstream retry and queue failure are separate findings
+
+The first source message `1788868365.043179` was sent at 11:52:45.043, but the
+first matching local HTTP request arrived at 11:53:45.946: **60.903 seconds
+before Paperclip received it**. The request carried retry 2 / `http_error`
+hints; those hints are diagnostic, not authenticated authority. No earlier
+matching request appears in this server log. Paperclip acknowledged the
+received request in 22.738 ms. Run `e007b44a-a6d9-4f17-92ba-19ee10c44552`
+took 22.542 seconds and its actual answer was published at 11:54:09.815:
+84.772 seconds from source to answer. All publications used one attempt and
+reused message `1788868427.157569`. Its displayed Slack timestamp is the
+original placeholder time, not when the final edit appeared. The source of
+the upstream transient has not been established.
+
+The next source `1788868603.774119` received working feedback on
+`1788868606.501909` within about three seconds. Follow-ups
+`1788868619.821029` and `1788868619.986369`, sent during that run, coalesced
+into wake `2982635e-5de7-4305-81a5-83854593cb5e`. One “Your follow-up is
+queued.” notice appeared at 11:57:01.497 on `1788868621.466899`; both source
+messages received acknowledgement reactions. Safe progress updated only the
+predecessor's working message.
+
+This is **not a passing FIFO round trip**. Predecessor
+`61b59b46-d382-4701-910c-ece9e4323dc1` failed at 11:57:30.118, and promoted
+successor `94bebeda-5c90-4810-8567-4ccc365df826` failed at 11:57:30.293.
+Their closed failure messages edited the correct separate provider messages,
+leaving no stale queue notice. The local diagnostics report a missing durable
+suspend proof followed by a runner-state identity mismatch; investigation is
+ongoing. These are not evidence that Luna itself is unsuitable, nor evidence
+that recovery or final-answer delivery succeeded.
+
+The predecessor had already emitted an accepted result and terminal event at
+11:57:14.660 and 11:57:14.669. The later failure happened while establishing
+durable suspension. Its retained runner had acknowledged only sequence 51,
+while the controller had committed sequence 625; 609 `item.delta` events
+remained in the durable outbox. Stop/suspend commands remained pending. The
+automatic recovery `b217e9ac-c82e-4468-8e9d-bdf85909eb38` exhausted its retry
+budget at 11:58:36.424. No state was deleted, forged, or manually marked
+successful. A control-loop backpressure regression and fix are in progress.
