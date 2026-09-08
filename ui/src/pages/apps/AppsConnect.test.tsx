@@ -359,6 +359,40 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).not.toContain("Chat with an agent");
   });
 
+  it.each([
+    ["telegram", "Telegram", "https://t.me/example_bot"],
+    ["discord", "Discord", "https://discord.com/channels/example"],
+  ])("does not reveal hidden %s setup from a pasted link or its generic follow-up", async (slug, name, url) => {
+    listGalleryMock.mockResolvedValue({ apps: [GITHUB, getAppStoreDefinition(slug)] });
+    await render();
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="MCP server URL"]')!;
+    await act(async () => setInputValue(input, url));
+    await flushReact();
+    expect(container.textContent).not.toContain(`This looks like ${name}`);
+    expect(buttonByText(`Use ${name}`)).toBeUndefined();
+    await act(async () => buttonByText("Continue")!.click());
+    await flushReact();
+    await passAccessStep();
+    expect(container.textContent).toContain("Connect your own MCP server");
+    expect(container.textContent).not.toContain(`guided setup for ${name}`);
+    expect(buttonByText(`Use ${name}`)).toBeUndefined();
+    expect(connectAppMock).not.toHaveBeenCalled();
+  });
+
+  it("matches GitHub tool URLs independently of gallery search while chat connectors are hidden", async () => {
+    await render();
+    await act(async () => setInputValue(container.querySelector<HTMLInputElement>('input[placeholder="Search apps…"]')!, "no matching cards"));
+    await act(async () => setInputValue(container.querySelector<HTMLInputElement>('input[aria-label="MCP server URL"]')!, "https://github.com/example/repository"));
+    await flushReact();
+    expect(container.textContent).toContain("This looks like GitHub");
+    expect(buttonByText("Use GitHub")).toBeTruthy();
+    await act(async () => buttonByText("Use GitHub")!.click());
+    await flushReact();
+    expect(container.textContent).toContain("Connect GitHub as");
+    expect(container.textContent).toContain("My GitHub account");
+    expect(container.textContent).not.toContain("Chat with an agent");
+  });
+
   // -------------------------------------------------------------------------
   // Access step (PAP-17835). Identity and agent reach are chosen before any
   // credential is entered.

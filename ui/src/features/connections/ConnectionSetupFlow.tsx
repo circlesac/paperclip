@@ -534,6 +534,7 @@ export function ConnectionSetupFlow({
   }, [host, routeNavigate]);
   const routeParams = useParams<{ appKey?: string }>();
   const { selectedCompany, selectedCompanyId } = useCompany();
+  const { enabled: chatConnectorsEnabled } = useChatConnectorsEnabled();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { pushToast } = useToast();
   const [searchParams] = useSearchParams();
@@ -827,6 +828,16 @@ export function ConnectionSetupFlow({
     queryFn: () => toolsApi.listGallery(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  // Use the same visible catalog for cards and every branded URL shortcut.
+  // Generic custom URLs remain usable without selecting a hidden provider.
+  const visibleGalleryApps = useMemo(
+    () => (galleryQuery.data?.apps ?? []).filter((app) =>
+      chatConnectorsEnabled ||
+      !app.methods.some((method) => method.transport === "chat_sdk") ||
+      appSupportsToolCatalogSetup(app),
+    ),
+    [galleryQuery.data, chatConnectorsEnabled],
+  );
   const fullRequestedDefinition = requestedAppKey
     ? getConnectableAppDefinition(requestedAppKey)
     : null;
@@ -980,8 +991,8 @@ export function ConnectionSetupFlow({
   // A curated definition covering the pasted endpoint is offered as a branded
   // convenience only; the generic flow remains the default and stays complete.
   const linkMatchedEntry = useMemo(
-    () => (linkUrl && !entry ? getAppDefinitionForUrl(linkUrl, galleryQuery.data?.apps ?? []) : null),
-    [entry, galleryQuery.data, linkUrl],
+    () => (linkUrl && !entry ? getAppDefinitionForUrl(linkUrl, visibleGalleryApps) : null),
+    [entry, visibleGalleryApps, linkUrl],
   );
 
   const selectedSetupMethod = entry
@@ -1872,10 +1883,10 @@ export function ConnectionSetupFlow({
     ? [preEnrollmentManagedMethod]
     : credentialSourceMethods;
   const credentialSourceApps = vercelConnectMode
-    ? (galleryQuery.data?.apps ?? []).filter(
+    ? visibleGalleryApps.filter(
         (app) => connectionMethodsForCredentialSource(app, credentialSource).length > 0,
       )
-    : galleryQuery.data?.apps ?? [];
+    : visibleGalleryApps;
   const zapierEntry = zapierSource
     ? galleryQuery.data?.apps.find((app) => app.slug === "zapier") ?? null
     : null;
@@ -1956,7 +1967,7 @@ export function ConnectionSetupFlow({
           source={searchParams.get("source")}
           onPick={useMatchedGalleryEntry}
           onUseLink={(url) => {
-            const matchedEntry = getAppDefinitionForUrl(url, galleryQuery.data?.apps ?? []);
+            const matchedEntry = getAppDefinitionForUrl(url, visibleGalleryApps);
             setEntry(null);
             setGalleryName("");
             setLinkUrl(url);
@@ -2488,7 +2499,6 @@ function GalleryStep({
   onPick: (entry: AppDefinition) => void;
   onUseLink: (link: string) => void;
 }) {
-  const { enabled: chatConnectorsEnabled } = useChatConnectorsEnabled();
   const [search, setSearch] = useState("");
   const [linkInput, setLinkInput] = useState("");
   const [linkError, setLinkError] = useState<string | null>(null);
@@ -2507,12 +2517,8 @@ function GalleryStep({
   }, [byo, byoOnly, loading]);
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return apps.filter((app) => (
-      chatConnectorsEnabled ||
-      !app.methods.some((method) => method.transport === "chat_sdk") ||
-      appSupportsToolCatalogSetup(app)
-    ) && (!q || app.name.toLowerCase().includes(q)));
-  }, [apps, search, chatConnectorsEnabled]);
+    return apps.filter((app) => !q || app.name.toLowerCase().includes(q));
+  }, [apps, search]);
   const normalizedLink = normalizeAppLink(linkInput);
   const matchedEntry = normalizedLink ? getAppDefinitionForUrl(normalizedLink, apps) : null;
   const zapierSource = source === "zapier";

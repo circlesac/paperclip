@@ -4760,13 +4760,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ],
       },
     });
-    await expect(
-      db
+    // The run's terminal write precedes the agent-status settlement. Wait for
+    // this exact configuration error instead of observing the intermediate idle state.
+    const failedAgent = await waitForValue(async () => {
+      const row = await db
         .select({ status: agents.status, errorReason: agents.errorReason })
         .from(agents)
         .where(eq(agents.id, agentId))
-        .then((rows) => rows[0] ?? null),
-    ).resolves.toMatchObject({
+        .then((rows) => rows[0] ?? null);
+      return row?.status === "error" &&
+        row.errorReason?.includes("configuration incomplete")
+        ? row
+        : null;
+    });
+    expect(failedAgent).toMatchObject({
       status: "error",
       errorReason: expect.stringContaining("configuration incomplete"),
     });
