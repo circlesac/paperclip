@@ -14,6 +14,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { initializeRunIdentity, reserveSteeredIdentity, reconcileSteeredIdentity } from "../run-identity.js";
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
@@ -142,6 +143,64 @@ describe("PaperclipRunnerToolAuthority", () => {
         arguments: {},
       }),
     ).rejects.toThrow("paperclip_runner_tool_not_advertised");
+  });
+
+  it("preserves direct-chat file tools across the guarded API rollout", () => {
+    const previousEnabled = process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
+    const previousCompanies =
+      process.env.PAPERCLIP_RUNNER_API_TOOLS_COMPANY_IDS;
+    const createAuthority = () =>
+      new PaperclipRunnerToolAuthority(db, {
+        companyId,
+        agentId,
+        issueId,
+        runId,
+        workspaceRoot: "/tmp/paperclip-runner-tools",
+        executionTargetKind: "local",
+      });
+    const requiredChatFileTools = [
+      READ_CURRENT_WAKE_COMMENTS_TOOL_NAME,
+      "list_chat_attachments",
+      "reuse_chat_attachment",
+      "register_deliverable",
+    ];
+
+    try {
+      delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
+      delete process.env.PAPERCLIP_RUNNER_API_TOOLS_COMPANY_IDS;
+      const disabledNames = createAuthority()
+        .definitions()
+        .map((tool) => tool.name);
+      expect(disabledNames).toEqual(
+        expect.arrayContaining(requiredChatFileTools),
+      );
+      expect(disabledNames).not.toContain("search_api");
+      expect(disabledNames).not.toContain("call_api");
+
+      process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = "true";
+      process.env.PAPERCLIP_RUNNER_API_TOOLS_COMPANY_IDS = companyId;
+      const enabledNames = createAuthority()
+        .definitions()
+        .map((tool) => tool.name);
+      expect(enabledNames).toEqual(
+        expect.arrayContaining([
+          ...requiredChatFileTools,
+          "search_api",
+          "call_api",
+        ]),
+      );
+    } finally {
+      if (previousEnabled === undefined) {
+        delete process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED;
+      } else {
+        process.env.PAPERCLIP_RUNNER_API_TOOLS_ENABLED = previousEnabled;
+      }
+      if (previousCompanies === undefined) {
+        delete process.env.PAPERCLIP_RUNNER_API_TOOLS_COMPANY_IDS;
+      } else {
+        process.env.PAPERCLIP_RUNNER_API_TOOLS_COMPANY_IDS = previousCompanies;
+      }
+    }
   });
 
   it("advertises structured human input in ask mode", () => {
@@ -547,6 +606,8 @@ describe("PaperclipRunnerToolAuthority", () => {
       },
     });
     const prerequisiteId = (prerequisite as { task: { id: string } }).task.id;
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, prerequisiteId)))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ action: "issue.created", agentId, runId, companyId })]));
     const dependent = await authority.execute({
       tool: "create_task",
       callId: "create-dependent",
@@ -660,6 +721,10 @@ describe("PaperclipRunnerToolAuthority", () => {
         },
       }),
     ).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
+
+    const creationEvents = (await db.select().from(activityLog).where(eq(activityLog.entityId, prerequisiteId)))
+      .filter(event => event.action === "issue.created");
+    expect(creationEvents).toHaveLength(1);
 
     const foreignCompanyId = "00000000-0000-4000-8000-000000000201";
     const foreignAgentId = "00000000-0000-4000-8000-000000000202";
@@ -807,6 +872,46 @@ describe("PaperclipRunnerToolAuthority", () => {
         .from(issueComments)
         .where(eq(issueComments.issueId, guardedIssueId)),
     ).toHaveLength(0);
+  });
+
+  it("captures delegation and approval origins before steering and preserves replay identity", async () => {
+    const issueId = "00000000-0000-4000-8000-000000000120";
+    const runId = "00000000-0000-4000-8000-000000000121";
+    await db.insert(issues).values({ id: issueId, companyId, title: "Identity delegation",
+      status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: issueId,
+      invocationSource: "assignment", triggerDetail: "system", contextSnapshot: { issueId } });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const origin = await initializeRunIdentity(db, {
+      companyId, runId, issueId, responsibleUserId: "person-a", cause: "instruction",
+    });
+    const [message] = await db.insert(issueComments).values({
+      companyId, issueId, body: "New instruction", authorUserId: "person-b",
+    }).returning();
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    const call = { tool: "create_task", callId: "identity-child", arguments: {
+      idempotencyKey: "identity-child", title: "Keep the initiating identity",
+      responsibleUserId: "forged-user", originIdentityContextId: "forged-context",
+    } };
+    const first = await authority.execute(call) as { task: { id: string } };
+    const pending = await reserveSteeredIdentity(db, { companyId, runId, issueId, messageId: message.id });
+    await reconcileSteeredIdentity(db, pending!);
+    await expect(authority.execute({ ...call, callId: "identity-child-replay" })).resolves.toEqual(first);
+    const [child] = await db.select().from(issues).where(eq(issues.id, first.task.id));
+    expect(child).toMatchObject({ originRunId: runId, originIdentityContextId: origin.id,
+      continuationIdentityContextId: origin.id });
+    const second = await authority.execute({ ...call, callId: "identity-child-b", arguments: {
+      idempotencyKey: "identity-child-b", title: "Use the next instruction identity",
+    } }) as { task: { id: string } };
+    const [nextChild] = await db.select().from(issues).where(eq(issues.id, second.task.id));
+    expect(nextChild.originIdentityContextId).toBe(pending!.id);
+    await authority.execute({ tool: "request_human_input", callId: "identity-approval", arguments: {
+      idempotencyKey: "identity-approval", interactionKind: "confirmation", title: "Approve continuation",
+      prompt: "Continue?", continuationPolicy: "wake_assignee", payload: {},
+    } });
+    const interactions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(interactions.find((row) => row.title === "Approve continuation")?.sourceIdentityContextId).toBe(pending!.id);
   });
 
   it("fails closed once the run is no longer active", async () => {

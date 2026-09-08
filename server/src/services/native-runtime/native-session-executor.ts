@@ -272,6 +272,7 @@ function clearNativeRuntimeRequestResolutions(runId: string): void {
 }
 
 type WarmNativeSession = {
+  credentialRunId?: string;
   session: NativeSession;
   ownerToken: symbol;
   configDigest: string;
@@ -1898,6 +1899,8 @@ function hasIdleWarmNativeSessionOwner(input: {
   if (input.execution.session.lifecyclePolicy.mode !== "warm") return false;
   const entry = warmNativeSessions.get(nativeSessionScopeKey(input.execution));
   if (!entry || entry.busy) return false;
+  // A verified idle owner proves the checkpoint belongs to this session even
+  // when its process must later rotate to a new run-scoped broker capability.
   const environmentId =
     input.runnerExecutionTarget?.kind === "remote"
       ? (input.runnerExecutionTarget.environmentId ?? null)
@@ -2968,12 +2971,20 @@ export async function getNativeSessionSteeringState(
   };
 }
 
+// Receipts live as long as this controller process. Durable identity reservations
+// hold credential acquisition after a restart until a provider receipt is known.
+const steeringDeliveries = new Map<string, Promise<{ turnId: string }>>();
+function clearSteeringDeliveries(runId: string) {
+  for (const key of steeringDeliveries.keys()) if (key.startsWith(`${runId}:`)) steeringDeliveries.delete(key);
+}
+
 /** Dispatches a true same-turn steering message and resolves only after ack. */
 export async function steerNativeSession(input: {
   runId: string;
   message: string;
   correlationId: string;
   timeoutMs?: number;
+  onAcknowledged?: () => Promise<void>;
 }): Promise<{ turnId: string }> {
   const active = activeNativeSessions.get(input.runId);
   if (!active) {
@@ -2998,14 +3009,24 @@ export async function steerNativeSession(input: {
     );
   }
 
+  const deliveryKey = `${input.runId}:${input.correlationId}`;
+  let delivery = steeringDeliveries.get(deliveryKey);
+  if (!delivery) {
+    delivery = active.session.steer({
+      turnId,
+      message: { role: "user", text: input.message },
+      correlationId: input.correlationId,
+    }).then(() => ({ turnId }));
+    steeringDeliveries.set(deliveryKey, delivery);
+    void delivery.catch(() => { steeringDeliveries.delete(deliveryKey); });
+  }
+  // Do not await the persistence callback here: the route holds the run lock
+  // until acknowledgement. After a timeout this callback can acquire that lock.
+  if (input.onAcknowledged) void delivery.then(input.onAcknowledged).catch(() => undefined);
   let timeout: ReturnType<typeof setTimeout> | null = null;
   try {
-    await Promise.race([
-      active.session.steer({
-        turnId,
-        message: { role: "user", text: input.message },
-        correlationId: input.correlationId,
-      }),
+    const acknowledged = await Promise.race([
+      delivery,
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(
           () =>
@@ -3019,7 +3040,7 @@ export async function steerNativeSession(input: {
         );
       }),
     ]);
-    return { turnId };
+    return acknowledged;
   } catch (error) {
     if (error instanceof NativeSessionSteeringError) throw error;
     const message = error instanceof Error ? error.message : String(error);
@@ -4380,7 +4401,16 @@ async function executePaperclipNativeSessionWithinScope(
   if (warmSessionId !== null && warmConfigDigest !== null) {
     const entry = warmNativeSessions.get(warmSessionId);
     if (entry) {
-      if (entry.configDigest !== warmConfigDigest) {
+      // Run-scoped broker capabilities must rotate with the process, while the
+      // settled provider checkpoint retains the conversation across runs.
+      const hasBrokerCapability = Boolean(
+        input.runnerEnvironment?.PAPERCLIP_GITHUB_BROKER_TOKEN,
+      );
+      const credentialRunChanged =
+        Boolean(entry.credentialRunId) !== hasBrokerCapability ||
+        (hasBrokerCapability &&
+          entry.credentialRunId !== input.execution.binding.runId);
+      if (entry.configDigest !== warmConfigDigest || credentialRunChanged) {
         if (entry.busy) throw new Error("native_session_supervisor_busy");
         if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
         warmNativeSessions.delete(warmSessionId);
@@ -4542,9 +4572,9 @@ async function executePaperclipNativeSessionWithinScope(
               warmSessionId === null
                 ? undefined
                 : NATIVE_WARM_SEMANTIC_RESULT_TERMINAL_GRACE_MS,
-            requireSessionCloseBeforeReturn:
-              runnerdBackend !== null &&
-              input.runnerExecutionTarget?.kind === "remote",
+            // Every durable runner must finish its bounded suspension before
+            // the next run verifies and rotates the saved authority.
+            requireSessionCloseBeforeReturn: runnerdBackend !== null,
             onCheckpoint:
               warmSessionId !== null && warmConfigDigest !== null
                 ? async (snapshot) =>
@@ -4607,6 +4637,8 @@ async function executePaperclipNativeSessionWithinScope(
                   existing.session = session;
                 } else
                   warmNativeSessions.set(warmSessionId, {
+                    credentialRunId: input.runnerEnvironment?.PAPERCLIP_GITHUB_BROKER_TOKEN
+                      ? input.execution.binding.runId : undefined,
                     session,
                     ownerToken: warmSessionOwnerToken,
                     configDigest: warmConfigDigest,
@@ -4636,6 +4668,7 @@ async function executePaperclipNativeSessionWithinScope(
                 });
               else {
                 activeNativeSessions.delete(input.execution.binding.runId);
+                clearSteeringDeliveries(input.execution.binding.runId);
                 clearNativeRuntimeRequestResolutions(
                   input.execution.binding.runId,
                 );
@@ -4670,6 +4703,7 @@ async function executePaperclipNativeSessionWithinScope(
       endedAtMs: Date.now(),
     });
     activeNativeSessions.delete(input.execution.binding.runId);
+    clearSteeringDeliveries(input.execution.binding.runId);
     clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
   } catch (error) {
     await leaseRenewal.stop().catch(() => undefined);
@@ -4701,6 +4735,7 @@ async function executePaperclipNativeSessionWithinScope(
     }
     trace.activate(taskSettleScope);
     activeNativeSessions.delete(input.execution.binding.runId);
+    clearSteeringDeliveries(input.execution.binding.runId);
     clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
     if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
       await releaseWarmNativeSession(
@@ -5139,6 +5174,22 @@ function processEnvironment(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+}
+
+/** Preserve package-manager shims that resolve dependencies relative to argv[0]. */
+export function buildRemoteCodexLauncherCommand(sourcePath: string, targetPath: string): string {
+  if (sourcePath === targetPath) throw new Error("runner_remote_preinstalled_source_conflict");
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const launcher = `#!/bin/sh\nexec ${quote(sourcePath)} "$@"\n`;
+  // Replace atomically: writing through an existing symlink would corrupt the
+  // image's shared CLI, and another run may be executing this launcher already.
+  return `umask 077; mkdir -p ${quote(posix.dirname(targetPath))} && ` +
+    `[ ! -d ${quote(targetPath)} ] && ` +
+    `paperclip_codex_launcher_tmp=$(mktemp ${quote(targetPath + ".tmp.XXXXXX")}) && ` +
+    `trap 'rm -f "$paperclip_codex_launcher_tmp"' 0 && ` +
+    `printf '%s' ${quote(launcher)} > "$paperclip_codex_launcher_tmp" && ` +
+    `chmod 700 "$paperclip_codex_launcher_tmp" && ` +
+    `mv -f "$paperclip_codex_launcher_tmp" ${quote(targetPath)}`;
 }
 
 export function parseRemoteExecutableCandidate(stdout: string): string | null {
@@ -6640,8 +6691,10 @@ async function createRunnerdBackendWithinSessionClaim(
       command: "sh",
       args: [
         "-c",
-        `umask 077; mkdir -p '${escapedDirectory}' && ` +
-          `ln -sfn '${escapedSource}' '${escapedTarget}'`,
+        targetPath === remoteCodexBinary
+          ? buildRemoteCodexLauncherCommand(sourcePath, targetPath)
+          : `umask 077; mkdir -p '${escapedDirectory}' && ` +
+            `ln -sfn '${escapedSource}' '${escapedTarget}'`,
       ],
       cwd: remoteTarget.remoteCwd,
       bypassSession: true,

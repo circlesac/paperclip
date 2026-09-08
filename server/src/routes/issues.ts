@@ -1,3 +1,10 @@
+import {
+  storedSteeringAcknowledgement,
+  reconcileSteeredIdentity,
+  reserveSteeredIdentity,
+  acceptSteeredIdentity,
+  rejectSteeredIdentity,
+} from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
@@ -11461,6 +11468,7 @@ export function issueRoutes(
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
         originRunId: createBody.originRunId ?? actor.runId,
+        originIdentityContextId: req.actor.identityContextId ?? null,
         executionPolicy,
         ...(sourceTrust ? { sourceTrust } : {}),
         createdByAgentId: actor.agentId,
@@ -14897,6 +14905,13 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
+      const steeringIdentity = await reserveSteeredIdentity(db, {
+        companyId: issue.companyId,
+        runId: req.body.targetRunId,
+        issueId: issue.id,
+        messageId: commentId,
+      });
+      let steeringDeliveryAttempted = false;
       let acknowledgedTurnId: string | null = null;
       let duplicate = false;
       let queue: IssueQueuedCommentQueue;
@@ -15028,11 +15043,21 @@ export function issueRoutes(
             });
           }
 
-          const acknowledgement = await steerNativeSession({
-            runId: locked.activeRun.id,
-            message: entry.comment.body,
-            correlationId: commentId,
-          });
+          steeringDeliveryAttempted = true;
+          const acknowledgement =
+            (steeringIdentity
+              ? await storedSteeringAcknowledgement(tx, steeringIdentity)
+              : null) ??
+            (await steerNativeSession({
+              runId: locked.activeRun.id,
+              message: entry.comment.body,
+              correlationId: commentId,
+              onAcknowledged: steeringIdentity
+                ? () => reconcileSteeredIdentity(db, steeringIdentity)
+                : undefined,
+            }));
+          if (steeringIdentity)
+            await acceptSteeredIdentity(tx, steeringIdentity);
           acknowledgedTurnId = acknowledgement.turnId;
           const remainingIds = locked.queue.entries
             .map((candidate) => candidate.comment.id)
@@ -15087,6 +15112,13 @@ export function issueRoutes(
           });
         });
       } catch (error) {
+        const uncertain =
+          steeringDeliveryAttempted &&
+          (!(error instanceof NativeSessionSteeringError) ||
+            error.code === "steering_timeout");
+        if (steeringIdentity && !uncertain)
+          await rejectSteeredIdentity(db, steeringIdentity);
+
         if (error instanceof NativeSessionSteeringError) {
           throw conflict(error.message, { code: error.code, retryable: true });
         }
@@ -15237,6 +15269,7 @@ export function issueRoutes(
               : (req.body.sourceRunId ?? null),
         },
         {
+          identityContextId: req.actor.identityContextId,
           agentId: actor.agentId,
           userId: actor.actorType === "user" ? actor.actorId : null,
         },

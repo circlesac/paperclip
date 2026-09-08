@@ -1,6 +1,6 @@
 {
-  "id": "c0fbdec3-797b-4517-a469-337cb035acf6",
-  "prevId": "3c1fa45a-2e1e-4860-9e5a-70d5475a8b15",
+  "id": "a270a194-2d61-4529-a0ef-19a1943fd62a",
+  "prevId": "13886a3f-ba8c-4be3-8028-499a93c531bf",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1622,7 +1622,7 @@
             }
           ],
           "isUnique": true,
-          "where": "(\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'question-response:%' OR \"agent_wakeup_requests\".\"idempotency_key\" LIKE 'interaction:%') AND \"agent_wakeup_requests\".\"status\" NOT IN ('skipped', 'failed', 'cancelled')",
+          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'question-response:%' AND \"agent_wakeup_requests\".\"status\" NOT IN ('skipped', 'failed', 'cancelled')",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -5870,7 +5870,7 @@
           "type": "boolean",
           "primaryKey": false,
           "notNull": true,
-          "default": false
+          "default": true
         },
         "allow_unlinked_people": {
           "name": "allow_unlinked_people",
@@ -6038,84 +6038,6 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
-        },
-        "chat_endpoints_live_bot_external_uq": {
-          "name": "chat_endpoints_live_bot_external_uq",
-          "columns": [
-            {
-              "expression": "provider",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "provider_account_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "bot_external_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"chat_endpoints\".\"status\" in ('verifying', 'active', 'paused', 'attention')\n          and \"chat_endpoints\".\"provider_account_id\" is not null\n          and \"chat_endpoints\".\"bot_external_id\" is not null",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_endpoints_live_discord_bot_external_uq": {
-          "name": "chat_endpoints_live_discord_bot_external_uq",
-          "columns": [
-            {
-              "expression": "provider",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "bot_external_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"chat_endpoints\".\"provider\" = 'discord'\n          and \"chat_endpoints\".\"status\" in ('verifying', 'active', 'paused', 'attention')\n          and \"chat_endpoints\".\"bot_external_id\" is not null",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "chat_endpoints_live_bot_username_uq": {
-          "name": "chat_endpoints_live_bot_username_uq",
-          "columns": [
-            {
-              "expression": "provider",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "provider_account_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "bot_username",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"chat_endpoints\".\"status\" in ('verifying', 'active', 'paused', 'attention')\n          and \"chat_endpoints\".\"provider_account_id\" is not null\n          and \"chat_endpoints\".\"bot_username\" is not null",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
         }
       },
       "foreignKeys": {
@@ -6176,7 +6098,7 @@
       "checkConstraints": {
         "chat_endpoints_provider_check": {
           "name": "chat_endpoints_provider_check",
-          "value": "\"chat_endpoints\".\"provider\" in ('slack', 'github', 'discord', 'microsoft-teams', 'telegram')"
+          "value": "\"chat_endpoints\".\"provider\" in ('slack', 'github', 'microsoft-teams', 'telegram')"
         },
         "chat_endpoints_status_check": {
           "name": "chat_endpoints_status_check",
@@ -6361,7 +6283,7 @@
       "checkConstraints": {
         "chat_external_principals_provider_check": {
           "name": "chat_external_principals_provider_check",
-          "value": "\"chat_external_principals\".\"provider\" in ('slack', 'github', 'discord', 'microsoft-teams', 'telegram')"
+          "value": "\"chat_external_principals\".\"provider\" in ('slack', 'github', 'microsoft-teams', 'telegram')"
         },
         "chat_external_principals_kind_check": {
           "name": "chat_external_principals_kind_check",
@@ -6624,12 +6546,6 @@
           "columns": [
             {
               "expression": "endpoint_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "conversation_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -6960,7 +6876,7 @@
       "checkConstraints": {
         "chat_publications_state_check": {
           "name": "chat_publications_state_check",
-          "value": "\"chat_publications\".\"state\" in ('pending', 'streaming', 'published', 'retry', 'delivery_unknown', 'failed', 'cancelled')"
+          "value": "\"chat_publications\".\"state\" in ('pending', 'streaming', 'published', 'retry', 'failed', 'cancelled')"
         }
       },
       "isRLSEnabled": false
@@ -20220,6 +20136,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "active_identity_context_id": {
+          "name": "active_identity_context_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "started_at": {
           "name": "started_at",
           "type": "timestamp with time zone",
@@ -25510,6 +25432,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "source_identity_context_id": {
+          "name": "source_identity_context_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
         "source_run_id": {
           "name": "source_run_id",
           "type": "uuid",
@@ -27236,6 +27164,18 @@
         "origin_run_id": {
           "name": "origin_run_id",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "origin_identity_context_id": {
+          "name": "origin_identity_context_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "continuation_identity_context_id": {
+          "name": "continuation_identity_context_id",
+          "type": "uuid",
           "primaryKey": false,
           "notNull": false
         },
@@ -35954,6 +35894,178 @@
             "id"
           ],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.run_identity_contexts": {
+      "name": "run_identity_contexts",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "company_id": {
+          "name": "company_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "responsible_user_id": {
+          "name": "responsible_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "parent_context_id": {
+          "name": "parent_context_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cause": {
+          "name": "cause",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "correlation_id": {
+          "name": "correlation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'accepted'"
+        },
+        "accepted_at": {
+          "name": "accepted_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "github": {
+          "name": "github",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "run_identity_contexts_run_revision_idx": {
+          "name": "run_identity_contexts_run_revision_idx",
+          "columns": [
+            {
+              "expression": "run_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "revision",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "run_identity_contexts_run_correlation_idx": {
+          "name": "run_identity_contexts_run_correlation_idx",
+          "columns": [
+            {
+              "expression": "run_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "correlation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "run_identity_contexts_company_run_idx": {
+          "name": "run_identity_contexts_company_run_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "run_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "run_identity_contexts_company_id_companies_id_fk": {
+          "name": "run_identity_contexts_company_id_companies_id_fk",
+          "tableFrom": "run_identity_contexts",
+          "tableTo": "companies",
+          "columnsFrom": [
+            "company_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

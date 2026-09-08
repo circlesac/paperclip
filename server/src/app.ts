@@ -1197,6 +1197,8 @@ export async function createApp(
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
     appServicesShutdown = (async () => {
+      scheduler.stop();
+      jobCoordinator.stop();
       disableFeedbackExportFlushes();
       if (chatPublicationTimer) {
         clearInterval(chatPublicationTimer);
