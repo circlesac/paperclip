@@ -1727,6 +1727,33 @@ impl CodexCommandExecutor {
                         "failed to restore Codex provider turn identities: {error}"
                     ))
                 })?;
+            if state.lifecycle == "prepared" && provider.active_provider_turn_id().is_some() {
+                // A stopped checkpoint has no active work to inherit. Inspect
+                // the actual resumed thread before publishing this process or
+                // accepting any of its buffered tool calls under new authority.
+                let provider_shutdown_failed = provider.shutdown().is_err();
+                drop(provider);
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("prepared state remains available after provider start");
+                state.provider_process_generation = process_generation;
+                state.lifecycle = "closed".to_owned();
+                let _ = state.push_terminal_event(NormalizedProviderEvent {
+                    event_type: "harness.diagnostic".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({
+                        "code": "prepared_provider_checkpoint_has_active_work",
+                        "paperclipAccepted": false,
+                        "providerReportedActive": true,
+                        "providerShutdownFailed": provider_shutdown_failed,
+                    }),
+                });
+                self.save_state()?;
+                return Err(DurableRunnerError::invalid(
+                    "prepared provider checkpoint resumed unexpected active work",
+                ));
+            }
             provider
                 .restore_completed_turn_authority(
                     state.completed_turn_authoritative
@@ -1881,31 +1908,46 @@ impl CodexCommandExecutor {
         next_state.active_provider_result_fingerprint = None;
         next_state.active_provider_result_disposition = None;
         next_state.last_agent_message = None;
-        let provider = self.provider.as_mut().ok_or_else(|| {
-            DurableRunnerError::invalid("run.attach requires the restored Codex provider process")
-        })?;
-        let retained_provider = !runtime_launch_changed
-            && provider
-                .attach_run_in_place(
-                    next_state.tool_bridge.authorized_tools().cloned(),
-                    next_state.completion_contract.as_ref().map(|contract| {
-                        (
-                            contract.revision.as_str(),
-                            contract.criterion_ids.as_slice(),
-                        )
-                    }),
-                )
-                .map_err(|error| {
+        let retained_provider = if let Some(provider) = self.provider.as_mut() {
+            !runtime_launch_changed
+                && provider
+                    .attach_run_in_place(
+                        next_state.tool_bridge.authorized_tools().cloned(),
+                        next_state.completion_contract.as_ref().map(|contract| {
+                            (
+                                contract.revision.as_str(),
+                                contract.criterion_ids.as_slice(),
+                            )
+                        }),
+                    )
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to retain Codex for warm run attachment: {error}"
+                        ))
+                    })?
+        } else if next_state.lifecycle == "prepared"
+            && next_state.provider_process_generation > 0
+            && next_state.pending_events.is_empty()
+        {
+            // turn.stop deliberately terminates the exact old process and
+            // retains a prepared, settled thread checkpoint. Rebind only its
+            // validated run-scoped settings here; open_session then restores
+            // that same thread under the new authority. Never restart during
+            // drain/suspend or require the stopped process to still exist.
+            false
+        } else {
+            return Err(DurableRunnerError::invalid(
+                "run.attach requires the restored Codex provider process",
+            ));
+        };
+        if !retained_provider {
+            if let Some(provider) = self.provider.as_mut() {
+                provider.shutdown().map_err(|error| {
                     DurableRunnerError::invalid(format!(
-                        "failed to retain Codex for warm run attachment: {error}"
+                        "failed to checkpoint Codex before attaching a new run: {error}"
                     ))
                 })?;
-        if !retained_provider {
-            provider.shutdown().map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "failed to checkpoint Codex before attaching a new run: {error}"
-                ))
-            })?;
+            }
             self.provider = None;
         }
         next_state.pending_events.clear();
@@ -2963,6 +3005,10 @@ impl CodexCommandExecutor {
         // an ambiguous-start failure cannot degrade into an empty successful
         // poll on the same executor.
         self.restore_provider_if_needed()?;
+        self.poll_current_provider()
+    }
+
+    fn poll_current_provider(&mut self) -> Result<(), DurableRunnerError> {
         // Receipt-limit interruption is autonomous recovery. It must advance
         // even while older durable events await acknowledgement, otherwise a
         // slow or disconnected controller can keep an exhausted provider turn
@@ -3306,6 +3352,18 @@ impl CommandExecutor for CodexCommandExecutor {
             .collect())
     }
 
+    fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if self.state.as_ref().is_some_and(|state| {
+            state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
+        }) {
+            // Reuse the bounded receipt-limit cleanup poll, including reserved
+            // terminal storage and terminal-before-deadline ordering. Do not
+            // restore/start a provider or ingest ordinary output under ACK debt.
+            self.poll_current_provider()?;
+        }
+        Ok(())
+    }
+
     fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
         if count == 0 {
             return Ok(());
@@ -3537,6 +3595,103 @@ mod tests {
         assert_eq!(terminal[0].event_type, "run.terminal");
         assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn stopped_prepared_checkpoint_rebinds_without_restarting_its_old_provider() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-stopped-checkpoint-rebind-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("must-not-start-during-attachment");
+        state.config.model = None;
+        state.active_provider_turn_id = None;
+        state.provider_process_generation = 1;
+        state.lifecycle = "prepared".to_owned();
+        let writer = CodexCommandExecutor::new(&directory);
+        writer.persist_state(&state).unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.restore().unwrap();
+        assert!(executor.provider.is_none());
+        executor.attach_run(&json!({})).unwrap();
+        assert!(executor.provider.is_none());
+        let rebound = executor.state.as_ref().unwrap();
+        assert_eq!(rebound.lifecycle, "prepared");
+        assert_eq!(rebound.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(rebound.provider_process_generation, 1);
+        assert!(rebound.pending_events.is_empty());
+        assert!(rebound.queued_events.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stopped_checkpoint_rebinding_keeps_unsettled_and_missing_process_fences() {
+        let mut settled = opencode_result_state();
+        settled.config.provider = "codex".to_owned();
+        settled.config.driver = "codex_app_server".to_owned();
+        settled.config.command = PathBuf::from("must-not-start-during-attachment");
+        settled.config.model = None;
+        settled.active_provider_turn_id = None;
+        settled.provider_process_generation = 1;
+        settled.lifecycle = "prepared".to_owned();
+        for change in [
+            "closed",
+            "session_open",
+            "active",
+            "ambiguous",
+            "pending",
+            "queued",
+            "thread_missing",
+            "generation_missing",
+            "profile_changed",
+        ] {
+            let mut state = settled.clone();
+            let mut payload = json!({});
+            match change {
+                "closed" | "session_open" => state.lifecycle = change.to_owned(),
+                "active" => state.active_provider_turn_id = Some("still-active".to_owned()),
+                "ambiguous" => state.ambiguous_turn_start_pending = true,
+                "pending" | "queued" => {
+                    let event = PolledEvent {
+                        executor_event_id: "undelivered-result".to_owned(),
+                        event_type: "run.result.proposed".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({}),
+                    };
+                    if change == "pending" {
+                        state.pending_events.push_back(event);
+                    } else {
+                        state.queued_events.push_back(event);
+                    }
+                }
+                "thread_missing" => state.thread_id = None,
+                "generation_missing" => state.provider_process_generation = 0,
+                "profile_changed" => {
+                    let mut config = state.config.clone();
+                    config.model = Some("different-model".to_owned());
+                    payload = json!({"provider": config});
+                }
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(&state).unwrap();
+            let mut executor =
+                CodexCommandExecutor::new(PathBuf::from("unused-rejected-attachment"));
+            executor.state = Some(state);
+            assert!(
+                executor.attach_run(&payload).is_err(),
+                "must reject {change}"
+            );
+            assert!(executor.provider.is_none());
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                before
+            );
+        }
     }
 
     #[test]
@@ -4626,13 +4781,9 @@ mod tests {
         });
         executor.restore_checked = true;
 
-        // Exercise receipt-limit recovery directly. `poll_provider` also
-        // restores a missing provider by design, while this unit test
-        // intentionally injects state without constructing a provider.
-        executor.retry_receipt_limit_interrupt().unwrap();
-        executor
-            .settle_receipt_limit_interrupt_if_deadline_elapsed()
-            .unwrap();
+        // ACK debt must still advance an already-pending cleanup deadline,
+        // without restoring/starting a process or releasing retained events.
+        executor.maintain_backpressured_provider().unwrap();
 
         let state = executor.state.as_ref().unwrap();
         assert_eq!(state.lifecycle, "provider_exited");
@@ -4646,6 +4797,13 @@ mod tests {
             .pending_events
             .iter()
             .any(|event| event.event_type == "turn.failed"));
+        let settled = serde_json::to_value(state).unwrap();
+        executor.maintain_backpressured_provider().unwrap();
+        assert_eq!(
+            serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+            settled
+        );
+        assert!(executor.provider.is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 }

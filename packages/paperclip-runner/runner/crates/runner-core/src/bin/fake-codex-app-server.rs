@@ -57,9 +57,9 @@ fn send_split_event_burst(state: &FakeState) -> io::Result<()> {
     }))
 }
 
-fn finish_split_event_burst(state: &FakeState) -> io::Result<()> {
+fn finish_split_event_burst(state: &FakeState, count: usize) -> io::Result<()> {
     let turn_id = state.active_turn_id.as_deref().unwrap_or("provider-turn-1");
-    for index in 0..48 {
+    for index in 0..count {
         send(json!({
             "method": "item/agentMessage/delta",
             "params": {
@@ -532,6 +532,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let emit_runtime_elicitation = args.iter().any(|value| value == "--runtime-elicitation");
     let emit_structured_activity = args.iter().any(|value| value == "--structured-activity");
     let emit_split_event_burst = args.iter().any(|value| value == "--split-event-burst");
+    let split_event_suffix_count = argument(&args, "--split-event-suffix-count")
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(48);
+    if !(1..=4096).contains(&split_event_suffix_count) {
+        return Err("split event suffix count must be between 1 and 4096".into());
+    }
     let require_skill_instructions = args
         .iter()
         .any(|value| value == "--include-skill-instructions");
@@ -771,7 +778,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if message.pointer("/result/success") != Some(&json!(true)) {
                 return Err("split event burst semantic tool failed".into());
             }
-            finish_split_event_burst(&state)?;
+            finish_split_event_burst(&state, split_event_suffix_count)?;
             finish_turn(&state_path, &mut state, "completed")?;
             continue;
         }

@@ -142,3 +142,44 @@ remained in the durable outbox. Stop/suspend commands remained pending. The
 automatic recovery `b217e9ac-c82e-4468-8e9d-bdf85909eb38` exhausted its retry
 budget at 11:58:36.424. No state was deleted, forged, or manually marked
 successful. A control-loop backpressure regression and fix are in progress.
+
+## Runner corrections and pre-deployment verification
+
+The new 1024-delta, post-semantic-result stress case reproduced the exact
+missing-suspension failure against the prior staged `af19f64d…` binary. The
+correction gates new provider ingestion while a sent durable prefix is still
+awaiting controller acknowledgements. Authenticated control frames continue
+in order; every individual event save and cumulative ACK save remains intact.
+There is no longer timeout or discarded durable output.
+
+Independent review required two additional safeguards. Backpressure still
+advances bounded, already-pending receipt-limit cleanup without starting a
+provider, and observes terminal events before deadline fallback. A safely
+stopped `prepared` checkpoint can rebind the next run without requiring its
+old process to exist, but a resumed provider reporting unexpected active work
+is stopped and rejected before any buffered tool is exposed.
+
+Candidate debug verification passed:
+
+- Rust library: **223/223** on the final rerun. The first run had one unchanged
+  ACPX process-liveness fixture failure; its isolated rerun and the full rerun
+  passed. The initial run is not counted as a pass.
+- Targeted real transport: **3/3**, including the original 48-delta case,
+  1024-delta saturation with **two actual turns**, and rejection of an unexpected
+  active resumed checkpoint. The successor retains the exact provider thread,
+  has a distinct turn identity, invokes the semantic handler once, and proves
+  exact durable suspension. This is not merely a session-read test.
+- Real Codex unacknowledged-terminal maintenance: **1/1**.
+- Runner and server TypeScript checks passed; independent review found no
+  remaining production blocker in these changes.
+
+Release/staged-binary verification and fresh live round trips remain pending.
+The failed Slack session is retained in quarantine; an audited task-scoped
+session reset after deployment will create a new provider session, not recover
+or replay the failed accepted answer. Paperclip issue, message, file, and run
+history will remain. No reset has been performed yet.
+
+The ignored, local webhook-only qualification proxy now has closed timing
+diagnostics, tested **6/6** without a real listener. They record only provider,
+timestamp, duration, status, outcome, and byte count; no bodies, headers,
+credentials, callback IDs, or URLs. The running proxy is not yet restarted.

@@ -4249,9 +4249,18 @@ fn receipt_limit_polls_an_authoritative_terminal_with_unacknowledged_events() {
         .iter()
         .any(|event| event.event_type == "turn.interrupted"));
 
+    recovered
+        .maintain_backpressured_provider()
+        .expect("observe the provider terminal while controller ACK debt gates ordinary polling");
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["receiptLimitInterruptPending"], false);
+    assert_eq!(persisted["lifecycle"], "session_open");
     let terminal = recovered
         .poll_events()
-        .expect("poll the provider terminal before old events are acknowledged");
+        .expect("retained authoritative terminal remains available after maintenance");
+    assert_eq!(&terminal[..pending.len()], pending.as_slice());
     assert!(terminal.iter().any(|event| {
         event.event_type == "turn.interrupted" && event.payload.get("code").is_none()
     }));

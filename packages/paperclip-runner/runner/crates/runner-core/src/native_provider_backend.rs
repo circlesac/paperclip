@@ -43,6 +43,14 @@ impl CommandExecutor for SelectedExecutor {
         }
     }
 
+    fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        match self {
+            Self::LocalFacade(executor) => executor.maintain_backpressured_provider(),
+            Self::Acpx(executor) => executor.maintain_backpressured_provider(),
+            Self::Managed(executor) => executor.maintain_backpressured_provider(),
+        }
+    }
+
     fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
         match self {
             Self::LocalFacade(executor) => executor.acknowledge_events(count),
@@ -169,6 +177,14 @@ impl CommandExecutor for NativeProviderCommandExecutor {
         self.selected
             .as_mut()
             .map_or_else(|| Ok(Vec::new()), CommandExecutor::poll_events)
+    }
+
+    fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        // A provider that has not yet been selected/restored cannot have
+        // in-process cleanup to advance. Never launch one merely for ACK debt.
+        self.selected
+            .as_mut()
+            .map_or_else(|| Ok(()), CommandExecutor::maintain_backpressured_provider)
     }
 
     fn rotate_authority(&mut self, config: &DurableRunnerConfig) {

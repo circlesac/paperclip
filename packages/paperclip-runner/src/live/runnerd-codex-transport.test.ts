@@ -1819,49 +1819,233 @@ it("continues rehydrating events after the committed-event window slides", async
   }
 }, 30_000);
 
-it("proves local suspension after an event backlog before rebinding the next run", async () => {
-  const stateDirectory = await mkdtemp(
-    join(tmpdir(), "runnerd-local-close-backlog-"),
-  );
-  const identity = {
-    runnerInstanceId: "runner-close-backlog",
-    environmentLeaseId: "lease-close-backlog",
-    runId: "run-close-first",
-    normalizedSessionId: "session-close-backlog",
-    turnId: "turn-close-first",
-    itemId: "item-close-first",
-  };
-  const readRunnerState = vi.fn(
-    async () =>
-      JSON.parse(
+it.each([48, 1024])(
+  "proves local suspension after an event backlog before rebinding the next run (%s suffix deltas)",
+  async (suffixCount) => {
+    const stateDirectory = await mkdtemp(
+      join(tmpdir(), "runnerd-local-close-backlog-"),
+    );
+    const identity = {
+      runnerInstanceId: "runner-close-backlog",
+      environmentLeaseId: "lease-close-backlog",
+      runId: "run-close-first",
+      normalizedSessionId: "session-close-backlog",
+      turnId: "turn-close-first",
+      itemId: "item-close-first",
+    };
+    const readRunnerState = vi.fn(
+      async () =>
+        JSON.parse(
+          await readFile(
+            join(stateDirectory, "runner", "runner-state.json"),
+            "utf8",
+          ),
+        ) as Record<string, unknown>,
+    );
+    const options = {
+      runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: fakeCodex,
+      codexArgs: fakeCodexArgs(
+        stateDirectory,
+        "--split-event-burst",
+        "--split-event-suffix-count",
+        String(suffixCount),
+        "--durable-turn-ids",
+      ),
+      stateDirectory,
+      lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
+      readRunnerState,
+    };
+    const first = createCapabilityRunnerdCodexTransport({
+      ...options,
+      prpIdentity: identity,
+    });
+    const semanticResult = vi.fn(async () => ({
+      success: true,
+      contentItems: [],
+    }));
+    first.transport.setServerRequestHandler(semanticResult);
+    let second:
+      ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+    try {
+      const opened = await first.transport.request("thread/start", {
+        cwd: tmpdir(),
+        dynamicTools: [
+          {
+            name: "get_task_context",
+            description: "Read the current task.",
+            inputSchema: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+        ],
+      });
+      const firstTurn = await first.transport.request("turn/start", {
+        input: [
+          {
+            type: "text",
+            text: "Emit a split event burst before the queued follow-up.",
+          },
+        ],
+      });
+      let deltas = 0;
+      for await (const event of first.transport.notifications()) {
+        if (event.method === "item/agentMessage/delta") deltas += 1;
+        // Match production: semantic result is already returned, but a long
+        // provider suffix remains. Close must service stop/suspend alongside
+        // cumulative ACKs, not wait for the entire suffix in this consumer.
+        if (suffixCount > 48 && deltas === 97) break;
+        if (event.method === "turn/completed") break;
+      }
+      expect(deltas).toBe(suffixCount > 48 ? 97 : 144);
+      expect(semanticResult).toHaveBeenCalledTimes(1);
+      if (suffixCount > 48) {
+        const beforeClose = await readRunnerState();
+        const unacknowledgedDeltas = (
+          beforeClose.outbox as { eventType: string }[]
+        ).filter((event) => event.eventType === "item.delta");
+        expect(unacknowledgedDeltas.length).toBeLessThanOrEqual(128);
+      }
+      await first.transport.close();
+      // Local transports have no remote checkpoint callback. They must still
+      // verify suspension rather than treating process termination as proof.
+      expect(readRunnerState).toHaveBeenCalled();
+      expect(await readRunnerState()).toMatchObject({
+        ...identity,
+        lifecycle: "suspended",
+      });
+      const control = JSON.parse(
         await readFile(
-          join(stateDirectory, "runner", "runner-state.json"),
+          join(stateDirectory, "control-plane", "control-plane-state.json"),
           "utf8",
         ),
-      ) as Record<string, unknown>,
+      );
+      expect(control.commands).toContainEqual(
+        expect.objectContaining({
+          type: "runner.suspend",
+          status: "completed",
+        }),
+      );
+      const durableDeltas = control.committedEvents.filter(
+        (event: { eventType: string }) => event.eventType === "item.delta",
+      );
+      // Explicit stop may cancel provider output not yet ingested. Every
+      // admitted delta is retained exactly once, without asserting that future
+      // unread output must survive cancellation.
+      if (suffixCount === 48) expect(durableDeltas).toHaveLength(144);
+      else expect(durableDeltas.length).toBeGreaterThanOrEqual(deltas);
+      expect(
+        new Set(
+          durableDeltas.map(
+            (event: { sourceEventId: string }) => event.sourceEventId,
+          ),
+        ).size,
+      ).toBe(durableDeltas.length);
+      const provider = JSON.parse(
+        await readFile(
+          join(stateDirectory, "runner", "codex-provider-state.json"),
+          "utf8",
+        ),
+      );
+      expect(provider.pendingEvents).toEqual([]);
+      expect(provider.queuedEvents).toEqual([]);
+      expect(provider.activeProviderTurnId).toBeNull();
+      second = createCapabilityRunnerdCodexTransport({
+        ...options,
+        readRunnerState: undefined,
+        prpIdentity: {
+          ...identity,
+          runId: "run-close-second",
+          turnId: "turn-close-second",
+          itemId: "item-close-second",
+        },
+      });
+      const secondSemanticResult = vi.fn(async () => ({
+        success: true,
+        contentItems: [],
+      }));
+      second.transport.setServerRequestHandler(secondSemanticResult);
+      const resumed = await second.transport.request("thread/read", {});
+      expect(resumed.thread).toMatchObject({
+        id: (opened.thread as Record<string, unknown>).id,
+      });
+      expect(second.evidence().diagnostics).toContain(
+        "runnerd attached the durable provider session to a fresh PRP run authority",
+      );
+      if (suffixCount > 48) {
+        const secondTurn = await second.transport.request("turn/start", {
+          input: [
+            {
+              type: "text",
+              text: "Run the queued follow-up under its own authority.",
+            },
+          ],
+        });
+        expect((secondTurn.turn as Record<string, unknown>).id).not.toBe(
+          (firstTurn.turn as Record<string, unknown>).id,
+        );
+        let secondDeltas = 0;
+        for await (const event of second.transport.notifications()) {
+          if (event.method === "item/agentMessage/delta") secondDeltas += 1;
+          if (secondDeltas === 97 || event.method === "turn/completed") break;
+        }
+        expect(secondDeltas).toBe(97);
+        expect(secondSemanticResult).toHaveBeenCalledTimes(1);
+        await second.transport.close();
+        expect(await readRunnerState()).toMatchObject({
+          lifecycle: "suspended",
+          runId: "run-close-second",
+          turnId: "turn-close-second",
+        });
+      }
+    } finally {
+      await Promise.allSettled([
+        first.transport.close(),
+        second?.transport.close(),
+      ]);
+      await rm(stateDirectory, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+it("rejects active work and buffered tools from a resumed stopped checkpoint", async () => {
+  const stateDirectory = await mkdtemp(
+    join(tmpdir(), "runnerd-stopped-resume-active-"),
   );
+  const identity = {
+    runnerInstanceId: "runner-stopped-active",
+    environmentLeaseId: "lease-stopped-active",
+    runId: "run-stopped-first",
+    normalizedSessionId: "session-stopped-active",
+    turnId: "turn-stopped-first",
+    itemId: "item-stopped-first",
+  };
   const options = {
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
     codexArgs: fakeCodexArgs(
       stateDirectory,
-      "--split-event-burst",
-      "--durable-turn-ids",
+      "--linger-after-turn-start",
+      "--resume-unowned-turn-when-marked",
+      "--emit-tool-call-on-resume",
     ),
     stateDirectory,
     lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
-    readRunnerState,
   };
   const first = createCapabilityRunnerdCodexTransport({
     ...options,
     prpIdentity: identity,
   });
-  first.transport.setServerRequestHandler(async () => ({
+  let second:
+    ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+  const semanticHandler = vi.fn(async () => ({
     success: true,
     contentItems: [],
   }));
-  let second:
-    ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+  first.transport.setServerRequestHandler(semanticHandler);
   try {
     const opened = await first.transport.request("thread/start", {
       cwd: tmpdir(),
@@ -1878,56 +2062,50 @@ it("proves local suspension after an event backlog before rebinding the next run
       ],
     });
     await first.transport.request("turn/start", {
-      input: [
-        {
-          type: "text",
-          text: "Emit a split event burst before the queued follow-up.",
-        },
-      ],
+      input: [{ type: "text", text: "Wait for another instruction." }],
     });
-    let deltas = 0;
-    for await (const event of first.transport.notifications()) {
-      if (event.method === "item/agentMessage/delta") deltas += 1;
-      if (event.method === "turn/completed") break;
-    }
-    expect(deltas).toBe(144);
+    await expect(
+      first.transport.notifications()[Symbol.asyncIterator]().next(),
+    ).resolves.toMatchObject({ value: { method: "turn/started" } });
     await first.transport.close();
-    // Local transports have no remote checkpoint callback. They must still
-    // verify suspension rather than treating process termination as proof.
-    expect(readRunnerState).toHaveBeenCalled();
-    expect(await readRunnerState()).toMatchObject({
-      ...identity,
-      lifecycle: "suspended",
+    const providerPath = join(
+      stateDirectory,
+      "runner",
+      "codex-provider-state.json",
+    );
+    expect(JSON.parse(await readFile(providerPath, "utf8"))).toMatchObject({
+      lifecycle: "prepared",
+      activeProviderTurnId: null,
     });
-    const control = JSON.parse(
-      await readFile(
-        join(stateDirectory, "control-plane", "control-plane-state.json"),
-        "utf8",
-      ),
-    );
-    expect(control.commands).toContainEqual(
-      expect.objectContaining({ type: "runner.suspend", status: "completed" }),
-    );
+    await writeFile(join(stateDirectory, "resume-unowned-turn"), "armed");
     second = createCapabilityRunnerdCodexTransport({
       ...options,
-      readRunnerState: undefined,
       prpIdentity: {
         ...identity,
-        runId: "run-close-second",
-        turnId: "turn-close-second",
-        itemId: "item-close-second",
+        runId: "run-stopped-second",
+        turnId: "turn-stopped-second",
+        itemId: "item-stopped-second",
       },
     });
-    second.transport.setServerRequestHandler(async () => ({
-      success: true,
-      contentItems: [],
-    }));
-    const resumed = await second.transport.request("thread/read", {});
-    expect(resumed.thread).toMatchObject({
-      id: (opened.thread as Record<string, unknown>).id,
+    second.transport.setServerRequestHandler(semanticHandler);
+    await expect(second.transport.request("thread/read", {})).rejects.toThrow(
+      "prepared provider checkpoint resumed unexpected active work",
+    );
+    const closed = JSON.parse(await readFile(providerPath, "utf8"));
+    expect(closed).toMatchObject({
+      lifecycle: "closed",
+      threadId: (opened.thread as Record<string, unknown>).id,
+      activeProviderTurnId: null,
     });
-    expect(second.evidence().diagnostics).toContain(
-      "runnerd attached the durable provider session to a fresh PRP run authority",
+    expect(semanticHandler).not.toHaveBeenCalled();
+    expect(closed.pendingEvents).toContainEqual(
+      expect.objectContaining({
+        eventType: "harness.diagnostic",
+        payload: expect.objectContaining({
+          code: "prepared_provider_checkpoint_has_active_work",
+          paperclipAccepted: false,
+        }),
+      }),
     );
   } finally {
     await Promise.allSettled([
