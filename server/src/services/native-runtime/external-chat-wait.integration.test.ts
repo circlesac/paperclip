@@ -2003,6 +2003,171 @@ describe("native external-chat response wait", () => {
     },
   );
 
+  it.each(["next_run", "concurrent_other_issue"] as const)(
+    "keeps a committed successful response authorized after runtime failure in %s",
+    async (failureScope) => {
+      const fixture = await seedWaitTurn("discord");
+      const gate = await seedPriorCompletionReview(fixture);
+      const resultJson = await finishReviewResponse(fixture);
+      const laterIssueId =
+        failureScope === "next_run" ? fixture.issueId : randomUUID();
+      const laterRunId = randomUUID();
+      if (laterIssueId !== fixture.issueId) {
+        await db
+          .insert(issues)
+          .values({
+            id: laterIssueId,
+            companyId: fixture.companyId,
+            title: "Concurrent task",
+            status: "in_progress",
+            assigneeAgentId: fixture.agentId,
+          });
+      }
+      await db
+        .insert(heartbeatRuns)
+        .values({
+          id: laterRunId,
+          companyId: fixture.companyId,
+          agentId: fixture.agentId,
+          runtimeMode: "native",
+          nativeIssueId: laterIssueId,
+          status: "running",
+          startedAt: new Date(),
+        });
+      await db
+        .update(issues)
+        .set({ executionRunId: laterRunId })
+        .where(eq(issues.id, laterIssueId));
+      const failRun = async (tx: typeof db) => {
+        await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "adapter_failed",
+            finishedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, laterRunId));
+        await tx
+          .update(issues)
+          .set({ executionRunId: null })
+          .where(eq(issues.id, laterIssueId));
+        // This is finalizeAgentStatus's failed-last-running-run projection,
+        // not a user pause, termination, or permission change.
+        await tx
+          .update(agents)
+          .set({ status: "error", errorReason: "Later runner startup failed" })
+          .where(eq(agents.id, fixture.agentId));
+      };
+      if (failureScope === "concurrent_other_issue") {
+        let ready!: () => void;
+        let release!: () => void;
+        const observed = new Promise<void>((resolve) => {
+          ready = resolve;
+        });
+        const released = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const holder = db.transaction(async (tx) => {
+          await failRun(tx as unknown as typeof db);
+          ready();
+          await released;
+        });
+        await observed;
+        try {
+          const attempt = await db
+            .transaction((tx) =>
+              authorizeNativeChatReviewPresentation(
+                tx as unknown as typeof db,
+                { ...fixture, resultJson },
+                "nonblocking",
+              ),
+            )
+            .then(
+              (value) => ({ value }),
+              (error: unknown) => ({ error }),
+            );
+          expect(attempt).toHaveProperty("error");
+          if ("error" in attempt)
+            expect(
+              isExternalChatWaitAuthorizationContention(attempt.error),
+            ).toBe(true);
+        } finally {
+          release();
+          await holder;
+        }
+      } else {
+        await db.transaction((tx) => failRun(tx as unknown as typeof db));
+      }
+      expect(
+        await db.transaction((tx) =>
+          authorizeNativeChatReviewPresentation(
+            tx as unknown as typeof db,
+            { ...fixture, resultJson },
+            "nonblocking",
+          ),
+        ),
+      ).toBe(true);
+      const summary = (resultJson.nativeResult as { summary: string }).summary;
+      const append = () =>
+        issueService(db).addComment(
+          fixture.issueId,
+          summary,
+          { agentId: fixture.agentId, runId: fixture.runId },
+          { authorizationReason: "allow_chat_run_presentation" },
+        );
+      const first = await append();
+      expect((await append()).id).toBe(first.id);
+      expect(
+        await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, first.id)),
+      ).toHaveLength(1);
+      expect(
+        await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, gate.id)),
+      ).toEqual([gate]);
+      expect(
+        await db
+          .select({ status: agents.status })
+          .from(agents)
+          .where(eq(agents.id, fixture.agentId)),
+      ).toEqual([{ status: "error" }]);
+      expect(
+        await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, laterRunId)),
+      ).toEqual([{ status: "failed" }]);
+      expect(
+        await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.companyId, fixture.companyId)),
+      ).toEqual([]);
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          runId: laterRunId,
+          issueId: laterIssueId,
+          resultJson,
+        }),
+      ).toBe(false);
+      await db
+        .update(companyMemberships)
+        .set({ status: "suspended" })
+        .where(eq(companyMemberships.principalId, fixture.userId));
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          resultJson,
+        }),
+      ).toBe(false);
+    },
+  );
+
   it.each([
     "gate_changed",
     "gate_policy_changed",
@@ -2010,6 +2175,10 @@ describe("native external-chat response wait", () => {
     "status_changed",
     "revoked_endpoint",
     "revoked_principal",
+    "agent_paused",
+    "agent_budget_paused",
+    "agent_terminated",
+    "agent_pending_approval",
     "spoofed_marker",
     "changed_summary",
     "changed_context",
@@ -2056,6 +2225,31 @@ describe("native external-chat response wait", () => {
           .update(companyMemberships)
           .set({ status: "suspended" })
           .where(eq(companyMemberships.principalId, fixture.userId));
+      if (
+        [
+          "agent_paused",
+          "agent_budget_paused",
+          "agent_terminated",
+          "agent_pending_approval",
+        ].includes(kind)
+      )
+        await db
+          .update(agents)
+          .set({
+            status:
+              kind === "agent_terminated"
+                ? "terminated"
+                : kind === "agent_pending_approval"
+                  ? "pending_approval"
+                  : "paused",
+            pauseReason:
+              kind === "agent_budget_paused"
+                ? "budget"
+                : kind === "agent_paused"
+                  ? "manual"
+                  : null,
+          })
+          .where(eq(agents.id, fixture.agentId));
       if (kind === "spoofed_marker")
         resultJson.externalChatReviewPresentation = {
           ...(resultJson.externalChatReviewPresentation as object),
@@ -2093,6 +2287,10 @@ describe("native external-chat response wait", () => {
           "status_changed",
           "revoked_endpoint",
           "revoked_principal",
+          "agent_paused",
+          "agent_budget_paused",
+          "agent_terminated",
+          "agent_pending_approval",
           "changed_context",
         ].includes(kind)
       ) {
