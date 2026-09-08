@@ -6,6 +6,7 @@ import {
   scopeMicrosoftTeamsEgress,
 } from "./chat-sdk-runtime.js";
 import type { ChatSdkRuntimeCallbacks } from "./chat-sdk-runtime.js";
+import { splitTelegramPublicationText } from "./chat-publication-stream.js";
 import type {
   ChatSdkStatePersistence,
   ChatSdkStateRecord,
@@ -1990,73 +1991,97 @@ describe("Chat SDK published adapter integration", () => {
     }
   });
 
-  it("keeps a worst-case durable Telegram part lossless after regular-message fallback", async () => {
-    const regularPayloads: Array<{ text?: string }> = [];
-    const providerFetch = vi.fn(
-      async (input: string | URL | Request, init?: RequestInit) => {
-        const method = new URL(String(input)).pathname.split("/").at(-1);
-        if (method === "sendRichMessage") {
-          return Response.json(
-            {
-              ok: false,
-              error_code: 400,
-              description: "Bad Request: method not found",
-            },
-            { status: 400 },
-          );
-        }
-        if (method === "sendMessage") {
-          regularPayloads.push(
-            JSON.parse(String(init?.body)) as { text?: string },
-          );
-          return Response.json({
-            ok: true,
-            result: {
-              message_id: 1,
-              date: 1_788_700_003,
-              chat: { id: 77112233, type: "private" },
-            },
-          });
-        }
-        throw new Error(`Unexpected Telegram method: ${method}`);
-      },
-    );
-    vi.stubGlobal("fetch", providerFetch);
-    const runtime = createChatSdkEndpointRuntime({
-      callbacks: { onMessage() {} },
-      companyId: "company-telegram-durable-part",
-      endpointId: "endpoint-telegram-durable-part",
-      logger: "silent",
-      persistence,
-      providerConfig: {
-        provider: "telegram",
-        userName: "paperclip_agent_bot",
-        credentials: {
-          botToken: "123:test",
-          secretToken: "telegram-webhook-secret",
+  it.each([
+    {
+      label: "worst-case durable part",
+      source: "!".repeat(1_600),
+      rendered: "\\!".repeat(1_600),
+    },
+    {
+      label: "exact escaped ceiling",
+      source: "!".repeat(2_048),
+      rendered: "\\!".repeat(2_048),
+    },
+    {
+      label: "exact astral ceiling",
+      source: "🙂".repeat(2_048),
+      rendered: "🙂".repeat(2_048),
+    },
+    {
+      label: "medium prose",
+      source: "A useful answer. ".repeat(120).trim(),
+      rendered: "A useful answer\\. ".repeat(120).trim(),
+    },
+  ])(
+    "keeps Telegram $label lossless after regular-message fallback",
+    async ({ source, rendered }) => {
+      const regularPayloads: Array<{ text?: string }> = [];
+      const providerFetch = vi.fn(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          const method = new URL(String(input)).pathname.split("/").at(-1);
+          if (method === "sendRichMessage") {
+            return Response.json(
+              {
+                ok: false,
+                error_code: 400,
+                description: "Bad Request: method not found",
+              },
+              { status: 400 },
+            );
+          }
+          if (method === "sendMessage") {
+            regularPayloads.push(
+              JSON.parse(String(init?.body)) as { text?: string },
+            );
+            return Response.json({
+              ok: true,
+              result: {
+                message_id: 1,
+                date: 1_788_700_003,
+                chat: { id: 77112233, type: "private" },
+              },
+            });
+          }
+          throw new Error(`Unexpected Telegram method: ${method}`);
         },
-      },
-    });
-    try {
-      const adapter = runtime.getProviderAdapter() as unknown as {
-        postMessage(
-          threadId: string,
-          message: { markdown: string },
-        ): Promise<unknown>;
-      };
-      const source = "!".repeat(1_600);
+      );
+      vi.stubGlobal("fetch", providerFetch);
+      const runtime = createChatSdkEndpointRuntime({
+        callbacks: { onMessage() {} },
+        companyId: "company-telegram-durable-part",
+        endpointId: "endpoint-telegram-durable-part",
+        logger: "silent",
+        persistence,
+        providerConfig: {
+          provider: "telegram",
+          userName: "paperclip_agent_bot",
+          credentials: {
+            botToken: "123:test",
+            secretToken: "telegram-webhook-secret",
+          },
+        },
+      });
+      try {
+        const adapter = runtime.getProviderAdapter() as unknown as {
+          postMessage(
+            threadId: string,
+            message: { markdown: string },
+          ): Promise<unknown>;
+        };
+        expect(splitTelegramPublicationText(source)).toEqual([source]);
+        await adapter.postMessage("telegram:77112233", { markdown: source });
 
-      await adapter.postMessage("telegram:77112233", { markdown: source });
-
-      const sentText = regularPayloads[0]?.text;
-      expect(sentText).toBe("\\!".repeat(1_600));
-      expect(sentText!.length).toBeLessThanOrEqual(4_096);
-      expect(sentText!.replaceAll("\\", "")).toBe(source);
-    } finally {
-      await runtime.shutdown();
-      vi.unstubAllGlobals();
-    }
-  });
+        expect(regularPayloads).toHaveLength(1);
+        const sentText = regularPayloads[0]?.text;
+        expect(sentText).toBe(rendered);
+        expect(sentText!.length).toBeLessThanOrEqual(4_096);
+        expect(sentText!.replaceAll("\\", "")).toBe(source);
+      } finally {
+        await runtime.shutdown();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
 
   it("parses verified Teams edit, delete, and restore envelopes through the public adapter contract", async () => {
     const runtime = createChatSdkEndpointRuntime({

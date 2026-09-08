@@ -27455,6 +27455,129 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return Boolean(consumed);
   }
 
+  async function committedResponseMayReplaceFailure(
+    publication: typeof chatPublications.$inferSelect,
+    runId: string,
+    providerMessageId: string,
+  ): Promise<boolean> {
+    if (
+      !publication.commentId ||
+      publication.payload.progressState !== undefined
+    )
+      return false;
+    return db
+      .transaction(async (tx) => {
+        const [run] = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, runId),
+              eq(heartbeatRuns.companyId, publication.companyId),
+              eq(heartbeatRuns.nativeIssueId, publication.issueId),
+              eq(heartbeatRuns.runtimeMode, "native"),
+              eq(heartbeatRuns.status, "succeeded"),
+              isNotNull(heartbeatRuns.finishedAt),
+            ),
+          )
+          .for("share", { noWait: true });
+        const presentation = run?.resultJson?.presentationDecision as
+          Record<string, unknown> | undefined;
+        if (
+          !run?.resultJson?.nativeCommittedChatResponse ||
+          presentation?.commentId !== publication.commentId
+        )
+          return false;
+        const [comment] = await tx
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.id, publication.commentId!),
+              eq(issueComments.companyId, publication.companyId),
+              eq(issueComments.issueId, publication.issueId),
+              eq(issueComments.createdByRunId, runId),
+              eq(issueComments.authorAgentId, run.agentId),
+              isNull(issueComments.deletedAt),
+            ),
+          )
+          .for("share", { noWait: true });
+        if (!comment) return false;
+        const [priorAnswer] = await tx
+          .select({ id: chatPublications.id })
+          .from(chatPublications)
+          .innerJoin(
+            issueComments,
+            and(
+              eq(issueComments.id, chatPublications.commentId),
+              eq(issueComments.companyId, publication.companyId),
+              eq(issueComments.createdByRunId, runId),
+            ),
+          )
+          .where(
+            and(
+              eq(chatPublications.companyId, publication.companyId),
+              eq(chatPublications.endpointId, publication.endpointId),
+              eq(chatPublications.conversationId, publication.conversationId),
+              eq(chatPublications.issueId, publication.issueId),
+              ne(chatPublications.id, publication.id),
+              inArray(chatPublications.state, [
+                "published",
+                "streaming",
+                "delivery_unknown",
+              ]),
+              sql`${chatPublications.payload}->>'progressState' is null`,
+            ),
+          )
+          .limit(1);
+        if (priorAnswer) return false;
+        // A historical progress row can retain this ID after a later edit.
+        // Only its CURRENT outbound link may grant this narrow exception; an
+        // authored answer or another run's failure must remain consumed.
+        const [failure] = await tx
+          .select({ id: chatPublications.id })
+          .from(chatMessageLinks)
+          .innerJoin(
+            chatPublications,
+            and(
+              eq(chatPublications.id, chatMessageLinks.publicationId),
+              eq(chatPublications.companyId, publication.companyId),
+              eq(chatPublications.endpointId, publication.endpointId),
+              eq(chatPublications.conversationId, publication.conversationId),
+              eq(chatPublications.issueId, publication.issueId),
+              eq(chatPublications.providerMessageId, providerMessageId),
+              eq(
+                chatPublications.idempotencyKey,
+                `run:${runId}:failed:${publication.endpointId}`,
+              ),
+              eq(chatPublications.state, "published"),
+              isNull(chatPublications.commentId),
+              sql`${chatPublications.payload}->>'progressState' = 'failed'`,
+            ),
+          )
+          .where(
+            and(
+              eq(chatMessageLinks.companyId, publication.companyId),
+              eq(chatMessageLinks.endpointId, publication.endpointId),
+              eq(chatMessageLinks.conversationId, publication.conversationId),
+              eq(chatMessageLinks.providerMessageId, providerMessageId),
+              eq(chatMessageLinks.direction, "outbound"),
+            ),
+          );
+        if (!failure) return false;
+        // The marker is read from the authoritative run, never the publication
+        // payload. Recheck accepted result/decision plus the complete current
+        // source batch, actor, access and epoch before borrowing its failure lane.
+        // The transport claim repeats those checks at the I/O boundary.
+        return authorizeRetainedChatSourcePublication(tx, publication);
+      })
+      .catch((error: unknown) => {
+        if (isExternalChatWaitAuthorizationContention(error))
+          throw new NativeChatReviewPresentationContentionError();
+        throw error;
+      });
+  }
+
   async function runPublicationToReplace(
     publication: typeof chatPublications.$inferSelect,
     payload: SafeChatPublicationPayload,
@@ -27514,10 +27637,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         );
         if (!replacement?.providerMessageId) return null;
         if (
-          await providerProgressLaneConsumed(
+          (await providerProgressLaneConsumed(
             publication,
             replacement.providerMessageId,
-          )
+          )) &&
+          !(await committedResponseMayReplaceFailure(
+            publication,
+            currentRunId,
+            replacement.providerMessageId,
+          ))
         )
           return null;
         // Replacement identity belongs to the run, not to the provider-visible
@@ -30167,20 +30295,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // publication won the race, this reply reflects Paperclip's latest
         // authoritative task state after that earlier send commits.
         const payload = await currentTaskControlPayload(publication);
-        const replaceProviderMessageId = CAPABILITIES[endpoint.provider]
-          .messageEdits
-          ? ((await interactionResolutionPublicationToReplace(
-              publication,
-              payload,
-            )) ??
-            (await interactionPromptPublicationToReplace(
-              publication,
-              payload,
-            )) ??
-            (await runPublicationToReplace(publication, payload)) ??
-            (await inboundWakePublicationToReplace(publication, payload)) ??
-            (await taskStatusPublicationToReplace(publication, payload)))
-          : null;
         await withCredentialMutationLease(
           recordForLease.endpoint,
           async (credentialGuard) => {
@@ -30191,6 +30305,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               },
             };
             try {
+              // A prior failure's provider ID may have been reused while this
+              // worker waited for the endpoint lane. Select against current
+              // outbound links only after owning that lane, before the final
+              // source authorization claim and provider I/O.
+              const replaceProviderMessageId = CAPABILITIES[endpoint.provider]
+                .messageEdits
+                ? ((await interactionResolutionPublicationToReplace(
+                    publication,
+                    payload,
+                  )) ??
+                  (await interactionPromptPublicationToReplace(
+                    publication,
+                    payload,
+                  )) ??
+                  (await runPublicationToReplace(publication, payload)) ??
+                  (await inboundWakePublicationToReplace(
+                    publication,
+                    payload,
+                  )) ??
+                  (await taskStatusPublicationToReplace(publication, payload)))
+                : null;
               const authorizationClaim =
                 await claimPublicationTransportAuthorization({
                   credentialLease,

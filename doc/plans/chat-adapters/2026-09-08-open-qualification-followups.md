@@ -7,7 +7,14 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
-Latest checkpoint: `4bc52cdbe` is pushed. The Codex already-ended-on-resume shutdown repair passed
+Latest checkpoint: `b4b6f5777` is pushed and deployed on live server 59.
+The previous qualification turn made progress: Telegram's original accepted
+photo answer was automatically presented, without another heartbeat or provider
+run. The next turn handled only the requested PR image removal; qualification
+has now resumed. Physical session cleanup and the original file retry remain
+unproved. Read the current live outcome below before relying on historical notes.
+
+The Codex already-ended-on-resume shutdown repair (`4bc52cdbe`) passed
 the full provider target (69 passed, one deliberate subprocess helper ignored).
 Its active/ended/no-authority regressions retain exact process-exit and
 same-thread/no-new-turn assertions. Three pre-existing immediate-poll fixtures
@@ -24,11 +31,65 @@ ended turns. Committed activation markers now pass exact read-only retry proof;
 uncommitted/foreign markers remain denied. Shutdown joins original database
 callbacks even after a maintenance timeout; the real abort/deadline canary and
 three heartbeat lifecycle cases passed. Final server typecheck passed.
-Server 58 remains unchanged pending controlled deployment. Root reopened the actual
-Telegram conversation and followed its task link to the exact failed B run;
-both old failure messages are still visible, and no Retry was submitted.
+Server 58 was stopped gracefully while idle; server 59 started at 22:19:25 UTC.
+Root reopened the actual Telegram conversation and verified the recovered answer
+visually. Its one canonical comment produced messages 153 and 154 at
+22:19:29.382 and 22:19:31.328 UTC, each with one publication attempt. A read-only
+recheck confirms zero new runs since deployment. The original B run remains
+failed/observed at attempt zero, and no Retry has been submitted.
 The signed staged runner SHA-256 is
 `3cb217996132fa0cbbb3fa169dacd4250e3318840ed15f3fa3d2961536f34ce9`.
+
+Two live defects remain. Historical generic recovery left an empty canonical
+session directory, which the cleanup admission currently rejects. The retained
+wire identity also differs from the normalized driver event stored in the DB;
+fix the exact composed identity proof and isolate maintenance receipts from the
+driver sequence namespace. James owns that repair; Epicurus independently
+reviews its proof and live-shaped tests. Do not erase the directory/quarantine,
+rewrite historical events, or rerun the already-accepted photo request.
+
+The recovered answer arrived as two new messages while old failure 150 remained.
+Boole owns a narrowly authorized same-run committed-answer replacement of the
+old failure lane, with real outbound-link topology and negative tests. Do not
+re-arm the already delivered answer merely to manufacture cleaner live proof.
+Root owns integration, deployment, docs and actual original-request retries.
+The Mac is currently locked, preventing browser operation; code/test work can
+continue. After unlock, recheck the browser and use the exact failed run's Retry
+control, not the unrelated generic continuation's task-level action.
+
+Root also traced the unnecessary split to the fixed 1,600-code-point threshold:
+the original answer is only 1,985 characters. Whole-message sizing now checks
+the pinned Telegram adapter's MarkdownV2 and plain fallback renderings, including
+emoji conversion, against its 4,096-UTF-16-unit truncation boundary. Responses
+that fit stay native and intact; larger prose retains durable FIFO parts, and
+larger structured Markdown retains its lossless document fallback. New tests
+failed 4/4 before the fix. Independent review found a rich-source truncation
+case hidden by Markdown reference definitions; its additional red-to-green
+regression now guards the rich-message source ceiling as well. The final
+stream/real-adapter cohort passes 74/74 and
+fresh-database medium/long publication cohort passes 4/4. These are automated
+results; the changed behavior has not yet been deployed or retested live.
+
+Boole's recovered-answer replacement is frozen with 54/54 focused integration
+tests. Target selection now occurs after acquiring the endpoint publication
+lane. A competing-link fixture proves a different owner that wins while the
+worker waits cannot have its message edited. Source/actor/generation and
+ambiguous-delivery exclusions remain intact. The complete fresh integration
+suite passed **536/536** (129.18s), and server typecheck passed. The first
+deterministic browser run reached **16 passes / one failure / four not run**:
+Slack's catalog navigation remained blank before setup, timing out while waiting
+for the Connectors heading. Its saved screenshot is completely blank; the
+first run did not retain a trace. A fresh run with tracing enabled is running;
+do not describe this unexplained navigation failure as fixed or all browser
+checks as passed yet. These chat UX changes are checkpointed separately from
+the physical-cleanup work.
+
+Boole's next bounded investigation is verified Slack deletion while reach is
+disabled: current filtering may fail to preserve an invalidation tombstone,
+allowing reuse after access is re-enabled. The proposed regression must prove
+that exact sequence before implementation; any fix must remain content-free,
+current-runtime and exact-source bound, with no comment or wake on disabled
+reach. This is separate, uncommitted work until verified.
 
 Base `63c8b5d8d` is pushed. All 24 CI jobs, quality, and Greptile's explicit
 500-file review passed; PR #13038 still requires CODEOWNER approval and is not

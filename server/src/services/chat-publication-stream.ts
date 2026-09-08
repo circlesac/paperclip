@@ -1,8 +1,47 @@
-import { parseMarkdown } from "chat";
+import { TelegramFormatConverter } from "@chat-adapter/telegram";
+import {
+  convertEmojiPlaceholders,
+  markdownToPlainText,
+  parseMarkdown,
+} from "chat";
 
 const DEFAULT_CHUNK_CODE_POINTS = 280;
 const DEFAULT_CHUNK_DELAY_MS = 75;
 export const TELEGRAM_DURABLE_PART_CODE_POINTS = 1_600;
+const TELEGRAM_MESSAGE_UTF16_LIMIT = 4_096;
+const TELEGRAM_RICH_MESSAGE_CODE_POINT_LIMIT = 32_768;
+const telegramConverter = new TelegramFormatConverter();
+
+function fitsSingleTelegramMessage(text: string): boolean {
+  try {
+    // The enabled rich-message path sends source Markdown, not the rendered
+    // fallback. Unused definitions can disappear from both fallbacks while
+    // still pushing a meaningful trailing paragraph past its source ceiling.
+    if (
+      Array.from(convertEmojiPlaceholders(text, "gchat")).length >
+      TELEGRAM_RICH_MESSAGE_CODE_POINT_LIMIT
+    )
+      return false;
+    // Match the pinned adapter's MarkdownV2 and plain fallback rendering,
+    // including emoji placeholders. Its truncation limit counts UTF-16 units,
+    // so source code-point length alone cannot establish that a message fits.
+    const rendered = convertEmojiPlaceholders(
+      telegramConverter.fromMarkdown(text),
+      "gchat",
+    );
+    const plain = markdownToPlainText(text);
+    const fallback = convertEmojiPlaceholders(
+      plain.trim() ? plain : text,
+      "gchat",
+    );
+    return (
+      rendered.length <= TELEGRAM_MESSAGE_UTF16_LIMIT &&
+      fallback.length <= TELEGRAM_MESSAGE_UTF16_LIMIT
+    );
+  } catch {
+    return false;
+  }
+}
 
 const TELEGRAM_SPLIT_SAFE_MARKDOWN_NODES = new Set([
   "break",
@@ -86,12 +125,13 @@ export function shouldStreamSafePublicationText(text: string): boolean {
 }
 
 /**
- * Telegram regular messages accept at most 4,096 UTF-16 code units after
- * Markdown conversion. At 1,600 source code points, either astral expansion or
- * MarkdownV2 escaping remains below the provider ceiling. Joining the returned
- * parts reconstructs the exact safe publication text.
+ * Keep the complete response intact when both adapter renderings fit its
+ * 4,096-UTF-16-unit ceiling. Otherwise use conservative 1,600-code-point parts
+ * so either astral expansion or MarkdownV2 escaping remains below that ceiling.
+ * Joining the returned parts reconstructs the exact safe publication text.
  */
 export function splitTelegramPublicationText(text: string): string[] {
+  if (fitsSingleTelegramMessage(text)) return [text];
   const points = Array.from(text);
   if (points.length <= TELEGRAM_DURABLE_PART_CODE_POINTS) return [text];
 
@@ -147,6 +187,7 @@ export function splitTelegramPublicationText(text: string): string[] {
  * short Markdown and long unstructured prose remain inline.
  */
 export function telegramMarkdownRequiresAttachment(text: string): boolean {
+  if (fitsSingleTelegramMessage(text)) return false;
   if (Array.from(text).length <= TELEGRAM_DURABLE_PART_CODE_POINTS)
     return false;
   const isPlainMarkdownDocument = (document: string): boolean => {

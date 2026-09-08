@@ -2288,3 +2288,97 @@ checkpointed separately. Live revalidation still shows zero running/queued
 runs and intact original Telegram/GitHub requests. Telegram A's accepted
 digest and server fingerprint recompute correctly, but its answer is still
 not presented. No live retry or manual checkpoint mutation has occurred yet.
+
+### Server 59: recovered Telegram answer delivered, cleanup still incomplete
+
+Maintenance checkpoint `b4b6f5777` was pushed and deployed using the normal
+server entry point and the signed release runner above. Server 58 was confirmed
+idle, received SIGTERM, drained heartbeat work with zero interrupted runs, and
+exited before server 59 began at 22:19:25 UTC. No quarantined state was deleted
+or rewritten to enable the restart.
+
+The original accepted photo run `fd7011b6-323b-461a-bc43-a81835bece5f` now has
+one selected comment (`b8148abf-e4c7-44a5-a467-aadb1c50da96`) based on the same
+accepted result `48917917-bd47-4cdf-837d-3d7dd4b80f57`. Its two publications
+`cd176eb6-96ce-4caf-bd27-99ba64ffffe7` and
+`e882d349-68d8-4e2e-81f1-8efe48bad7e7` delivered Telegram messages 153 and 154
+at 22:19:29.382 and 22:19:31.328 UTC, with one attempt each. Root read the actual
+messages in Telegram and visually inspected the rendered answer. The run is
+succeeded/committed with its old error preserved privately. Read-only database
+revalidation found zero new heartbeat runs since deployment. This proves saved
+answer presentation without another model turn, not successful physical cleanup.
+
+The experience still needs work: old failure message 150 remained beside the
+new answer. The consumed-progress-lane rule currently prevents replacing that
+same-run failure. A regression must include the actual outbound message link;
+the earlier fixture omitted it. Any exception must revalidate the exact selected
+committed response and current source/access/epoch, and must not replay an
+already-delivered response or edit another run's notice.
+
+Automatic physical cleanup remains ineligible. A historical generic continuation
+left a completely empty canonical root; the original quarantined files remain
+intact. The proposed repair must verify and preserve that exact empty directory,
+never replace nonempty or changed state. Inspection also found that the database
+contains the normalized driver identity, not the raw wire identity expected by
+the current predicate. A production-shaped proof and separate maintenance event
+namespace are required before deployment, so cleanup events cannot collide with
+the original driver's sequence stream.
+
+The original Telegram document request remains failed/observed at attempt zero,
+without a result; the original GitHub request remains failed before native
+startup. Neither has been retried. The subsequent browser entry-point call
+reported that the Mac is locked. Browser qualification is paused on that real
+environment gate while the bounded fixes and automated tests continue.
+
+### Telegram whole-message sizing
+
+Inspecting the two delivered parts found lengths 1,223 and 762, reconstructing
+the 1,985-character selected comment. The fixed 1,600-code-point threshold was
+unnecessarily splitting a response that fits in one message. The
+[Telegram message contract](https://core.telegram.org/bots/api#sendmessage)
+permits 4,096 characters after entity parsing; the pinned adapter additionally
+truncates its serialized MarkdownV2/plain fallback at 4,096 UTF-16 units.
+
+Whole-message admission now measures both actual adapter renderings, including
+emoji placeholder conversion. A medium answer or code block that fits stays
+native and intact. Larger plain text retains the established durable FIFO
+parts; larger structured Markdown still becomes one lossless document instead
+of being cut across syntax boundaries. This does not re-arm previously sent
+parts or rewrite the historical live messages.
+
+Four regression cases failed before the fix: medium prose, medium code, exact
+escaped punctuation and exact astral-Unicode ceilings. The final helper and
+real pinned-adapter cohort passed **73/73**, including actual regular-message
+fallback request bodies at the boundary. Fresh-database medium prose/code and
+oversized FIFO/document cases passed **4/4**. The first focused integration
+attempt passed 3/4; its prose fixture expected trailing whitespace which safe
+publication intentionally trims. The corrected fixture ends in a final word;
+the exact content assertion remains. Provider HTTP is mocked in these suites;
+live sizing/recovery retests remain outstanding while the Mac is locked.
+
+Independent review found one additional branch: unused Markdown reference
+definitions can disappear from both ordinary renderings while still exceeding
+the pinned rich-message source limit and truncating a meaningful trailing
+paragraph. A new red-to-green test guards the emoji-converted rich source's
+32,768-code-point ceiling too. Final helper/adapter coverage is **74/74**.
+A read-only check against the exact original live comment now returns one
+lossless native part; no provider request was made by that diagnostic.
+
+The recovered-answer replacement regression passed **54/54** on a fresh
+database. It now uses the exact current outbound failure link, selected
+committed-response marker and full retained-source authorization. Another run's
+failure, authored output, forged marker, changed source/principal/generation,
+and unresolved same-run output do not qualify. Selection was moved under the
+existing endpoint publication lease: a real competing-link fixture holds that
+lease while a worker waits, changes ownership, and proves the worker does not
+edit the former owner's message when it acquires the lane. No historical live
+publication was re-armed or edited to test this.
+
+The frozen combined chat UX slice passed the complete fresh integration suite
+**536/536** (129.18s), the focused setup/webhook/interaction surfaces **136/136**,
+and server typecheck. The first deterministic browser run had **16 passes, one
+failure and four not run**: Slack's initial catalog page remained blank and
+the Connectors heading timed out after 30 seconds, before any provider setup.
+Root inspected the blank screenshot. This run retained no trace, so the cause
+is not established. A fresh diagnostic run enables tracing without changing
+timeouts, assertions or retries; its result must be recorded separately.

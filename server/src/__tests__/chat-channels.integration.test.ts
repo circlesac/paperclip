@@ -26046,6 +26046,75 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it.each([
+    {
+      label: "prose",
+      source: `${"The cat rests beside the window in warm light. ".repeat(55)}Done.`,
+    },
+    {
+      label: "formatted code",
+      source: `\`\`\`ts\n${"const ready = true;\n".repeat(110)}\`\`\``,
+    },
+  ])(
+    "keeps medium Telegram $label in one native publication",
+    async ({ source }) => {
+      const fixture = await seedCompany();
+      const { callbacks, endpoint, runtime, service } =
+        await configuredTelegramEndpoint(fixture);
+      const chatId = "77118846";
+      const dm = makeThread({
+        channelId: chatId,
+        id: `telegram:${chatId}`,
+        isDM: true,
+        name: "Telegram intact output",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "telegram",
+        thread: dm.thread,
+        message: makeMessage({
+          id: `${chatId}:1`,
+          text: "Send the complete result",
+          userId: chatId,
+        }),
+        trigger: "direct_message",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id, chatId);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await service.listConversations(endpoint.id);
+      if (!conversation)
+        throw new Error("Expected Telegram intact conversation");
+      const comment = await issueService(db).addComment(
+        conversation.issueId,
+        source,
+        { userId: "owner-user" },
+        { authorType: "user" },
+      );
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!providerRuntime)
+        throw new Error("Expected Telegram provider runtime");
+      providerRuntime.posts.length = 0;
+      const publication = await service.publishComment(
+        endpoint.id,
+        conversation.id,
+        comment.id,
+      );
+      expect(publication).toMatchObject({ state: "published", attempts: 1 });
+      const rows = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.commentId, comment.id));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.payload.transportPart).toBeUndefined();
+      expect(providerRuntime.posts).toHaveLength(1);
+      expect(providerRuntime.posts[0]?.text).toBe(source);
+      expect(providerRuntime.posts[0]?.attachments ?? []).toHaveLength(0);
+      await service.processPendingPublications();
+      expect(providerRuntime.posts).toHaveLength(1);
+    },
+  );
+
   it("segments long Telegram output into durable FIFO publications and resumes at the failed part", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service } =
@@ -26185,7 +26254,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const source = [
       "## Complete result",
       "[Open the evidence](https://example.test/evidence?case=telegram)",
-      `\`\`\`ts\n${"const value = 1;\n".repeat(100)}\`\`\``,
+      `\`\`\`ts\n${"const value = 1;\n".repeat(250)}\`\`\``,
       Array.from({ length: 100 }, (_value, index) => `- Finding ${index}`).join(
         "\n",
       ),
@@ -48041,59 +48110,114 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
-  it("updates only the same-run failure notice when recovering an accepted response", async () => {
-    const context = await committedChatResponseRecoveryFixture("telegram");
-    try {
-      const unrelatedRunId = randomUUID();
-      for (const [runId, messageId] of [
-        [context.runId, "same-run-message"],
-        [unrelatedRunId, "later-turn-message"],
-      ]) {
-        await db
-          .insert(chatPublications)
-          .values({
-            companyId: context.fixture.companyId,
-            endpointId: context.endpoint.id,
-            conversationId: context.conversation.id,
-            issueId: context.issue.id,
-            idempotencyKey: `run:${runId}:failed:${context.endpoint.id}`,
-            payload: {
-              text: "Maya stopped before completing this turn.",
-              progressState: "failed",
-            },
-            state: "published",
-            providerMessageId: messageId,
-            publishedAt: new Date(),
-            attemptCount: 1,
-          });
-      }
-      await expect(context.repair()).resolves.toBe(true);
-      await context.service.processPendingPublications(100);
-      expect(context.providerRuntime.posts).toEqual([]);
-      expect(context.providerRuntime.edits).toEqual([
-        {
-          threadId: context.thread.thread.id,
-          messageId: "same-run-message",
-          text: context.result.summary,
+  async function linkedCommittedResponseFailure(
+    context: Awaited<ReturnType<typeof committedChatResponseRecoveryFixture>>,
+    runId = context.runId,
+    messageId = "same-run-message",
+  ) {
+    const [failure] = await db
+      .insert(chatPublications)
+      .values({
+        companyId: context.fixture.companyId,
+        endpointId: context.endpoint.id,
+        conversationId: context.conversation.id,
+        issueId: context.issue.id,
+        idempotencyKey: `run:${runId}:failed:${context.endpoint.id}`,
+        payload: {
+          text: "Maya stopped before completing this turn.",
+          progressState: "failed",
         },
-      ]);
-      await context.service.processPendingPublications(100);
-      expect(context.providerRuntime.edits).toHaveLength(1);
-    } finally {
-      await context.service.shutdown();
-    }
-  });
+        state: "published",
+        providerMessageId: messageId,
+        publishedAt: new Date(),
+        attempts: 1,
+      })
+      .returning();
+    await db.insert(chatMessageLinks).values({
+      companyId: context.fixture.companyId,
+      endpointId: context.endpoint.id,
+      conversationId: context.conversation.id,
+      publicationId: failure.id,
+      providerMessageId: messageId,
+      direction: "outbound",
+    });
+    return failure;
+  }
+
+  it.each(["slack", "telegram"] as const)(
+    "updates only the linked same-run %s failure notice when recovering an accepted response",
+    async (provider) => {
+      const context = await committedChatResponseRecoveryFixture(provider);
+      try {
+        const unrelatedRunId = randomUUID();
+        for (const [runId, messageId] of [
+          [context.runId, "same-run-message"],
+          [unrelatedRunId, "later-turn-message"],
+        ]) {
+          await linkedCommittedResponseFailure(context, runId, messageId);
+        }
+        await expect(context.repair()).resolves.toBe(true);
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.posts).toEqual([]);
+        expect(context.providerRuntime.edits).toEqual([
+          {
+            threadId: context.thread.thread.id,
+            messageId: "same-run-message",
+            text: context.result.summary,
+          },
+        ]);
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.edits).toHaveLength(1);
+        expect(context.providerRuntime.posts).toEqual([]);
+        const [answer] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
+          );
+        expect(answer).toMatchObject({
+          state: "published",
+          providerMessageId: "same-run-message",
+          attempts: 1,
+        });
+        await expect(
+          db
+            .select({ publicationId: chatMessageLinks.publicationId })
+            .from(chatMessageLinks)
+            .where(
+              and(
+                eq(chatMessageLinks.endpointId, context.endpoint.id),
+                eq(chatMessageLinks.providerMessageId, "same-run-message"),
+              ),
+            ),
+        ).resolves.toEqual([{ publicationId: answer.id }]);
+        await expect(
+          db
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.nativeIssueId, context.issue.id)),
+        ).resolves.toEqual([{ id: context.runId }]);
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
 
   it.each([
     "source_edited",
     "principal_revoked",
     "generation_changed",
     "marker_changed",
+    "delivery_unknown",
   ] as const)(
     "rechecks a recovered response at provider dispatch after %s",
     async (mutation) => {
       const context = await committedChatResponseRecoveryFixture("slack");
       try {
+        const failure = await linkedCommittedResponseFailure(context);
         await expect(context.repair()).resolves.toBe(true);
         if (mutation === "source_edited")
           await db
@@ -48124,6 +48248,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{nativeCommittedChatResponse,resultId}', to_jsonb(${randomUUID()}::text))`,
             })
             .where(eq(heartbeatRuns.id, context.runId));
+        if (mutation === "delivery_unknown")
+          await db
+            .update(chatPublications)
+            .set({ state: "delivery_unknown" })
+            .where(eq(chatPublications.id, failure.id));
         await context.service.processPendingPublications(100);
         expect(context.providerRuntime.posts).toEqual([]);
         expect(context.providerRuntime.edits).toEqual([]);
@@ -48131,13 +48260,335 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           db
             .select({ state: chatPublications.state })
             .from(chatPublications)
-            .where(eq(chatPublications.endpointId, context.endpoint.id)),
-        ).resolves.toEqual([{ state: "cancelled" }]);
+            .where(
+              and(
+                eq(chatPublications.endpointId, context.endpoint.id),
+                isNotNull(chatPublications.commentId),
+              ),
+            ),
+        ).resolves.toEqual([
+          { state: mutation === "delivery_unknown" ? "pending" : "cancelled" },
+        ]);
+        await expect(
+          db
+            .select()
+            .from(chatPublications)
+            .where(eq(chatPublications.id, failure.id)),
+        ).resolves.toEqual([
+          {
+            ...failure,
+            state:
+              mutation === "delivery_unknown"
+                ? "delivery_unknown"
+                : "published",
+          },
+        ]);
       } finally {
         await context.service.shutdown();
       }
     },
   );
+
+  it.each([
+    "other_run_failure",
+    "authored_answer",
+    "payload_claim_only",
+  ] as const)(
+    "does not lend a consumed failure lane to a recovered answer with %s",
+    async (mutation) => {
+      const context = await committedChatResponseRecoveryFixture("telegram");
+      try {
+        const failure = await linkedCommittedResponseFailure(context);
+        await expect(context.repair()).resolves.toBe(true);
+        const [answer] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
+          );
+        let currentLinkPublicationId = failure.id;
+        if (mutation === "payload_claim_only") {
+          const [run] = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, context.runId));
+          const callerPayload = {
+            ...answer.payload,
+            nativeCommittedChatResponse:
+              run.resultJson!.nativeCommittedChatResponse,
+          };
+          await db
+            .update(chatPublications)
+            .set({ payload: callerPayload })
+            .where(eq(chatPublications.id, answer.id));
+          await db
+            .update(heartbeatRuns)
+            .set({
+              resultJson: sql`${heartbeatRuns.resultJson} - 'nativeCommittedChatResponse'`,
+            })
+            .where(eq(heartbeatRuns.id, context.runId));
+        } else {
+          // The old same-run failure retains its provider ID, but the current
+          // outbound link is now owned by a different failure or authored text.
+          const [otherComment] =
+            mutation === "authored_answer"
+              ? await db
+                  .insert(issueComments)
+                  .values({
+                    companyId: context.fixture.companyId,
+                    issueId: context.issue.id,
+                    authorAgentId: context.fixture.assignedAgentId,
+                    body: "An already published answer",
+                  })
+                  .returning()
+              : [];
+          const [current] = await db
+            .insert(chatPublications)
+            .values({
+              companyId: context.fixture.companyId,
+              endpointId: context.endpoint.id,
+              conversationId: context.conversation.id,
+              issueId: context.issue.id,
+              idempotencyKey: `run:${randomUUID()}:failed:${context.endpoint.id}`,
+              ...(otherComment ? { commentId: otherComment.id } : {}),
+              payload:
+                mutation === "authored_answer"
+                  ? { text: "An already published answer" }
+                  : { text: "A later run failed", progressState: "failed" },
+              state: "published",
+              providerMessageId: failure.providerMessageId,
+              publishedAt: new Date(),
+              attempts: 1,
+            })
+            .returning();
+          currentLinkPublicationId = current.id;
+          await db
+            .update(chatMessageLinks)
+            .set({ publicationId: current.id, commentId: current.commentId })
+            .where(
+              and(
+                eq(chatMessageLinks.endpointId, context.endpoint.id),
+                eq(
+                  chatMessageLinks.providerMessageId,
+                  failure.providerMessageId!,
+                ),
+              ),
+            );
+        }
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.edits).toEqual([]);
+        // A denied replacement is not a denied, otherwise-authorized answer.
+        expect(context.providerRuntime.posts).toEqual([
+          { threadId: context.thread.thread.id, text: context.result.summary },
+        ]);
+        await expect(
+          db
+            .select({ publicationId: chatMessageLinks.publicationId })
+            .from(chatMessageLinks)
+            .where(
+              and(
+                eq(chatMessageLinks.endpointId, context.endpoint.id),
+                eq(
+                  chatMessageLinks.providerMessageId,
+                  failure.providerMessageId!,
+                ),
+              ),
+            ),
+        ).resolves.toEqual([{ publicationId: currentLinkPublicationId }]);
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.posts).toHaveLength(1);
+        expect(context.providerRuntime.edits).toEqual([]);
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
+
+  it.each(["streaming", "delivery_unknown"] as const)(
+    "does not replace a failure while another exact-run authored publication is %s",
+    async (state) => {
+      const context = await committedChatResponseRecoveryFixture("slack");
+      try {
+        const failure = await linkedCommittedResponseFailure(context);
+        await expect(context.repair()).resolves.toBe(true);
+        const [answer] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
+          );
+        // Later-created unresolved output deliberately does not block the
+        // normal FIFO head. The replacement check must see it independently.
+        const [unresolved] = await db
+          .insert(chatPublications)
+          .values({
+            companyId: context.fixture.companyId,
+            endpointId: context.endpoint.id,
+            conversationId: context.conversation.id,
+            issueId: context.issue.id,
+            commentId: answer.commentId,
+            idempotencyKey: `uncertain-answer:${randomUUID()}`,
+            payload: { text: "Another unresolved authored output" },
+            state,
+            attempts: 1,
+            createdAt: new Date(answer.createdAt.getTime() + 1),
+          })
+          .returning();
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.edits).toEqual([]);
+        expect(context.providerRuntime.posts).toEqual(
+          state === "delivery_unknown"
+            ? []
+            : [
+                {
+                  threadId: context.thread.thread.id,
+                  text: context.result.summary,
+                },
+              ],
+        );
+        await expect(
+          db
+            .select()
+            .from(chatPublications)
+            .where(eq(chatPublications.id, unresolved.id)),
+        ).resolves.toEqual([unresolved]);
+        await expect(
+          db
+            .select({ publicationId: chatMessageLinks.publicationId })
+            .from(chatMessageLinks)
+            .where(
+              and(
+                eq(chatMessageLinks.endpointId, context.endpoint.id),
+                eq(
+                  chatMessageLinks.providerMessageId,
+                  failure.providerMessageId!,
+                ),
+              ),
+            ),
+        ).resolves.toEqual([{ publicationId: failure.id }]);
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
+
+  it("rechecks the recovered failure link after waiting for the provider mutation lane", async () => {
+    const context = await committedChatResponseRecoveryFixture("telegram");
+    const blockerToken = `recovery-link-owner:${randomUUID()}`;
+    let worker: Promise<number> | undefined;
+    let restore = () => {};
+    const releaseBlocker = () =>
+      db
+        .delete(chatEndpointLeases)
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, context.endpoint.id),
+            eq(chatEndpointLeases.leaseKey, "credentials"),
+            eq(chatEndpointLeases.token, blockerToken),
+          ),
+        );
+    try {
+      const failure = await linkedCommittedResponseFailure(context);
+      await expect(context.repair()).resolves.toBe(true);
+      await db.insert(chatEndpointLeases).values({
+        companyId: context.fixture.companyId,
+        endpointId: context.endpoint.id,
+        leaseKey: "credentials",
+        token: blockerToken,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      let attempted = false;
+      const originalInsert = db.insert.bind(db);
+      const insertSpy = vi.spyOn(db, "insert").mockImplementation((table) => {
+        const builder = originalInsert(table);
+        if (table === chatEndpointLeases) {
+          const originalValues = builder.values.bind(builder);
+          builder.values = ((values: {
+            endpointId?: string;
+            leaseKey?: string;
+            token?: string;
+          }) => {
+            if (
+              values.endpointId === context.endpoint.id &&
+              values.leaseKey === "credentials" &&
+              values.token !== blockerToken
+            )
+              attempted = true;
+            return originalValues(values);
+          }) as typeof builder.values;
+        }
+        return builder;
+      });
+      restore = () => insertSpy.mockRestore();
+      worker = context.service.processPendingPublications(100);
+      await expect.poll(() => attempted).toBe(true);
+      expect(context.providerRuntime.posts).toEqual([]);
+      expect(context.providerRuntime.edits).toEqual([]);
+      // Simulate the current lease owner's durable publication commit before
+      // releasing the endpoint. The earlier same-run row keeps its old ID.
+      const [successor] = await db
+        .insert(chatPublications)
+        .values({
+          companyId: context.fixture.companyId,
+          endpointId: context.endpoint.id,
+          conversationId: context.conversation.id,
+          issueId: context.issue.id,
+          idempotencyKey: `run:${randomUUID()}:failed:${context.endpoint.id}`,
+          payload: {
+            text: "A successor's failure must not be rewritten",
+            progressState: "failed",
+          },
+          state: "published",
+          providerMessageId: failure.providerMessageId,
+          attempts: 1,
+          publishedAt: new Date(),
+        })
+        .returning();
+      await db
+        .update(chatMessageLinks)
+        .set({ publicationId: successor.id })
+        .where(
+          and(
+            eq(chatMessageLinks.endpointId, context.endpoint.id),
+            eq(chatMessageLinks.providerMessageId, failure.providerMessageId!),
+          ),
+        );
+      await releaseBlocker();
+      await worker;
+      expect(context.providerRuntime.edits).toEqual([]);
+      expect(context.providerRuntime.posts).toEqual([
+        { threadId: context.thread.thread.id, text: context.result.summary },
+      ]);
+      await expect(
+        db
+          .select({ publicationId: chatMessageLinks.publicationId })
+          .from(chatMessageLinks)
+          .where(
+            and(
+              eq(chatMessageLinks.endpointId, context.endpoint.id),
+              eq(
+                chatMessageLinks.providerMessageId,
+                failure.providerMessageId!,
+              ),
+            ),
+          ),
+      ).resolves.toEqual([{ publicationId: successor.id }]);
+    } finally {
+      await releaseBlocker();
+      try {
+        await worker;
+      } finally {
+        restore();
+        await context.service.shutdown();
+      }
+    }
+  });
 
   it.each([false, true])(
     "never replaces or resurrects an already selected answer (deleted=%s)",

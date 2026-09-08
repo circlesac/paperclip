@@ -42,6 +42,28 @@ describe("safe chat publication streaming", () => {
     expect(shouldStreamSafePublicationText("x".repeat(281))).toBe(true);
   });
 
+  it.each([
+    {
+      label: "medium prose",
+      source: "A useful answer with ordinary words. ".repeat(55),
+    },
+    {
+      label: "medium fenced code",
+      source: `\`\`\`ts\n${"const result = true;\n".repeat(100)}\`\`\``,
+    },
+    { label: "UTF-16 boundary", source: "🙂".repeat(2_048) },
+    { label: "escaped boundary", source: "!".repeat(2_048) },
+  ])(
+    "keeps $label in one native Telegram message when conversion fits",
+    ({ source }) => {
+      expect(
+        new TelegramFormatConverter().fromMarkdown(source).length,
+      ).toBeLessThanOrEqual(4_096);
+      expect(splitTelegramPublicationText(source)).toEqual([source]);
+      expect(telegramMarkdownRequiresAttachment(source)).toBe(false);
+    },
+  );
+
   it("splits Telegram publications losslessly on Unicode code-point boundaries", () => {
     const source = `${"*".repeat(TELEGRAM_DURABLE_PART_CODE_POINTS)}${"🙂".repeat(
       TELEGRAM_DURABLE_PART_CODE_POINTS,
@@ -59,7 +81,7 @@ describe("safe chat publication streaming", () => {
   });
 
   it("keeps long ordinary Telegram prose inline and splits on readable boundaries", () => {
-    const source = `${"A readable sentence with words. ".repeat(90)}Tail.`;
+    const source = `${"A readable sentence with words. ".repeat(180)}Tail.`;
 
     expect(telegramMarkdownRequiresAttachment(source)).toBe(false);
     const parts = splitTelegramPublicationText(source);
@@ -89,9 +111,7 @@ describe("safe chat publication streaming", () => {
       expect(parts.join("")).toBe(source);
       expect(parts.length).toBeGreaterThan(1);
       expect(
-        parts.every(
-          (part) => converter.fromMarkdown(part).length <= 4_096,
-        ),
+        parts.every((part) => converter.fromMarkdown(part).length <= 4_096),
       ).toBe(true);
     },
   );
@@ -99,16 +119,16 @@ describe("safe chat publication streaming", () => {
   it.each([
     {
       label: "a fenced code block",
-      source: `\`\`\`text\n${"const result = true;\n".repeat(100)}\`\`\``,
+      source: `\`\`\`text\n${"const result = true;\n".repeat(250)}\`\`\``,
     },
     {
       label: "a link",
-      source: `[${"evidence ".repeat(210)}](https://example.test/evidence)`,
+      source: `[${"evidence ".repeat(600)}](https://example.test/evidence)`,
     },
     {
       label: "a list",
       source: Array.from(
-        { length: 220 },
+        { length: 500 },
         (_value, index) => `- Result ${index}`,
       ).join("\n"),
     },
@@ -127,9 +147,9 @@ describe("safe chat publication streaming", () => {
   );
 
   it("keeps short structured Telegram Markdown native", () => {
-    expect(telegramMarkdownRequiresAttachment("```ts\nconst ok = true;\n```")).toBe(
-      false,
-    );
+    expect(
+      telegramMarkdownRequiresAttachment("```ts\nconst ok = true;\n```"),
+    ).toBe(false);
     expect(
       telegramMarkdownRequiresAttachment(
         "[Open the task](https://example.test/task)",
@@ -139,19 +159,28 @@ describe("safe chat publication streaming", () => {
 
   it("uses an attachment when a plain paragraph would split into a Markdown heading", () => {
     const converter = new TelegramFormatConverter();
-    const source = `${"x".repeat(1_599)} # Heading ${"tail ".repeat(40)}`;
+    const source = `${"x".repeat(1_599)} # Heading ${"tail ".repeat(1_000)}`;
     const parts = splitTelegramPublicationText(source);
 
-    expect(parts).toHaveLength(2);
+    expect(parts.length).toBeGreaterThan(1);
     expect(parts[1]).toMatch(/^# Heading/);
     expect(converter.fromMarkdown(source)).toContain("\\# Heading");
     expect(converter.fromMarkdown(parts[1]!)).toMatch(/^\*Heading/);
     expect(telegramMarkdownRequiresAttachment(source)).toBe(true);
   });
 
+  it("does not admit hidden Markdown source that the rich-message path would truncate", () => {
+    const source = `[unused]: https://example.test/${"x".repeat(33_000)}\n\nVisible trailing answer.`;
+    expect(
+      new TelegramFormatConverter().fromMarkdown(source).length,
+    ).toBeLessThan(4_096);
+    expect(splitTelegramPublicationText(source).length).toBeGreaterThan(1);
+    expect(telegramMarkdownRequiresAttachment(source)).toBe(true);
+  });
+
   it("keeps a Markdown escape prefix with its escaped punctuation", () => {
     const converter = new TelegramFormatConverter();
-    const source = `${"x".repeat(1_599)}\\!${"y".repeat(120)}`;
+    const source = `${"x".repeat(1_599)}\\!${"y".repeat(3_000)}`;
     const parts = splitTelegramPublicationText(source);
 
     expect(parts.join("")).toBe(source);
