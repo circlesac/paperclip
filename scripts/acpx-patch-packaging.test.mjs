@@ -47,6 +47,53 @@ const claudeAcpPatch = await readFile(
   "utf8",
 );
 
+for (const version of ["0.12.0", "0.13.1"]) {
+  test(`ACPX ${version} release patch uses portable generated unified hunks`, async () => {
+    const patch = await readFile(
+      new URL(`../patches/acpx@${version}.patch`, import.meta.url),
+      "utf8",
+    );
+    const lines = patch.split("\n");
+    let hunkCount = 0;
+    for (let index = 0; index < lines.length; index += 1) {
+      const header = lines[index].match(
+        /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/,
+      );
+      if (!header) continue;
+      hunkCount += 1;
+      const body = [];
+      while (index + 1 < lines.length && /^[ +\-]/.test(lines[index + 1])) {
+        body.push(lines[++index]);
+      }
+      assert.equal(
+        body.filter((line) => !line.startsWith("+")).length,
+        Number(header[2] ?? 1),
+      );
+      assert.equal(
+        body.filter((line) => !line.startsWith("-")).length,
+        Number(header[4] ?? 1),
+      );
+      const prefix = body.findIndex((line) => !line.startsWith(" "));
+      const suffix = body
+        .slice()
+        .reverse()
+        .findIndex((line) => !line.startsWith(" "));
+      // pnpm patch-commit emits three context lines. Hand-added asymmetric
+      // context can force GNU patch's locate_hunk() to require EOF even when
+      // BSD patch and git apply accept the same source and hunk.
+      assert.ok(
+        prefix >= 0 && prefix <= 3,
+        `regenerate ${version} hunk at old line ${header[1]} with pnpm patch-commit (prefix ${prefix})`,
+      );
+      assert.ok(
+        suffix >= 0 && suffix <= 3,
+        `regenerate ${version} hunk at old line ${header[1]} with pnpm patch-commit (suffix ${suffix})`,
+      );
+    }
+    assert.ok(hunkCount > 0);
+  });
+}
+
 test("published packages preserve the patched ACPX runtime", () => {
   assert.equal(
     rootPackage.pnpm.patchedDependencies["acpx@0.12.0"],

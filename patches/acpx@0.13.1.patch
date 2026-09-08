@@ -1,5 +1,5 @@
 diff --git a/dist/live-checkpoint-BSIrfgVo.js b/dist/live-checkpoint-BSIrfgVo.js
-index d454fd7c5bf742b469be75eb8c3988b694a0ffaa..f5775e731d6a4808c7bd59b4228da766f46ce3db 100644
+index d454fd7c5bf742b469be75eb8c3988b694a0ffaa..17f0739318e61744af3eaa760cfbdc84dc5d3c1b 100644
 --- a/dist/live-checkpoint-BSIrfgVo.js
 +++ b/dist/live-checkpoint-BSIrfgVo.js
 @@ -1661,7 +1661,7 @@ const ZED_TAG_KEYS = /* @__PURE__ */ new Set([
@@ -45,16 +45,7 @@ index d454fd7c5bf742b469be75eb8c3988b694a0ffaa..f5775e731d6a4808c7bd59b4228da766
  		stdio: [
  			"pipe",
  			"pipe",
-@@ -3952,18 +3962,21 @@ function createAgentProtocolConnection(options) {
- function resolveClientCapabilities(params) {
- 	const baseCapabilities = {
- 		fs: {
- 			readTextFile: params.fs,
- 			writeTextFile: params.fs
- 		},
- 		terminal: params.terminal,
- 		...params.elicitationModes.length > 0 ? { elicitation: {
- 			...params.elicitationModes.includes("form") ? { form: {} } : {},
+@@ -3961,10 +3971,13 @@ function resolveClientCapabilities(params) {
  			...params.elicitationModes.includes("url") ? { url: {} } : {}
  		} } : {}
  	};
@@ -69,6 +60,7 @@ index d454fd7c5bf742b469be75eb8c3988b694a0ffaa..f5775e731d6a4808c7bd59b4228da766
 +		_meta: { ...typedSessionFailureMeta, ...DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META }
  	};
  }
+ function hasResponseField(response, field) {
 @@ -4216,9 +4229,21 @@ var AcpClient = class {
  		this.lastAgentExit = void 0;
  		this.lastKnownPid = child.pid ?? void 0;
@@ -138,8 +130,7 @@ index d454fd7c5bf742b469be75eb8c3988b694a0ffaa..f5775e731d6a4808c7bd59b4228da766
  		});
  		child.once("close", (exitCode, signal) => {
  			this.recordAgentExit("process_close", exitCode, signal);
-@@ -6434,15 +6477,39 @@ async function closeConnectedSession(options) {
- //#endregion
+@@ -6435,6 +6478,27 @@ async function withConnectedSession(options) {
  //#region src/runtime/engine/prompt-turn.ts
  const SESSION_REPLY_IDLE_MS = 1e3;
  const SESSION_REPLY_DRAIN_TIMEOUT_MS = 5e3;
@@ -167,9 +158,7 @@ index d454fd7c5bf742b469be75eb8c3988b694a0ffaa..f5775e731d6a4808c7bd59b4228da766
  async function runPromptTurn(params) {
  	try {
  		const promptPromise = params.client.prompt(params.sessionId, params.prompt, params.onPromptRequestStarted, params.onElicitation);
- 		await params.onPromptStarted?.();
- 		const response = await withTimeout(promptPromise, params.timeoutMs);
- 		await params.client.waitForSessionUpdatesIdle?.({
+@@ -6444,6 +6508,9 @@ async function runPromptTurn(params) {
  			idleMs: SESSION_REPLY_IDLE_MS,
  			timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS
  		}).catch(() => {});
@@ -178,8 +167,9 @@ index d454fd7c5bf742b469be75eb8c3988b694a0ffaa..f5775e731d6a4808c7bd59b4228da766
 +			throw new Error(`ACP agent reported a terminal ${terminalFailureCategory} failure.`);
  		recordPromptResponseUsage(params.conversation, response.usage, params.promptMessageId);
  		return {
+ 			stopReason: response.stopReason,
 diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
-index e8102acb03c4c38830ad5ec22f356125eb0423b7..fcb1a1906f587b33ad818389c035f90362b0617e 100644
+index e8102acb03c4c38830ad5ec22f356125eb0423b7..fa94c67bb8389437fe3ac3e8b92f56949778b1f1 100644
 --- a/dist/runtime.d.ts
 +++ b/dist/runtime.d.ts
 @@ -1,7 +1,8 @@
@@ -252,7 +242,7 @@ index e8102acb03c4c38830ad5ec22f356125eb0423b7..fcb1a1906f587b33ad818389c035f903
  type AcpFileSessionStoreOptions = {
    stateDir: string;
 diff --git a/dist/runtime.js b/dist/runtime.js
-index a1f4a70a003792c6eacf68b6b038f37bfec1db53..50029e881c07a7228ddd978bb03d040629cf776b 100644
+index a1f4a70a003792c6eacf68b6b038f37bfec1db53..5c0562034f5bcb726536136db3cb2d3f83e5a8b5 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
 @@ -371,7 +371,7 @@ const PROMPT_EVENT_PARSERS = {
@@ -332,7 +322,7 @@ index a1f4a70a003792c6eacf68b6b038f37bfec1db53..50029e881c07a7228ddd978bb03d0406
  		if (!active) return;
  		const { task, turn } = active;
 diff --git a/dist/session-options-DwRDODlr.d.ts b/dist/session-options-DwRDODlr.d.ts
-index c3da1645235bbea22de3f8484149051cd7dca56b..ad1f2f6c6a7f477e83dc0061e4168c00c23382da 100644
+index c3da1645235bbea22de3f8484149051cd7dca56b..1cd88ed98a5346a345838227e8fd9e7616d0b42b 100644
 --- a/dist/session-options-DwRDODlr.d.ts
 +++ b/dist/session-options-DwRDODlr.d.ts
 @@ -1,4 +1,5 @@
