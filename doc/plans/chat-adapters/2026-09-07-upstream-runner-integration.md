@@ -1120,3 +1120,64 @@ suite passes **56/56**, with server typecheck passing. The real authority test
 creates the documented question on an in-review, human-review-required task,
 replays it idempotently, and verifies the original task/review state and one
 audit event. Live requalification is still required.
+
+### Live sequential questions pass (September 8, 08:38–08:40 UTC)
+
+The clean `7df7d4ca1` live process reached startup-ready at 08:38:32.585;
+the verified webhook proxy stayed running. Root repeated the same natural
+two-question request in the existing Discord and Telegram conversations.
+
+- Discord: source `1e79740e-670f-4926-8752-a65bd06ae9a4` took **10.192s** and
+  displayed real Amber/Cobalt buttons. The Cobalt click at 08:39:12.587 settled
+  `dd3a3984-0844-498c-bd52-0ec519cba4eb`. Continuation
+  `a7a34328-1dfb-44a4-8134-a78faaa2501f` took **15.268s** and displayed a new,
+  separate Apple/Pear question (`303e8bba-7d8f-4c4e-8a38-61d4e7d72531`).
+  The Pear click at 08:39:42.027 led to
+  `5c5394c1-0ec1-4bf3-817c-357076b28513` (**19.009s**) and exactly
+  **Cobalt Pear**, visibly delivered once at `1546802203795390525`,
+  08:40:04.504 (publication attempt one).
+- Telegram: source `926f9adb-1d73-407d-9da7-e8e9a65b1329` took **9.071s** and
+  displayed real Amber/Cobalt buttons. The Amber click at 08:39:21.032 settled
+  `f374a67e-f48f-4097-b3bc-cc318937ce96`. Continuation
+  `cb7468ef-5ccc-4203-ad7d-13aed9b1f388` took **13.344s** and displayed the
+  separate Apple/Pear question (`1be9f0f0-0335-4e71-bd82-509c7bc4bc16`).
+  The Apple click at 08:39:55.677 led to
+  `5742e514-7e3f-464c-80cc-0d7ed41c7c04` (**17.804s**) and exactly
+  **Amber Apple**, visibly delivered once at `417200359:96`, 08:40:16.984
+  (publication attempt one).
+
+Both provider UIs removed the controls from each answered card. There were
+exactly two questions and three runs per conversation, with no duplicate answer
+or follow-up work. Screenshots show the resulting cards and final Discord
+answer; Telegram's settled answer was verified in its live accessibility state.
+The original independent human-review interactions remain pending with no
+resolution timestamp. These journeys pass functionally and the interaction
+experience is substantially improved: actual controls, one question at a time,
+visible working feedback, and a concise answer preserving both selections.
+All four answer deliveries have one claim attempt, zero errors, and exactly one
+fallback-wake target. Both tasks remain in review.
+An independent audit of actual Codex rollouts confirms **gpt-5.6-luna in all
+six turns**, four real `request_human_input` calls using `payload.questions`,
+and two real `paperclip_finish` calls yielding to `response_wake`. All four
+provider-session declarations contain the corrected real-task question and
+completion descriptions. Each channel retains its task-scoped workspace;
+the first question uses a fresh provider session and the two answer turns
+share a resumed provider session. No Terra substitution occurred.
+The final-answer click-to-publication times were **22.477s** (Discord) and
+**21.307s** (Telegram), distinct from run duration and not a general latency SLO.
+
+An independent source audit also confirms the native tracing boundary: rich
+run events and the Runner Inspector remain private in Paperclip. External
+providers currently receive only coalesced queued/working/waiting/completed/
+failed milestones, authorized final responses, files, and supported question
+controls. Raw tool activity is not relayed. Long turns still have coarse
+"working" feedback; richer public progress would need its own closed,
+cadence-limited phase mapping, not forwarding Board snippets or tool names.
+
+One run-log timing presentation gap remains: the final Discord run's
+`task.run.measured` span reports 69.091s because its start comes from the
+original provider comment at 08:38:49.891, including the preceding question
+and human-answer wait. The current run actually starts at 08:39:42.527 and
+finishes at 08:40:01.536 (19.009s). This is an ambiguous aggregate-span label,
+not evidence of a 69-second current model call. The latest run and its private
+Runner Inspector are open in the Board for inspection; raw capture stays off.
