@@ -498,3 +498,42 @@ rows are hidden. Root then enabled the actual Experimental Settings switch
 on this qualification instance and verified that all four existing active
 chat connections and Microsoft Teams setup reappeared. Other instance flags
 and provider lifecycles were unchanged.
+
+## Landing CI and fresh native shutdown regression
+
+PR [#13038](https://github.com/paperclipai/paperclip/pull/13038) is open as one
+review, currently 473 changed files. Merge `1a442f5a0` also incorporates
+upstream `b97101893`; a later fetch found no further master commits.
+Workspace typecheck and build passed after that merge. The corrected browser
+cohort passed **10/10** on isolated port 3199 and a fresh database, including
+the default-off GitHub tool flow and all four file-send refresh outcomes.
+Follow-up native recovery **9/9**, legacy rollback **1/1**, issue routes
+**92/92**, and clipboard/identity-preview **37/37** passed. These focused
+results do not make the still-running broad suite or CI green. Greptile has
+not yet produced a review after the requested file-limit override.
+
+Telegram's fresh long-answer submission at 13:28:03.761 UTC created run
+`f262ca93-3c29-4338-a625-0d2239757e38`, native Codex app-server Luna. It ran
+13:28:05.910–13:29:17.661 and failed with
+`provider_transport_failed: runner did not durably suspend before checkpoint`.
+A 4,092-character native result and successful terminal metadata had been
+accepted, but that was not enough to complete cleanup or authorize final
+delivery. Working, progress and failure publications each used one attempt
+against Telegram message `417200359:119`. The actual chat showed failure;
+no successful long-document handoff was observed.
+
+Durable inspection found a 128-delta suffix (source sequences 174–301) already
+committed by the controller while the runner's persisted ACK remained 173.
+The stop command waited about 9.8 seconds before entering the command journal;
+suspend had not entered it when the bounded close failed. No host sleep/wake
+occurred in this interval. This is acknowledgment/control-command starvation,
+not slow model inference. The proposed fix batches cumulative ACK persistence
+without weakening replay, command durability, or suspension proof.
+
+Slack's subsequent `TOKEN-SYSTEM-LIVE-0908` submission at 13:40:12.298 UTC
+also failed. Run `2c17e336-f6b2-4763-9d8f-ba9a3c8b296a`, native Luna,
+13:40:14.272–13:41:17.434, ended with `native_session_retry_exhausted` and
+`native_session_cleanup_quarantined: prior session cleanup remains incomplete`.
+The visible working message became a truthful failure. Further live sends
+are paused until safe recovery and the shutdown regression are addressed;
+the newly staged prose fix is not claimed to have passed live on this attempt.

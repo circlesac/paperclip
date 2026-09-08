@@ -58,6 +58,12 @@ completed review is visible yet. Do not report the review as accepted.
 The issue route fixtures also pass **92/92** after adding the missing left-join
 mock and the fifth database argument to comment assertions. The clipboard and
 identity-preview cohort passes **37/37**, with both server and UI typechecks.
+The parked-answer fixture now uses real durable linked-user lineage and checks
+revocation before dispatch: **16/16** batching tests pass. Both ACPX patch files
+were regenerated with pnpm after reproducing GNU patch's asymmetric-context
+failure; their resulting vendor files are byte-identical to the intended code.
+Packaging **15/15** and actual fresh GNU-patch staging **2/2** pass. No lockfile
+was edited. These fixes are committed; the next CI run must confirm them.
 
 ## Current tested/deployed state
 
@@ -123,6 +129,13 @@ identity-preview cohort passes **37/37**, with both server and UI typechecks.
   prior-session cleanup, so further live sends are paused while the runner
   fairness/cleanup regression is fixed. Do not clear safety state to force
   a green result or increase deadlines in place of fixing command progress.
+  Commit `440ae9bbd` batches cumulative ACK persistence at 16 advances while
+  preserving replay and command/lifecycle save boundaries. Root passed all
+  **226/226** core tests, the refined before-command persistence assertion,
+  and **87/87** tests against signed binary SHA-256 `3c69ea061539…`. The real
+  socket backlog/suspension/rebind case is included in those 87 tests. Live
+  recovery and retesting remain pending; verify exact prior process ownership
+  and let startup reconciliation settle without changing durable history.
 - **Telegram latency:** one message took 234.435 seconds _before reaching the
   local webhook proxy_, then Luna ran for 13.433 seconds. The next independent
   message reached the proxy in 0.583 seconds and answered in 16.228 seconds
