@@ -29,6 +29,10 @@ import {
   type PrpTerminalState,
 } from "./protocol/replay-contract.js";
 import { parsePaperclipQuestionSet } from "./contracts/question-set.js";
+import {
+  retainedRunnerdCleanupProofIsCurrent,
+  type RetainedRunnerdCleanupProof,
+} from "./live/runnerd-codex-transport.js";
 
 export const DEFAULT_NATIVE_RUNTIME_INPUT_LIVE_WINDOW_MS = 120_000;
 export const DEFAULT_NATIVE_SEMANTIC_RESULT_TERMINAL_GRACE_MS = 5_000;
@@ -78,6 +82,47 @@ interface QuarantinedSessionCleanup {
 }
 
 const quarantinedSessionCleanups = new Set<QuarantinedSessionCleanup>();
+const sessionOriginRunnerInstances = new WeakMap<NativeSession, string>();
+
+/** Retire only the exact owner whose separate authenticated cleanup completed.
+ * The rejected close promise remains rejected; this neither resets a session
+ * nor authorizes an execution. Other quarantined owners remain admission gates. */
+export function completeRetainedNativeSessionCleanup(
+  proof: RetainedRunnerdCleanupProof,
+): number {
+  if (!retainedRunnerdCleanupProofIsCurrent(proof))
+    throw new NativeSessionCleanupQuarantinedError();
+  const domain = JSON.stringify([
+    proof.binding.companyId,
+    proof.backend.kind,
+    proof.backend.name,
+  ]);
+  const matches = [...quarantinedSessionCleanups].filter((entry) => {
+    const identity = entry.session.identity();
+    return (
+      entry.domain === domain &&
+      Object.entries(proof.binding).every(
+        ([key, value]) => identity[key as keyof typeof identity] === value,
+      )
+    );
+  });
+  if (
+    matches.length > 1 ||
+    matches.some(
+      (entry) =>
+        sessionOriginRunnerInstances.get(entry.session) !==
+          proof.identity.runnerInstanceId ||
+        !entry.operatorRecoveryRequired ||
+        entry.attempt ||
+        entry.recovery ||
+        entry.timer,
+    )
+  ) {
+    throw new NativeSessionCleanupQuarantinedError();
+  }
+  for (const entry of matches) quarantinedSessionCleanups.delete(entry);
+  return matches.length;
+}
 
 export interface ExecuteNativeSessionOptions {
   input: NativeExecutionInput;
@@ -1690,6 +1735,7 @@ export async function executeNativeSession(
     }
     throw error;
   }
+  sessionOriginRunnerInstances.set(session, options.runnerInstanceId);
   let sessionClosePromise: Promise<void> | null = null;
   let sessionQuarantined = false;
   const quarantineSession = (reason: string) => {

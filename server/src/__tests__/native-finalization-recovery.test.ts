@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   agents,
@@ -20,7 +21,10 @@ import {
   CONTROL_PLANE_CONFORMANCE_TERMINAL,
 } from "../vendor/paperclip-runner/testing.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { reconcileNativeFinalizations } from "../services/native-runtime/native-finalization-reconciler.js";
+import {
+  reconcileNativeFinalizations,
+  reconcileRetainedNativeSessionCleanups,
+} from "../services/native-runtime/native-finalization-reconciler.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 
 describe("P6-16/P6-25/P6-28 native finalization recovery", () => {
@@ -321,5 +325,294 @@ describe("P6-16/P6-25/P6-28 native finalization recovery", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, staleIssueId))).resolves.toEqual([
         expect.objectContaining({ status: "resolved", outcome: "false_positive" }),
       ]);
+  });
+});
+
+describe("retained native cleanup discovery", () => {
+  let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  const companyId = randomUUID();
+  const agentId = randomUUID();
+  const closeError =
+    "provider_transport_failed: runner did not durably suspend before checkpoint";
+
+  beforeAll(async () => {
+    temporary = await startEmbeddedPostgresTestDatabase(
+      "paperclip-native-cleanup-sweep-",
+    );
+    db = createDb(temporary.connectionString);
+    await db
+      .insert(companies)
+      .values({ id: companyId, name: "Cleanup sweep", issuePrefix: "NCS" });
+    await db
+      .insert(agents)
+      .values({
+        id: agentId,
+        companyId,
+        name: "Cleanup",
+        adapterType: "codex_local",
+      });
+  });
+  afterEach(async () => {
+    // Remove only this suite's discovery rows; the throwaway database retains
+    // its accepted-result fixtures until teardown. No physical cleanup runs.
+    await db
+      .delete(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.companyId, companyId));
+    await reconcileRetainedNativeSessionCleanups(db, {
+      cleanup: async ({ runId }) => ({ runId, status: "not_eligible" }),
+    });
+  });
+  afterAll(async () => {
+    await temporary.cleanup();
+  });
+
+  async function candidate(
+    options: {
+      run?: Partial<typeof heartbeatRuns.$inferInsert>;
+      coordinator?: Partial<typeof nativeRunFinalizations.$inferInsert>;
+      schemaStatus?: string;
+    } = {},
+  ) {
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const contractId = randomUUID();
+    await db
+      .insert(issues)
+      .values({
+        id: issueId,
+        companyId,
+        title: "Retained session",
+        assigneeAgentId: agentId,
+      });
+    await db.insert(completionContracts).values({
+      id: contractId,
+      companyId,
+      issueId,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "phase6-v3",
+      risk: "standard",
+      completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {},
+      canonicalSha256: runId,
+      createdByActorType: "system",
+      createdByActorId: "test",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      runtimeMode: "native",
+      status: "succeeded",
+      nativeIssueId: issueId,
+      nativeSessionId: runId,
+      nativePhase: "terminal_failure",
+      completionContractId: contractId,
+      completionContractSha256: runId,
+      finishedAt: new Date(),
+      errorCode: "adapter_failed",
+      error: closeError,
+      ...options.run,
+    });
+    const [result] = await db
+      .insert(nativeRunResults)
+      .values({
+        companyId,
+        issueId,
+        runId,
+        completionContractId: contractId,
+        serverFingerprint: runId,
+        canonicalSha256: runId,
+        schemaStatus: options.schemaStatus ?? "accepted",
+        resultJson: {},
+      })
+      .returning();
+    const [assessment] = await db
+      .insert(workAssessments)
+      .values({
+        companyId,
+        issueId,
+        runId,
+        contractId,
+        resultId: result!.id,
+        triggerKind: "native_result",
+        triggerActorCompanyId: companyId,
+        priorIssueStatus: "in_progress",
+        priorStatusVersion: 0,
+        policyVersion: "phase6-v3",
+        assessmentJson: {},
+        inputDigest: runId,
+      })
+      .returning();
+    const [decision] = await db
+      .insert(statusDecisions)
+      .values({
+        companyId,
+        issueId,
+        runId,
+        assessmentId: assessment!.id,
+        decisionVersion: 1,
+        policyVersion: "phase6-v3",
+        fromStatus: "in_progress",
+        toStatus: "in_review",
+        reasonCode: "prior_status_terminal_preserved",
+        decisionJson: {},
+        decisionDigest: runId,
+      })
+      .returning();
+    await db.insert(nativeRunFinalizations).values({
+      companyId,
+      issueId,
+      runId,
+      phase: "committed",
+      resultId: result!.id,
+      assessmentId: assessment!.id,
+      decisionId: decision!.id,
+      ...options.coordinator,
+    });
+    return runId;
+  }
+
+  it("discovers exact committed results even with stale nativePhase or privately recovered errors", async () => {
+    const stale = await candidate();
+    const recovered = await candidate({
+      run: {
+        error: null,
+        errorCode: null,
+        resultJson: {
+          recoveredExecutionFailure: {
+            error: closeError,
+            errorCode: "adapter_failed",
+          },
+        },
+      },
+    });
+    const before = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId));
+    const cleanup = vi.fn(
+      async ({ runId }: { runId: string; companyId: string }) => ({
+        runId,
+        status: "not_eligible" as const,
+      }),
+    );
+    await reconcileRetainedNativeSessionCleanups(db, { cleanup, limit: 5 });
+    expect(cleanup.mock.calls.map(([input]) => input.runId).sort()).toEqual(
+      [stale, recovered].sort(),
+    );
+    expect(
+      cleanup.mock.calls.every(([input]) => input.companyId === companyId),
+    ).toBe(true);
+    expect(
+      await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, companyId)),
+    ).toEqual(before);
+  });
+
+  it.each([
+    { run: { runtimeMode: "legacy" } },
+    { run: { status: "running" } },
+    { run: { finishedAt: null } },
+    { run: { error: "another failure" } },
+    { run: { errorCode: "setup_failed" } },
+    {
+      run: {
+        error: "newer failure",
+        errorCode: "adapter_failed",
+        resultJson: {
+          recoveredExecutionFailure: {
+            error: closeError,
+            errorCode: "adapter_failed",
+          },
+        },
+      },
+    },
+    { schemaStatus: "rejected" },
+    { coordinator: { phase: "retryable_failure" } },
+    { coordinator: { nextAttemptAt: new Date(0) } },
+    {
+      coordinator: {
+        leaseOwner: "another-controller",
+        leaseExpiresAt: new Date(Date.now() + 120_000),
+      },
+    },
+    ...["started", "settled", "operator_required"].map((phase) => ({
+      coordinator: {
+        recoveryHistory: [{ kind: "native_cleanup_maintenance", phase }],
+      },
+    })),
+  ])(
+    "excludes ineligible or previously attempted cleanup: %j",
+    async (options) => {
+      await candidate(options);
+      const cleanup = vi.fn();
+      expect(
+        await reconcileRetainedNativeSessionCleanups(db, { cleanup, limit: 5 }),
+      ).toEqual([]);
+      expect(cleanup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("joins overlap and advances beyond a permanently ineligible first candidate", async () => {
+    const ids = [await candidate(), await candidate()].sort();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const cleanup = vi.fn(
+      async ({ runId }: { runId: string; companyId: string }) => {
+        started();
+        await held;
+        return { runId, status: "not_eligible" as const };
+      },
+    );
+    const first = reconcileRetainedNativeSessionCleanups(db, { cleanup });
+    await entered;
+    const overlapping = reconcileRetainedNativeSessionCleanups(db, { cleanup });
+    expect(overlapping).toBe(first);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    release();
+    await first;
+    await reconcileRetainedNativeSessionCleanups(db, { cleanup });
+    expect(cleanup.mock.calls.map(([input]) => input.runId)).toEqual(ids);
+    await reconcileRetainedNativeSessionCleanups(db, { cleanup });
+    expect(cleanup.mock.calls.map(([input]) => input.runId)).toEqual([
+      ...ids,
+      ids[0],
+    ]);
+  });
+
+  it("isolates one failure and resets its joined owner for the next bounded sweep", async () => {
+    const ids = [await candidate(), await candidate()].sort();
+    const onError = vi.fn();
+    const cleanup = vi.fn(
+      async ({ runId }: { runId: string; companyId: string }) => {
+        if (runId === ids[0]) throw new Error("fixture cleanup refused");
+        return { runId, status: "operator_required" as const };
+      },
+    );
+    expect(
+      await reconcileRetainedNativeSessionCleanups(db, {
+        cleanup,
+        onError,
+        limit: 2,
+      }),
+    ).toEqual([{ runId: ids[1], status: "operator_required" }]);
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), ids[0]);
+    await reconcileRetainedNativeSessionCleanups(db, {
+      cleanup,
+      onError,
+      limit: 2,
+    });
+    expect(cleanup).toHaveBeenCalledTimes(4);
   });
 });

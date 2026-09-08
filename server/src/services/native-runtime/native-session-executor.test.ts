@@ -14,8 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   heartbeatRuns,
+  heartbeatRunEvents,
   issues,
   nativeRunFinalizations,
+  nativeRunResults,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -34,6 +36,7 @@ import {
   verifyNativeHarnessBackupStamp,
 } from "./native-harness-backup-stamp.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { buildNativeHeartbeatPreparationSpans } from "./native-run-trace.js";
 import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
@@ -103,6 +106,8 @@ const durableRunnerState = (
 
 const state = vi.hoisted(() => ({
   execute: vi.fn(),
+  cleanup: vi.fn(),
+  retireCleanup: vi.fn(),
   createTransport: vi.fn((_options: RunnerTransportOptions) => ({
     transport: {},
   })),
@@ -156,6 +161,8 @@ vi.mock("../../vendor/paperclip-runner/index.js", async (importOriginal) => ({
   createNativeSessionBackend: state.createBackend,
   createRunnerdCodexTransport: state.createTransport,
   executeNativeSession: state.execute,
+  settleRetainedRunnerdSession: state.cleanup,
+  completeRetainedNativeSessionCleanup: state.retireCleanup,
   parsePaperclipQuestionSet: (value: unknown) => value,
 }));
 
@@ -218,6 +225,8 @@ import {
   assertRemoteRunnerBuildMetadata,
   nativeSessionFailureDisposition,
   nativeFailedRunRetryStateIsSafe,
+  nativePreProviderRetryAfterCleanupStateIsSafe,
+  reconcileRetainedNativeSessionCleanup,
   nativeProviderUsageLimitFromEvent,
   nativeSessionFailureSourceCode,
   nativeSessionRecoveryProjection,
@@ -2086,6 +2095,296 @@ const execution = {
   credentialBindings: [],
 } as NativeExecutionInputV1;
 
+describe("retained native cleanup activation", () => {
+  it.each([
+    "settled",
+    "live_owner",
+    "foreign_event",
+    "maintenance_failure",
+    "activation_commit_failure",
+    "activation_commit_stalled",
+  ])("preserves exact original evidence for %s", async (mode) => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "paperclip-maintenance-activation-"),
+    );
+    const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
+    const canonical = (value: unknown): string =>
+      value && typeof value === "object" && !Array.isArray(value)
+        ? `{${Object.entries(value)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
+            .join(",")}}`
+        : JSON.stringify(value);
+    const key = createHash("sha256")
+      .update(
+        canonical({
+          schema: "paperclip.native-session-scope.v2",
+          companyId: execution.binding.companyId,
+          agentId: execution.binding.agentId,
+          workspace: {
+            kind: "managed",
+            executionWorkspaceId: execution.binding.executionWorkspaceId,
+          },
+          provider: {
+            driverKind: execution.session.driverKind,
+            identity: { kind: "codex" },
+          },
+          normalizedSessionId: execution.session.normalizedSessionId,
+        }),
+      )
+      .digest("hex");
+    const root = join(directory, key);
+    const quarantine = join(
+      directory,
+      "quarantine",
+      `${key}.identity_indeterminate.fixture`,
+    );
+    const identity = {
+      runId: execution.binding.runId,
+      runnerInstanceId: "runner-cleanup",
+      environmentLeaseId: "lease-cleanup",
+      normalizedSessionId: execution.session.normalizedSessionId,
+      turnId: "turn-cleanup",
+      itemId: "item-cleanup",
+    };
+    const event = {
+      sourceEventId: "original-provider-identity",
+      sourceInstanceId: identity.runnerInstanceId,
+      runId: identity.runId,
+      normalizedSessionId: identity.normalizedSessionId,
+      eventType: "session.resumed",
+      payload: { providerSessionId: "exact-thread", processId: 99_999_998 },
+    };
+    const run = {
+      id: identity.runId,
+      ...execution.binding,
+      runtimeMode: "native",
+      status: "succeeded",
+      nativeIssueId: execution.binding.issueId,
+      nativeSessionId: identity.normalizedSessionId,
+      runnerInstanceId: identity.runnerInstanceId,
+      finishedAt: new Date(),
+      processPid: mode === "live_owner" ? process.pid : 99_999_999,
+      processGroupId: mode === "live_owner" ? process.pid : 99_999_999,
+      completionContractId: "contract",
+      completionContractSha256: "sha",
+      errorCode: "adapter_failed",
+      error:
+        "provider_transport_failed: runner did not durably suspend before checkpoint",
+      runnerProfileJson: {
+        nativeExecutionInput: execution,
+        nativeToolContractFingerprint:
+          nativeToolContractFingerprintForTarget("local"),
+      },
+    };
+    const coordinator: Record<string, unknown> = {
+      runId: run.id,
+      phase: "committed",
+      resultId: "result",
+      assessmentId: "assessment",
+      decisionId: "decision",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: null,
+      recoveryHistory: [],
+    };
+    let transactionOpen = false;
+    let releaseCommit!: () => void;
+    const commitGate = new Promise<void>((release) => {
+      releaseCommit = release;
+    });
+    const db = {
+      select: () => ({
+        from: (table: unknown) => {
+          const rows =
+            table === heartbeatRuns
+              ? [run]
+              : table === nativeRunFinalizations
+                ? [coordinator]
+                : table === nativeRunResults
+                  ? [{ schemaStatus: "accepted" }]
+                  : table === heartbeatRunEvents
+                    ? [
+                        {
+                          payload: {
+                            prpEvent:
+                              mode === "foreign_event"
+                                ? { ...event, runId: "foreign" }
+                                : event,
+                          },
+                        },
+                      ]
+                    : [];
+          const query = {
+            where: () => query,
+            for: () => query,
+            limit: async () => rows,
+          };
+          return query;
+        },
+      }),
+      update: () => ({
+        set: (values: Record<string, unknown>) => ({
+          where: () => {
+            Object.assign(coordinator, values);
+            return Object.assign(Promise.resolve([]), {
+              returning: async () => [{ runId: run.id }],
+            });
+          },
+        }),
+      }),
+      transaction: async (operation: (tx: Db) => Promise<unknown>) => {
+        transactionOpen = true;
+        const before = structuredClone(coordinator);
+        try {
+          const result = await operation(db as unknown as Db);
+          if (
+            mode === "activation_commit_stalled" &&
+            (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(
+              -1,
+            )?.phase === "settled"
+          )
+            await commitGate;
+          if (
+            mode === "activation_commit_failure" &&
+            (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(
+              -1,
+            )?.phase === "settled"
+          ) {
+            throw new Error("injected commit failure");
+          }
+          return result;
+        } catch (error) {
+          Object.assign(coordinator, before);
+          throw error;
+        } finally {
+          transactionOpen = false;
+        }
+      },
+    };
+    try {
+      await mkdir(join(quarantine, "runner"), { recursive: true });
+      await mkdir(join(quarantine, "control-plane"), { recursive: true });
+      const source = [
+        [
+          "control-plane/control-plane-state.json",
+          {
+            ...durableControlPlaneState(identity),
+            committedEvents: [{ envelope: { payload: event } }],
+          },
+        ],
+        ["runner/runner-state.json", durableRunnerState(identity, "ready")],
+        [
+          "runner/codex-provider-state.json",
+          {
+            lifecycle: "turn_active",
+            threadId: "exact-thread",
+            config: {
+              provider: "codex",
+              command: "codex",
+              cwd: execution.workspace.cwd,
+            },
+          },
+        ],
+      ] as const;
+      for (const [file, data] of source)
+        await writeFile(join(quarantine, file), JSON.stringify(data));
+      const original = await Promise.all(
+        source.map(([file]) => readFile(join(quarantine, file), "utf8")),
+      );
+      state.cleanup.mockReset();
+      state.retireCleanup.mockReset();
+      state.cleanup.mockImplementation(async (input) => {
+        await input.authorize();
+        if (mode === "maintenance_failure")
+          throw new Error("injected unproven owner");
+        return { ...input, settledFingerprint: "verified-fixture-fingerprint" };
+      });
+      state.retireCleanup.mockImplementation(() => {
+        expect(transactionOpen).toBe(false);
+        expect(
+          (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(-1)
+            ?.phase,
+        ).toBe("settled");
+        return 1;
+      });
+      const pendingOutcome = reconcileRetainedNativeSessionCleanup(
+        db as unknown as Db,
+        { companyId: run.companyId, runId: run.id },
+      );
+      if (mode === "activation_commit_stalled") {
+        await vi.waitFor(() =>
+          expect(
+            (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(
+              -1,
+            )?.phase,
+          ).toBe("settled"),
+        );
+        expect(state.retireCleanup).not.toHaveBeenCalled();
+        await expect(
+          createRunnerdBackend({
+            db: db as unknown as Db,
+            execution,
+            runnerInstanceId: "successor-runner",
+          }),
+        ).rejects.toThrow("native_session_supervisor_busy");
+        releaseCommit();
+      }
+      const outcome = await pendingOutcome;
+      const succeeds = ["settled", "activation_commit_stalled"].includes(mode);
+      expect(outcome.status).toBe(
+        succeeds
+          ? "settled"
+          : ["live_owner", "foreign_event"].includes(mode)
+            ? "not_eligible"
+            : "operator_required",
+      );
+      expect(
+        await Promise.all(
+          source.map(([file]) => readFile(join(quarantine, file), "utf8")),
+        ),
+      ).toEqual(original);
+      expect(state.cleanup).toHaveBeenCalledTimes(
+        ["live_owner", "foreign_event"].includes(mode) ? 0 : 1,
+      );
+      expect(state.retireCleanup).toHaveBeenCalledTimes(succeeds ? 1 : 0);
+      expect(coordinator.phase).toBe("committed");
+      expect(coordinator.resultId).toBe("result");
+      if (succeeds) {
+        await access(root);
+        expect(
+          (coordinator.recoveryHistory as Array<Record<string, unknown>>).map(
+            (entry) => entry.phase,
+          ),
+        ).toEqual(["started", "activation_prepared", "settled"]);
+      } else if (mode === "activation_commit_failure") {
+        // Simulate a fresh caller after the in-memory reservation ended.
+        // The canonical directory must not look reusable without its
+        // committed settlement receipt, and must not be quarantined again.
+        await expect(
+          createRunnerdBackend({
+            db: db as unknown as Db,
+            execution,
+            runnerInstanceId: "successor-runner",
+          }),
+        ).rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+        await access(root);
+        expect(
+          (coordinator.recoveryHistory as Array<Record<string, unknown>>).map(
+            (entry) => entry.phase,
+          ),
+        ).toEqual(["started", "activation_prepared", "operator_required"]);
+      }
+    } finally {
+      releaseCommit();
+      if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("explicit failed native retry physical evidence", () => {
   it.each([
     "suspended",
@@ -2215,6 +2514,75 @@ describe("explicit failed native retry physical evidence", () => {
           allowVerifiedBackup: false,
         }),
       ).toBe(kind === "suspended" || kind === "bootstrap");
+      if (!bootstrap && kind !== "symlink") {
+        const files = [
+          "control-plane/control-plane-state.json",
+          "runner/runner-state.json",
+          "runner/codex-provider-state.json",
+        ];
+        const bytes = await Promise.all(
+          files.map((file) => readFile(join(root, file))),
+        );
+        const fingerprint = createHash("sha256")
+          .update(
+            JSON.stringify(
+              bytes.map((value) =>
+                createHash("sha256").update(value).digest("hex"),
+              ),
+            ),
+          )
+          .digest("hex");
+        const receipt = {
+          kind: "native_cleanup_maintenance",
+          version: 1,
+          phase: "settled",
+          requestId: "exact-cleanup",
+          nativeSessionId: execution.session.normalizedSessionId,
+          runnerInstanceId: "runner-retry",
+          providerSessionId: "exact-thread",
+          sourceFingerprint: "a".repeat(64),
+          settledFingerprint: fingerprint,
+        };
+        const input = {
+          failedExecution: {
+            ...execution,
+            binding: { ...execution.binding, runId: "failed-before-provider" },
+          },
+          retiredExecution: execution,
+          ...execution.binding,
+          failedRunId: "failed-before-provider",
+          retiredRunId: execution.binding.runId,
+          nativeSessionId: execution.session.normalizedSessionId!,
+          runnerInstanceId:
+            kind === "wrong_runner" ? "foreign-runner" : "runner-retry",
+          providerSessionId:
+            kind === "wrong_thread" ? "foreign-thread" : "exact-thread",
+          processPid: kind === "live_pid" ? process.pid : 99_999_999,
+          processGroupId: 99_999_999,
+          receipt,
+        };
+        expect(nativePreProviderRetryAfterCleanupStateIsSafe(input)).toBe(
+          kind === "suspended",
+        );
+        expect(
+          nativePreProviderRetryAfterCleanupStateIsSafe({
+            ...input,
+            receipt: { ...receipt, settledFingerprint: "changed" },
+          }),
+        ).toBe(false);
+        expect(
+          nativePreProviderRetryAfterCleanupStateIsSafe({
+            ...input,
+            receipt: { ...receipt, sourceFingerprint: undefined },
+          }),
+        ).toBe(false);
+        expect(
+          nativePreProviderRetryAfterCleanupStateIsSafe({
+            ...input,
+            receipt: { ...receipt, requestId: "" },
+          }),
+        ).toBe(false);
+      }
       expect(await readdir(stateBase)).toEqual(before);
       if (!bootstrap)
         expect(

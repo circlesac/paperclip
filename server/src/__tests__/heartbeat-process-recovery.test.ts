@@ -52,11 +52,15 @@ import {
   issueWorkProducts,
   issues,
   nativeRunFinalizations,
+  nativeRunResults,
   plugins,
   projects,
   projectWorkspaces,
+  statusDecisionEffects,
+  statusDecisions,
   toolApplications,
   toolConnections,
+  workAssessments,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -71,9 +75,22 @@ import {
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { NativeRunnerOwnershipUnverifiedError } from "../services/native-runtime/native-runner-ownership.js";
-const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
+const mockTelemetryClient = vi.hoisted(() => ({
+  track: vi.fn(),
+  hashPrivateRef: vi.fn(() => "test-private-reference"),
+}));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
+const mockRetainedNativeCleanup = vi.hoisted(() =>
+  vi.fn<
+    typeof import("../services/native-runtime/native-session-executor.js").reconcileRetainedNativeSessionCleanup
+  >(),
+);
+const mockExecutePaperclipNativeSession = vi.hoisted(() =>
+  vi.fn<
+    typeof import("../services/native-runtime/native-session-executor.js").executePaperclipNativeSession
+  >(),
+);
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async (_input?: unknown) => ({
     exitCode: 0,
@@ -89,6 +106,23 @@ const mockAdapterExecute = vi.hoisted(() =>
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => mockTelemetryClient,
 }));
+
+vi.mock("../services/native-runtime/native-session-executor.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../services/native-runtime/native-session-executor.js")
+  >("../services/native-runtime/native-session-executor.js");
+  mockRetainedNativeCleanup.mockImplementation(
+    actual.reconcileRetainedNativeSessionCleanup,
+  );
+  mockExecutePaperclipNativeSession.mockImplementation(
+    actual.executePaperclipNativeSession,
+  );
+  return {
+    ...actual,
+    reconcileRetainedNativeSessionCleanup: mockRetainedNativeCleanup,
+    executePaperclipNativeSession: mockExecutePaperclipNativeSession,
+  };
+});
 
 vi.mock("../services/local-service-supervisor.js", async () => {
   const actual = await vi.importActual<
@@ -137,6 +171,14 @@ import {
   currentNativeControllerIdentity,
 } from "../services/native-runtime/native-restart-recovery.ts";
 import { claimNativeSessionResumptions } from "../services/native-runtime/native-finalization-reconciler.ts";
+import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
+import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
+import * as paperclipRunner from "../vendor/paperclip-runner/index.js";
+import {
+  CONTROL_PLANE_CONFORMANCE_OPEN,
+  CONTROL_PLANE_CONFORMANCE_RESULT,
+  CONTROL_PLANE_CONFORMANCE_TERMINAL,
+} from "../vendor/paperclip-runner/testing.js";
 import { recoveryService } from "../services/recovery/service.ts";
 import {
   readHotRestartIntent,
@@ -386,6 +428,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    const nativeExecutor = await vi.importActual<
+      typeof import("../services/native-runtime/native-session-executor.js")
+    >("../services/native-runtime/native-session-executor.js");
+    mockRetainedNativeCleanup
+      .mockReset()
+      .mockImplementation(nativeExecutor.reconcileRetainedNativeSessionCleanup);
     const localServiceSupervisor = await vi.importActual<
       typeof import("../services/local-service-supervisor.js")
     >("../services/local-service-supervisor.js");
@@ -467,7 +515,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
+    await db.update(issues).set({ lastStatusDecisionId: null });
+    await db.delete(statusDecisionEffects);
     await db.delete(nativeRunFinalizations);
+    await db.delete(statusDecisions);
+    await db.delete(workAssessments);
+    await db.delete(nativeRunResults);
     await db.update(heartbeatRuns).set({ completionContractId: null });
     await db.delete(completionContracts);
     for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -1534,6 +1587,253 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.issueIds).not.toContain(issueId);
     expect(result.continuationRequeued).toBe(0);
   });
+
+  it.each(["settled", "rejected", "late_callback"] as const)(
+    "joins startup and reap retained cleanup, keeps recovery live, and drains its %s operation",
+    async (outcome) => {
+      await withTempPaperclipHome(async () => {
+        const fixture = await seedRunFixture({ runtimeMode: "native" });
+        const { companyId, agentId, issueId, runId } = fixture;
+        const contractId = randomUUID();
+        const runnerInstanceId = randomUUID();
+        const contractSha = `maintenance-contract-${runId}`;
+        await db.insert(completionContracts).values({
+          id: contractId,
+          companyId,
+          issueId,
+          revision: 1,
+          schemaVersion: "paperclip.completion-contract.v1",
+          policyVersion: "phase6-v1",
+          risk: "standard",
+          completionAuthority: "server_arbiter",
+          incompleteCriteriaPolicy: "preserve_non_terminal",
+          contractJson: {
+            revision: "phase6-v1",
+            objective: "Retained cleanup lifecycle",
+            criteria: [{ id: "objective", requirement: "Keep cleanup joined" }],
+          },
+          canonicalSha256: contractSha,
+          createdByActorType: "system",
+          createdByActorId: "test",
+        });
+        await db
+          .update(heartbeatRuns)
+          .set({
+            nativeIssueId: issueId,
+            nativeSessionId: runId,
+            runnerInstanceId,
+            completionContractId: contractId,
+            completionContractSha256: contractSha,
+          })
+          .where(eq(heartbeatRuns.id, runId));
+        // Use the real accepted-result/finalization path. Only physical cleanup
+        // is held below; startup, candidate discovery, reaping and drain are real.
+        const port = new PaperclipControlPlanePort(db, {
+          companyId,
+          issueId,
+          runId,
+          agentId,
+          sessionId: runId,
+          completionContractId: contractId,
+          completionContractSha256: contractSha,
+          sourceInstanceId: runnerInstanceId,
+          controlPlaneSourceInstanceId: `maintenance-control-${runId}`,
+        });
+        await port.openRun({
+          ...CONTROL_PLANE_CONFORMANCE_OPEN,
+          identity: { companyId, issueId, runId, agentId, sessionId: runId },
+          sourceInstanceId: runnerInstanceId,
+        });
+        await port.completeRun({
+          result: CONTROL_PLANE_CONFORMANCE_RESULT,
+          terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+          callerResultId: `maintenance-result-${runId}`,
+        });
+        await db.insert(workspaceOperations).values({
+          companyId,
+          heartbeatRunId: runId,
+          issueId,
+          phase: "workspace_finalize",
+          status: "succeeded",
+        });
+        await expect(
+          finalizeNativeRun({
+            db,
+            runId,
+            workspaceFinalizeStatus: "succeeded",
+            projectRunStatus: true,
+          }),
+        ).resolves.toMatchObject({ phase: "committed" });
+        // The visible successful result was already repaired. This private
+        // diagnostic is what permits the separate control-only maintenance lane.
+        await db
+          .update(heartbeatRuns)
+          .set({
+            resultJson: sql`${heartbeatRuns.resultJson} || ${JSON.stringify({
+              recoveredExecutionFailure: {
+                errorCode: "adapter_failed",
+                error:
+                  "provider_transport_failed: runner did not durably suspend before checkpoint",
+              },
+            })}::jsonb`,
+          })
+          .where(eq(heartbeatRuns.id, runId));
+        const beforeRuns = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.companyId, companyId));
+        const beforeWakes = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.companyId, companyId));
+        const beforeResults = await db
+          .select()
+          .from(nativeRunResults)
+          .where(eq(nativeRunResults.runId, runId));
+        expect(beforeRuns).toEqual([
+          expect.objectContaining({
+            status: "succeeded",
+            nativePhase: "committed",
+            error: null,
+            errorCode: null,
+          }),
+        ]);
+        expect(beforeResults).toEqual([
+          expect.objectContaining({ schemaStatus: "accepted" }),
+        ]);
+
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let releaseLateCallback!: () => void;
+        const lateCallback = new Promise<void>((resolve) => {
+          releaseLateCallback = resolve;
+        });
+        const pendingOperationDrain =
+          outcome === "late_callback"
+            ? vi
+                .spyOn(paperclipRunner, "drainRetainedRunnerdMaintenanceOperations")
+                .mockImplementation(() => lateCallback)
+            : null;
+        let physicalCleanupFinished = false;
+        mockRetainedNativeCleanup.mockImplementationOnce(
+          async (cleanupDb, input) => {
+            expect(cleanupDb).toBe(db);
+            expect(input).toEqual({ companyId, runId });
+            await held;
+            physicalCleanupFinished = true;
+            if (outcome === "rejected")
+              throw new Error("maintenance-test-closed-failure");
+            return {
+              runId,
+              status: outcome === "late_callback" ? "operator_required" : "settled",
+            };
+          },
+        );
+        const heartbeat = heartbeatService(db);
+        let startupFinished = false;
+        const startup = heartbeat
+          .recoverNativeRunsAfterRestart()
+          .then((result) => {
+            startupFinished = true;
+            return result;
+          });
+        let drain: Promise<void> | undefined;
+        try {
+          await vi.waitFor(
+            () => {
+              expect(mockRetainedNativeCleanup).toHaveBeenCalledTimes(1);
+              expect(startupFinished).toBe(true);
+            },
+            { timeout: 2_000 },
+          );
+          expect((await startup).claims).toEqual([]);
+          expect(physicalCleanupFinished).toBe(false);
+
+          const unrelated = await seedRunFixture({
+            adapterType: "process",
+            includeIssue: false,
+          });
+          let reapFinished = false;
+          const reap = heartbeat.reapOrphanedRuns().then((result) => {
+            reapFinished = true;
+            return result;
+          });
+          await vi.waitFor(() => expect(reapFinished).toBe(true), {
+            timeout: 2_000,
+          });
+          expect((await reap).reaped).toBe(1);
+          expect(await heartbeat.getRun(unrelated.runId)).toMatchObject({
+            status: "failed",
+          });
+          expect(mockRetainedNativeCleanup).toHaveBeenCalledTimes(1);
+          expect(physicalCleanupFinished).toBe(false);
+
+          let drainFinished = false;
+          drain = heartbeat.drainActiveRunExecutions().then(() => {
+            drainFinished = true;
+          });
+          // A completed unrelated DB read is a deterministic scheduling barrier:
+          // drain has entered its await while the physical cleanup is still held.
+          await heartbeat.getRun(runId);
+          expect(drainFinished).toBe(false);
+          expect(heartbeat.getTaskDrainStatus()).toMatchObject({
+            pendingWakes: 0,
+            quiescent: false,
+          });
+          expect(heartbeat.getTaskDrainStatus().activeRuns).toBeGreaterThan(0);
+          expect(mockAdapterExecute).not.toHaveBeenCalled();
+          expect(mockExecutePaperclipNativeSession).not.toHaveBeenCalled();
+          release();
+          if (pendingOperationDrain) {
+            await vi.waitFor(() =>
+              expect(pendingOperationDrain).toHaveBeenCalled(),
+            );
+            expect(physicalCleanupFinished).toBe(true);
+            expect(drainFinished).toBe(false);
+            expect(heartbeat.getTaskDrainStatus().quiescent).toBe(false);
+          }
+          releaseLateCallback();
+          await drain;
+          expect(physicalCleanupFinished).toBe(true);
+          expect(heartbeat.getTaskDrainStatus()).toMatchObject({
+            activeRuns: 0,
+            pendingWakes: 0,
+            quiescent: true,
+          });
+          expect(mockRetainedNativeCleanup).toHaveBeenCalledTimes(1);
+          expect(mockAdapterExecute).not.toHaveBeenCalled();
+          expect(mockExecutePaperclipNativeSession).not.toHaveBeenCalled();
+          expect(
+            await db
+              .select()
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.companyId, companyId)),
+          ).toEqual(beforeRuns);
+          expect(
+            await db
+              .select()
+              .from(agentWakeupRequests)
+              .where(eq(agentWakeupRequests.companyId, companyId)),
+          ).toEqual(beforeWakes);
+          expect(
+            await db
+              .select()
+              .from(nativeRunResults)
+              .where(eq(nativeRunResults.runId, runId)),
+          ).toEqual(beforeResults);
+        } finally {
+          release();
+          releaseLateCallback();
+          await startup;
+          await drain;
+          await heartbeat.drainActiveRunExecutions();
+          pendingOperationDrain?.mockRestore();
+        }
+      });
+    },
+  );
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();

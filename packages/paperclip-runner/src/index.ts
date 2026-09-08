@@ -52,7 +52,11 @@ export * from "./drivers/runner-tool-bridge.js";
 export {
   createRunnerdCodexTransport,
   defaultCapabilityRunnerdBinary,
+  drainRetainedRunnerdMaintenanceOperations,
   resolveSourceCodexHome,
+  settleRetainedRunnerdSession,
+  retainedRunnerdCleanupProofIsCurrent,
+  type RetainedRunnerdCleanupProof,
   type RunnerdCodexTransport,
   type RunnerdCodexTransportOptions,
 } from "./live/runnerd-codex-transport.js";

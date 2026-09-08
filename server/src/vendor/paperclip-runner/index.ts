@@ -94,6 +94,10 @@ export const createRunnerdCodexTransport: (
 export const defaultCapabilityRunnerdBinary =
   runner.defaultCapabilityRunnerdBinary;
 export const executeNativeSession = runner.executeNativeSession;
+export const completeRetainedNativeSessionCleanup = runner.completeRetainedNativeSessionCleanup;
+export const settleRetainedRunnerdSession = runner.settleRetainedRunnerdSession;
+export const drainRetainedRunnerdMaintenanceOperations =
+  runner.drainRetainedRunnerdMaintenanceOperations;
 export const nativeRuntimePromptDigest = runner.nativeRuntimePromptDigest;
 export const normalizePrpResultSignals = runner.normalizePrpResultSignals;
 export const parseCodexTurnDiff = runner.parseCodexTurnDiff;

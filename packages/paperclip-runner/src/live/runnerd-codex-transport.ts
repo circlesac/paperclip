@@ -34,6 +34,8 @@ import type {
   DurableRecoveryCommittedEvent,
   DurableRecoveryIdentity,
 } from "../contracts/durable-recovery.js";
+import type { NativeRunIdentity } from "../contracts/types.js";
+import type { PrpEvent } from "../protocol/replay-contract.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import type {
   HarnessRuntimeRequestResolution,
@@ -1630,6 +1632,607 @@ function approvedRunnerArtifact(runnerBinaryPath: string): {
       .update(readFileSync(runnerBinaryPath))
       .digest("hex")}`,
   };
+}
+
+export interface RetainedRunnerdCleanupProof {
+  readonly binding: Readonly<NativeRunIdentity>;
+  readonly identity: Readonly<DurableRecoveryIdentity>;
+  readonly backend: Readonly<{ kind: string; name: string }>;
+  readonly providerSessionId: string;
+  readonly activationDirectory: string;
+  readonly sourceFingerprint: string;
+  readonly settledFingerprint: string;
+}
+
+const retainedRunnerdCleanupProofs = new WeakMap<object, readonly number[]>();
+const retainedMaintenanceOperations = new Map<string, Set<Promise<unknown>>>();
+
+/** A timeout revokes cleanup authority, not ownership of an already-started
+ * callback. Shutdown must join the original operations, including any that
+ * another retained callback registers while the current snapshot settles. */
+export async function drainRetainedRunnerdMaintenanceOperations(): Promise<void> {
+  while (retainedMaintenanceOperations.size > 0) {
+    await Promise.allSettled(
+      [...retainedMaintenanceOperations.values()].flatMap((operations) => [
+        ...operations,
+      ]),
+    );
+  }
+}
+
+const MAINTENANCE_STATE_FILES = [
+  "control-plane/control-plane-state.json",
+  "runner/runner-state.json",
+  "runner/codex-provider-state.json",
+] as const;
+
+function maintenanceDenied(): Error {
+  return new Error("native_cleanup_maintenance_unproven");
+}
+
+function maintenanceProcessAbsent(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || process.platform === "win32")
+    return false;
+  return [pid, -pid].every((target) => {
+    try {
+      process.kill(target, 0);
+      return false;
+    } catch (error) {
+      return record(error).code === "ESRCH";
+    }
+  });
+}
+
+function readMaintenanceState(root: string) {
+  assertRealDirectory(root);
+  assertRealDirectory(resolve(root, "runner"));
+  assertRealDirectory(resolve(root, "control-plane"));
+  const bytes = MAINTENANCE_STATE_FILES.map((file) => {
+    const path = resolve(root, file);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 32 * 1024 * 1024)
+      throw maintenanceDenied();
+    return readFileSync(path);
+  });
+  const [control, runner, provider] = bytes.map((value) =>
+    record(JSON.parse(value.toString("utf8"))),
+  );
+  return {
+    control: control!,
+    runner: runner!,
+    provider: provider!,
+    fingerprint: createHash("sha256")
+      .update(
+        JSON.stringify(
+          bytes.map((value) =>
+            createHash("sha256").update(value).digest("hex"),
+          ),
+        ),
+      )
+      .digest("hex"),
+  };
+}
+
+function assertMaintenanceBinding(
+  state: ReturnType<typeof readMaintenanceState>,
+  identity: DurableRecoveryIdentity,
+  providerSessionId: string,
+  allowRestoringOpen = false,
+) {
+  if (
+    !recoveryIdentityMatches(record(state.control.identity), identity) ||
+    !recoveryIdentityMatches(state.runner, identity) ||
+    state.runner.schema !== "paperclip.runner.durable.state.v1" ||
+    state.provider.schema !== "paperclip.runner.codex-provider-state.v1" ||
+    record(state.provider.config).provider !== "codex" ||
+    state.provider.threadId !== providerSessionId ||
+    !Array.isArray(state.runner.outbox) ||
+    !Array.isArray(state.provider.pendingEvents) ||
+    !Array.isArray(state.provider.queuedEvents) ||
+    !Array.isArray(state.control.commands) ||
+    !Array.isArray(state.control.committedEvents) ||
+    Object.keys(record(record(state.provider.toolBridge).pending)).length !==
+      0 ||
+    state.provider.ambiguousTurnStartPending === true ||
+    !(
+      allowRestoringOpen
+        ? ["turn_active", "prepared", "session_open"]
+        : ["turn_active", "prepared"]
+    ).includes(String(state.provider.lifecycle))
+  )
+    throw maintenanceDenied();
+}
+
+/** A proof cannot be manufactured by JSON or reused after the activated
+ * checkpoint or any of its exact process owners changes. */
+export function retainedRunnerdCleanupProofIsCurrent(
+  proof: RetainedRunnerdCleanupProof,
+): boolean {
+  const pids = retainedRunnerdCleanupProofs.get(proof);
+  if (!pids || !pids.every(maintenanceProcessAbsent)) return false;
+  try {
+    const state = readMaintenanceState(proof.activationDirectory);
+    assertMaintenanceBinding(state, proof.identity, proof.providerSessionId);
+    return (
+      state.fingerprint === proof.settledFingerprint &&
+      state.runner.lifecycle === "suspended"
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Settle an inventoried COPY of one retained local Codex authority. This is
+ * deliberately not a NativeSession: it has no turn-start, tool execution,
+ * result selection, or authority-rotation API. The embedding server owns the
+ * durable recovery lease, original-source proof, and atomic activation. */
+export async function settleRetainedRunnerdSession(input: {
+  binding: NativeRunIdentity;
+  identity: DurableRecoveryIdentity;
+  backend: { kind: string; name: string };
+  stateDirectory: string;
+  activationDirectory: string;
+  sourceFingerprint: string;
+  providerSessionId: string;
+  originalRunnerPid: number;
+  originalProviderPid: number;
+  runnerBinary?: string;
+  environment?: NodeJS.ProcessEnv;
+  sourceCodexHome?: string | null;
+  authorize: () => Promise<void>;
+  appendEvent: (event: PrpEvent) => Promise<void>;
+  signal?: AbortSignal;
+}): Promise<RetainedRunnerdCleanupProof> {
+  const root = resolve(input.stateDirectory);
+  if (
+    retainedMaintenanceOperations.has(root) ||
+    root === resolve(input.activationDirectory) ||
+    input.binding.runId !== input.identity.runId ||
+    input.binding.sessionId !== input.identity.normalizedSessionId ||
+    !input.providerSessionId
+  )
+    throw maintenanceDenied();
+  const initial = readMaintenanceState(root);
+  assertMaintenanceBinding(initial, input.identity, input.providerSessionId);
+  if (initial.fingerprint !== input.sourceFingerprint)
+    throw maintenanceDenied();
+  const originalCommands = initial.control.commands as Array<
+    Record<string, unknown>
+  >;
+  if (
+    originalCommands.some(
+      (command) =>
+        command.status === "pending" &&
+        !["turn.stop", "runner.drain", "runner.suspend"].includes(
+          String(command.type),
+        ),
+    )
+  )
+    throw maintenanceDenied();
+  const retainedEvents = [
+    ...(initial.runner.outbox as unknown[]).map((event) =>
+      record(record(record(event).envelope).payload),
+    ),
+    ...(initial.provider.pendingEvents as unknown[]).map(record),
+    ...(initial.provider.queuedEvents as unknown[]).map(record),
+  ];
+  // This bounded recovery does not resolve or redeliver any tool input, even
+  // a historical input whose result might already exist in the old journal.
+  if (
+    retainedEvents.some((event) =>
+      [
+        "semantic_tool.input",
+        "mcp_app.tool_input",
+        "runtime.input.requested",
+        "runtime_request.created",
+      ].includes(String(event.eventType)),
+    )
+  )
+    throw maintenanceDenied();
+  for (const event of retainedEvents) {
+    if (
+      !["session.started", "session.resumed", "harness.ready"].includes(
+        String(event.eventType),
+      )
+    )
+      continue;
+    const identity = resolveRunnerdSessionIdentity(event.payload);
+    // Replayed historical identities cannot grant authority to kill a PID
+    // that may have since been reused by an unrelated process.
+    if (
+      identity.threadId !== input.providerSessionId ||
+      identity.processId !== input.originalProviderPid
+    )
+      throw maintenanceDenied();
+  }
+  const pids = new Set([input.originalRunnerPid, input.originalProviderPid]);
+  const providerProofs = new Map<
+    number,
+    { sourceEventId: string; digest: string; authenticated: boolean }
+  >();
+  if (pids.size !== 2 || ![...pids].every(maintenanceProcessAbsent))
+    throw maintenanceDenied();
+  const runnerBinary = input.runnerBinary ?? defaultCapabilityRunnerdBinary();
+  const artifact = approvedRunnerArtifact(runnerBinary);
+  const codexHome = resolve(root, "codex-home");
+  const deadline = Date.now() + 30_000;
+  let failure: unknown;
+  const eventCommits = new Set<Promise<void>>();
+  const bounded = async <T>(
+    operation: Promise<T>,
+    expiresAt = deadline,
+  ): Promise<T> => {
+    const retained =
+      retainedMaintenanceOperations.get(root) ?? new Set<Promise<unknown>>();
+    retainedMaintenanceOperations.set(root, retained);
+    retained.add(operation);
+    const released = () => {
+      retained.delete(operation);
+      if (
+        !retained.size &&
+        retainedMaintenanceOperations.get(root) === retained
+      )
+        retainedMaintenanceOperations.delete(root);
+    };
+    void operation.then(released, released);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort: (() => void) | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_resolve, reject) => {
+          const fail = () => {
+            failure ??= maintenanceDenied();
+            reject(failure);
+          };
+          timer = setTimeout(fail, Math.max(0, expiresAt - Date.now()));
+          abort = fail;
+          input.signal?.addEventListener("abort", abort, { once: true });
+          if (input.signal?.aborted) fail();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (abort) input.signal?.removeEventListener("abort", abort);
+    }
+  };
+  const authorize = async () => {
+    input.signal?.throwIfAborted();
+    if (failure) throw failure;
+    if (Date.now() >= deadline) throw maintenanceDenied();
+    await bounded(input.authorize());
+  };
+  await authorize();
+  await bounded(
+    releaseMaterializedNativeRuntimeSkills(resolve(codexHome, "skills")),
+  );
+  await bounded(
+    prepareIsolatedCodexHome({
+      context: null,
+      codexHome,
+      sourceCodexHome:
+        input.sourceCodexHome ?? resolveSourceCodexHome(input.environment),
+      apiKey:
+        input.environment?.CODEX_API_KEY ?? input.environment?.OPENAI_API_KEY,
+    }),
+  );
+  // A previously journaled suspend must be honored before a later drain.
+  // A second exact-authority connection can then drain the retained provider
+  // prefix; no old command is removed, reordered, or treated as completed.
+  for (let epoch = 0; epoch < 3; epoch++) {
+    await authorize();
+    if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
+    const before = readMaintenanceState(root);
+    assertMaintenanceBinding(before, input.identity, input.providerSessionId);
+    const epochRestoresProvider = before.provider.lifecycle === "turn_active";
+    const epochProviderPids = new Set<number>();
+    const epochCompletedCommands = new Set(
+      (before.control.commands as Array<Record<string, unknown>>)
+        .filter((command) => command.status !== "pending")
+        .map((command) => command.commandId),
+    );
+    if (
+      !epochRestoresProvider &&
+      (before.provider.activeProviderTurnId != null ||
+        (before.control.commands as Array<Record<string, unknown>>).some(
+          (command) =>
+            command.status === "pending" &&
+            !["runner.drain", "runner.suspend"].includes(String(command.type)),
+        ))
+    ) {
+      throw maintenanceDenied();
+    }
+    const core = new DurablePrpControlPlane({
+      stateDirectory: resolve(root, "control-plane"),
+      identity: input.identity,
+      expectedRunnerVersion: artifact.version,
+      expectedRunnerDigest: artifact.digest,
+      onProtocolIntegrityError: (error) => {
+        failure = error;
+      },
+      onSemanticToolInput: async () => {
+        // Never delegate a tool from a cleanup connection.
+        throw maintenanceDenied();
+      },
+      onCommittedEvent: (event) => {
+        const commit = (async () => {
+          try {
+            if (
+              [
+                "semantic_tool.input",
+                "mcp_app.tool_input",
+                "runtime.input.requested",
+                "runtime_request.created",
+              ].includes(event.eventType)
+            ) {
+              throw maintenanceDenied();
+            }
+            if (
+              ["session.started", "session.resumed", "harness.ready"].includes(
+                event.eventType,
+              )
+            ) {
+              const identity = resolveRunnerdSessionIdentity(event.payload);
+              if (
+                identity.threadId !== input.providerSessionId ||
+                identity.processId === null
+              )
+                throw maintenanceDenied();
+              pids.add(identity.processId);
+              if (identity.processId !== input.originalProviderPid) {
+                const digest = commandDigest(event.payload);
+                const prior = providerProofs.get(identity.processId);
+                if (
+                  prior &&
+                  (prior.sourceEventId !== event.sourceEventId ||
+                    prior.digest !== digest)
+                )
+                  throw maintenanceDenied();
+                if (!prior) epochProviderPids.add(identity.processId);
+                providerProofs.set(identity.processId, {
+                  sourceEventId: event.sourceEventId,
+                  digest,
+                  authenticated: true,
+                });
+              }
+            }
+            await authorize();
+            await bounded(input.appendEvent(event));
+          } catch (error) {
+            failure = error;
+            throw error;
+          }
+        })();
+        eventCommits.add(commit);
+        void commit.then(
+          () => eventCommits.delete(commit),
+          () => eventCommits.delete(commit),
+        );
+        return commit;
+      },
+    });
+    let handle: RunnerProcessHandle | null = null;
+    let exited = false;
+    let epochCompleted = false;
+    try {
+      const pending = core.store.state.commands.filter(
+        (command) => command.status === "pending",
+      );
+      let terminalQueued = pending.some(
+        (command) => command.type === "runner.suspend",
+      );
+      if (
+        !terminalQueued &&
+        before.provider.activeProviderTurnId !== null &&
+        before.provider.activeProviderTurnId !== undefined
+      ) {
+        core.queueCommand("turn.stop", {
+          reason: "exact retained authority cleanup",
+        });
+      }
+      await core.start();
+      await authorize();
+      handle = spawnRunner({
+        connectUrl: core.connectUrl,
+        stateDirectory: resolve(root, "runner"),
+        identity: input.identity,
+        ticket: core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS),
+        maxOutboxBytes: RUNNERD_MAX_OUTBOX_BYTES,
+        p0ReserveBytes: RUNNERD_P0_RESERVE_BYTES,
+        maxRuntimeMs: 30_000,
+        reconnectGraceMs: 2_000,
+        lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+        runnerBinaryPath: runnerBinary,
+        runnerVersion: artifact.version,
+        runnerDigest: artifact.digest,
+        environment: createCapabilityRunnerdProviderEnvironment({
+          provider: "codex",
+          options: { environment: input.environment },
+          identity: input.identity,
+          codexHome,
+          runtimeContextPath: resolve(root, "runtime-context.json"),
+          hasRuntimeContext: false,
+        }),
+      });
+      if (!handle.child.pid) throw maintenanceDenied();
+      pids.add(handle.child.pid);
+      void handle.completion.then(
+        () => {
+          exited = true;
+        },
+        (error) => {
+          exited = true;
+          failure = error;
+        },
+      );
+      let drainQueued = false;
+      while (!exited) {
+        await authorize();
+        const state = readMaintenanceState(root);
+        assertMaintenanceBinding(
+          state,
+          input.identity,
+          input.providerSessionId,
+          epochRestoresProvider,
+        );
+        const provider = providerDrainStateFromSnapshot(state.provider);
+        if (!terminalQueued && provider.providerSettled) {
+          if (!drainQueued) {
+            core.queueCommand("runner.drain", {}, undefined, true);
+            drainQueued = true;
+          } else if (
+            provider.pendingEventCount === 0 &&
+            (state.runner.outbox as unknown[]).length === 0 &&
+            !core.store.state.commands.some(
+              (command) => command.status === "pending",
+            )
+          ) {
+            core.queueCommand("runner.suspend", {}, undefined, true);
+            terminalQueued = true;
+          }
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+      await handle.completion;
+      await authorize();
+      epochCompleted = true;
+    } finally {
+      if (handle && !exited)
+        await waitForProcess(handle, 250).catch(() => undefined);
+      await core.stop();
+      // Timed-out database operations remain observed in the retained map;
+      // they cannot authorize another attempt or produce a cleanup proof.
+      await bounded(
+        Promise.allSettled([...eventCommits]),
+        Date.now() + 1_000,
+      ).catch(() => undefined);
+      if (!epochCompleted || failure) {
+        // Only a newly authenticated exact provider identity is kill
+        // authority. An interrupted startup with no identity stays unknown
+        // and cannot produce a settlement proof or clear quarantine.
+        const owned = [...providerProofs]
+          .filter(([, proof]) => proof.authenticated)
+          .map(([pid]) => pid);
+        for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+          for (const pid of owned) {
+            if (!maintenanceProcessAbsent(pid)) {
+              try {
+                process.kill(-pid, signal);
+              } catch {
+                /* keep the failed owner retained */
+              }
+            }
+          }
+          const cleanupDeadline = Date.now() + 500;
+          while (
+            !owned.every(maintenanceProcessAbsent) &&
+            Date.now() < cleanupDeadline
+          ) {
+            await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+          }
+        }
+      }
+    }
+    if (failure) throw failure;
+    const settled = readMaintenanceState(root);
+    assertMaintenanceBinding(settled, input.identity, input.providerSessionId);
+    if (settled.runner.lifecycle !== "suspended") throw maintenanceDenied();
+    // The old suspend can precede the restored process's identity event on
+    // the wire. Keep that persisted identity provisional until the next
+    // no-launch epoch authenticates the exact source event and payload.
+    for (const raw of [
+      ...(settled.provider.pendingEvents as unknown[]),
+      ...(settled.provider.queuedEvents as unknown[]),
+    ]) {
+      const event = record(raw);
+      if (event.eventType !== "session.resumed") continue;
+      const identity = resolveRunnerdSessionIdentity(event.payload);
+      if (
+        identity.threadId !== input.providerSessionId ||
+        identity.processId === null ||
+        typeof event.executorEventId !== "string"
+      )
+        throw maintenanceDenied();
+      if (identity.processId === input.originalProviderPid) continue;
+      const sourceEventId = `event_executor_${createHash("sha256")
+        .update("paperclip.executor-event.v1\0")
+        .update(input.identity.runnerInstanceId)
+        .update("\0")
+        .update(event.executorEventId)
+        .digest("hex")}`;
+      const digest = commandDigest(event.payload);
+      const prior = providerProofs.get(identity.processId);
+      if (
+        prior &&
+        (prior.sourceEventId !== sourceEventId || prior.digest !== digest)
+      )
+        throw maintenanceDenied();
+      if (!prior) {
+        epochProviderPids.add(identity.processId);
+        providerProofs.set(identity.processId, {
+          sourceEventId,
+          digest,
+          authenticated: false,
+        });
+      }
+      pids.add(identity.processId);
+    }
+    if (
+      !Number.isSafeInteger(before.provider.providerProcessGeneration) ||
+      settled.provider.providerProcessGeneration !==
+        Number(before.provider.providerProcessGeneration) +
+          (epochRestoresProvider ? 1 : 0)
+    )
+      throw maintenanceDenied();
+    const provider = providerDrainStateFromSnapshot(settled.provider);
+    const stops = (
+      settled.control.commands as Array<Record<string, unknown>>
+    ).filter(
+      (command) =>
+        command.type === "turn.stop" &&
+        !epochCompletedCommands.has(command.commandId),
+    );
+    // A successful prior epoch must never cover an unidentified process from
+    // a later startup. Prepared drain-only epochs cannot launch a provider;
+    // every restoring epoch needs its own authenticated PID and exit proof.
+    const stopProven = !epochRestoresProvider
+      ? epochProviderPids.size === 0
+      : epochProviderPids.size === 1 &&
+        stops.length > 0 &&
+        stops.every(
+          (command) =>
+            command.status === "completed" &&
+            record(record(command.result).result).providerExitConfirmed ===
+              true,
+        );
+    if (!stopProven || ![...pids].every(maintenanceProcessAbsent))
+      throw maintenanceDenied();
+    if (
+      settled.provider.lifecycle === "prepared" &&
+      stopProven &&
+      [...providerProofs.values()].every((proof) => proof.authenticated) &&
+      provider.providerSettled &&
+      provider.pendingEventCount === 0 &&
+      (settled.runner.outbox as unknown[]).length === 0 &&
+      (settled.control.commands as Array<Record<string, unknown>>).every(
+        (command) => command.status !== "pending",
+      ) &&
+      [...pids].every(maintenanceProcessAbsent)
+    ) {
+      const proof = Object.freeze({
+        binding: Object.freeze({ ...input.binding }),
+        identity: Object.freeze({ ...input.identity }),
+        backend: Object.freeze({ ...input.backend }),
+        providerSessionId: input.providerSessionId,
+        activationDirectory: resolve(input.activationDirectory),
+        sourceFingerprint: input.sourceFingerprint,
+        settledFingerprint: settled.fingerprint,
+      });
+      retainedRunnerdCleanupProofs.set(proof, Object.freeze([...pids]));
+      return proof;
+    }
+  }
+  throw maintenanceDenied();
 }
 
 type BuildOwnedCliArtifact =

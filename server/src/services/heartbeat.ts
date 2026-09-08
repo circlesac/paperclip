@@ -178,6 +178,8 @@ import {
   type NativeRestartRecoveryClaim,
   rebindNativeSessionCheckpoint,
   reconcileNativeFinalizations,
+  reconcileRetainedNativeSessionCleanup,
+  reconcileRetainedNativeSessionCleanups,
   resolveHeartbeatNativeRuntimeMode,
 } from "./native-runtime/index.js";
 import {
@@ -192,6 +194,7 @@ import {
   type NativeRunHistoricalSpan,
 } from "./native-runtime/native-run-trace.js";
 import {
+  drainRetainedRunnerdMaintenanceOperations,
   parseNativeExecutionInput,
   type NativeExecutionInput,
   type NativeSessionBackend,
@@ -13981,6 +13984,7 @@ export function heartbeatService(
       environmentRuntime,
       onWorkspaceSettled: settleRecoveredNativeWorkspace,
     });
+    scheduleRetainedNativeSessionCleanup();
     const intent = await readHotRestartIntent().catch((error) => {
       logger.warn(
         { err: error },
@@ -17157,6 +17161,31 @@ export function heartbeatService(
     ).catch(() => undefined);
   }
 
+  function scheduleRetainedNativeSessionCleanup() {
+    // The per-database sweep joins startup and periodic callers. One bounded
+    // control-only repair must not hold up unrelated provider ingress or the
+    // entire orphan reaper, but shutdown must still await its physical owner.
+    const cleanup = reconcileRetainedNativeSessionCleanups(db, {
+      cleanup: (input) => reconcileRetainedNativeSessionCleanup(db, input),
+      onError: (error, runId) => {
+        logger.warn(
+          { err: error, runId },
+          "retained native session cleanup failed",
+        );
+      },
+    })
+      .then(() => undefined)
+      .catch((error) => {
+        logger.warn({ err: error }, "retained native cleanup discovery failed");
+      })
+      // The bounded maintenance attempt may fail before an already-started
+      // database callback settles. Keep shutdown ownership until the original
+      // operations finish; their timeout cannot authorize closing the database.
+      .finally(() => drainRetainedRunnerdMaintenanceOperations());
+    activeRunExecutionPromises.add(cleanup);
+    void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -17173,6 +17202,7 @@ export function heartbeatService(
         "failed to reconcile persisted native finalizations before orphan reaping",
       );
     });
+    scheduleRetainedNativeSessionCleanup();
     await dispatchPendingNativeStatusWakeups().catch((error) => {
       logger.warn(
         { err: error },

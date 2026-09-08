@@ -2254,3 +2254,37 @@ Live Telegram still shows the original A/B failure messages. Root opened B's
 exact run through the task UI and verified the Retry control without invoking
 it. The photo answer has not been redelivered, and the original queued file
 request has not been retried; these fixture results are not live success.
+
+### Frozen maintenance slice before live deployment
+
+The two final integration edges are repaired. Exact failed-request retry can
+recognize an intact activation marker only against the locked committed
+receipt, matching run/session/thread and both digests; normal executor admission
+owns its eventual removal. Older successful warm runs that share a PID do not
+displace the actual cleanup owner. A released local pre-provider environment
+lease is allowed only without provider ownership or pending cleanup. The
+original failed run remains observed at attempt zero, with no rewritten history.
+The focused native retry cohort passed **26/26**, including 13 new cases.
+
+Maintenance timeout no longer loses shutdown ownership of an already-started
+database operation. The tracked sweep joins the original retained callbacks in
+`finally`; timeout still revokes authority and cannot produce a cleanup proof.
+The real abort/deadline canary passed, the broader lifecycle cohort passed
+**12/12**, and its final strengthened success/rejection/late-callback cases
+passed **3/3**. Root's final normal staged transport suite passed **91/91**.
+
+Root's first combined run was **524/525**, again at the held-lock fixture's
+one-second observation. The row remains locked until the observation succeeds,
+so allowing a bounded five-second condition proves the same nonblocking
+behavior without imposing a one-second SLA on accumulated fixture history.
+The final fresh database run passed **526/526** (148.87s). The deterministic
+browser suite passed **21/21** with no retries/skips and mocked provider HTTP,
+not live accounts. Normal runner TypeScript build and final server typecheck
+passed. The release runner is staged and strict-signature verified with SHA-256
+`3cb217996132fa0cbbb3fa169dacd4250e3318840ed15f3fa3d2961536f34ce9`.
+
+The Rust repair is pushed as `4bc52cdbe`; the maintenance slice is being
+checkpointed separately. Live revalidation still shows zero running/queued
+runs and intact original Telegram/GitHub requests. Telegram A's accepted
+digest and server fingerprint recompute correctly, but its answer is still
+not presented. No live retry or manual checkpoint mutation has occurred yet.

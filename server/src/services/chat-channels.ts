@@ -104,6 +104,7 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import {
   nativeFailedRunRetryStateIsSafe,
+  nativePreProviderRetryAfterCleanupStateIsSafe,
   nativeProviderRecoveryEvidence,
 } from "./native-runtime/native-session-executor.js";
 import { parseChatWebhookPublicBaseUrl } from "../chat-webhook-public-url.js";
@@ -9763,6 +9764,163 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ),
       )
       .for("share", { noWait: true });
+    // A queued request can fail before its first provider event because the
+    // predecessor's exact retained checkpoint has not yet been suspended.
+    // A later authenticated cleanup receipt can authorize retrying that
+    // request; never pretend it exhausted provider execution attempts.
+    if (
+      coordinator &&
+      run.nativeIssueId === issueId &&
+      run.status === "failed" &&
+      run.errorCode === "adapter_failed" &&
+      run.error === "runner_state_identity_mismatch" &&
+      run.nativePhase === "observed" &&
+      coordinator.phase === "observed" &&
+      coordinator.attempt === 0 &&
+      !coordinator.leaseOwner &&
+      !coordinator.leaseExpiresAt &&
+      !coordinator.nextAttemptAt &&
+      !coordinator.resultId &&
+      !coordinator.assessmentId &&
+      !coordinator.decisionId &&
+      run.nativeSessionId &&
+      run.processPid &&
+      run.processGroupId === run.processPid
+    ) {
+      const [event] = await tx
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.companyId, run.companyId),
+            eq(heartbeatRunEvents.runId, run.id),
+            or(
+              isNotNull(heartbeatRunEvents.sourceInstanceId),
+              sql`${heartbeatRunEvents.payload}->'prpEvent' is not null`,
+            ),
+          ),
+        )
+        .limit(1);
+      const [result] = await tx
+        .select({ id: nativeRunResults.id })
+        .from(nativeRunResults)
+        .where(
+          and(
+            eq(nativeRunResults.companyId, run.companyId),
+            eq(nativeRunResults.runId, run.id),
+          ),
+        )
+        .limit(1);
+      const checkpoint = run.runnerProfileJson?.sessionCheckpoint as
+        Record<string, unknown> | undefined;
+      const binding = checkpoint?.identity as
+        Record<string, unknown> | undefined;
+      if (
+        !event &&
+        !result &&
+        binding?.companyId === run.companyId &&
+        binding?.issueId === issueId &&
+        binding?.agentId === run.agentId &&
+        binding?.runId === run.id &&
+        binding?.sessionId === run.nativeSessionId &&
+        typeof checkpoint?.providerSessionId === "string"
+      ) {
+        const predecessors = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.agentId, run.agentId),
+              eq(heartbeatRuns.nativeIssueId, issueId),
+              eq(heartbeatRuns.nativeSessionId, run.nativeSessionId),
+              eq(heartbeatRuns.processPid, run.processPid),
+              eq(heartbeatRuns.processGroupId, run.processGroupId),
+              eq(heartbeatRuns.runtimeMode, "native"),
+              eq(heartbeatRuns.status, "succeeded"),
+              ne(heartbeatRuns.id, run.id),
+              // Warm runs can share a PID and session. Only a durable maintenance
+              // owner is a candidate; the physical check below must still prove
+              // that this exact run owns the canonical suspended checkpoint.
+              sql`exists (select 1 from native_run_finalizations retired
+            where retired.company_id = ${heartbeatRuns.companyId}
+              and retired.run_id = ${heartbeatRuns.id}
+              and retired.phase = 'committed'
+              and exists (select 1 from jsonb_array_elements(retired.recovery_history) receipt
+                where receipt->>'kind' = 'native_cleanup_maintenance'
+                  and receipt->>'phase' = 'settled' and receipt->>'version' = '1'))`,
+            ),
+          )
+          .for("share", { noWait: true })
+          .limit(2);
+        if (predecessors.length === 1) {
+          const predecessor = predecessors[0]!;
+          const [retired] = await tx
+            .select()
+            .from(nativeRunFinalizations)
+            .where(
+              and(
+                eq(nativeRunFinalizations.companyId, run.companyId),
+                eq(nativeRunFinalizations.issueId, issueId),
+                eq(nativeRunFinalizations.runId, predecessor.id),
+              ),
+            )
+            .for("share", { noWait: true });
+          const receipt = retired?.recoveryHistory.findLast(
+            (entry) => entry.kind === "native_cleanup_maintenance",
+          );
+          const leases = await tx
+            .select()
+            .from(environmentLeases)
+            .where(
+              and(
+                eq(environmentLeases.companyId, run.companyId),
+                eq(environmentLeases.heartbeatRunId, run.id),
+              ),
+            )
+            .for("share", { noWait: true });
+          if (
+            retired?.phase === "committed" &&
+            retired.resultId &&
+            retired.assessmentId &&
+            retired.decisionId &&
+            !retired.leaseOwner &&
+            !retired.leaseExpiresAt &&
+            !retired.nextAttemptAt &&
+            receipt?.version === 1 &&
+            receipt.phase === "settled" &&
+            typeof receipt.requestId === "string" &&
+            receipt.requestId.length > 0 &&
+            receipt.nativeSessionId === run.nativeSessionId &&
+            receipt.runnerInstanceId === predecessor.runnerInstanceId &&
+            receipt.providerSessionId === checkpoint.providerSessionId &&
+            typeof receipt.settledFingerprint === "string" &&
+            /^[a-f0-9]{64}$/.test(receipt.settledFingerprint) &&
+            typeof receipt.sourceFingerprint === "string" &&
+            /^[a-f0-9]{64}$/.test(receipt.sourceFingerprint) &&
+            leases.every(
+              (lease) =>
+                lease.provider === "local" &&
+                lease.providerLeaseId === null &&
+                lease.issueId === issueId &&
+                ["failed", "released", "expired"].includes(lease.status) &&
+                (lease.cleanupStatus === null || lease.cleanupStatus === "success") &&
+                lease.releasedAt !== null,
+            )
+          ) {
+            return {
+              coordinator,
+              leases,
+              retiredOwner: {
+                predecessor,
+                receipt,
+                providerSessionId: checkpoint.providerSessionId,
+              },
+            };
+          }
+        }
+      }
+    }
     const detail = coordinator?.failureDetail;
     const ordinary = [
       "provider_process_exited",
@@ -9843,7 +10001,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
     )
       throw failedChatRetryDenied();
-    return { coordinator, leases };
+    return { coordinator, leases, retiredOwner: null };
   }
 
   async function assertFailedNativeRetryState(
@@ -9864,11 +10022,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .for("share", { noWait: true });
     if (!run) throw failedChatRetryDenied();
     if (run.runtimeMode !== "native") return;
-    const { coordinator, leases } = await failedNativeRetryCoordinator(
-      tx,
-      run,
-      source.issueId,
-    );
+    const { coordinator, leases, retiredOwner } =
+      await failedNativeRetryCoordinator(tx, run, source.issueId);
+    if (retiredOwner) {
+      if (
+        !nativePreProviderRetryAfterCleanupStateIsSafe({
+          failedExecution: run.runnerProfileJson?.nativeExecutionInput,
+          retiredExecution:
+            retiredOwner.predecessor.runnerProfileJson?.nativeExecutionInput,
+          companyId,
+          issueId: source.issueId,
+          agentId: source.agentId,
+          failedRunId: run.id,
+          retiredRunId: retiredOwner.predecessor.id,
+          nativeSessionId: run.nativeSessionId!,
+          runnerInstanceId: retiredOwner.predecessor.runnerInstanceId!,
+          providerSessionId: retiredOwner.providerSessionId,
+          processPid: run.processPid!,
+          processGroupId: run.processGroupId!,
+          receipt: retiredOwner.receipt,
+        })
+      )
+        throw failedChatRetryDenied();
+      return;
+    }
     const checkpoint = run.runnerProfileJson?.sessionCheckpoint as
       Record<string, unknown> | undefined;
     if (

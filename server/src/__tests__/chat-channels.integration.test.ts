@@ -4,7 +4,7 @@ import {
   generateKeyPairSync,
   randomUUID,
 } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -17099,98 +17099,148 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .where(eq(chatDeliveries.endpointId, endpoint.id)),
     ).toHaveLength(0);
 
+    const originalTransaction = db.transaction.bind(db);
+    let injectedAdmissionFailure = false;
     const transactionSpy = vi
       .spyOn(db, "transaction")
-      .mockRejectedValueOnce(new Error("injected durable admission failure"));
+      .mockImplementation((async (
+        ...args: Parameters<typeof originalTransaction>
+      ) => {
+        const [callback, config] = args;
+        return originalTransaction(async (tx) => {
+          const result = await callback(tx);
+          if (!injectedAdmissionFailure) {
+            const [uncommittedReceipt] = await tx
+              .select({ id: chatDeliveries.id })
+              .from(chatDeliveries)
+              .where(
+                and(
+                  eq(chatDeliveries.companyId, fixture.companyId),
+                  eq(chatDeliveries.endpointId, endpoint.id),
+                  sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = '9200.1'`,
+                ),
+              );
+            if (uncommittedReceipt) {
+              // Only the receipt transaction can see its uncommitted insert.
+              // Fail before commit/ack, leaving unrelated transactions intact.
+              injectedAdmissionFailure = true;
+              throw new Error("injected durable admission failure");
+            }
+          }
+          return result;
+        }, config);
+      }) as typeof db.transaction);
 
-    timingEvents.length = 0;
-    const rejected = await observedRequest();
-    expect(rejected.status).toBe(503);
-    expect(rejected.headers["retry-after"]).toBe("1");
-    expect(timingEvents.map((event) => event.stage)).toEqual([
-      "http_received",
-      "handler_started",
-      "endpoint_resolved",
-      "runtime_requested",
-      "runtime_ready",
-      "response_ready",
-      "response_finished",
-    ]);
-    expect(timingEvents.at(-1)?.statusCode).toBe(503);
-    expect(
-      await db
-        .select()
-        .from(chatDeliveries)
-        .where(eq(chatDeliveries.endpointId, endpoint.id)),
-    ).toHaveLength(0);
+    try {
+      // A Gateway ownership renewal or another endpoint's work may transact
+      // before this receipt. It must not consume this endpoint's insert fault.
+      await expect(
+        db.transaction(async (tx) =>
+          tx
+            .select({ id: chatEndpoints.id })
+            .from(chatEndpoints)
+            .where(eq(chatEndpoints.id, endpoint.id)),
+        ),
+      ).resolves.toEqual([{ id: endpoint.id }]);
+      expect(injectedAdmissionFailure).toBe(false);
 
-    transactionSpy.mockRestore();
-    await service.runtime.removeEndpoint(endpoint.id);
-    timingEvents.length = 0;
-    const acceptedRetry = await observedRequest(true);
-    expect(acceptedRetry.status).toBe(200);
-    await vi.waitFor(async () => {
-      const deliveries = await db
-        .select()
-        .from(chatDeliveries)
-        .where(eq(chatDeliveries.endpointId, endpoint.id));
-      expect(deliveries).toHaveLength(1);
-      expect(deliveries[0].state).toBe("processed");
-    });
-    const [initialDelivery] = await db
-      .select()
-      .from(chatDeliveries)
-      .where(eq(chatDeliveries.endpointId, endpoint.id));
-    const initialDuplicateCount = Number(
-      initialDelivery.normalizedEvent.deduplication?.duplicateCount ?? 0,
-    );
-    expect(initialDuplicateCount).toBe(0);
-    const receiptEvent = timingEvents.find(
-      (event) => event.stage === "durable_receipt",
-    );
-    expect(receiptEvent).toMatchObject({
-      endpointId: endpoint.id,
-      receiptId: initialDelivery.id,
-      receiptKind: "message_delivery",
-      slackRetryNumHint: 1,
-    });
-    expect(timingEvents.map((event) => event.stage)).toEqual([
-      "http_received",
-      "handler_started",
-      "endpoint_resolved",
-      "runtime_requested",
-      "runtime_initializing",
-      "runtime_ready",
-      "durable_receipt",
-      "response_ready",
-      "response_finished",
-    ]);
-    expect(timingEvents.indexOf(receiptEvent!)).toBeLessThan(
-      timingEvents.findIndex((event) => event.stage === "response_ready"),
-    );
-    expect(JSON.stringify(timingEvents)).not.toContain(signingSecret);
-    expect(JSON.stringify(timingEvents)).not.toContain(
-      "@maya prove durable receipt",
-    );
-    expect(JSON.stringify(timingEvents)).not.toContain(signature);
-    const acceptedRedelivery = await observedRequest(true);
-    expect(acceptedRedelivery.status).toBe(200);
-    await vi.waitFor(async () => {
-      const [delivery] = await db
-        .select()
-        .from(chatDeliveries)
-        .where(eq(chatDeliveries.endpointId, endpoint.id));
-      expect(
-        Number(delivery.normalizedEvent.deduplication?.duplicateCount ?? 0),
-      ).toBeGreaterThan(initialDuplicateCount);
+      timingEvents.length = 0;
+      const rejected = await observedRequest();
+      expect(injectedAdmissionFailure).toBe(true);
+      expect(rejected.status).toBe(503);
+      expect(rejected.headers["retry-after"]).toBe("1");
+      expect(timingEvents.map((event) => event.stage)).toEqual([
+        "http_received",
+        "handler_started",
+        "endpoint_resolved",
+        "runtime_requested",
+        "runtime_ready",
+        "response_ready",
+        "response_finished",
+      ]);
+      expect(timingEvents.at(-1)?.statusCode).toBe(503);
       expect(
         await db
           .select()
-          .from(issues)
-          .where(eq(issues.companyId, fixture.companyId)),
-      ).toHaveLength(1);
-    });
-    await service.shutdown();
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id)),
+      ).toHaveLength(0);
+
+      transactionSpy.mockRestore();
+      await service.runtime.removeEndpoint(endpoint.id);
+      timingEvents.length = 0;
+      const acceptedRetry = await observedRequest(true);
+      expect(acceptedRetry.status).toBe(200);
+      // This checks eventual processing after durable acknowledgement, not a
+      // one-second worker SLA. Keep the condition bounded under suite load.
+      await vi.waitFor(
+        async () => {
+          const deliveries = await db
+            .select()
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.endpointId, endpoint.id));
+          expect(deliveries).toHaveLength(1);
+          expect(deliveries[0].state).toBe("processed");
+        },
+        { timeout: 5_000 },
+      );
+      const [initialDelivery] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id));
+      const initialDuplicateCount = Number(
+        initialDelivery.normalizedEvent.deduplication?.duplicateCount ?? 0,
+      );
+      expect(initialDuplicateCount).toBe(0);
+      const receiptEvent = timingEvents.find(
+        (event) => event.stage === "durable_receipt",
+      );
+      expect(receiptEvent).toMatchObject({
+        endpointId: endpoint.id,
+        receiptId: initialDelivery.id,
+        receiptKind: "message_delivery",
+        slackRetryNumHint: 1,
+      });
+      expect(timingEvents.map((event) => event.stage)).toEqual([
+        "http_received",
+        "handler_started",
+        "endpoint_resolved",
+        "runtime_requested",
+        "runtime_initializing",
+        "runtime_ready",
+        "durable_receipt",
+        "response_ready",
+        "response_finished",
+      ]);
+      expect(timingEvents.indexOf(receiptEvent!)).toBeLessThan(
+        timingEvents.findIndex((event) => event.stage === "response_ready"),
+      );
+      expect(JSON.stringify(timingEvents)).not.toContain(signingSecret);
+      expect(JSON.stringify(timingEvents)).not.toContain(
+        "@maya prove durable receipt",
+      );
+      expect(JSON.stringify(timingEvents)).not.toContain(signature);
+      const acceptedRedelivery = await observedRequest(true);
+      expect(acceptedRedelivery.status).toBe(200);
+      await vi.waitFor(async () => {
+        const [delivery] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id));
+        expect(
+          Number(delivery.normalizedEvent.deduplication?.duplicateCount ?? 0),
+        ).toBeGreaterThan(initialDuplicateCount);
+        expect(
+          await db
+            .select()
+            .from(issues)
+            .where(eq(issues.companyId, fixture.companyId)),
+        ).toHaveLength(1);
+      });
+    } finally {
+      transactionSpy.mockRestore();
+      await service.shutdown();
+    }
   });
 
   it("cannot publish a runtime whose initialization is overtaken by pause", async () => {
@@ -40559,6 +40609,411 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   }
 
   it.each([
+    "settled",
+    "older_warm_run",
+    "committed_marker",
+    "foreign_marker",
+    "prepared_marker",
+    "pending_lease_cleanup",
+    "missing_receipt",
+    "activation_prepared",
+    "changed_checkpoint",
+    "late_event",
+    "leased",
+    "wrong_thread",
+    "source_edited",
+  ])(
+    "retries only the original pre-provider Telegram request after exact cleanup: %s",
+    async (mode) => {
+      const context = await committedChatResponseRecoveryFixture("telegram");
+      const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      const directory = mkdtempSync(
+        path.join(os.tmpdir(), "paperclip-chat-cleanup-retry-"),
+      );
+      process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
+      try {
+        const runId = randomUUID();
+        const nativeSessionId = context.binding.normalizedSessionId;
+        const runnerInstanceId = context.binding.runnerSourceInstanceId;
+        const inputFor = (id: string) => ({
+          schema: "paperclip.native-execution-input.v1",
+          provider: { kind: "codex", model: null },
+          binding: {
+            companyId: context.fixture.companyId,
+            runId: id,
+            issueId: context.issue.id,
+            agentId: context.fixture.assignedAgentId,
+            executionWorkspaceId: id,
+          },
+          task: {
+            identifier: context.issue.identifier,
+            title: "Exact queued request",
+            description: null,
+            prompt: "Exact queued request",
+            workMode: "standard",
+          },
+          workspace: {
+            cwd: "/tmp/paperclip-cleanup-retry",
+            repoUrl: null,
+            repoRef: null,
+            branchName: null,
+          },
+          session: {
+            normalizedSessionId: nativeSessionId,
+            driverKind: "codex_app_server",
+            protocolVersion: 1,
+            lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+          },
+          completionContract: {
+            id: context.binding.completionContractId,
+            sha256: context.binding.completionContractSha256,
+            schemaVersion: "paperclip.completion-contract.v1",
+            contract: {
+              revision: "recovered-response-v1",
+              objective: "Exact request",
+              criteria: [
+                { id: "response", requirement: "Return the requested answer" },
+              ],
+            },
+          },
+          interactionResponses: [],
+          credentialBindings: [],
+        });
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "succeeded",
+            processPid: 99_999_999,
+            processGroupId: 99_999_999,
+            runnerProfileJson: {
+              nativeExecutionInput: inputFor(context.runId),
+            },
+          })
+          .where(eq(heartbeatRuns.id, context.runId));
+        if (mode === "older_warm_run") {
+          const olderId = randomUUID();
+          await db
+            .insert(heartbeatRuns)
+            .values({
+              id: olderId,
+              companyId: context.fixture.companyId,
+              agentId: context.fixture.assignedAgentId,
+              status: "succeeded",
+              finishedAt: new Date(Date.now() - 60_000),
+              runtimeMode: "native",
+              nativeIssueId: context.issue.id,
+              nativeSessionId,
+              runnerInstanceId,
+              processPid: 99_999_999,
+              processGroupId: 99_999_999,
+              runnerProfileJson: { nativeExecutionInput: inputFor(olderId) },
+            });
+        }
+        await deliverMessage({
+          callbacks: context.runtime.configurations.get(context.endpoint.id)!
+            .callbacks,
+          endpointId: context.endpoint.id,
+          provider: "telegram",
+          thread: context.thread.thread,
+          message: makeMessage({
+            id: `${context.thread.thread.channelId}:102`,
+            text: "The exact queued request B",
+            userId: context.thread.thread.channelId,
+          }),
+          trigger: "direct_message",
+        });
+        const [action] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.conversationId, context.conversation.id),
+              eq(chatActions.kind, "inbound_wakeup"),
+              sql`${chatActions.id} <> ${context.action.id}::uuid`,
+            ),
+          );
+        expect(action).toBeDefined();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: context.fixture.companyId,
+          agentId: context.fixture.assignedAgentId,
+          status: "failed",
+          errorCode: "adapter_failed",
+          error: "runner_state_identity_mismatch",
+          finishedAt: new Date(),
+          wakeupRequestId: action.id,
+          runtimeMode: "native",
+          nativeIssueId: context.issue.id,
+          nativeSessionId,
+          runnerInstanceId,
+          nativePhase: "observed",
+          processPid: 99_999_999,
+          processGroupId: 99_999_999,
+          contextSnapshot: {
+            issueId: context.issue.id,
+            taskKey: context.issue.identifier,
+            source: "chat:telegram",
+            wakeCommentId: action.payload.commentId,
+            wakeCommentIds: [action.payload.commentId],
+          },
+          runnerProfileJson: {
+            nativeExecutionInput: inputFor(runId),
+            sessionCheckpoint: {
+              providerSessionId:
+                mode === "wrong_thread"
+                  ? "another-thread"
+                  : "same-retained-thread",
+              identity: {
+                companyId: context.fixture.companyId,
+                issueId: context.issue.id,
+                agentId: context.fixture.assignedAgentId,
+                runId,
+                sessionId: nativeSessionId,
+              },
+            },
+          },
+        });
+        await db
+          .update(agentWakeupRequests)
+          .set({ status: "failed", runId })
+          .where(eq(agentWakeupRequests.id, action.id));
+        await db
+          .insert(nativeRunFinalizations)
+          .values({
+            companyId: context.fixture.companyId,
+            issueId: context.issue.id,
+            runId,
+            phase: "observed",
+            attempt: 0,
+            leaseOwner: mode === "leased" ? "other-owner" : null,
+          });
+        await db
+          .insert(environmentLeases)
+          .values({
+            companyId: context.fixture.companyId,
+            issueId: context.issue.id,
+            heartbeatRunId: runId,
+            provider: "local",
+            status: "failed",
+            releasedAt: new Date(),
+            cleanupStatus: mode === "pending_lease_cleanup" ? "pending" : null,
+          });
+        await db
+          .update(issues)
+          .set({ status: "in_review", executionRunId: null })
+          .where(eq(issues.id, context.issue.id));
+        const canonical = (value: unknown): string =>
+          value && typeof value === "object" && !Array.isArray(value)
+            ? `{${Object.entries(value)
+                .sort(([a], [b]) => a.localeCompare(b))
+                .map(
+                  ([key, entry]) =>
+                    `${JSON.stringify(key)}:${canonical(entry)}`,
+                )
+                .join(",")}}`
+            : JSON.stringify(value);
+        const key = createHash("sha256")
+          .update(
+            canonical({
+              schema: "paperclip.native-session-scope.v2",
+              companyId: context.fixture.companyId,
+              agentId: context.fixture.assignedAgentId,
+              workspace: { kind: "transient", ...inputFor(runId).workspace },
+              provider: {
+                driverKind: "codex_app_server",
+                identity: { kind: "codex" },
+              },
+              normalizedSessionId: nativeSessionId,
+            }),
+          )
+          .digest("hex");
+        const root = path.join(directory, key);
+        mkdirSync(path.join(root, "runner"), { recursive: true });
+        mkdirSync(path.join(root, "control-plane"), { recursive: true });
+        const identity = {
+          runId: context.runId,
+          runnerInstanceId,
+          environmentLeaseId: context.runId,
+          normalizedSessionId: nativeSessionId,
+        };
+        const files = [
+          [
+            "control-plane/control-plane-state.json",
+            {
+              schema: "paperclip.runner.durable.control-plane-state.v1",
+              identity,
+            },
+          ],
+          [
+            "runner/runner-state.json",
+            {
+              schema: "paperclip.runner.durable.state.v1",
+              ...identity,
+              lifecycle: "suspended",
+              outbox: [],
+            },
+          ],
+          [
+            "runner/codex-provider-state.json",
+            {
+              schema: "paperclip.runner.codex-provider-state.v1",
+              lifecycle: "prepared",
+              threadId: "same-retained-thread",
+              activeProviderTurnId: null,
+              config: { provider: "codex", driver: "codex_app_server" },
+              pendingEvents: [],
+              queuedEvents: [],
+              toolBridge: { pending: {} },
+            },
+          ],
+        ] as const;
+        const bytes = files.map(([file, data]) => {
+          const text = JSON.stringify(data);
+          writeFileSync(path.join(root, file), text);
+          return text;
+        });
+        const fingerprint = createHash("sha256")
+          .update(
+            JSON.stringify(
+              bytes.map((text) =>
+                createHash("sha256").update(text).digest("hex"),
+              ),
+            ),
+          )
+          .digest("hex");
+        await db
+          .update(nativeRunFinalizations)
+          .set({
+            recoveryHistory:
+              mode === "missing_receipt"
+                ? []
+                : [
+                    {
+                      kind: "native_cleanup_maintenance",
+                      version: 1,
+                      phase:
+                        mode === "activation_prepared" ||
+                        mode === "prepared_marker"
+                          ? "activation_prepared"
+                          : "settled",
+                      requestId: "exact-cleanup-receipt",
+                      nativeSessionId,
+                      runnerInstanceId,
+                      providerSessionId: "same-retained-thread",
+                      sourceFingerprint: "a".repeat(64),
+                      settledFingerprint: fingerprint,
+                    },
+                  ],
+          })
+          .where(eq(nativeRunFinalizations.runId, context.runId));
+        if (
+          ["committed_marker", "foreign_marker", "prepared_marker"].includes(
+            mode,
+          )
+        ) {
+          writeFileSync(
+            path.join(root, "cleanup-activation.json"),
+            JSON.stringify({
+              schema: "paperclip.native_cleanup_activation.v1",
+              companyId: context.fixture.companyId,
+              issueId: context.issue.id,
+              runId: context.runId,
+              requestId:
+                mode === "foreign_marker"
+                  ? "another-receipt"
+                  : "exact-cleanup-receipt",
+              sourceFingerprint: "a".repeat(64),
+              settledFingerprint: fingerprint,
+            }),
+          );
+        }
+        if (mode === "changed_checkpoint")
+          writeFileSync(
+            path.join(root, "runner/runner-state.json"),
+            JSON.stringify({ ...files[1][1], lifecycle: "ready" }),
+          );
+        if (mode === "late_event")
+          await db
+            .insert(heartbeatRunEvents)
+            .values({
+              companyId: context.fixture.companyId,
+              agentId: context.fixture.assignedAgentId,
+              runId,
+              seq: 1,
+              eventType: "session.started",
+              sourceInstanceId: runnerInstanceId,
+              payload: { prpEvent: { sourceKind: "runner" } },
+            });
+        if (mode === "source_edited")
+          await db
+            .update(issueComments)
+            .set({ body: "Changed after admission", updatedAt: new Date() })
+            .where(eq(issueComments.id, String(action.payload.commentId)));
+        const stage = () =>
+          db.transaction((tx) =>
+            context.service.prepareFailedChatRunRetry(tx, {
+              companyId: context.fixture.companyId,
+              issueId: context.issue.id,
+              agentId: context.fixture.assignedAgentId,
+              failedRunId: runId,
+              initiatedByUserId: "owner-user",
+            }),
+          );
+        const [original] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        if (
+          mode === "settled" ||
+          mode === "older_warm_run" ||
+          mode === "committed_marker"
+        ) {
+          const intent = await stage();
+          expect(await stage()).toEqual(intent);
+          await expect(
+            context.service.processFailedChatRunRetry(intent.actionId),
+          ).resolves.toMatchObject({ status: "queued" });
+          const [receipt] = await db
+            .select()
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, intent.actionId));
+          expect(receipt.payload).toMatchObject({
+            retryOfRunId: runId,
+            wakeCommentIds: [action.payload.commentId],
+          });
+          expect(
+            await db
+              .select()
+              .from(heartbeatRuns)
+              .where(eq(heartbeatRuns.id, runId)),
+          ).toEqual([original]);
+          expect(
+            (
+              await db
+                .select()
+                .from(nativeRunFinalizations)
+                .where(eq(nativeRunFinalizations.runId, runId))
+            )[0],
+          ).toMatchObject({ phase: "observed", attempt: 0 });
+          if (mode === "committed_marker")
+            expect(existsSync(path.join(root, "cleanup-activation.json"))).toBe(
+              true,
+            );
+        } else
+          await expect(stage()).rejects.toMatchObject({
+            details: { code: "chat_failed_run_retry_not_authorized" },
+          });
+      } finally {
+        await context.service.shutdown();
+        if (previous === undefined)
+          delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+        else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
     "bootstrap",
     "checkpoint",
     "missing_coordinator",
@@ -42339,7 +42794,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             finished = true;
           });
           await vi.waitFor(() => expect(finished).toBe(true), {
-            timeout: 1_000,
+            // The row stays locked until this assertion completes, so this
+            // proves nonblocking publication without imposing a one-second
+            // SLA on a sweep through the entire accumulated fixture history.
+            timeout: 5_000,
           });
           if (flushError) throw flushError;
           const ready = await db

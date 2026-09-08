@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   closeSync,
   constants,
   existsSync,
@@ -40,6 +41,7 @@ import type {
 import {
   NativeSessionCleanupQuarantinedError,
   NativeSessionProtocolIntegrityError,
+  completeRetainedNativeSessionCleanup,
   acpxRuntimeSessionDirectoryName,
   createNativeSessionBackend,
   createRunnerdCodexTransport,
@@ -48,6 +50,7 @@ import {
   parseNativeExecutionInput,
   parsePaperclipQuestionSet,
   resolveSourceCodexHome,
+  settleRetainedRunnerdSession,
   type RunnerProcessHandle,
   type RunnerProcessLaunchSpec,
 } from "../../vendor/paperclip-runner/index.js";
@@ -69,6 +72,7 @@ import {
   issueThreadInteractions,
   issues,
   nativeRunFinalizations,
+  nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
@@ -1527,6 +1531,611 @@ type PriorRunnerdStateVerification =
   | "terminal_state_indeterminate"
   | "unavailable";
 
+const CLEANUP_CANONICAL_FILES = [
+  "control-plane/control-plane-state.json",
+  "runner/runner-state.json",
+  "runner/codex-provider-state.json",
+] as const;
+const CLEANUP_ACTIVATION_FILE = "cleanup-activation.json";
+
+function cleanupStateSnapshot(root: string) {
+  if (
+    ![root, resolve(root, "runner"), resolve(root, "control-plane")].every(
+      isSafeNativeStateDirectory,
+    )
+  ) {
+    throw new Error("native_cleanup_maintenance_unproven");
+  }
+  const bytes = CLEANUP_CANONICAL_FILES.map((file) =>
+    readBoundedNativeFile(
+      resolve(root, file),
+      NATIVE_RUNNER_STATE_MAX_BYTES,
+      "native_cleanup_maintenance_unproven",
+    ),
+  );
+  const [control, runner, provider] = bytes.map((value) =>
+    record(JSON.parse(value.toString("utf8"))),
+  );
+  return {
+    control: control!,
+    runner: runner!,
+    provider: provider!,
+    fingerprint: createHash("sha256")
+      .update(
+        JSON.stringify(
+          bytes.map((value) =>
+            createHash("sha256").update(value).digest("hex"),
+          ),
+        ),
+      )
+      .digest("hex"),
+  };
+}
+
+function cleanupProcessAbsent(pid: unknown): pid is number {
+  if (
+    process.platform === "win32" ||
+    !Number.isSafeInteger(pid) ||
+    Number(pid) <= 0
+  )
+    return false;
+  return [Number(pid), -Number(pid)].every((target) => {
+    try {
+      process.kill(target, 0);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  });
+}
+
+/** Exact local cleanup only: the accepted result and original quarantine are
+ * never rewritten. A failed/interrupted maintenance attempt is retained for
+ * inspection, not retried from an older snapshot with unknown process owners. */
+export async function reconcileRetainedNativeSessionCleanup(
+  db: Db,
+  input: {
+    companyId: string;
+    runId: string;
+  },
+): Promise<{
+  status: "settled" | "not_eligible" | "operator_required";
+  runId: string;
+}> {
+  const denied = () => new Error("native_cleanup_maintenance_unproven");
+  const leaseOwner = `native-cleanup:${randomUUID()}`;
+  let reservedScope: string | null = null;
+  const releaseScope = () => {
+    if (
+      reservedScope &&
+      executingRunnerdSessionScopes.get(reservedScope) === leaseOwner
+    ) {
+      executingRunnerdSessionScopes.delete(reservedScope);
+    }
+  };
+  let claim: {
+    execution: NativeExecutionInput;
+    run: typeof heartbeatRuns.$inferSelect;
+    quarantine: string;
+    root: string;
+    source: ReturnType<typeof cleanupStateSnapshot>;
+    providerPid: number;
+    providerSessionId: string;
+    identity: {
+      runnerInstanceId: string;
+      environmentLeaseId: string;
+      runId: string;
+      normalizedSessionId: string;
+      turnId: string;
+      itemId: string;
+    };
+    history: Array<Record<string, unknown>>;
+  } | null = null;
+  try {
+    claim = await db.transaction(async (tx) => {
+      const run = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, input.runId),
+            eq(heartbeatRuns.companyId, input.companyId),
+          ),
+        )
+        .for("update", { noWait: true })
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (
+        !run ||
+        run.runtimeMode !== "native" ||
+        !run.nativeIssueId ||
+        !run.nativeSessionId ||
+        !run.runnerInstanceId ||
+        !["succeeded", "failed"].includes(run.status) ||
+        !run.finishedAt ||
+        !cleanupProcessAbsent(run.processPid) ||
+        run.processGroupId !== run.processPid
+      )
+        return null;
+      const execution = parseNativeExecutionInput(
+        record(run.runnerProfileJson).nativeExecutionInput,
+      );
+      const failure = record(record(run.resultJson).recoveredExecutionFailure);
+      const errorCode = run.errorCode ?? failure.errorCode;
+      const error = run.error ?? failure.error;
+      if (
+        errorCode !== "adapter_failed" ||
+        error !==
+          "provider_transport_failed: runner did not durably suspend before checkpoint" ||
+        execution.binding.companyId !== run.companyId ||
+        execution.binding.agentId !== run.agentId ||
+        execution.binding.issueId !== run.nativeIssueId ||
+        execution.binding.runId !== run.id ||
+        nativeSessionKey(execution) !== run.nativeSessionId ||
+        execution.provider.kind !== "codex" ||
+        execution.session.driverKind !== "codex_app_server" ||
+        record(run.runnerProfileJson).nativeToolContractFingerprint !==
+          nativeToolContractFingerprintForTarget("local")
+      )
+        return null;
+      const scope = nativeSessionScopeKey(execution);
+      if (
+        activeNativeSessions.has(run.id) ||
+        executingRunnerdSessionScopes.has(scope) ||
+        initializingSessionToolAuthorities.has(scope) ||
+        warmNativeSessions.has(scope)
+      )
+        return null;
+      executingRunnerdSessionScopes.set(scope, leaseOwner);
+      reservedScope = scope;
+      const coordinator = await tx
+        .select()
+        .from(nativeRunFinalizations)
+        .where(
+          and(
+            eq(nativeRunFinalizations.runId, run.id),
+            eq(nativeRunFinalizations.companyId, run.companyId),
+            eq(nativeRunFinalizations.issueId, run.nativeIssueId),
+          ),
+        )
+        .for("update", { noWait: true })
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (
+        !coordinator ||
+        coordinator.phase !== "committed" ||
+        !coordinator.resultId ||
+        !coordinator.assessmentId ||
+        !coordinator.decisionId ||
+        coordinator.nextAttemptAt ||
+        (coordinator.leaseOwner &&
+          coordinator.leaseExpiresAt &&
+          coordinator.leaseExpiresAt > new Date()) ||
+        coordinator.recoveryHistory.some(
+          (event) => event.kind === "native_cleanup_maintenance",
+        )
+      )
+        return null;
+      const result = await tx
+        .select()
+        .from(nativeRunResults)
+        .where(
+          and(
+            eq(nativeRunResults.id, coordinator.resultId),
+            eq(nativeRunResults.runId, run.id),
+            eq(nativeRunResults.companyId, run.companyId),
+            eq(nativeRunResults.issueId, run.nativeIssueId),
+          ),
+        )
+        .for("share", { noWait: true })
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (!result || result.schemaStatus !== "accepted") return null;
+      const environment = await tx
+        .select({ id: environmentLeases.id })
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.companyId, run.companyId),
+            eq(environmentLeases.heartbeatRunId, run.id),
+            inArray(environmentLeases.status, ["active", "pending_cleanup"]),
+          ),
+        )
+        .limit(1);
+      if (environment.length) return null;
+      const root = scopedRunnerdStateRoot(execution);
+      if (lstatSync(root, { throwIfNoEntry: false })) return null;
+      const parent = resolve(runnerdStateBase(), "quarantine");
+      if (!isSafeNativeStateDirectory(parent)) return null;
+      const entries = readdirSync(parent);
+      if (entries.length > 4096) return null;
+      const candidates = entries.filter((name) =>
+        name.startsWith(`${basename(root)}.identity_indeterminate.`),
+      );
+      if (candidates.length !== 1) return null;
+      const quarantine = resolve(parent, candidates[0]!);
+      const source = cleanupStateSnapshot(quarantine);
+      const identity = record(source.control.identity);
+      if (
+        !durableIdentityMatchesExecution(identity, execution) ||
+        identity.runnerInstanceId !== run.runnerInstanceId ||
+        ![
+          "runnerInstanceId",
+          "environmentLeaseId",
+          "runId",
+          "normalizedSessionId",
+          "turnId",
+          "itemId",
+        ].every(
+          (key) =>
+            typeof identity[key] === "string" &&
+            identity[key] &&
+            source.runner[key] === identity[key],
+        ) ||
+        source.runner.lifecycle !== "ready" ||
+        source.provider.lifecycle !== "turn_active" ||
+        record(source.provider.config).provider !== "codex" ||
+        record(source.provider.config).command !== "codex" ||
+        record(source.provider.config).cwd !== execution.workspace.cwd ||
+        !Array.isArray(source.control.committedEvents)
+      )
+        return null;
+      const providerEvents = source.control.committedEvents
+        .map((entry) => record(record(record(entry).envelope).payload))
+        .filter((event) =>
+          ["session.started", "session.resumed"].includes(
+            String(event.eventType),
+          ),
+        );
+      const providerEvent = providerEvents.at(-1);
+      const provider = record(providerEvent?.payload);
+      if (
+        !providerEvent ||
+        !cleanupProcessAbsent(provider.processId) ||
+        typeof provider.providerSessionId !== "string" ||
+        source.provider.threadId !== provider.providerSessionId ||
+        providerEvent.runId !== run.id ||
+        providerEvent.sourceInstanceId !== run.runnerInstanceId ||
+        providerEvent.normalizedSessionId !== run.nativeSessionId ||
+        typeof providerEvent.sourceEventId !== "string"
+      )
+        return null;
+      const persisted = await tx
+        .select({ payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, run.id),
+            eq(heartbeatRunEvents.companyId, run.companyId),
+            eq(heartbeatRunEvents.sourceInstanceId, run.runnerInstanceId),
+            eq(heartbeatRunEvents.sourceEventId, providerEvent.sourceEventId),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (
+        !persisted ||
+        canonicalJson(record(persisted.payload).prpEvent) !==
+          canonicalJson(providerEvent)
+      )
+        return null;
+      const history = [
+        ...coordinator.recoveryHistory,
+        {
+          kind: "native_cleanup_maintenance",
+          version: 1,
+          phase: "started",
+          requestId: leaseOwner,
+          sourceFingerprint: source.fingerprint,
+          startedAt: new Date().toISOString(),
+        },
+      ];
+      await tx
+        .update(nativeRunFinalizations)
+        .set({
+          leaseOwner,
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+          recoveryHistory: history,
+          updatedAt: new Date(),
+        })
+        .where(eq(nativeRunFinalizations.runId, run.id));
+      return {
+        execution,
+        run,
+        quarantine,
+        root,
+        source,
+        providerPid: provider.processId,
+        providerSessionId: provider.providerSessionId,
+        identity: identity as {
+          runnerInstanceId: string;
+          environmentLeaseId: string;
+          runId: string;
+          normalizedSessionId: string;
+          turnId: string;
+          itemId: string;
+        },
+        history,
+      };
+    });
+  } catch {
+    releaseScope();
+    return { status: "not_eligible", runId: input.runId };
+  }
+  if (!claim) {
+    releaseScope();
+    return { status: "not_eligible", runId: input.runId };
+  }
+  const owned = claim;
+  let stagingDirectory: string | null = null;
+  const authorize = async () => {
+    const lease = await db
+      .select({ runId: nativeRunFinalizations.runId })
+      .from(nativeRunFinalizations)
+      .where(
+        and(
+          eq(nativeRunFinalizations.runId, owned.run.id),
+          eq(nativeRunFinalizations.companyId, owned.run.companyId),
+          eq(nativeRunFinalizations.phase, "committed"),
+          eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+          gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+        ),
+      )
+      .limit(1);
+    if (
+      !lease.length ||
+      !reservedScope ||
+      executingRunnerdSessionScopes.get(reservedScope) !== leaseOwner ||
+      cleanupStateSnapshot(owned.quarantine).fingerprint !==
+        owned.source.fingerprint ||
+      lstatSync(owned.root, { throwIfNoEntry: false }) ||
+      !cleanupProcessAbsent(owned.run.processPid) ||
+      !cleanupProcessAbsent(owned.providerPid)
+    )
+      throw denied();
+  };
+  try {
+    await authorize();
+    const copy = mkdtempSync(
+      resolve(runnerdStateBase(), `${basename(owned.root)}.cleanup-`),
+    );
+    stagingDirectory = copy;
+    chmodSync(copy, 0o700);
+    for (const folder of ["runner", "control-plane"])
+      mkdirSync(resolve(copy, folder), { mode: 0o700 });
+    for (const file of CLEANUP_CANONICAL_FILES) {
+      copyFileSync(
+        resolve(owned.quarantine, file),
+        resolve(copy, file),
+        constants.COPYFILE_EXCL,
+      );
+      chmodSync(resolve(copy, file), 0o600);
+    }
+    const port = new PaperclipControlPlanePort(db, {
+      companyId: owned.run.companyId,
+      issueId: owned.run.nativeIssueId!,
+      agentId: owned.run.agentId,
+      runId: owned.run.id,
+      sessionId: owned.run.nativeSessionId!,
+      sourceInstanceId: owned.run.runnerInstanceId!,
+      controlPlaneSourceInstanceId: `cleanup:${owned.run.id}`,
+      completionContractId: owned.run.completionContractId!,
+      completionContractSha256: owned.run.completionContractSha256!,
+    });
+    const proof = await settleRetainedRunnerdSession({
+      binding: {
+        companyId: owned.run.companyId,
+        issueId: owned.run.nativeIssueId!,
+        agentId: owned.run.agentId,
+        runId: owned.run.id,
+        sessionId: owned.run.nativeSessionId!,
+      },
+      identity: owned.identity,
+      backend: { kind: "runner", name: "codex_app_server" },
+      stateDirectory: copy,
+      activationDirectory: owned.root,
+      sourceFingerprint: owned.source.fingerprint,
+      providerSessionId: owned.providerSessionId,
+      originalRunnerPid: owned.run.processPid!,
+      originalProviderPid: owned.providerPid,
+      authorize,
+      appendEvent: async (event) => {
+        await port.appendEvent(event);
+      },
+    });
+    // Commit intent before the filesystem handoff. A crash can then be
+    // distinguished from an unattempted quarantine; never replay its source.
+    const preparedHistory = [
+      ...owned.history,
+      {
+        kind: "native_cleanup_maintenance",
+        version: 1,
+        phase: "activation_prepared",
+        requestId: leaseOwner,
+        sourceFingerprint: proof.sourceFingerprint,
+        settledFingerprint: proof.settledFingerprint,
+        stagingName: basename(copy),
+        nativeSessionId: owned.run.nativeSessionId,
+        runnerInstanceId: owned.run.runnerInstanceId,
+        providerSessionId: owned.providerSessionId,
+      },
+    ];
+    writeFileSync(
+      resolve(copy, CLEANUP_ACTIVATION_FILE),
+      JSON.stringify({
+        schema: "paperclip.native_cleanup_activation.v1",
+        companyId: owned.run.companyId,
+        issueId: owned.run.nativeIssueId,
+        runId: owned.run.id,
+        requestId: leaseOwner,
+        sourceFingerprint: proof.sourceFingerprint,
+        settledFingerprint: proof.settledFingerprint,
+      }),
+      { flag: "wx", mode: 0o600 },
+    );
+    const prepared = await db
+      .update(nativeRunFinalizations)
+      .set({ recoveryHistory: preparedHistory, updatedAt: new Date() })
+      .where(
+        and(
+          eq(nativeRunFinalizations.runId, owned.run.id),
+          eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+          gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+        ),
+      )
+      .returning({ runId: nativeRunFinalizations.runId });
+    if (!prepared.length) throw denied();
+    owned.history = preparedHistory;
+    await db.transaction(async (tx) => {
+      const current = await tx
+        .select()
+        .from(nativeRunFinalizations)
+        .where(
+          and(
+            eq(nativeRunFinalizations.runId, owned.run.id),
+            eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+            gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+          ),
+        )
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (!current || current.phase !== "committed") throw denied();
+      await authorize();
+      renameSync(copy, owned.root);
+      await tx
+        .update(nativeRunFinalizations)
+        .set({
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          recoveryHistory: [
+            ...owned.history,
+            {
+              kind: "native_cleanup_maintenance",
+              version: 1,
+              phase: "settled",
+              requestId: leaseOwner,
+              sourceFingerprint: proof.sourceFingerprint,
+              settledFingerprint: proof.settledFingerprint,
+              nativeSessionId: owned.run.nativeSessionId,
+              runnerInstanceId: owned.run.runnerInstanceId,
+              providerSessionId: owned.providerSessionId,
+              settledAt: new Date().toISOString(),
+            },
+          ],
+          updatedAt: new Date(),
+        })
+        .where(eq(nativeRunFinalizations.runId, owned.run.id));
+    });
+    completeRetainedNativeSessionCleanup(proof);
+    rmSync(resolve(owned.root, CLEANUP_ACTIVATION_FILE));
+    return { status: "settled", runId: input.runId };
+  } catch {
+    if (stagingDirectory && existsSync(stagingDirectory)) {
+      // Keep the failed journal, not transient copied provider credentials.
+      try {
+        scrubRunnerdQuarantineLaunchState(stagingDirectory);
+      } catch {
+        /* retain fail-closed ownership */
+      }
+    }
+    await db
+      .update(nativeRunFinalizations)
+      .set({
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        recoveryHistory: [
+          ...owned.history,
+          {
+            kind: "native_cleanup_maintenance",
+            version: 1,
+            phase: "operator_required",
+            requestId: leaseOwner,
+            code: "native_cleanup_maintenance_unproven",
+          },
+        ],
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(nativeRunFinalizations.runId, owned.run.id),
+          eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+        ),
+      );
+    return { status: "operator_required", runId: input.runId };
+  } finally {
+    releaseScope();
+  }
+}
+
+async function assertCleanupActivationCommitted(
+  db: Db,
+  root: string,
+  execution: NativeExecutionInput,
+): Promise<void> {
+  const path = resolve(root, CLEANUP_ACTIVATION_FILE);
+  if (!lstatSync(path, { throwIfNoEntry: false })) return;
+  const marker = record(
+    JSON.parse(
+      readBoundedNativeFile(
+        path,
+        4096,
+        "native_cleanup_maintenance_unproven",
+      ).toString("utf8"),
+    ),
+  );
+  if (
+    marker.schema !== "paperclip.native_cleanup_activation.v1" ||
+    marker.companyId !== execution.binding.companyId ||
+    marker.issueId !== execution.binding.issueId ||
+    typeof marker.runId !== "string" ||
+    typeof marker.requestId !== "string"
+  ) {
+    throw new NativeSessionCleanupQuarantinedError();
+  }
+  const coordinator = await db
+    .select()
+    .from(nativeRunFinalizations)
+    .where(
+      and(
+        eq(nativeRunFinalizations.runId, marker.runId),
+        eq(nativeRunFinalizations.companyId, execution.binding.companyId),
+        eq(nativeRunFinalizations.issueId, execution.binding.issueId),
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0]);
+  const receipt = coordinator?.recoveryHistory.findLast(
+    (entry) =>
+      entry.kind === "native_cleanup_maintenance" &&
+      entry.requestId === marker.requestId,
+  );
+  const snapshot = cleanupStateSnapshot(root);
+  if (
+    coordinator?.phase !== "committed" ||
+    receipt?.phase !== "settled" ||
+    receipt.sourceFingerprint !== marker.sourceFingerprint ||
+    receipt.settledFingerprint !== marker.settledFingerprint ||
+    snapshot.fingerprint !== marker.settledFingerprint ||
+    snapshot.runner.runId !== marker.runId ||
+    snapshot.runner.lifecycle !== "suspended" ||
+    snapshot.provider.lifecycle !== "prepared" ||
+    !Array.isArray(snapshot.control.committedEvents)
+  )
+    throw new NativeSessionCleanupQuarantinedError();
+  const owners = snapshot.control.committedEvents
+    .map((entry) => record(record(record(entry).envelope).payload))
+    .filter((event) =>
+      ["session.started", "session.resumed"].includes(String(event.eventType)),
+    )
+    .map((event) => record(event.payload).processId);
+  if (!owners.length || !owners.every(cleanupProcessAbsent))
+    throw new NativeSessionCleanupQuarantinedError();
+  // A committed receipt survived a crash after rename. Normal admission now
+  // applies its existing exact old-owner/session fences; no process is started here.
+  rmSync(path);
+}
+
 /** Read-only admission evidence for an explicit retry of a terminal failed
  * run. Never migrate/archive state, release an owner, or contact a provider.
  * Normal executor admission independently verifies the state again. */
@@ -1691,6 +2300,55 @@ export function nativeFailedRunRetryStateIsSafe(input: {
   }
 }
 
+/** Physical half of retrying a request rejected before provider admission.
+ * The caller separately proves the failed receipt/coordinator has no native
+ * events or result and selects exactly one committed cleanup owner. */
+export function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
+  failedExecution: unknown;
+  retiredExecution: unknown;
+  companyId: string; issueId: string; agentId: string;
+  failedRunId: string; retiredRunId: string; nativeSessionId: string;
+  runnerInstanceId: string; providerSessionId: string;
+  processPid: number; processGroupId: number;
+  receipt: Record<string, unknown>;
+}): boolean {
+  try {
+    const failed = parseNativeExecutionInput(input.failedExecution);
+    const retired = parseNativeExecutionInput(input.retiredExecution);
+    if (input.failedRunId === input.retiredRunId || failed.binding.runId !== input.failedRunId ||
+      retired.binding.runId !== input.retiredRunId || failed.binding.companyId !== input.companyId ||
+      failed.binding.issueId !== input.issueId || failed.binding.agentId !== input.agentId ||
+      nativeSessionScopeKey(failed) !== nativeSessionScopeKey(retired) ||
+      input.receipt.kind !== "native_cleanup_maintenance" || input.receipt.version !== 1 ||
+      input.receipt.phase !== "settled" || input.receipt.nativeSessionId !== input.nativeSessionId ||
+      input.receipt.runnerInstanceId !== input.runnerInstanceId ||
+      input.receipt.providerSessionId !== input.providerSessionId ||
+      typeof input.receipt.requestId !== "string" || input.receipt.requestId.length === 0 ||
+      typeof input.receipt.sourceFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(input.receipt.sourceFingerprint) ||
+      typeof input.receipt.settledFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(input.receipt.settledFingerprint) ||
+      !nativeFailedRunRetryStateIsSafe({
+        execution: retired, companyId: input.companyId, issueId: input.issueId, agentId: input.agentId,
+        runId: input.retiredRunId, nativeSessionId: input.nativeSessionId, runnerInstanceId: input.runnerInstanceId,
+        providerSessionId: input.providerSessionId, processPid: input.processPid, processGroupId: input.processGroupId,
+        recoveryMode: "exact_checkpoint_resume", allowVerifiedBackup: false,
+      })) return false;
+    const root = scopedRunnerdStateRoot(retired);
+    const markerPath = resolve(root, CLEANUP_ACTIVATION_FILE);
+    if (lstatSync(markerPath, { throwIfNoEntry: false })) {
+      // A crash after receipt commit may leave the activation marker. This
+      // read-only proof accepts only that exact committed handoff; normal
+      // executor admission independently reconciles the marker before launch.
+      const marker = record(JSON.parse(readBoundedNativeFile(markerPath, 4096, "native_cleanup_maintenance_unproven").toString("utf8")));
+      if (marker.schema !== "paperclip.native_cleanup_activation.v1" ||
+        marker.companyId !== input.companyId || marker.issueId !== input.issueId ||
+        marker.runId !== input.retiredRunId || marker.requestId !== input.receipt.requestId ||
+        marker.sourceFingerprint !== input.receipt.sourceFingerprint ||
+        marker.settledFingerprint !== input.receipt.settledFingerprint) return false;
+    }
+    return cleanupStateSnapshot(root).fingerprint === input.receipt.settledFingerprint;
+  } catch { return false; }
+}
+
 async function verifyPriorRunnerdStateForSessionScope(input: {
   db: Db;
   root: string;
@@ -1773,6 +2431,7 @@ async function migrateRunnerdStateRootForExecution(input: {
     if (!isSafeNativeStateDirectory(scoped)) {
       throw new Error("runner_state_directory_unsafe");
     }
+    await assertCleanupActivationCommitted(input.db, scoped, input.execution);
     const identity = readRunnerdDurableIdentity(scoped);
     if (!identity) {
       if (input.restartRecovery?.kind !== "reattach_existing_runner") {
@@ -6598,6 +7257,10 @@ export async function createRunnerdBackend(input: {
   ) => Promise<unknown>;
 }): Promise<NativeSessionBackend> {
   const sessionScopeId = nativeSessionScopeKey(input.execution);
+  const scopeOwner = executingRunnerdSessionScopes.get(sessionScopeId);
+  if (scopeOwner && scopeOwner !== input.execution.binding.runId) {
+    throw new Error("native_session_supervisor_busy");
+  }
   if (initializingSessionToolAuthorities.has(sessionScopeId)) {
     throw new Error("native_session_supervisor_busy");
   }
