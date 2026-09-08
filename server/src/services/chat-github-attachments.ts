@@ -97,18 +97,54 @@ export function restoreGitHubAttachmentLimitOmissions(
     limitOmissions.set(message, value);
 }
 
+const GITHUB_ATTACHMENT_DIAGNOSTIC_CODES = [
+  "github_attachment_not_public",
+  "github_attachment_invalid_response",
+  "github_attachment_unsafe_redirect",
+  "github_attachment_too_large",
+  "github_attachment_empty",
+  "github_attachment_unsupported_type",
+  "github_attachment_download_failed",
+  "github_attachment_source_mismatch",
+  "github_attachment_canonical_authority_unavailable",
+  "github_attachment_canonical_api_request_failed",
+  "github_attachment_canonical_api_access_denied",
+  "github_attachment_canonical_api_status_unexpected",
+  "github_attachment_canonical_api_invalid_response",
+  "github_attachment_canonical_api_too_large",
+  "github_attachment_canonical_response_unavailable",
+  "github_attachment_canonical_source_mismatch",
+  "github_attachment_canonical_body_mismatch",
+  "github_attachment_canonical_html_unavailable",
+  "github_attachment_canonical_file_unsupported",
+  "github_attachment_canonical_image_count_invalid",
+  "github_attachment_canonical_target_denied",
+  "github_attachment_canonical_mapping_ambiguous",
+  "github_attachment_canonical_signed_anchor_only",
+  "github_attachment_canonical_image_without_source_anchor",
+  "github_attachment_canonical_anchor_missing",
+] as const;
+type GitHubAttachmentDiagnosticCode =
+  (typeof GITHUB_ATTACHMENT_DIAGNOSTIC_CODES)[number];
+
+/** Read no request/response data; SDK wrappers may retain a closed error as cause. */
+export function githubAttachmentDiagnosticCode(
+  error: unknown,
+): GitHubAttachmentDiagnosticCode | null {
+  for (let depth = 0; depth < 4 && error instanceof Error; depth++) {
+    if (
+      GITHUB_ATTACHMENT_DIAGNOSTIC_CODES.includes(
+        error.message as GitHubAttachmentDiagnosticCode,
+      )
+    )
+      return error.message as GitHubAttachmentDiagnosticCode;
+    error = error.cause;
+  }
+  return null;
+}
+
 export class GitHubAttachmentUnavailableError extends Error {
-  constructor(
-    readonly code:
-      | "github_attachment_not_public"
-      | "github_attachment_invalid_response"
-      | "github_attachment_unsafe_redirect"
-      | "github_attachment_too_large"
-      | "github_attachment_empty"
-      | "github_attachment_unsupported_type"
-      | "github_attachment_download_failed"
-      | "github_attachment_source_mismatch",
-  ) {
+  constructor(readonly code: GitHubAttachmentDiagnosticCode) {
     // Closed codes only: URLs, signed redirects and provider response bodies never escape.
     super(code);
     this.name = "GitHubAttachmentUnavailableError";
@@ -421,7 +457,7 @@ export function githubAttachmentCommentFetch(
         responseTimeoutMs: DOWNLOAD_TIMEOUT_MS,
         error: () =>
           new GitHubAttachmentUnavailableError(
-            "github_attachment_download_failed",
+            "github_attachment_canonical_api_request_failed",
           ),
       },
     );
@@ -436,7 +472,14 @@ export function githubAttachmentCommentFetch(
     ) {
       await response.body?.cancel();
       throw new GitHubAttachmentUnavailableError(
-        "github_attachment_not_public",
+        [401, 403, 404].includes(response.status)
+          ? "github_attachment_canonical_api_access_denied"
+          : response.status !== 200
+            ? "github_attachment_canonical_api_status_unexpected"
+            : Number(response.headers.get("content-length") ?? 0) >
+                MAX_COMMENT_RESPONSE_BYTES
+              ? "github_attachment_canonical_api_too_large"
+              : "github_attachment_canonical_api_invalid_response",
       );
     }
     const reader = response.body.getReader();
@@ -455,7 +498,7 @@ export function githubAttachmentCommentFetch(
         size += next.value.byteLength;
         if (size > MAX_COMMENT_RESPONSE_BYTES)
           throw new GitHubAttachmentUnavailableError(
-            "github_attachment_too_large",
+            "github_attachment_canonical_api_too_large",
           );
         chunks.push(next.value);
       }
@@ -479,6 +522,18 @@ export function resolveGitHubCommentAttachmentTarget(
   attachment: Attachment,
   value: unknown,
 ): URL | null {
+  try {
+    return resolveCanonicalAttachmentTargetOrThrow(attachment, value);
+  } catch (error) {
+    if (error instanceof GitHubAttachmentUnavailableError) return null;
+    throw error;
+  }
+}
+
+function resolveCanonicalAttachmentTargetOrThrow(
+  attachment: Attachment,
+  value: unknown,
+): URL {
   const locator = handles.get(attachment);
   const request = githubAttachmentCommentRequest(attachment);
   if (
@@ -488,7 +543,9 @@ export function resolveGitHubCommentAttachmentTarget(
     typeof value !== "object" ||
     Array.isArray(value)
   )
-    return null;
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_response_unavailable",
+    );
   const row = value as Record<string, unknown>;
   const thread =
     /^github:([^:]+):(?:(issue):)?([1-9][0-9]*)(?::rc:([1-9][0-9]*))?$/i.exec(
@@ -497,55 +554,106 @@ export function resolveGitHubCommentAttachmentTarget(
   if (
     String(row.id) !== locator.sourceMessageId ||
     typeof row.url !== "string" ||
-    row.url.toLowerCase() !== request.url.toLowerCase() ||
+    row.url.toLowerCase() !== request.url.toLowerCase()
+  )
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_source_mismatch",
+    );
+  if (
     typeof row.body !== "string" ||
     row.body.length > 200_000 ||
     createHash("sha256").update(row.body).digest("hex") !==
-      locator.sourceBodySha256 ||
-    typeof row.body_html !== "string" ||
-    row.body_html.length > 600_000
+      locator.sourceBodySha256
   )
-    return null;
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_body_mismatch",
+    );
+  if (typeof row.body_html !== "string" || row.body_html.length > 600_000)
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_html_unavailable",
+    );
   if (thread[4]) {
     if (
       row.pull_request_url !==
         `https://api.github.com/repos/${thread[1]}/pulls/${thread[3]}` ||
       String(row.in_reply_to_id ?? row.id) !== thread[4]
     )
-      return null;
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_canonical_source_mismatch",
+      );
   } else if (
     row.issue_url !==
     `https://api.github.com/repos/${thread[1]}/issues/${thread[3]}`
   )
-    return null;
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_source_mismatch",
+    );
   const assetId = /\/assets\/([a-f0-9-]+)$/i.exec(locator.url)?.[1];
   // Generic private files have no documented signed-download representation.
-  if (!assetId) return null;
+  if (!assetId)
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_file_unsupported",
+    );
+  const sourceBody = row.body;
+  const signedImage = (src: string): URL | null => {
+    const target = allowedRedirect(src, locator.url);
+    return target &&
+      target.hostname === "private-user-images.githubusercontent.com" &&
+      new RegExp(
+        `^/[1-9][0-9]*/[1-9][0-9]*-${assetId}\\.(?:png|jpe?g|gif|webp)$`,
+        "i",
+      ).test(target.pathname) &&
+      [...target.searchParams.keys()].join(",") === "jwt" &&
+      /^[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+$/i.test(
+        target.searchParams.get("jwt") ?? "",
+      ) &&
+      !sourceBody.includes(src)
+      ? target
+      : null;
+  };
   const fragment = JSDOM.fragment(row.body_html);
   const candidates: URL[] = [];
   for (const anchor of fragment.querySelectorAll("a[href]")) {
     if (anchor.getAttribute("href") !== locator.url) continue;
     const images = anchor.querySelectorAll("img[src]");
-    if (images.length !== 1) return null;
+    if (images.length !== 1)
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_canonical_image_count_invalid",
+      );
     const src = images[0]!.getAttribute("src")!;
-    const target = allowedRedirect(src, locator.url);
-    if (
-      !target ||
-      target.hostname !== "private-user-images.githubusercontent.com" ||
-      !new RegExp(
-        `^/[1-9][0-9]*/[1-9][0-9]*-${assetId}\\.(?:png|jpe?g|gif|webp)$`,
-        "i",
-      ).test(target.pathname) ||
-      [...target.searchParams.keys()].join(",") !== "jwt" ||
-      !/^[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+$/i.test(
-        target.searchParams.get("jwt") ?? "",
-      ) ||
-      row.body.includes(src)
-    )
-      return null;
+    const target = signedImage(src);
+    if (!target)
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_canonical_target_denied",
+      );
     candidates.push(target);
   }
-  return candidates.length === 1 ? candidates[0]! : null;
+  if (candidates.length === 1) return candidates[0]!;
+  if (candidates.length > 1)
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_mapping_ambiguous",
+    );
+  // Shape-only evidence for the next legitimate provider test. These forms
+  // remain denied; observing them does not widen the supported mapping.
+  for (const anchor of fragment.querySelectorAll("a[href]")) {
+    const images = anchor.querySelectorAll("img[src]");
+    const src = images.length === 1 ? images[0]!.getAttribute("src")! : "";
+    if (src && anchor.getAttribute("href") === src && signedImage(src))
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_canonical_signed_anchor_only",
+      );
+  }
+  if (
+    [...fragment.querySelectorAll("img[src]")].some((image) =>
+      signedImage(image.getAttribute("src")!),
+    )
+  )
+    throw new GitHubAttachmentUnavailableError(
+      "github_attachment_canonical_image_without_source_anchor",
+    );
+  throw new GitHubAttachmentUnavailableError(
+    "github_attachment_canonical_anchor_missing",
+  );
 }
 
 function imageSignatureMatches(body: Buffer, mime: string): boolean {
@@ -635,14 +743,10 @@ export async function prepareGitHubPublicAttachment(
           signal.throwIfAborted();
           const canonical = await resolveComment(commentRequest, signal);
           signal.throwIfAborted();
-          const target = resolveGitHubCommentAttachmentTarget(
+          const target = resolveCanonicalAttachmentTargetOrThrow(
             attachment,
             canonical,
           );
-          if (!target)
-            throw new GitHubAttachmentUnavailableError(
-              "github_attachment_not_public",
-            );
           url = target;
           continue;
         }

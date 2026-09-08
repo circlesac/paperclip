@@ -109,6 +109,7 @@ import {
   rehydrateGitHubPublicAttachment,
 } from "../services/chat-github-attachments.js";
 import * as attachmentEgress from "../services/remote-http-fetch.js";
+import { logger as chatAttachmentLogger } from "../middleware/logger.js";
 import type {
   PrpStructuredRunResult,
   PrpTerminalState,
@@ -14116,6 +14117,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     "storage",
     "cancel_race",
     "delivery_race",
+    "signed_anchor",
   ] as const)(
     "resolves an admitted GitHub private image after restart with current reach at %s",
     async (revokeAt) => {
@@ -14151,8 +14153,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           issue_url:
             "https://api.github.com/repos/paperclipai/paperclip/issues/93",
           body,
-          body_html: `<a href="${sourceUrl}"><img src="${signedUrl}"></a>`,
+          body_html: `<a href="${revokeAt === "signed_anchor" ? signedUrl : sourceUrl}"><img src="${signedUrl}"></a>`,
         });
+      const warning = vi.spyOn(chatAttachmentLogger, "warn");
       let receiptMutation: Promise<unknown> | undefined;
       const egress = vi
         .spyOn(attachmentEgress, "guardedRemoteHttpFetch")
@@ -14299,14 +14302,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           },
           expect.any(AbortSignal),
         );
-        expect(egress).toHaveBeenCalledTimes(2);
+        expect(egress).toHaveBeenCalledTimes(
+          revokeAt === "signed_anchor" ? 1 : 2,
+        );
         const stored = await db
           .select()
           .from(issueAttachments)
           .where(eq(issueAttachments.companyId, fixture.companyId));
         expect(stored).toHaveLength(revokeAt === "none" ? 1 : 0);
         expect(restarted.wakeup).toHaveBeenCalledTimes(
-          revokeAt === "none" ? 1 : 0,
+          revokeAt === "none" || revokeAt === "signed_anchor" ? 1 : 0,
         );
         expect(storage.objects.size).toBe(revokeAt === "none" ? 1 : 0);
         if (["download", "cancel_race", "delivery_race"].includes(revokeAt))
@@ -14319,6 +14324,30 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(eq(chatDeliveries.endpointId, endpoint.id));
         expect(JSON.stringify(deliveries)).not.toContain("privatepayload");
         expect(JSON.stringify(deliveries)).not.toContain("body_html");
+        if (revokeAt === "signed_anchor") {
+          const code = "github_attachment_canonical_signed_anchor_only";
+          const diagnostic = warning.mock.calls.find(
+            ([fields]) =>
+              typeof fields === "object" &&
+              fields !== null &&
+              "attachmentDiagnosticCode" in fields &&
+              fields.attachmentDiagnosticCode === code,
+          );
+          expect(diagnostic?.[0]).toMatchObject({
+            endpointId: endpoint.id,
+            deliveryId: deliveries[0]!.id,
+            error: code,
+            attachmentDiagnosticCode: code,
+          });
+          expect(JSON.stringify(diagnostic)).not.toMatch(
+            /privatepayload|jwt|body_html|https:/,
+          );
+          const wakeJson = JSON.stringify(restarted.wakeup.mock.calls);
+          expect(wakeJson).toContain('"download_unavailable":1');
+          expect(wakeJson).not.toContain(code);
+          expect(storage.putFile).not.toHaveBeenCalled();
+          expect(deliveries[0]!.state).toBe("processed");
+        }
         if (revokeAt === "none") {
           expect([...storage.objects.values()][0]).toEqual(bytes);
           await restarted.service.processPendingDeliveries();
@@ -14331,6 +14360,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await restarted?.service.shutdown();
         resolve.mockRestore();
         egress.mockRestore();
+        warning.mockRestore();
       }
     },
   );

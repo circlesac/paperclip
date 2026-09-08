@@ -76,3 +76,23 @@ provides a separately reviewed supported representation, it must still report
 unavailable without substituting another attachment. Then test a review-comment
 image and a changed/deleted source. Do not make the repository public to obtain
 a passing result.
+
+### Closed diagnostics for provider qualification
+
+A first live private review-comment image was not imported; a signed anchor in
+the browser is not evidence of the App REST response. The product now emits
+only a closed `attachmentDiagnosticCode` beside the endpoint, issue, and
+delivery IDs in the existing rejection log. Codes distinguish App authority or
+request failure, exact source/body mismatch, missing rendering, unsupported
+generic files, ambiguous/denied mapping, and a valid same-UUID signed-image
+shape without the required original source anchor. In particular,
+`github_attachment_canonical_signed_anchor_only` detects an exact signed
+anchor/image pair but still denies it. It is diagnostic evidence, not new
+download authority.
+
+No response HTML, URL, JWT query, token, or provider error details enter these
+diagnostics. SDK-wrapped errors retain only exact whitelisted codes with bounded
+cause traversal; unknown errors collapse to a closed request-failed code.
+Durable current-input omissions and agent prompts still use only
+`download_unavailable`. The next live test must establish the actual App
+rendering shape before extending accepted mappings.

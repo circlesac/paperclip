@@ -5,6 +5,7 @@ import {
   canonicalGitHubAttachmentUrl,
   githubAttachmentCommentRequest,
   githubAttachmentCommentFetch,
+  githubAttachmentDiagnosticCode,
   githubAttachmentLocator,
   githubAttachmentLimitOmissions,
   githubPublicAttachmentsFromMessage,
@@ -72,6 +73,87 @@ function canonicalComment(overrides: Record<string, unknown> = {}) {
 }
 
 describe("GitHub exact-comment private image resolution", () => {
+  it.each(
+    [
+      [null, "response_unavailable"],
+      [canonicalComment({ id: 9999 }), "source_mismatch"],
+      [canonicalComment({ body: "changed source body" }), "body_mismatch"],
+      [canonicalComment({ body_html: null }), "html_unavailable"],
+      [canonicalComment({ body_html: "<p>No image</p>" }), "anchor_missing"],
+      [
+        canonicalComment({ body_html: `<a href="${imageUrl}"></a>` }),
+        "image_count_invalid",
+      ],
+      [
+        canonicalComment({
+          body_html: `<a href="${imageUrl}"><img src="https://127.0.0.1/private?token=secret"></a>`,
+        }),
+        "target_denied",
+      ],
+      [
+        canonicalComment({
+          body_html: `<a href="${imageUrl}"><img src="${signedImageUrl}"></a><a href="${imageUrl}"><img src="${signedImageUrl}"></a>`,
+        }),
+        "mapping_ambiguous",
+      ],
+      [
+        canonicalComment({
+          body_html: `<a href="${signedImageUrl}"><img src="${signedImageUrl}"></a>`,
+        }),
+        "signed_anchor_only",
+      ],
+      [
+        canonicalComment({ body_html: `<img src="${signedImageUrl}">` }),
+        "image_without_source_anchor",
+      ],
+    ].map(([value, suffix]) => ({ value, suffix })),
+  )(
+    "returns only a closed diagnostic for canonical $suffix failure",
+    async ({ value, suffix }) => {
+      request.mockResolvedValueOnce(new Response("private", { status: 404 }));
+      const error = await prepareGitHubPublicAttachment(
+        attachment(),
+        undefined,
+        async () => value,
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(error).toMatchObject({
+        code: `github_attachment_canonical_${suffix}`,
+        message: `github_attachment_canonical_${suffix}`,
+      });
+      expect(JSON.stringify(error)).not.toMatch(
+        /https:|jwt|token|body_html|privatepayload/,
+      );
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(
+        resolveGitHubCommentAttachmentTarget(attachment(), value),
+      ).toBeNull();
+    },
+  );
+  it("preserves only exact closed SDK cause codes with bounded traversal", () => {
+    const code = "github_attachment_canonical_api_access_denied";
+    expect(
+      githubAttachmentDiagnosticCode(
+        new Error(`outer ${signedImageUrl}`, {
+          cause: new Error(code),
+        }),
+      ),
+    ).toBe(code);
+    expect(
+      githubAttachmentDiagnosticCode(new Error(`${code}: ${signedImageUrl}`)),
+    ).toBeNull();
+    expect(
+      githubAttachmentDiagnosticCode({
+        message: code,
+        request: { authorization: "secret" },
+      }),
+    ).toBeNull();
+    const cyclic = new Error("unknown secret");
+    cyclic.cause = cyclic;
+    expect(githubAttachmentDiagnosticCode(cyclic)).toBeNull();
+  });
   it.each([
     { version: 2 },
     { sourceBodySha256: "a".repeat(64) },
@@ -184,7 +266,9 @@ describe("GitHub exact-comment private image resolution", () => {
     request.mockResolvedValue(new Response("private", { status: 404 }));
     await expect(
       prepareGitHubPublicAttachment(fileAttachment(), undefined, resolve),
-    ).rejects.toMatchObject({ code: "github_attachment_not_public" });
+    ).rejects.toMatchObject({
+      code: "github_attachment_canonical_file_unsupported",
+    });
     expect(request).toHaveBeenCalledTimes(1);
   });
   it("uses the documented review-comment media type and exact review-root binding", () => {
@@ -253,7 +337,9 @@ describe("GitHub exact-comment private image resolution", () => {
         method: "GET",
         headers: { accept: expected.accept, authorization: "token test-only" },
       }),
-    ).rejects.toMatchObject({ code: "github_attachment_not_public" });
+    ).rejects.toMatchObject({
+      code: "github_attachment_canonical_api_status_unexpected",
+    });
     expect(request).toHaveBeenCalledTimes(1);
     expect(request.mock.calls[0]![1]).toMatchObject({
       redirect: "manual",
@@ -275,7 +361,9 @@ describe("GitHub exact-comment private image resolution", () => {
         expected.url,
         { method: "GET", headers: { accept: expected.accept } },
       ),
-    ).rejects.toMatchObject({ message: "github_attachment_not_public" });
+    ).rejects.toMatchObject({
+      message: "github_attachment_canonical_api_too_large",
+    });
     request.mockResolvedValue(new Response("private", { status: 404 }));
     await expect(
       prepareGitHubPublicAttachment(attachment(), undefined, async () => {
@@ -344,6 +432,28 @@ describe("GitHub exact-comment private image resolution", () => {
       expect(
         new Headers(request.mock.calls[0]![1].headers).get("authorization"),
       ).toBe("token ghs-test-only");
+      request.mockResolvedValueOnce(
+        new Response("private response body", { status: 403 }),
+      );
+      await expect(
+        runtime.resolveGitHubAttachmentComment(
+          githubAttachmentCommentRequest(attachment())!,
+          new AbortController().signal,
+        ),
+      ).rejects.toMatchObject({
+        message: "github_attachment_canonical_api_access_denied",
+      });
+      request.mockRejectedValueOnce(
+        new Error(`private provider detail ${signedImageUrl}`),
+      );
+      await expect(
+        runtime.resolveGitHubAttachmentComment(
+          githubAttachmentCommentRequest(attachment())!,
+          new AbortController().signal,
+        ),
+      ).rejects.toMatchObject({
+        message: "github_attachment_canonical_api_request_failed",
+      });
     } finally {
       await runtime.shutdown();
     }
@@ -401,12 +511,14 @@ describe("GitHub exact-comment private image resolution", () => {
       }
       const runtime = createRuntime();
       try {
-        expect(
-          await runtime.resolveGitHubAttachmentComment(
+        await expect(
+          runtime.resolveGitHubAttachmentComment(
             githubAttachmentCommentRequest(attachment())!,
             new AbortController().signal,
           ),
-        ).toBeNull();
+        ).rejects.toMatchObject({
+          code: "github_attachment_canonical_authority_unavailable",
+        });
         expect(providerFetch).not.toHaveBeenCalled();
         expect(request).not.toHaveBeenCalled();
       } finally {

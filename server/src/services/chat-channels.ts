@@ -8764,6 +8764,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           {
             endpointId: input.endpoint.id,
             issueId: input.issueId,
+            ...(error instanceof GitHubAttachmentUnavailableError
+              ? {
+                  deliveryId: input.deliveryId,
+                  attachmentDiagnosticCode: error.code,
+                }
+              : {}),
             attachmentName: sanitizeFilename(attachment.name),
             error: redactError(error),
           },

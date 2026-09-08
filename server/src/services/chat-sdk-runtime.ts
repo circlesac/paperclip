@@ -52,6 +52,8 @@ import type { StateAdapter } from "chat";
 import {
   githubAttachmentLocator,
   githubAttachmentCommentFetch,
+  githubAttachmentDiagnosticCode,
+  GitHubAttachmentUnavailableError,
   isGitHubAttachmentCommentRequest,
   githubPublicAttachmentsFromMessage,
   rehydrateGitHubPublicAttachment,
@@ -1942,8 +1944,14 @@ export class ChatSdkEndpointRuntime {
     request: GitHubAttachmentCommentRequest,
     signal: AbortSignal,
   ): Promise<unknown> {
-    if (!this.githubAttachmentAppAuthority) return null;
-    if (!isGitHubAttachmentCommentRequest(request)) return null;
+    if (!this.githubAttachmentAppAuthority)
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_canonical_authority_unavailable",
+      );
+    if (!isGitHubAttachmentCommentRequest(request))
+      throw new GitHubAttachmentUnavailableError(
+        "github_attachment_source_mismatch",
+      );
     try {
       signal.throwIfAborted();
       const result = await (this.adapter as GitHubAdapter).octokit.request(
@@ -1962,10 +1970,13 @@ export class ChatSdkEndpointRuntime {
       );
       signal.throwIfAborted();
       return result.data;
-    } catch {
+    } catch (error) {
       // Octokit errors can carry request headers or authenticated HTML. Neither
       // belongs in adapter logs, durable ingress, nor agent-visible results.
-      return null;
+      throw new GitHubAttachmentUnavailableError(
+        githubAttachmentDiagnosticCode(error) ??
+          "github_attachment_canonical_api_request_failed",
+      );
     }
   }
 
