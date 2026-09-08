@@ -1,4 +1,5 @@
 import { logger } from "../middleware/logger.js";
+import type { DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 
 type WakeupTriggerDetail = "manual" | "ping" | "callback" | "system";
 type WakeupSource = "timer" | "assignment" | "on_demand" | "automation";
@@ -16,6 +17,7 @@ export interface IssueAssignmentWakeupDeps {
       requestedByActorType?: "user" | "agent" | "system";
       requestedByActorId?: string | null;
       contextSnapshot?: Record<string, unknown>;
+      durableChatRequest?: DurableChatWakeupRequest;
     },
   ) => Promise<unknown>;
 }
@@ -36,6 +38,7 @@ export function queueIssueAssignmentWakeup(input: {
    * exact wake comment. These are prompt diagnostics, never authorization. */
   attachmentOmissionReasons?: Record<string, number> | null;
   rethrowOnError?: boolean;
+  durableChatRequest?: DurableChatWakeupRequest;
 }) {
   if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
 
@@ -52,6 +55,9 @@ export function queueIssueAssignmentWakeup(input: {
       },
       requestedByActorType: input.requestedByActorType,
       requestedByActorId: input.requestedByActorId ?? null,
+      ...(input.durableChatRequest
+        ? { durableChatRequest: input.durableChatRequest }
+        : {}),
       contextSnapshot: {
         issueId: input.issue.id,
         source: input.contextSource,

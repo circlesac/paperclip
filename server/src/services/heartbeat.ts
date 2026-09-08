@@ -1,4 +1,10 @@
 import { initializeRunIdentity } from "./run-identity.js";
+import {
+  assertDurableChatWakeupReceipt,
+  assertDurableChatWakeupRequest,
+  unadmittedChatWakeupCondition,
+  type DurableChatWakeupRequest,
+} from "./durable-chat-wakeup.js";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
 import {
   cleanupGitHubOperationLaunchers,
@@ -222,6 +228,12 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
   NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
 } from "./native-runtime/native-runner-ownership.js";
+import {
+  findNativeChatWorkspaceScope,
+  materializeNativeChatTaskRoot,
+  nativeChatWorkspaceCwd,
+  nativeChatWorkspaceMatches,
+} from "./native-runtime/native-chat-workspace.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { emitAgentTaskRun } from "./agent-task-run-telemetry.js";
@@ -234,6 +246,7 @@ import {
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
+  CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
   findHeartbeatRunCompletionComment,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
   HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS,
@@ -3340,6 +3353,7 @@ function normalizeMaxConcurrentRuns(value: unknown) {
 }
 
 interface WakeupOptions {
+  durableChatRequest?: DurableChatWakeupRequest;
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
   reason?: string | null;
@@ -17675,16 +17689,19 @@ export function heartbeatService(
       reason:
         | "live_process_identifier"
         | "observed_owner_unverified"
-        | "adopted_runner_authentication_timeout";
+        | "adopted_runner_authentication_timeout"
+        | "native_chat_workspace_scope_mismatch";
       processPidAlive?: boolean;
       processGroupAlive?: boolean;
     },
   ) {
+    const durableOwnershipHold =
+      evidence.reason === "adopted_runner_authentication_timeout" ||
+      evidence.reason === "native_chat_workspace_scope_mismatch";
     if (
       run.errorCode === NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE &&
       run.error === NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE &&
-      (evidence.reason !== "adopted_runner_authentication_timeout" ||
-        isNativeRunnerOwnershipHeld(run))
+      (!durableOwnershipHold || isNativeRunnerOwnershipHeld(run))
     )
       return run;
     const blockedStatus = run.status === "failed" ? "failed" : "running";
@@ -17695,7 +17712,7 @@ export function heartbeatService(
       {
         error: NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE,
         errorCode: NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
-        ...(evidence.reason === "adopted_runner_authentication_timeout"
+        ...(durableOwnershipHold
           ? {
               nativePhase: "terminal_failure",
               nativePhaseUpdatedAt: new Date(),
@@ -19609,6 +19626,50 @@ export function heartbeatService(
           : selectedEnvironmentId
             ? await environmentsSvc.getById(selectedEnvironmentId)
             : null;
+      const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
+        adapterType: agent.adapterType,
+        environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
+        companyId: agent.companyId,
+        agentId: agent.id,
+        issueId,
+      });
+      const nativeChatExpectedCwd = nativeChatWorkspaceScope
+        ? nativeChatWorkspaceCwd(
+            nativeChatWorkspaceScope,
+            reusableExistingExecutionWorkspace,
+            requestedShouldReuseExisting,
+          )
+        : null;
+      if (
+        nativeChatWorkspaceScope &&
+        persistedNativeExecutionInput &&
+        !nativeChatWorkspaceMatches({
+          scope: nativeChatWorkspaceScope,
+          expectedCwd: nativeChatExpectedCwd,
+          execution: persistedNativeExecutionInput,
+        })
+      ) {
+        // Never rewrite an admitted provider input or release ownership of an
+        // older process whose permissions still include the shared agent home.
+        throw new NativeRunnerOwnershipUnverifiedError(
+          "native_chat_workspace_scope_mismatch",
+        );
+      }
+      if (
+        nativeChatWorkspaceScope &&
+        (!nativeChatExpectedCwd ||
+          executionProjectId !== nativeChatWorkspaceScope.projectId)
+      ) {
+        throw new ConfigurationIncompleteFailure(
+          "External chat requires a task-owned isolated workspace. Configure and select an existing isolated worktree for this project task; shared project workspaces cannot be used for external chat.",
+          {
+            configurationIncomplete: {
+              reason: "native_chat_workspace_isolation_required",
+              issueId,
+            },
+          },
+        );
+      }
       const sharedWorkspaceConcurrency = resolveSharedWorkspaceConcurrency({
         projectPolicy: projectExecutionWorkspacePolicy,
         issueSettings: issueExecutionWorkspaceSettings,
@@ -19892,17 +19953,54 @@ export function heartbeatService(
           );
           return preflightEnvironment.driver;
         },
-        resolveWorkspace: () =>
-          resolveWorkspaceForRun(agent, context, previousSessionParams, {
-            useProjectWorkspace:
-              requestedExecutionWorkspaceMode !== "agent_default",
-            // Thread the selected environment driver so run-workspace resolution can tell a local
-            // target from a remote one, and a confined sandbox target from an unconfined remote
-            // target. A remote run resolves referenced projects only for the confined sandbox
-            // transport with the remote flag on. This never changes the anchor workspace.
-            executionEnvironmentDriver:
-              selectedEnvironmentForConfig?.driver ?? null,
-          }),
+        resolveWorkspace: async () => {
+          if (
+            nativeChatWorkspaceScope &&
+            !nativeChatWorkspaceScope.projectId
+          ) {
+            const cwd = await materializeNativeChatTaskRoot(
+              nativeChatWorkspaceScope,
+            );
+            return {
+              cwd,
+              source: "task_session" as const,
+              projectId: null,
+              workspaceId: null,
+              repoUrl: null,
+              repoRef: null,
+              workspaceHints: [],
+              warnings: [],
+              baseCwdFallback: false,
+              materializationFailures: [],
+              additionalWorkspaces: [],
+              referencedProjectFailures: [],
+            };
+          }
+          const workspace = await resolveWorkspaceForRun(
+            agent,
+            context,
+            previousSessionParams,
+            {
+              useProjectWorkspace:
+                requestedExecutionWorkspaceMode !== "agent_default",
+              // Thread the selected environment driver so run-workspace resolution can tell a local
+              // target from a remote one, and a confined sandbox target from an unconfined remote
+              // target. A remote run resolves referenced projects only for the confined sandbox
+              // transport with the remote flag on. This never changes the anchor workspace.
+              executionEnvironmentDriver:
+                selectedEnvironmentForConfig?.driver ?? null,
+            },
+          );
+          // Additional referenced projects are a separate trusted Board
+          // capability, not extra readable roots for an external conversation.
+          return nativeChatWorkspaceScope
+            ? {
+                ...workspace,
+                additionalWorkspaces: [],
+                referencedProjectFailures: [],
+              }
+            : workspace;
+        },
       });
       const hostExecutionWorkspaceConfig =
         stripHostWorkspaceProvisionForLowTrustSandbox({
@@ -20579,6 +20677,21 @@ export function heartbeatService(
       const workspaceRealization = realizationResult.workspaceRealization;
       const executionTarget = realizationResult.executionTarget;
       const remoteExecution = realizationResult.remoteExecution;
+      if (
+        nativeChatWorkspaceScope &&
+        (executionTarget?.kind === "remote" ||
+          path.resolve(executionWorkspace.cwd) !== nativeChatExpectedCwd)
+      ) {
+        throw new ConfigurationIncompleteFailure(
+          "External chat workspace realization did not preserve this task's isolated filesystem. Repair its workspace before retrying.",
+          {
+            configurationIncomplete: {
+              reason: "native_chat_workspace_realization_mismatch",
+              issueId,
+            },
+          },
+        );
+      }
       const dispatchResolvedInteractionContinuationWithAtomicGate = async <T>(
         dispatch: (markDispatchStarted: () => void) => Promise<T>,
       ): Promise<
@@ -23034,12 +23147,26 @@ export function heartbeatService(
                 livenessRun.id,
                 livenessRun.companyId,
               );
+            const externalChatPresentationContext =
+              isExternalChatPresentationContext(livenessRun.contextSnapshot);
+            const externalChatPresentationAuthorization =
+              issueId && externalChatPresentationContext
+                ? await resolveChatRunPresentationAuthorizationReason(db, {
+                    companyId: livenessRun.companyId,
+                    issueId,
+                    runId: livenessRun.id,
+                  })
+                : null;
             const resolved = resolveHeartbeatRunResponse({
               resultJson: persistedResultJson,
               existingComment: existingRunComment,
               finalAgentMessage,
               preferFinalResponseOverExistingComment:
-                isExternalChatPresentationContext(livenessRun.contextSnapshot),
+                externalChatPresentationContext,
+              externalChatResponseWakeSummaryAuthorized:
+                Boolean(adapterResult.nativeFinalization) &&
+                externalChatPresentationAuthorization ===
+                  CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
             });
             let presentationDecision: RunPresentationDecision =
               resolved.decision;
@@ -23261,7 +23388,7 @@ export function heartbeatService(
           const heldRun = await getRun(run.id);
           if (heldRun)
             await markNativeOwnershipUnverified(heldRun, {
-              reason: "adopted_runner_authentication_timeout",
+              reason: err.reason,
             });
           return;
         }
@@ -23559,7 +23686,10 @@ export function heartbeatService(
         const heldRun = await getRun(run.id).catch(() => null);
         if (heldRun)
           await markNativeOwnershipUnverified(heldRun, {
-            reason: "adopted_runner_authentication_timeout",
+            reason:
+              outerErr instanceof NativeRunnerOwnershipUnverifiedError
+                ? outerErr.reason
+                : "adopted_runner_authentication_timeout",
           }).catch(() => undefined);
       } else if (isWorkspaceBusyDeferral(outerErr)) {
         // Expected contention on a shared project workspace, not a
@@ -24918,6 +25048,39 @@ export function heartbeatService(
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
 
+    const durableRequest = opts.durableChatRequest;
+    if (durableRequest) {
+      assertDurableChatWakeupRequest(durableRequest, {
+        agentId,
+        companyId: agent.companyId,
+        issueId,
+        commentId: wakeCommentId ?? null,
+        requestedByActorType: opts.requestedByActorType,
+        requestedByActorId: opts.requestedByActorId,
+      });
+      opts = { ...opts, idempotencyKey: durableRequest.idempotencyKey };
+    }
+    const durableReceiptFields = durableRequest
+      ? { id: durableRequest.id, requestedAt: durableRequest.requestedAt }
+      : {};
+    const existingDurableReceipt = async (queryDb: Db) => {
+      if (!durableRequest) return null;
+      const receipt = await queryDb
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, durableRequest.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (receipt) assertDurableChatWakeupReceipt(durableRequest, receipt);
+      return receipt;
+    };
+    const priorReceipt = await existingDurableReceipt(db);
+    if (priorReceipt) {
+      // Replaying an admission receipt is not fresh authority to dispatch it.
+      // The normal queue owns dispatch and its current execution-policy checks.
+      return priorReceipt.runId ? getRun(priorReceipt.runId) : null;
+    }
+
     const agentDebug = parseObject(parseObject(agent.runtimeConfig).debug);
     const runDebug = parseObject(enrichedContextSnapshot.debug);
     if (
@@ -24938,6 +25101,7 @@ export function heartbeatService(
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
     ) => {
       await db.insert(agentWakeupRequests).values({
+        ...durableReceiptFields,
         companyId: agent.companyId,
         agentId,
         source,
@@ -25279,6 +25443,35 @@ export function heartbeatService(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
 
+        const durableReceipt = await existingDurableReceipt(
+          tx as unknown as Db,
+        );
+        if (durableReceipt)
+          return { kind: "durable" as const, receipt: durableReceipt };
+        if (durableRequest) {
+          if (issueId !== durableRequest.issueId)
+            throw new Error("chat_inbound_wakeup_binding_denied");
+          await durableRequest.authorize(tx as unknown as Db);
+        } else {
+          const [held] = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.id, issueId),
+                eq(issues.companyId, agent.companyId),
+                unadmittedChatWakeupCondition(issues.id, issues.companyId),
+              ),
+            )
+            .limit(1);
+          if (held) {
+            throw conflict(
+              "This task has external chat input that has not been admitted. Check the connection's Activity; let pending input finish, or restore access and send a new authorized message before starting the task.",
+              { code: "chat_inbound_wakeup_unadmitted", issueId },
+            );
+          }
+        }
+
         const issue = await tx
           .select({
             id: issues.id,
@@ -25303,6 +25496,7 @@ export function heartbeatService(
 
         if (!issue) {
           await tx.insert(agentWakeupRequests).values({
+            ...durableReceiptFields,
             companyId: agent.companyId,
             agentId,
             source,
@@ -25325,6 +25519,7 @@ export function heartbeatService(
             issue.assigneeAgentId !== issueStateGuard.assigneeAgentId)
         ) {
           await tx.insert(agentWakeupRequests).values({
+            ...durableReceiptFields,
             companyId: agent.companyId,
             agentId,
             source,
@@ -25356,6 +25551,7 @@ export function heartbeatService(
           issue.createdAt < worktreeExecutionCutoff
         ) {
           await tx.insert(agentWakeupRequests).values({
+            ...durableReceiptFields,
             companyId: agent.companyId,
             agentId,
             source,
@@ -25658,6 +25854,7 @@ export function heartbeatService(
           !blockedInteractionWake
         ) {
           await tx.insert(agentWakeupRequests).values({
+            ...durableReceiptFields,
             companyId: agent.companyId,
             agentId,
             source,
@@ -25771,6 +25968,7 @@ export function heartbeatService(
               updatedAt: now,
             });
             await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
               source,
@@ -25845,9 +26043,31 @@ export function heartbeatService(
           const availableActiveExecutionRun = isSameExecutionAgent
             ? filterZombieCoalesceTarget(activeExecutionRun, liveRunExecutions)
             : activeExecutionRun;
+          const activeWakeActor =
+            durableRequest && availableActiveExecutionRun?.wakeupRequestId
+              ? await tx
+                  .select({
+                    type: agentWakeupRequests.requestedByActorType,
+                    id: agentWakeupRequests.requestedByActorId,
+                  })
+                  .from(agentWakeupRequests)
+                  .where(
+                    eq(
+                      agentWakeupRequests.id,
+                      availableActiveExecutionRun.wakeupRequestId,
+                    ),
+                  )
+                  .limit(1)
+                  .then((rows) => rows[0] ?? null)
+              : null;
+          const sameDurableActor =
+            !durableRequest ||
+            (activeWakeActor?.type === durableRequest.requestedByActorType &&
+              activeWakeActor.id === durableRequest.requestedByActorId);
 
           if (
             opts.allowRunCoalescing !== false &&
+            sameDurableActor &&
             isSameExecutionAgent &&
             !shouldDeferFollowupWake &&
             !shouldQueueFollowupForRunningWake &&
@@ -25873,6 +26093,7 @@ export function heartbeatService(
               .then((rows) => rows[0] ?? availableActiveExecutionRun);
 
             await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
               source,
@@ -25907,6 +26128,18 @@ export function heartbeatService(
                   eq(agentWakeupRequests.agentId, agentId),
                   eq(agentWakeupRequests.status, "deferred_issue_execution"),
                   sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                  ...(durableRequest
+                    ? [
+                        eq(
+                          agentWakeupRequests.requestedByActorType,
+                          durableRequest.requestedByActorType,
+                        ),
+                        eq(
+                          agentWakeupRequests.requestedByActorId,
+                          durableRequest.requestedByActorId,
+                        ),
+                      ]
+                    : []),
                 ),
               )
               .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -25941,10 +26174,32 @@ export function heartbeatService(
                 })
                 .where(eq(agentWakeupRequests.id, existingDeferred.id));
 
+              if (durableRequest) {
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason,
+                  payload: {
+                    ...(payload ?? {}),
+                    coalescedIntoWakeupRequestId: existingDeferred.id,
+                  },
+                  status: "coalesced",
+                  coalescedCount: 1,
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                  runId: existingDeferred.runId,
+                  finishedAt: new Date(),
+                });
+              }
               return { kind: "deferred" as const };
             }
 
             await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
               source,
@@ -26057,6 +26312,7 @@ export function heartbeatService(
 
             if (throttleDecision.blocked) {
               await tx.insert(agentWakeupRequests).values({
+                ...durableReceiptFields,
                 companyId: agent.companyId,
                 agentId,
                 source,
@@ -26095,6 +26351,7 @@ export function heartbeatService(
         if (dailyCapBlock) {
           const now = new Date();
           await tx.insert(agentWakeupRequests).values({
+            ...durableReceiptFields,
             companyId: agent.companyId,
             agentId,
             source,
@@ -26130,6 +26387,7 @@ export function heartbeatService(
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
           .values({
+            ...durableReceiptFields,
             companyId: agent.companyId,
             agentId,
             source,
@@ -26184,6 +26442,9 @@ export function heartbeatService(
         void emitAgentTaskRun(db, cancelledRun);
       }
 
+      if (outcome.kind === "durable") {
+        return outcome.receipt.runId ? getRun(outcome.receipt.runId) : null;
+      }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
         return null;
       }
@@ -26208,6 +26469,8 @@ export function heartbeatService(
       await startNextQueuedRunForAgent(agent.id);
       return newRun;
     }
+
+    if (durableRequest) throw new Error("chat_inbound_wakeup_binding_denied");
 
     const activeRuns = await db
       .select()
@@ -26279,6 +26542,7 @@ export function heartbeatService(
         .then((rows) => rows[0] ?? coalescedTargetRun);
 
       await db.insert(agentWakeupRequests).values({
+        ...durableReceiptFields,
         companyId: agent.companyId,
         agentId,
         source,
@@ -26310,6 +26574,7 @@ export function heartbeatService(
       if (dailyCapBlock) {
         const now = new Date();
         await tx.insert(agentWakeupRequests).values({
+          ...durableReceiptFields,
           companyId: agent.companyId,
           agentId,
           source,
@@ -26345,6 +26610,7 @@ export function heartbeatService(
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
+          ...durableReceiptFields,
           companyId: agent.companyId,
           agentId,
           source,

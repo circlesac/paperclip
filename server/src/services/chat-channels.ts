@@ -30,6 +30,10 @@ import {
 import { alias, type AnyPgColumn } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
+  createDurableChatWakeupRequest,
+  assertDurableChatWakeupReceipt,
+} from "./durable-chat-wakeup.js";
+import {
   agentWakeupRequests,
   agents,
   assets,
@@ -8640,6 +8644,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             eq(issueComments.companyId, input.endpoint.companyId),
           ),
         );
+      await tx
+        .update(chatActions)
+        .set({
+          status: "failed",
+          result: { code: "inbound_wakeup_attachment_unavailable" },
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatActions.deliveryId, input.activeDelivery.id),
+            eq(chatActions.kind, "inbound_wakeup"),
+            eq(chatActions.status, "preparing"),
+          ),
+        );
       const staged = await stageProviderEffect(tx, {
         endpoint: input.endpoint,
         deliveryId: input.activeDelivery.id,
@@ -8990,6 +9008,517 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return false;
       },
     );
+  }
+
+  async function stageInboundWakeup(
+    tx: DbOrTransaction,
+    input: {
+      endpoint: EndpointRow;
+      deliveryId: string;
+      conversation: typeof chatConversations.$inferSelect;
+      commentId: string;
+      principalId: string;
+      actorUserId: string | null;
+    },
+  ) {
+    await tx
+      .insert(chatActions)
+      .values({
+        companyId: input.endpoint.companyId,
+        endpointId: input.endpoint.id,
+        deliveryId: input.deliveryId,
+        conversationId: input.conversation.id,
+        principalId: input.principalId,
+        kind: "inbound_wakeup",
+        providerActionId: `inbound_wakeup:${input.deliveryId}`,
+        status: "preparing",
+        payload: {
+          version: 1,
+          issueId: input.conversation.issueId,
+          agentId: input.endpoint.assignedAgentId,
+          commentId: input.commentId,
+          sessionGeneration: input.conversation.sessionGeneration,
+          requestedByActorType: input.actorUserId ? "user" : "system",
+          requestedByActorId: input.actorUserId ?? input.principalId,
+        },
+      })
+      .onConflictDoNothing();
+  }
+
+  async function authorizeInboundWakeup(
+    tx: DbOrTransaction,
+    action: typeof chatActions.$inferSelect,
+  ) {
+    const payload = action.payload;
+    const deny = () =>
+      forbidden(
+        "This accepted chat message is no longer authorized to start work",
+        { code: "chat_action_authorization_changed" },
+      );
+    if (
+      payload.version !== 1 ||
+      typeof payload.issueId !== "string" ||
+      typeof payload.agentId !== "string" ||
+      typeof payload.commentId !== "string" ||
+      !action.conversationId ||
+      !action.principalId ||
+      !action.deliveryId ||
+      !["user", "system"].includes(String(payload.requestedByActorType)) ||
+      typeof payload.requestedByActorId !== "string"
+    )
+      throw deny();
+    const issue = await tx
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, action.companyId),
+          eq(issues.id, payload.issueId),
+        ),
+      )
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (
+      !issue ||
+      issue.assigneeAgentId !== payload.agentId ||
+      ["backlog", "done", "cancelled"].includes(issue.status)
+    )
+      throw deny();
+    // The scheduler already owns the issue lock. Do not wait in the opposite
+    // order behind an ingress transaction which owns the endpoint first.
+    const endpoint = await tx
+      .select()
+      .from(chatEndpoints)
+      .where(
+        and(
+          eq(chatEndpoints.companyId, action.companyId),
+          eq(chatEndpoints.id, action.endpointId),
+        ),
+      )
+      .for("no key update", { noWait: true })
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const delivery = await tx
+      .select()
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.companyId, action.companyId),
+          eq(chatDeliveries.id, action.deliveryId),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const fence = delivery ? lifecycleRuntimeFence(delivery) : null;
+    if (
+      !endpoint ||
+      endpoint.assignedAgentId !== payload.agentId ||
+      !delivery ||
+      delivery.endpointId !== endpoint.id ||
+      delivery.conversationId !== action.conversationId ||
+      delivery.principalId !== action.principalId ||
+      !fence ||
+      !(await runtimeCallbackEndpoint(tx as DbTransaction, endpoint.id, fence, [
+        "verifying",
+        "active",
+      ]))
+    )
+      throw deny();
+    const conversation = await tx
+      .select()
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, action.companyId),
+          eq(chatConversations.id, action.conversationId),
+        ),
+      )
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (
+      !conversation ||
+      conversation.endpointId !== endpoint.id ||
+      conversation.issueId !== issue.id ||
+      conversation.sessionGeneration !== payload.sessionGeneration ||
+      !["active", "waiting"].includes(conversation.state)
+    )
+      throw deny();
+    const resource = conversation.resourceId
+      ? await tx
+          .select()
+          .from(chatEndpointResources)
+          .where(
+            and(
+              eq(chatEndpointResources.endpointId, endpoint.id),
+              eq(chatEndpointResources.id, conversation.resourceId),
+            ),
+          )
+          .for("update")
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const authorization = await lockCurrentPrincipalAuthorization(
+      tx,
+      endpoint,
+      action.principalId,
+    );
+    const expectedUserId =
+      payload.requestedByActorType === "user" ? payload.requestedByActorId : null;
+    if (
+      !(conversation.isDirectMessage
+        ? endpoint.allowDirectMessages
+        : nonDirectDestinationAllowed(endpoint, resource)) ||
+      !authorization.allowed ||
+      authorization.userId !== expectedUserId ||
+      (payload.requestedByActorType === "system" &&
+        payload.requestedByActorId !== action.principalId)
+    )
+      throw deny();
+    const source = await tx
+      .select({
+        authorUserId: issueComments.authorUserId,
+        deletedAt: issueComments.deletedAt,
+      })
+      .from(chatMessageLinks)
+      .innerJoin(
+        issueComments,
+        and(
+          eq(issueComments.id, chatMessageLinks.commentId),
+          eq(issueComments.companyId, action.companyId),
+          eq(issueComments.issueId, issue.id),
+        ),
+      )
+      .where(
+        and(
+          eq(chatMessageLinks.companyId, action.companyId),
+          eq(chatMessageLinks.endpointId, endpoint.id),
+          eq(chatMessageLinks.conversationId, conversation.id),
+          eq(chatMessageLinks.deliveryId, delivery.id),
+          eq(chatMessageLinks.commentId, payload.commentId),
+          eq(chatMessageLinks.direction, "inbound"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!source || source.deletedAt || source.authorUserId !== expectedUserId)
+      throw deny();
+    return { issue, delivery, endpoint, conversation };
+  }
+
+  async function acceptInboundWakeup(
+    deliveryId: string,
+    attachmentResult: Awaited<ReturnType<typeof ingestAttachments>>,
+  ) {
+    await db.transaction(async (tx) => {
+      const action = await tx
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.deliveryId, deliveryId),
+            eq(chatActions.kind, "inbound_wakeup"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!action) throw new Error("chat_inbound_wakeup_intent_missing");
+      const { delivery } = await authorizeInboundWakeup(tx, action);
+      if (delivery.state === "processed") return;
+      if (delivery.state !== "processing")
+        throw new Error("chat_inbound_wakeup_delivery_claim_lost");
+      if (action.status !== "preparing") {
+        const existingReceipt = await tx
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, action.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!existingReceipt)
+          throw new Error("chat_inbound_wakeup_action_claim_lost");
+        assertDurableChatWakeupReceipt(
+          createDurableChatWakeupRequest({
+            id: action.id,
+            companyId: action.companyId,
+            agentId: String(action.payload.agentId),
+            issueId: String(action.payload.issueId),
+            commentId: String(action.payload.commentId),
+            requestedByActorType: action.payload.requestedByActorType as
+              "user" | "system",
+            requestedByActorId: String(action.payload.requestedByActorId),
+            requestedAt: action.createdAt,
+            authorize: async () => {},
+          }),
+          existingReceipt,
+        );
+      }
+      const accepted = await tx
+        .update(chatDeliveries)
+        .set({
+          state: "processed",
+          processedAt: new Date(),
+          redactedError: attachmentOmissionDetail(attachmentResult),
+          nextAttemptAt: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatDeliveries.id, deliveryId),
+            eq(chatDeliveries.state, "processing"),
+            eq(chatDeliveries.updatedAt, delivery.updatedAt),
+          ),
+        )
+        .returning({ id: chatDeliveries.id });
+      if (accepted.length !== 1)
+        throw new Error("chat_inbound_wakeup_delivery_claim_lost");
+      // An operator can repair a failed delivery ledger after its wake was
+      // already committed. Keep the immutable receipt and never admit twice.
+      if (action.status !== "preparing") return;
+      const issued = await tx
+        .update(chatActions)
+        .set({
+          status: "issued",
+          payload: {
+            ...action.payload,
+            attachmentOmissionReasons: attachmentResult.omissionReasons,
+          },
+          updatedAt: new Date(),
+        })
+        .where(
+          and(eq(chatActions.id, action.id), eq(chatActions.status, "preparing")),
+        )
+        .returning({ id: chatActions.id });
+      if (issued.length !== 1)
+        throw new Error("chat_inbound_wakeup_action_claim_lost");
+    });
+  }
+
+  async function settleRejectedInboundWakeups(onlyDeliveryId?: string) {
+    await db
+      .update(chatActions)
+      .set({
+        status: "failed",
+        result: { code: "inbound_wakeup_delivery_rejected" },
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(chatActions.kind, "inbound_wakeup"),
+          eq(chatActions.status, "preparing"),
+          onlyDeliveryId ? eq(chatActions.deliveryId, onlyDeliveryId) : undefined,
+          sql`exists (select 1 from ${chatDeliveries}
+            where ${chatDeliveries.id} = ${chatActions.deliveryId}
+              and ${chatDeliveries.companyId} = ${chatActions.companyId}
+              and ${chatDeliveries.endpointId} = ${chatActions.endpointId}
+              and ${chatDeliveries.state} in ('filtered', 'failed'))`,
+        ),
+      );
+  }
+
+  async function processInboundWakeup(deliveryId: string): Promise<boolean> {
+    const now = new Date();
+    const candidate = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.deliveryId, deliveryId),
+          eq(chatActions.kind, "inbound_wakeup"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (
+      !candidate ||
+      !["preparing", "issued", "processing"].includes(candidate.status)
+    )
+      return true;
+    if (
+      candidate.status === "preparing" ||
+      (candidate.status === "processing" &&
+        candidate.updatedAt.getTime() >
+          now.getTime() - DELIVERY_PROCESSING_STALE_MS) ||
+      (typeof candidate.result?.retryAt === "string" &&
+        Date.parse(candidate.result.retryAt) > now.getTime())
+    )
+      return false;
+    const claimed = await db
+      .update(chatActions)
+      .set({ status: "processing", updatedAt: now })
+      .where(
+        and(
+          eq(chatActions.id, candidate.id),
+          eq(chatActions.status, candidate.status),
+          eq(chatActions.updatedAt, candidate.updatedAt),
+        ),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!claimed) return false;
+    const attemptCount = Number(candidate.result?.attemptCount ?? 0) + 1;
+    const receiptDeclined = (row: typeof agentWakeupRequests.$inferSelect) =>
+      ["skipped", "cancelled", "failed"].includes(row.status);
+    const settle = (status: string, result: Record<string, unknown>) =>
+      db.transaction(async (tx) => {
+        const changed = await tx
+          .update(chatActions)
+          .set({ status, result, updatedAt: new Date() })
+          .where(
+            and(
+              eq(chatActions.id, claimed.id),
+              eq(chatActions.status, "processing"),
+              eq(chatActions.updatedAt, now),
+            ),
+          )
+          .returning({ id: chatActions.id });
+        if (changed.length && status === "failed") {
+          await tx
+            .update(chatDeliveries)
+            .set({
+              redactedError:
+                result.code === "inbound_wakeup_authorization_changed"
+                  ? "Input saved. Work was not scheduled because current chat access no longer permits it."
+                  : "Input saved. Its work request was skipped, cancelled, or failed; no automatic replay was performed.",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatDeliveries.id, deliveryId),
+                eq(chatDeliveries.companyId, claimed.companyId),
+                eq(chatDeliveries.state, "processed"),
+              ),
+            );
+        }
+      });
+    let request: ReturnType<typeof createDurableChatWakeupRequest> | null = null;
+    const receipt = async () => {
+      const row = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, claimed.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (row && request) assertDurableChatWakeupReceipt(request, row);
+      return row;
+    };
+    try {
+      if (
+        claimed.payload.version !== 1 ||
+        typeof claimed.payload.agentId !== "string" ||
+        typeof claimed.payload.issueId !== "string" ||
+        typeof claimed.payload.commentId !== "string" ||
+        typeof claimed.payload.requestedByActorId !== "string" ||
+        !["user", "system"].includes(String(claimed.payload.requestedByActorType))
+      ) {
+        throw forbidden("Invalid durable inbound chat source", {
+          code: "chat_action_authorization_changed",
+        });
+      }
+      request = createDurableChatWakeupRequest({
+        id: claimed.id,
+        companyId: claimed.companyId,
+        agentId: claimed.payload.agentId,
+        issueId: claimed.payload.issueId,
+        commentId: claimed.payload.commentId,
+        requestedByActorType: claimed.payload.requestedByActorType as
+          "user" | "system",
+        requestedByActorId: String(claimed.payload.requestedByActorId),
+        requestedAt: claimed.createdAt,
+        authorize: async (tx) => {
+          const current = await authorizeInboundWakeup(tx, claimed);
+          if (current.delivery.state !== "processed")
+            throw new Error("chat_inbound_wakeup_acceptance_not_committed");
+        },
+      });
+      const priorReceipt = await receipt();
+      if (priorReceipt) {
+        await settle(receiptDeclined(priorReceipt) ? "failed" : "processed", {
+          code: receiptDeclined(priorReceipt)
+            ? `inbound_wakeup_${priorReceipt.status}`
+            : "inbound_wakeup_already_durable",
+          wakeupRequestId: priorReceipt.id,
+          runId: priorReceipt.runId,
+          receiptStatus: priorReceipt.status,
+          attemptCount,
+        });
+        return true;
+      }
+      const context = await db.transaction((tx) =>
+        authorizeInboundWakeup(tx, claimed),
+      );
+      if (context.delivery.state !== "processed")
+        throw new Error("chat_inbound_wakeup_acceptance_not_committed");
+      await queueIssueAssignmentWakeup({
+        heartbeat: options.heartbeat,
+        issue: context.issue,
+        reason: "External chat message received",
+        mutation: "chat_message_received",
+        contextSource: `chat:${context.endpoint.provider}`,
+        requestedByActorType: request.requestedByActorType,
+        requestedByActorId: request.requestedByActorId,
+        taskKey: context.issue.identifier,
+        wakeCommentId: request.commentId,
+        attachmentOmissionReasons: claimed.payload.attachmentOmissionReasons as
+          Record<string, number> | undefined,
+        durableChatRequest: request,
+        rethrowOnError: true,
+      });
+      const durable = await receipt();
+      if (!durable) throw new Error("chat_inbound_wakeup_receipt_missing");
+      await settle(receiptDeclined(durable) ? "failed" : "processed", {
+        code: receiptDeclined(durable)
+          ? `inbound_wakeup_${durable.status}`
+          : "inbound_wakeup_durable",
+        wakeupRequestId: durable.id,
+        runId: durable.runId,
+        receiptStatus: durable.status,
+        ...(durable.status === "skipped" ? { reason: durable.reason } : {}),
+        attemptCount,
+      });
+      return true;
+    } catch (error) {
+      const conflictingReceipt =
+        error instanceof Error &&
+        error.message === "chat_inbound_wakeup_receipt_conflict";
+      const durable = request && !conflictingReceipt ? await receipt() : null;
+      if (durable) {
+        await settle(receiptDeclined(durable) ? "failed" : "processed", {
+          code: receiptDeclined(durable)
+            ? `inbound_wakeup_${durable.status}`
+            : "inbound_wakeup_already_durable",
+          wakeupRequestId: durable.id,
+          runId: durable.runId,
+          receiptStatus: durable.status,
+          attemptCount,
+        });
+        return true;
+      }
+      const denied =
+        conflictingReceipt || isExternalActionAuthorizationChange(error);
+      await settle(denied ? "failed" : "issued", {
+        code: conflictingReceipt
+          ? "inbound_wakeup_receipt_conflict"
+          : denied
+            ? "inbound_wakeup_authorization_changed"
+            : "inbound_wakeup_retry",
+        attemptCount,
+        ...(!denied
+          ? {
+              retryAt: new Date(
+                Date.now() +
+                  Math.min(30_000, 1000 * 2 ** Math.min(attemptCount, 5)),
+              ).toISOString(),
+            }
+          : {}),
+      });
+      if (!denied)
+        logger.warn(
+          { deliveryId, error: redactError(error) },
+          "accepted inbound chat wakeup will retry",
+        );
+      return denied;
+    }
   }
 
   async function processMessage(
@@ -9673,6 +10202,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         }
         const rebound = await db
           .select({
+            conversation: chatConversations,
             issueId: chatConversations.issueId,
             resourceId: chatConversations.resourceId,
             assigneeAgentId: issues.assigneeAgentId,
@@ -9697,6 +10227,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           )
           .then((rows) => rows[0] ?? null);
         if (!rebound) throw notFound("Bound task not found");
+        if (!activeDelivery.principalId)
+          throw new Error("chat_inbound_wakeup_principal_missing");
+        await stageInboundWakeup(db, {
+          endpoint,
+          deliveryId: activeDelivery.id,
+          conversation: rebound.conversation,
+          commentId: inboundCommentId,
+          principalId: activeDelivery.principalId,
+          actorUserId: rebound.authorUserId,
+        });
         // Attachment storage follows the atomic task/comment/link mutation.
         // If a later wakeup or provider subscription failed, retry from the
         // committed delivery link and fill in only files that are still
@@ -9724,38 +10264,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ) {
           return;
         }
-        await queueIssueAssignmentWakeup({
-          heartbeat: options.heartbeat,
-          issue: {
-            id: rebound.issueId,
-            assigneeAgentId: rebound.assigneeAgentId,
-            status: rebound.issueStatus,
-          },
-          reason: "External chat message received",
-          mutation: "chat_message_received",
-          contextSource: `chat:${endpoint.provider}:recovery`,
-          requestedByActorType: rebound.authorUserId ? "user" : "system",
-          requestedByActorId:
-            rebound.authorUserId ?? activeDelivery.principalId,
-          taskKey: rebound.issueIdentifier,
-          wakeCommentId: inboundCommentId,
-          attachmentOmissionReasons: attachmentResult.omissionReasons,
-          rethrowOnError: true,
-        });
         // Subscription is part of the durable acceptance boundary. If it
         // fails, keep the delivery retryable; the committed message link makes
         // the retry resume here without duplicating the task or comment.
         if (addressed && !thread.isDM) await thread.subscribe();
-        await db
-          .update(chatDeliveries)
-          .set({
-            conversationId: existingMessageLink.conversationId,
-            state: "processed",
-            processedAt: new Date(),
-            redactedError: attachmentOmissionDetail(attachmentResult),
-            updatedAt: new Date(),
-          })
-          .where(eq(chatDeliveries.id, activeDelivery.id));
+        await acceptInboundWakeup(activeDelivery.id, attachmentResult);
+        await processInboundWakeup(activeDelivery.id);
         return;
       }
 
@@ -10494,6 +11008,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             updatedAt: new Date(),
           })
           .where(eq(toolConnections.id, taskEndpoint.connectionId));
+        await stageInboundWakeup(taskTx, {
+          endpoint: taskEndpoint,
+          deliveryId: activeDelivery.id,
+          conversation,
+          commentId: comment.id,
+          principalId: principalResolution.principal.id,
+          actorUserId: taskUserId,
+        });
         return { actorUserId: taskUserId, comment, conversation, issue };
       };
       const taskMutation = await db.transaction(async (tx) => {
@@ -10643,41 +11165,24 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ) {
         return;
       }
-      await queueIssueAssignmentWakeup({
-        heartbeat: options.heartbeat,
-        issue: {
-          id: issue.id,
-          assigneeAgentId: endpoint.assignedAgentId,
-          status: issue.status === "backlog" ? "todo" : issue.status,
-        },
-        reason: "External chat message received",
-        mutation: "chat_message_received",
-        contextSource: `chat:${endpoint.provider}`,
-        requestedByActorType: actorUserId ? "user" : "system",
-        requestedByActorId: actorUserId ?? principalResolution.principal.id,
-        taskKey: issue.identifier,
-        wakeCommentId: comment.id,
-        attachmentOmissionReasons: attachmentResult.omissionReasons,
-        rethrowOnError: true,
-      });
       // Do not discard a subscription failure after marking the delivery
       // processed. A retry reuses the committed message link above and tries
       // this idempotent subscription again before completing the delivery.
       if (addressed && !thread.isDM) await thread.subscribe();
-      await db
-        .update(chatDeliveries)
-        .set({
-          state: "processed",
-          processedAt: new Date(),
-          redactedError: attachmentOmissionDetail(attachmentResult),
-          updatedAt: new Date(),
-        })
+      await acceptInboundWakeup(activeDelivery.id, attachmentResult);
+      if (!(await processInboundWakeup(activeDelivery.id))) return;
+      const acceptedWake = await db
+        .select({ status: chatActions.status })
+        .from(chatActions)
         .where(
           and(
-            eq(chatDeliveries.id, activeDelivery.id),
-            eq(chatDeliveries.state, "processing"),
+            eq(chatActions.deliveryId, activeDelivery.id),
+            eq(chatActions.kind, "inbound_wakeup"),
           ),
-        );
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (acceptedWake?.status !== "processed") return;
       // Provider-visible acknowledgement begins only after the task, external
       // comment, durable wakeup request, delivery state, and message link commit.
       await Promise.allSettled([
@@ -10704,7 +11209,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         typeof error === "object" &&
         "code" in error &&
         error.code === "CHAT_PROVIDER_EFFECT_AMBIGUOUS";
-      const terminal = providerEffectAmbiguous || activeDelivery.attempts >= 5;
+      const terminal =
+        providerEffectAmbiguous ||
+        isExternalActionAuthorizationChange(error) ||
+        activeDelivery.attempts >= 5;
       await db
         .update(chatDeliveries)
         .set({
@@ -10724,6 +11232,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             eq(chatDeliveries.state, "processing"),
           ),
         );
+      if (terminal) await settleRejectedInboundWakeups(activeDelivery.id);
       throw error;
     }
   }
@@ -11019,6 +11528,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   }
 
   function deliveryReady(delivery: DeliveryRow, now: Date): boolean {
+    // Accepted input may still own the conversation head through its wake
+    // outbox. The action dispatcher checks its own retry/claim deadline.
+    if (delivery.state === "processed") return true;
     if (delivery.state === "received")
       return !delivery.nextAttemptAt || delivery.nextAttemptAt <= now;
     if (delivery.state === "retry") {
@@ -11042,7 +11554,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .where(
         and(
           eq(chatDeliveries.endpointId, endpointId),
-          inArray(chatDeliveries.state, ["received", "retry", "processing"]),
+          or(
+            inArray(chatDeliveries.state, ["received", "retry", "processing"]),
+            and(
+              eq(chatDeliveries.state, "processed"),
+              pendingInboundWakeupCondition(),
+            ),
+          ),
           notInArray(chatDeliveries.eventKind, [
             "reaction_added",
             "reaction_removed",
@@ -11111,6 +11629,25 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
       .limit(1)
       .then((rows) => rows[0] ?? candidate);
+  }
+
+  function pendingInboundWakeupCondition(readyOnly = false): SQL {
+    return sql`exists (
+      select 1 from ${chatActions}
+      where ${chatActions.deliveryId} = ${chatDeliveries.id}
+        and ${chatActions.endpointId} = ${chatDeliveries.endpointId}
+        and ${chatActions.companyId} = ${chatDeliveries.companyId}
+        and ${chatActions.kind} = 'inbound_wakeup'
+        and ${chatActions.status} in ('issued', 'processing')
+        ${
+          readyOnly
+            ? sql`and (
+          (${chatActions.status} = 'issued' and (${chatActions.result}->>'retryAt' is null or (${chatActions.result}->>'retryAt')::timestamptz <= now()))
+          or (${chatActions.status} = 'processing' and ${chatActions.updatedAt} <= ${new Date(Date.now() - DELIVERY_PROCESSING_STALE_MS).toISOString()}::timestamptz)
+        )`
+            : sql``
+        }
+    )`;
   }
 
   async function acquireConversationDeliveryLease(input: {
@@ -11346,6 +11883,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           threadId,
         );
         if (!delivery || !deliveryReady(delivery, new Date())) break;
+        if (delivery.state === "processed") {
+          if (!(await processInboundWakeup(delivery.id))) break;
+          continue;
+        }
         if (endpoint.status === "archived" || endpoint.status === "revoked") {
           await db
             .update(chatDeliveries)
@@ -11488,6 +12029,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           state === "filtered" ||
           state === "failed"
         ) {
+          if (state !== "processed")
+            await settleRejectedInboundWakeups(delivery.id);
           liveInboundMessages.delete(delivery.id);
           continue;
         }
@@ -11502,6 +12045,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
 
     const next = await earliestOpenConversationDelivery(endpointId, threadId);
+    if (next?.state === "processed") {
+      const [ready] = await db.select({ id: chatDeliveries.id }).from(chatDeliveries)
+        .where(and(eq(chatDeliveries.id, next.id), pendingInboundWakeupCondition(true))).limit(1);
+      return Boolean(ready);
+    }
     return Boolean(next && deliveryReady(next, new Date()));
   }
 
@@ -15692,7 +16240,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         "mention",
         ingressOnly,
         null,
-        undefined,
+        { ...runtimeContextForRecord(record), endpointRuntime },
         undefined,
         null,
         false,
@@ -19854,6 +20402,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
    * or no-longer-available files are omitted without losing the text turn.
    */
   async function processPendingDeliveries(limit = 25, onlyDeliveryId?: string) {
+    await settleRejectedInboundWakeups(onlyDeliveryId);
     // Provider-visible effects that are not backed by a task publication use
     // chat_actions as their outbox. Reconcile them before inbound deliveries
     // so a crashed processing claim is quarantined before the delivery worker
@@ -19900,6 +20449,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               "reaction_removed",
             ]),
             or(
+              and(
+                eq(chatDeliveries.state, "processed"),
+                pendingInboundWakeupCondition(true),
+              ),
               and(
                 eq(chatDeliveries.state, "received"),
                 or(
@@ -20784,27 +21337,44 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         code: "chat_delivery_not_failed",
       });
     }
-    const claimed = await db
-      .update(chatDeliveries)
-      .set({
-        state: "retry",
-        nextAttemptAt: new Date(),
-        redactedError: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(chatDeliveries.id, delivery.id),
-          eq(chatDeliveries.state, "failed"),
-          eq(chatDeliveries.attempts, delivery.attempts),
-        ),
-      )
-      .returning({ id: chatDeliveries.id });
-    if (!claimed.length) {
-      throw conflict("This delivery is already being replayed", {
-        code: "chat_delivery_replay_conflict",
-      });
-    }
+    await db.transaction(async (tx) => {
+      const claimed = await tx
+        .update(chatDeliveries)
+        .set({
+          state: "retry",
+          nextAttemptAt: new Date(),
+          redactedError: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatDeliveries.id, delivery.id),
+            eq(chatDeliveries.state, "failed"),
+            eq(chatDeliveries.attempts, delivery.attempts),
+          ),
+        )
+        .returning({ id: chatDeliveries.id });
+      if (!claimed.length) {
+        throw conflict("This delivery is already being replayed", {
+          code: "chat_delivery_replay_conflict",
+        });
+      }
+      // The operator requested a fresh attempt at an input that never reached
+      // scheduling. Preserve its immutable scope; acceptance rechecks the
+      // original external actor and current reach before any admission.
+      await tx
+        .update(chatActions)
+        .set({ status: "preparing", result: null, updatedAt: new Date() })
+        .where(
+          and(
+            eq(chatActions.endpointId, endpointId),
+            eq(chatActions.deliveryId, delivery.id),
+            eq(chatActions.kind, "inbound_wakeup"),
+            eq(chatActions.status, "failed"),
+            sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.id} = ${chatActions.id})`,
+          ),
+        );
+    });
     await processPendingDeliveries(1, delivery.id);
     const replayed = await db
       .select({ state: chatDeliveries.state })

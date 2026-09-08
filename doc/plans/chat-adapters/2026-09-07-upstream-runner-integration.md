@@ -669,3 +669,59 @@ The simple completion latency improved substantially, but these visible output
 failures still make the interaction quality unacceptable. No file delivery or
 response-wake journey is marked qualified until the corrected server is tested
 through the actual provider UI again.
+
+### Cohesive native chat hardening before the next live retest
+
+The native local workspace fix selects external tasks from durable task and
+conversation state. Projectless chats receive separate company/agent/task
+directories outside the legacy shared agent home; an existing provider process
+with the old shared-root input is held, never silently migrated or replaced.
+Project-backed local chats require a task-owned isolated worktree. Extra project
+roots are not inherited into an external conversation. This complements the
+native Codex root-denied permission policy; a different workspace ID alone would
+not isolate readable files.
+
+Inbound task/comment creation now also stages a durable wake intent. Attachment
+ingestion and provider subscription finish before acceptance; acceptance and
+intent readiness commit together, before scheduler admission. The action ID is
+also the unique wake receipt ID. Retries repair the ledger without scheduling
+twice, preserve the original actor, and recheck current access under the task
+lock. A pending intent cannot be bypassed by generic stranded-task recovery.
+Failed original authorization does not become valid merely because the external
+account is linked later. Explicit Board reauthorization is not implemented in
+this slice; no caller-supplied actor/source flag bypasses the guard.
+
+The accepted native response-wait summary is now eligible for publication only
+with committed finalization and current exact chat binding. Attachment tool
+descriptions name all required arguments and bounds; the native tool-contract
+fingerprint advances to v8 so resumed provider sessions get the new declarations.
+
+Supporting verification on the combined source snapshot:
+
+- Native-runtime directory: **1,253/1,253**, 33 files, 164.74s, including real
+  processes (`native-cohesive-root-01.log`).
+- Codex driver, completion schema and transport: **293/293**
+  (`native-codex-luna-contract-root-01.log`).
+- Response summary and native attachment catalog: **73/73**
+  (`native-wait-summary-catalog-root-01.log`).
+- Real PostgreSQL default-local workspace dispatch, retained legacy ownership
+  and four unadmitted-intent recovery states: **6/6**, with 135 unrelated tests
+  excluded (`native-workspace-outbox-recovery-root-01.log`).
+- Deterministic browser contracts: **9/9** on their isolated fixture server,
+  not live provider accounts (`chat-ui-native-followup-root-02.log`).
+- Shared and UI typechecks passed. The full chat integration snapshot initially
+  passed **286/294**; it exposed Slack slash-command fence propagation, replay
+  expectations and receipt-aware fixture gaps. Those fixes and retry readiness
+  regressions passed the focused cohorts. The final fresh PostgreSQL rerun
+  passed **295/295** in 103.76s (`inbound-wakeup-full-11.log`), with durable
+  scheduler **8/8** and targeted compatibility regressions **12/12**.
+- Explicit Board wake attempts for four unadmitted-intent states now return an
+  actionable 409 instead of silently doing nothing. Those **4/4** real PostgreSQL
+  tests also prove no run, receipt, action rewrite or adapter execution occurred.
+  This is not a reauthorization bypass.
+- Full server/runner build and subsequent emitted server typecheck passed
+  (`native-chat-cohesive-build-root-01.log`,
+  `native-chat-cohesive-tsc-root-02.log`). The lockfile is unchanged.
+
+These checks do not qualify the still-failing visible photo/file and final-reply
+journeys. The next deployment and live provider outcomes are recorded separately.

@@ -8,7 +8,11 @@ export const NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT =
 
 /** An unauthenticated retained process is not evidence that execution stopped. */
 export class NativeRunnerOwnershipUnverifiedError extends Error {
-  constructor() {
+  constructor(
+    readonly reason:
+      | "adopted_runner_authentication_timeout"
+      | "native_chat_workspace_scope_mismatch" = "adopted_runner_authentication_timeout",
+  ) {
     super(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
     this.name = "NativeRunnerOwnershipUnverifiedError";
   }

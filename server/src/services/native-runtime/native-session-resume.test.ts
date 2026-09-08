@@ -15,6 +15,10 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "../../__tests__/helpers/embedded-postgres.js";
 import { canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
+import {
+  LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION,
+  REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION,
+} from "./chat-attachment-reuse.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import {
   buildNativeExecutionWithCheckpoint,
@@ -169,6 +173,51 @@ const PRE_RESPONSE_WAKE_YIELD_TOOL_CONTRACT_FINGERPRINT = `sha256:${createHash(
         readChatAttachment: "always_advertised_run_scope_local_staging.v1",
         structuredHumanInput:
           "always_advertised_run_issue_agent_binding_gated.v1",
+      },
+      tools: [
+        { name: "register_deliverable", version: 1 },
+        {
+          name: "read_current_wake_comments",
+          semanticContract: "paperclip.server-current-wake-comments.v1",
+          version: 1,
+        },
+        {
+          name: "list_chat_attachments",
+          semanticContract: "paperclip.server-chat-attachment-reuse.v1",
+          version: 1,
+        },
+        {
+          name: "reuse_chat_attachment",
+          semanticContract: "paperclip.server-chat-attachment-reuse.v1",
+          version: 1,
+        },
+        {
+          name: "read_chat_attachment",
+          semanticContract: "paperclip.server-chat-attachment-read.v1",
+          version: 1,
+        },
+        { name: "request_human_input", version: 1 },
+      ],
+    }),
+  )
+  .digest("hex")}`;
+
+const PRE_EXPLICIT_CHAT_ATTACHMENT_GUIDANCE_TOOL_CONTRACT_FINGERPRINT = `sha256:${createHash(
+  "sha256",
+)
+  .update(
+    JSON.stringify({
+      schema: "paperclip.native-tool-contract.v7",
+      executionTargetKind: "local",
+      advertisementPolicy: {
+        readCurrentWakeComments: "always_advertised_binding_gated.v1",
+        historicalChatAttachments:
+          "always_advertised_conversation_binding_gated.v1",
+        registerDeliverable: "local_workspace_only.v1",
+        readChatAttachment: "always_advertised_run_scope_local_staging.v1",
+        structuredHumanInput:
+          "always_advertised_run_issue_agent_binding_gated.v1",
+        semanticCompletion: "finish_response_wake_concrete_object.v2",
       },
       tools: [
         { name: "register_deliverable", version: 1 },
@@ -1068,6 +1117,33 @@ describe("rebindNativeSessionCheckpoint", () => {
         previousRun: previousRun({
           nativeToolContractFingerprint:
             PRE_RESPONSE_WAKE_YIELD_TOOL_CONTRACT_FINGERPRINT,
+        }),
+        currentExecution: execution(currentRunId),
+      }),
+    ).toBeNull();
+  });
+
+  it("rotates provider threads whose retained attachment tools lack explicit invocation guidance", () => {
+    expect(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION.description).toContain(
+      "Call with {}",
+    );
+    expect(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION.description).toContain(
+      "1 through 50",
+    );
+    expect(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION.description).toContain(
+      "All four arguments are required",
+    );
+    expect(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION.description).toContain(
+      "same key unchanged on every retry",
+    );
+    expect(
+      PRE_EXPLICIT_CHAT_ATTACHMENT_GUIDANCE_TOOL_CONTRACT_FINGERPRINT,
+    ).not.toBe(NATIVE_TOOL_CONTRACT_FINGERPRINT);
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: previousRun({
+          nativeToolContractFingerprint:
+            PRE_EXPLICIT_CHAT_ATTACHMENT_GUIDANCE_TOOL_CONTRACT_FINGERPRINT,
         }),
         currentExecution: execution(currentRunId),
       }),

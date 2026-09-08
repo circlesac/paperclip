@@ -265,6 +265,25 @@ function hasYieldedSemanticResult(resultJson: Record<string, unknown>) {
   );
 }
 
+function readAcceptedExternalChatResponseWakeSummary(
+  resultJson: Record<string, unknown>,
+) {
+  const nativeResult = record(resultJson.nativeResult);
+  const continuation = record(nativeResult.continuation);
+  if (
+    resultJson.finalizationPhase !== "committed" ||
+    resultJson.finalizationReasonCode !== "external_chat_response_waiting" ||
+    nativeResult.schema !== "paperclip.run_result.v1" ||
+    nativeResult.reportedWorkDisposition !== "yielded" ||
+    continuation.kind !== "response_wake" ||
+    !readCommentText(continuation.summary) ||
+    !readCommentText(continuation.idempotencyKey)
+  ) {
+    return null;
+  }
+  return readCommentText(nativeResult.summary);
+}
+
 export function projectHistoricalHeartbeatRunComment(
   body: string,
   resultJson: Record<string, unknown> | null | undefined,
@@ -333,6 +352,7 @@ export function resolveHeartbeatRunResponse(input: {
   resultJson: Record<string, unknown> | null | undefined;
   existingComment?: { id: string; body?: string | null } | null;
   preferFinalResponseOverExistingComment?: boolean;
+  externalChatResponseWakeSummaryAuthorized?: boolean;
   finalAgentMessage?: {
     text: string;
     sourceEventId: string | null;
@@ -421,30 +441,49 @@ export function resolveHeartbeatRunResponse(input: {
   };
 
   if (input.preferFinalResponseOverExistingComment === true) {
-    if (!hasYieldedSemanticResult(resultJson)) {
-      const upstream = resolveCompletedUpstreamResponse();
-      if (upstream) {
+    if (hasYieldedSemanticResult(resultJson)) {
+      const responseWakeSummary =
+        input.externalChatResponseWakeSummaryAuthorized === true
+          ? readAcceptedExternalChatResponseWakeSummary(resultJson)
+          : null;
+      if (responseWakeSummary) {
         return {
-          ...upstream,
-          decision: {
-            ...upstream.decision,
+          text: responseWakeSummary,
+          decision: decision("semantic_result_summary", {
+            commentAction: "create",
             reasonCodes: [
-              ...upstream.decision.reasonCodes,
+              "accepted_external_chat_response_wake_summary",
               "external_chat_final_precedence",
             ],
-          },
+          }),
         };
       }
+      return {
+        text: null,
+        decision: decision("none", {
+          commentAction: "none",
+          reasonCodes: ["yielded_control_plane_wait"],
+        }),
+      };
+    }
+    const upstream = resolveCompletedUpstreamResponse();
+    if (upstream) {
+      return {
+        ...upstream,
+        decision: {
+          ...upstream.decision,
+          reasonCodes: [
+            ...upstream.decision.reasonCodes,
+            "external_chat_final_precedence",
+          ],
+        },
+      };
     }
     return {
       text: null,
       decision: decision("none", {
         commentAction: "none",
-        reasonCodes: [
-          hasYieldedSemanticResult(resultJson)
-            ? "yielded_control_plane_wait"
-            : "external_chat_final_response_unavailable",
-        ],
+        reasonCodes: ["external_chat_final_response_unavailable"],
       }),
     };
   }

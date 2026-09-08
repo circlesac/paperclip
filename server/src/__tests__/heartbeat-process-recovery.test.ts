@@ -20,12 +20,14 @@ import {
   agentWakeupRequests,
   authUsers,
   budgetPolicies,
+  chatActions,
   chatConversations,
   chatEndpoints,
   companySecretBindings,
   companySecrets,
   companySkills,
   companies,
+  completionContracts,
   costEvents,
   documentAnnotationAnchorSnapshots,
   documentAnnotationComments,
@@ -62,6 +64,13 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
+import {
+  resolveDefaultAgentWorkspaceDir,
+  resolvePaperclipInstanceRoot,
+} from "../home-paths.js";
+import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { NativeRunnerOwnershipUnverifiedError } from "../services/native-runtime/native-runner-ownership.js";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
@@ -458,6 +467,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
     await db.delete(nativeRunFinalizations);
+    await db.update(heartbeatRuns).set({ completionContractId: null });
+    await db.delete(completionContracts);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await db.delete(issueComments);
       await db.delete(issueDocuments);
@@ -958,7 +969,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       assignedAgentId: input.agentId,
       status: "active",
     });
-    await db.insert(chatConversations).values({
+    const [conversation] = await db.insert(chatConversations).values({
       companyId: input.companyId,
       endpointId,
       issueId: input.issueId,
@@ -966,7 +977,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       externalThreadId: `slack:CCHATWAIT:${randomUUID()}`,
       externalLabel: "Slack thread",
       state: input.state,
-    });
+    }).returning({ id: chatConversations.id });
+    return { endpointId, conversationId: conversation!.id };
   }
 
   async function seedInReviewParticipantRunFixture(input?: {
@@ -2109,9 +2121,201 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     } finally {
       if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
       else process.env.PAPERCLIP_HOME = previousHome;
+      // Native dispatch materializes read-only runtime bundles in this owned
+      // temporary home. Restore directory permissions solely for test cleanup.
+      const makeDirectoriesWritable = async (
+        directory: string,
+      ): Promise<void> => {
+        const stat = await fs.lstat(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+        await fs.chmod(directory, 0o700);
+        for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+          if (entry.isDirectory())
+            await makeDirectoriesWritable(path.join(directory, entry.name));
+        }
+      };
+      await makeDirectoriesWritable(home);
       await fs.rm(home, { recursive: true, force: true });
     }
   }
+
+  it("dispatches local native external chat inside the server-selected task root", async () => {
+    await withTempPaperclipHome(async () => {
+      const { companyId, agentId, issueId, runId } =
+        await seedQueuedIssueRunFixture();
+      await fs.mkdir(resolvePaperclipInstanceRoot(), { recursive: true });
+      await db
+        .update(agents)
+        .set({
+          adapterType: "paperclip_runner",
+          adapterConfig: { provider: "codex", model: "gpt-5.6-luna" },
+        })
+        .where(eq(agents.id, agentId));
+      await db
+        .update(issues)
+        .set({ originKind: "chat_channel" })
+        .where(eq(issues.id, issueId));
+      await db
+        .update(heartbeatRuns)
+        .set({
+          runtimeMode: "native",
+          runtimeModeResolvedAt: new Date(),
+          nativeIssueId: issueId,
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      const nativeSessionBackendFactory = vi.fn(
+        (_execution: { workspace: { cwd: string } }) => {
+          // Stop at the real provider boundary, without spawning a provider.
+          throw new NativeRunnerOwnershipUnverifiedError();
+        },
+      );
+      const heartbeat = heartbeatService(db, { nativeSessionBackendFactory });
+      await heartbeat.resumeQueuedRuns();
+      await waitForValue(
+        async () =>
+          nativeSessionBackendFactory.mock.calls.length > 0 ||
+          Boolean((await heartbeat.getRun(runId))?.errorCode),
+        8_000,
+      );
+      await heartbeat.waitForRunExecutionDrain(runId);
+      expect(nativeSessionBackendFactory).toHaveBeenCalledTimes(1);
+      const input = nativeSessionBackendFactory.mock.calls[0]![0];
+      expect(input.workspace.cwd).toBe(
+        path.join(
+          await fs.realpath(resolvePaperclipInstanceRoot()),
+          "chat-workspaces",
+          companyId,
+          agentId,
+          issueId,
+        ),
+      );
+      expect(input.workspace.cwd).not.toBe(
+        resolveDefaultAgentWorkspaceDir(agentId),
+      );
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    });
+  });
+
+  it("holds admitted native chat with a legacy shared cwd without replacing input or releasing ownership", async () => {
+    await withTempPaperclipHome(async () => {
+      const { companyId, agentId, issueId, runId } =
+        await seedQueuedIssueRunFixture();
+      const legacyCwd = resolveDefaultAgentWorkspaceDir(agentId);
+      await fs.mkdir(legacyCwd, { recursive: true });
+      const nativeExecutionInput = buildNativeExecutionInput({
+        companyId,
+        runId,
+        agentId,
+        issue: {
+          id: issueId,
+          identifier: "CHAT-1",
+          title: "Legacy chat",
+          description: null,
+          workMode: "standard",
+        },
+        taskPrompt: "Keep the admitted session intact",
+        workspace: {
+          id: runId,
+          cwd: legacyCwd,
+          repoUrl: null,
+          repoRef: null,
+          branchName: null,
+        },
+        normalizedSessionId: randomUUID(),
+        provider: "codex",
+        completionContract: {
+          id: randomUUID(),
+          sha256: `sha256:${"a".repeat(64)}`,
+          schemaVersion: "paperclip.run-result.v1",
+          contract: {
+            revision: "1",
+            objective: "Retain ownership",
+            criteria: [
+              {
+                id: "objective",
+                requirement: "Do not replace a shared-root session",
+              },
+            ],
+          },
+        },
+        runtimeContext: nativeRuntimeContextFixture(),
+      });
+      await db
+        .update(agents)
+        .set({
+          adapterType: "paperclip_runner",
+          adapterConfig: { provider: "codex", model: "gpt-5.6-luna" },
+        })
+        .where(eq(agents.id, agentId));
+      await db
+        .update(issues)
+        .set({ originKind: "chat_channel" })
+        .where(eq(issues.id, issueId));
+      await db
+        .update(heartbeatRuns)
+        .set({
+          runtimeMode: "native",
+          runtimeModeResolvedAt: new Date(),
+          nativeIssueId: issueId,
+          runnerProfileJson: { nativeExecutionInput },
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      const { leaseId } = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId,
+        driver: "ownership-test",
+      });
+      const nativeSessionBackendFactory = vi.fn(() => {
+        throw new Error("Provider must not be opened");
+      });
+      const heartbeat = heartbeatService(db, { nativeSessionBackendFactory });
+      await heartbeat.resumeQueuedRuns();
+      await waitForValue(
+        async () => (await heartbeat.getRun(runId))?.errorCode,
+        8_000,
+      );
+      await heartbeat.waitForRunExecutionDrain(runId);
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "running",
+        nativePhase: "terminal_failure",
+        errorCode: "native_execution_ownership_unverified",
+        runnerProfileJson: { nativeExecutionInput },
+      });
+      expect(
+        await db
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(eq(issues.id, issueId)),
+      ).toEqual([{ executionRunId: runId }]);
+      expect(
+        await db
+          .select({ releasedAt: environmentLeases.releasedAt })
+          .from(environmentLeases)
+          .where(eq(environmentLeases.id, leaseId)),
+      ).toEqual([{ releasedAt: null }]);
+      const events = await heartbeat.listEvents(runId);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            reason: "native_chat_workspace_scope_mismatch",
+          }),
+        }),
+      );
+      expect(nativeSessionBackendFactory).not.toHaveBeenCalled();
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      expect(mockTerminateLocalService).not.toHaveBeenCalled();
+      await expect(
+        fs.stat(path.join(resolvePaperclipInstanceRoot(), "chat-workspaces")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      expect(
+        await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.retryOfRunId, runId)),
+      ).toEqual([]);
+    });
+  });
 
   it("captures a hot-restart shutdown snapshot without interrupting running runs", async () => {
     const child = spawnAliveProcess();
@@ -6572,6 +6776,92 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(heartbeatRuns.agentId, agentId));
     expect(runs).toHaveLength(0);
   });
+
+  it.each(["preparing", "issued", "processing", "failed"])(
+    "does not bypass a %s durable inbound-chat wake intent with generic assignment recovery",
+    async (status) => {
+      const { companyId, agentId, issueId } =
+        await seedAssignedTodoNoRunFixture();
+      const { endpointId, conversationId } = await bindChatConversation({
+        agentId,
+        companyId,
+        issueId,
+        state: "active",
+      });
+      const actionId = randomUUID();
+      const [originalAction] = await db
+        .insert(chatActions)
+        .values({
+          id: actionId,
+          companyId,
+          endpointId,
+          conversationId,
+          kind: "inbound_wakeup",
+          providerActionId: `inbound_wakeup:${randomUUID()}`,
+          status,
+          payload: {
+            version: 1,
+            issueId,
+            agentId,
+            commentId: randomUUID(),
+            sessionGeneration: 1,
+            requestedByActorType: "system",
+            requestedByActorId: randomUUID(),
+          },
+        })
+        .returning();
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result).toMatchObject({
+        assignmentDispatched: 0,
+        dispatchRequeued: 0,
+        continuationRequeued: 0,
+        escalated: 0,
+        skipped: 0,
+        issueIds: [],
+      });
+      // An explicit Board request must get an actionable conflict, not a
+      // silent skipped response or fresh authority for the denied input.
+      await expect(
+        heartbeat.wakeup(agentId, {
+          source: "on_demand",
+          triggerDetail: "manual",
+          requestedByActorType: "user",
+          requestedByActorId: "responsible-user",
+          payload: { issueId },
+          contextSnapshot: {
+            issueId,
+            triggeredBy: "board",
+            source: "issue.manual",
+          },
+        }),
+      ).rejects.toMatchObject({
+        status: 409,
+        details: { code: "chat_inbound_wakeup_unadmitted", issueId },
+      });
+      expect(
+        await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.companyId, companyId)),
+      ).toEqual([]);
+      expect(
+        await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.companyId, companyId)),
+      ).toEqual([]);
+      expect(
+        await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, actionId)),
+      ).toEqual([originalAction]);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    },
+  );
 
   it("creates a board recovery action for budget-blocked assigned work and continues the sweep", async () => {
     const blocked = await seedAssignedTodoNoRunFixture();

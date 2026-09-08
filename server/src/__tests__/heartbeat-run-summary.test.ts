@@ -615,6 +615,91 @@ describe("resolveHeartbeatRunResponse", () => {
     });
   });
 
+  it("publishes only an authorized committed external response-wake summary", () => {
+    const responseWakeResult = {
+      finalizationPhase: "committed",
+      finalizationReasonCode: "external_chat_response_waiting",
+      nativeResult: {
+        schema: "paperclip.run_result.v1",
+        reportedWorkDisposition: "yielded",
+        summary: "SLACK-LUNA-WAITING",
+        continuation: {
+          kind: "response_wake",
+          summary: "Wait for the next external reply.",
+          idempotencyKey: "response-wake-slack-1",
+        },
+      },
+    };
+    const resolve = (
+      resultJson: Record<string, unknown>,
+      authorized: boolean,
+    ) =>
+      resolveHeartbeatRunResponse({
+        resultJson,
+        preferFinalResponseOverExistingComment: true,
+        externalChatResponseWakeSummaryAuthorized: authorized,
+        finalAgentMessage: {
+          text: "Internal narration must not become the provider reply.",
+          sourceEventId: "event-response-wake",
+          channel: "final",
+        },
+      });
+
+    expect(resolve(responseWakeResult, true)).toMatchObject({
+      text: "SLACK-LUNA-WAITING",
+      decision: {
+        chosenSource: "semantic_result_summary",
+        commentAction: "create",
+        reasonCodes: [
+          "accepted_external_chat_response_wake_summary",
+          "external_chat_final_precedence",
+        ],
+      },
+    });
+    expect(resolve(responseWakeResult, false)).toMatchObject({
+      text: null,
+      decision: {
+        chosenSource: "none",
+        reasonCodes: ["yielded_control_plane_wait"],
+      },
+    });
+    for (const resultJson of [
+      { ...responseWakeResult, finalizationPhase: "retryable_failure" },
+      {
+        ...responseWakeResult,
+        finalizationReasonCode: "governed_response_waiting",
+      },
+      {
+        ...responseWakeResult,
+        nativeResult: {
+          ...responseWakeResult.nativeResult,
+          continuation: {
+            ...responseWakeResult.nativeResult.continuation,
+            kind: "same_agent",
+          },
+        },
+      },
+      {
+        ...responseWakeResult,
+        nativeResult: {
+          ...responseWakeResult.nativeResult,
+          continuation: {
+            kind: "response_wake",
+            summary: "Wait for the next external reply.",
+          },
+        },
+      },
+    ]) {
+      expect(resolve(resultJson, true)).toMatchObject({
+        text: null,
+        decision: {
+          chosenSource: "none",
+          reasonCodes: ["yielded_control_plane_wait"],
+        },
+      });
+    }
+  });
+
   it("keeps ordinary comment precedence unchanged", () => {
     expect(
       resolveHeartbeatRunResponse({
