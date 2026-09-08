@@ -75,6 +75,20 @@ const identityMigrations = [
   "0245_misty_nightshade.sql",
 ];
 
+const provenanceMigration = "0256_chat_interaction_wakeup_provenance.sql";
+const legacyProvenance = "0245_chat_interaction_wakeup_idempotency";
+const canonicalProvenance = "0251_chat_interaction_wakeup_idempotency";
+
+async function executeMigration(sql: postgres.Sql, file: string) {
+  const content = await readFile(
+    new URL(`./migrations/${file}`, import.meta.url),
+    "utf8",
+  );
+  for (const statement of content.split("--> statement-breakpoint")) {
+    if (statement.trim()) await sql.unsafe(statement);
+  }
+}
+
 async function migrationHash(file: string) {
   const content = await readFile(
     new URL(`./migrations/${file}`, import.meta.url),
@@ -216,6 +230,313 @@ describe("chat and execution identity migration reconciliation", () => {
 });
 
 const support = await getEmbeddedPostgresTestSupport();
+(support.supported ? describe : describe.skip)(
+  "chat wake migration provenance",
+  () => {
+    it(
+      "repairs deployed provenance without replaying historical SQL or changing wake execution state",
+      async () => {
+        const database = await startEmbeddedPostgresTestDatabase(
+          "paperclip-chat-provenance-",
+        );
+        const sql = postgres(database.connectionString, {
+          max: 1,
+          onnotice: () => {},
+        });
+        try {
+          const companyId = randomUUID(),
+            agentId = randomUUID(),
+            retainedId = randomUUID();
+          await sql`INSERT INTO companies (id,name,issue_prefix) VALUES (${companyId},'Provenance upgrade','PRV')`;
+          await sql`INSERT INTO agents (id,company_id,name) VALUES (${agentId},${companyId},'Upgrade agent')`;
+          const originalKey = `interaction:${randomUUID()}`;
+          const oldLine = `Safely retired duplicate by migration 0245; retained wake request ${retainedId}`;
+          const newLine = `Safely retired duplicate by migration 0251; retained wake request ${retainedId}`;
+          const retired = {
+            migration: legacyProvenance,
+            retainedWakeRequestId: retainedId,
+            originalIdempotencyKey: originalKey,
+            previousStatus: "queued",
+            linkedRunId: null,
+            resolution: "retired_unstarted_duplicate",
+            futureAuditField: { preserved: true },
+          };
+          const cases: Array<{
+            name: string;
+            dedupe: postgres.JSONValue;
+            key?: string;
+            status?: string;
+            error?: string | null;
+            correct?: boolean;
+            correctedError?: string | null;
+            id?: string;
+          }> = [
+            {
+              name: "retired first UUID",
+              id: "00000000-0000-0000-0000-000000000000",
+              dedupe: retired,
+              error: oldLine,
+              correct: true,
+              correctedError: newLine,
+            },
+            {
+              name: "preserves unrelated audit prefix",
+              dedupe: retired,
+              error: `Unrelated migration 0245 note\n${oldLine}`,
+              correct: true,
+              correctedError: `Unrelated migration 0245 note\n${newLine}`,
+            },
+            {
+              name: "preserves non-final generated line",
+              dedupe: retired,
+              error: `${oldLine}\nLater operator note`,
+              correct: true,
+            },
+            {
+              name: "does not replace arbitrary suffix",
+              dedupe: retired,
+              error: `Operator quoted: ${oldLine}`,
+              correct: true,
+            },
+            {
+              name: "does not replace another retained ID",
+              dedupe: retired,
+              error: oldLine.replace(retainedId, randomUUID()),
+              correct: true,
+            },
+            {
+              name: "later terminalized rekeyed wake",
+              dedupe: {
+                ...retired,
+                previousStatus: "running",
+                linkedRunId: randomUUID(),
+                resolution: "rekeyed_preserving_execution_history",
+              },
+              key: "historical",
+              status: "failed",
+              error: oldLine,
+              correct: true,
+            },
+            {
+              name: "already canonical",
+              dedupe: { ...retired, migration: canonicalProvenance },
+              error: oldLine,
+            },
+            {
+              name: "unrelated migration",
+              dedupe: { ...retired, migration: "0245_misty_nightshade" },
+              error: oldLine,
+            },
+            { name: "array metadata", dedupe: [retired] },
+            { name: "null metadata", dedupe: null },
+            { name: "string metadata", dedupe: legacyProvenance },
+            {
+              name: "unknown resolution",
+              dedupe: { ...retired, resolution: "unknown" },
+            },
+            {
+              name: "missing linked-run field",
+              dedupe: { ...retired, linkedRunId: undefined },
+            },
+            {
+              name: "malformed retained ID",
+              dedupe: { ...retired, retainedWakeRequestId: "not-a-uuid" },
+            },
+            {
+              name: "malformed linked-run ID",
+              dedupe: {
+                ...retired,
+                linkedRunId: "not-a-uuid",
+                resolution: "rekeyed_preserving_execution_history",
+              },
+              key: "historical",
+            },
+            {
+              name: "non-interaction source key",
+              dedupe: { ...retired, originalIdempotencyKey: "timer:unrelated" },
+            },
+            {
+              name: "non-string previous status",
+              dedupe: { ...retired, previousStatus: ["queued"] },
+            },
+            {
+              name: "inconsistent retired resolution",
+              dedupe: { ...retired, previousStatus: "running" },
+            },
+            {
+              name: "inconsistent rekeyed resolution",
+              dedupe: {
+                ...retired,
+                resolution: "rekeyed_preserving_execution_history",
+              },
+              key: "historical",
+            },
+            {
+              name: "unrelated current key",
+              dedupe: retired,
+              key: "timer:unrelated",
+            },
+          ];
+          // More than one keyset batch, including an unrelated-only middle batch.
+          await sql`INSERT INTO agent_wakeup_requests (id,company_id,agent_id,source,payload)
+        SELECT ('00000000-0000-0000-0001-' || lpad(n::text,12,'0'))::uuid, ${companyId}, ${agentId}, 'timer', '{"unrelated":true}'::jsonb
+        FROM generate_series(1,1001) AS n`;
+          const expectedChanges = new Map<
+            string,
+            { error: string | null; payload: Record<string, unknown> }
+          >();
+          for (const fixture of cases) {
+            const id = fixture.id ?? randomUUID();
+            const key =
+              fixture.key === "historical"
+                ? `historical-interaction-wake-duplicate:${id}`
+                : (fixture.key ?? originalKey);
+            const payload = {
+              unrelated: { preserved: true },
+              migrationDedupe: fixture.dedupe,
+            };
+            const error = fixture.error ?? null;
+            await sql`INSERT INTO agent_wakeup_requests
+          (id,company_id,agent_id,source,reason,status,idempotency_key,run_id,payload,error,requested_at,claimed_at,finished_at,created_at,updated_at)
+          VALUES (${id},${companyId},${agentId},'automation',${fixture.name},${fixture.status ?? "skipped"},${key},${fixture.status === "failed" ? randomUUID() : null},${sql.json(payload)},${error},'2026-09-01T00:00:00Z','2026-09-01T00:00:01Z','2026-09-01T00:00:02Z','2026-09-01T00:00:00Z','2026-09-01T00:00:02Z')`;
+            if (fixture.correct)
+              expectedChanges.set(id, {
+                payload: {
+                  ...payload,
+                  migrationDedupe: {
+                    ...(fixture.dedupe as object),
+                    migration: canonicalProvenance,
+                  },
+                },
+                error: fixture.correctedError ?? error,
+              });
+          }
+          await sql`DELETE FROM drizzle.__drizzle_migrations WHERE hash = ${await migrationHash(provenanceMigration)}`;
+          const legacyHash = chatMigrations[5][1];
+          await sql`UPDATE drizzle.__drizzle_migrations SET created_at = ${chatMigrations[5][2]} WHERE hash = ${legacyHash}`;
+          const historyBefore =
+            await sql`SELECT id,hash,created_at::text FROM drizzle.__drizzle_migrations ORDER BY id`;
+          expect(
+            historyBefore.filter((row) => row.hash === legacyHash),
+          ).toHaveLength(1);
+          const rowsBefore =
+            await sql`SELECT row_to_json(w) AS row FROM agent_wakeup_requests w WHERE company_id = ${companyId} ORDER BY id`;
+          const expected = rowsBefore.map(({ row }) => ({
+            row: { ...row, ...expectedChanges.get(row.id) },
+          }));
+          expect(
+            await inspectMigrations(database.connectionString),
+          ).toMatchObject({
+            status: "needsMigrations",
+            pendingMigrations: [provenanceMigration],
+          });
+          await applyPendingMigrations(database.connectionString);
+          expect(
+            await sql`SELECT row_to_json(w) AS row FROM agent_wakeup_requests w WHERE company_id = ${companyId} ORDER BY id`,
+          ).toEqual(expected);
+          expect(
+            await sql`SELECT id,hash,created_at::text FROM drizzle.__drizzle_migrations WHERE id <= ${historyBefore.at(-1)!.id} ORDER BY id`,
+          ).toEqual(historyBefore);
+          const historyAfter =
+            await sql`SELECT id,hash,created_at::text FROM drizzle.__drizzle_migrations ORDER BY id`;
+          expect(historyAfter).toHaveLength(historyBefore.length + 1);
+          await executeMigration(sql, provenanceMigration);
+          await applyPendingMigrations(database.connectionString);
+          expect(
+            await sql`SELECT row_to_json(w) AS row FROM agent_wakeup_requests w WHERE company_id = ${companyId} ORDER BY id`,
+          ).toEqual(expected);
+          expect(
+            await sql`SELECT id,hash,created_at::text FROM drizzle.__drizzle_migrations ORDER BY id`,
+          ).toEqual(historyAfter);
+        } finally {
+          await sql.end();
+          await database.cleanup();
+        }
+      },
+      EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+    );
+
+    it(
+      "corrects both original repair resolutions on a fresh migration path",
+      async () => {
+        const database = await startEmbeddedPostgresTestDatabase(
+          "paperclip-chat-provenance-fresh-",
+        );
+        const sql = postgres(database.connectionString, {
+          max: 1,
+          onnotice: () => {},
+        });
+        try {
+          const companyId = randomUUID(),
+            agentId = randomUUID(),
+            retainedId = randomUUID(),
+            queuedId = randomUUID(),
+            activeId = randomUUID();
+          await sql`INSERT INTO companies (id,name,issue_prefix) VALUES (${companyId},'Fresh provenance','FPV')`;
+          await sql`INSERT INTO agents (id,company_id,name) VALUES (${agentId},${companyId},'Fresh agent')`;
+          await sql`DROP INDEX agent_wakeup_requests_question_response_delivery_idempotency_uq`;
+          const key = `interaction:${randomUUID()}`;
+          for (const [id, status, runId] of [
+            [retainedId, "succeeded", randomUUID()],
+            [queuedId, "queued", null],
+            [activeId, "running", randomUUID()],
+          ] as const) {
+            await sql`INSERT INTO agent_wakeup_requests (id,company_id,agent_id,source,status,run_id,idempotency_key,payload,error)
+          VALUES (${id},${companyId},${agentId},'automation',${status},${runId},${key},'{"preserved":true}'::jsonb,'Prior audit')`;
+          }
+          await executeMigration(sql, `${canonicalProvenance}.sql`);
+          const before =
+            await sql`SELECT row_to_json(w) AS row FROM agent_wakeup_requests w WHERE company_id = ${companyId} ORDER BY id`;
+          expect(
+            before.filter(
+              ({ row }) =>
+                row.payload.migrationDedupe?.migration === legacyProvenance,
+            ),
+          ).toHaveLength(2);
+          expect(
+            before.find(({ row }) => row.id === queuedId)!.row.status,
+          ).toBe("skipped");
+          expect(
+            before.find(({ row }) => row.id === activeId)!.row.status,
+          ).toBe("running");
+          await executeMigration(sql, provenanceMigration);
+          const expected = before.map(({ row }) =>
+            row.id === retainedId
+              ? { row }
+              : {
+                  row: {
+                    ...row,
+                    payload: {
+                      ...row.payload,
+                      migrationDedupe: {
+                        ...row.payload.migrationDedupe,
+                        migration: canonicalProvenance,
+                      },
+                    },
+                    error:
+                      row.id === queuedId
+                        ? `Prior audit\nSafely retired duplicate by migration 0251; retained wake request ${retainedId}`
+                        : row.error,
+                  },
+                },
+          );
+          expect(
+            await sql`SELECT row_to_json(w) AS row FROM agent_wakeup_requests w WHERE company_id = ${companyId} ORDER BY id`,
+          ).toEqual(expected);
+          await executeMigration(sql, provenanceMigration);
+          expect(
+            await sql`SELECT row_to_json(w) AS row FROM agent_wakeup_requests w WHERE company_id = ${companyId} ORDER BY id`,
+          ).toEqual(expected);
+        } finally {
+          await sql.end();
+          await database.cleanup();
+        }
+      },
+      EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+    );
+  },
+);
+
 (support.supported ? describe : describe.skip)(
   "chat identity migration upgrade",
   () => {

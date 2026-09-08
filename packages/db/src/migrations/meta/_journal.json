@@ -1779,6 +1779,13 @@
       "when": 1788832482645,
       "tag": "0255_cynical_hellcat",
       "breakpoints": true
+    },
+    {
+      "idx": 256,
+      "version": "7",
+      "when": 1788880065244,
+      "tag": "0256_chat_interaction_wakeup_provenance",
+      "breakpoints": true
     }
   ]
 }
