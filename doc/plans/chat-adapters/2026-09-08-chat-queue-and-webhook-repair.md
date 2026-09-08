@@ -1799,17 +1799,17 @@ Hello-timeout and handshake-error recovery controls, plus retirement during
 recovery. Independent review found no further blocker in this scoped repair.
 
 Frozen offline installation passed with zero downloads. Package/workspace patch
-configuration agrees. The generated lockfile now records previously missing
+configuration agrees. The locally generated lockfile records previously missing
 chat SDK dependencies and patch hashes: all 1,435 existing package keys remain,
 99 are newly recorded, and no existing importer or transitive dependency version
 changed. Full workspace typecheck and build passed. The staged native runner
 still passes strict signature verification and has unchanged SHA-256
 `e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
 
-The superseded v5/v6 surface notes remain at immutable links in
-`wireframes-archive.md`; their setup audit and minimum-setup specification stay
-in the worktree. This reserves the new lockfile and WebSocket patch within one
-500-file PR without removing current implementation or tests.
+The superseded v5 surface note remains at an immutable link in
+`wireframes-archive.md`; its setup audit and the v6 note/minimum-setup
+specification stay in the worktree. This reserves the WebSocket patch within
+one 500-file PR without removing current implementation or tests.
 
 ### Live post-onboarding compatibility
 
@@ -1880,3 +1880,26 @@ database session. Coverage includes all five providers, default-off GitHub
 tool routing, agent Channels off/on, and file batches across reload and
 ambiguous response loss. Provider HTTP is mocked; this does not replace the
 live proofs or clear the Discord-login and Teams-tenant gates.
+
+### CI-owned lockfile correction
+
+Commit `55b91bedd` accidentally included the locally generated lockfile used for
+packaging verification. The repository's quality gate and trusted PR workflow
+correctly reject manual lockfile changes; CI regenerates and uploads its own
+copy for all downstream frozen installs. The follow-up restores the committed
+lockfile exactly to origin/master while retaining every manifest/patch change
+and the already tested installed dependencies. The prior local frozen-install
+pass applies to that generated verification copy, not the stale checked-in
+lockfile. No existing dependency version was deliberately upgraded.
+
+The freed file slot restores the v6 surface note byte-for-byte from `c52e98c9b`.
+Only v5 remains archived for this fix; the combined PR still has 500 files.
+The failed quality-policy run is a real failed gate, not a product-test failure
+or a green full CI run. New exact-head CI and Greptile review remain required.
+Server 57 started clean `55b91bedd` at **20:24:00.769 UTC**, became ready at
+**20:24:05.493**, and reconnected the real Discord Gateway. The packaging-only
+correction does not change those production bytes.
+All five lockfile-policy/workflow tests pass, and the actual staged 500-file
+diff passes the repository's lockfile check. Re-running the installed Discord
+cohort after restoring the baseline lockfile still passes **88/88**, with no
+skips. No install or package rewrite occurred during this correction.

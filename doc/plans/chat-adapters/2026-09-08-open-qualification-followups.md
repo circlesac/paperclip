@@ -25,12 +25,23 @@ Fresh full chat integration passed **421/421** and the deterministic browser
 suite passed **12/12** on separate new PostgreSQL databases, with no skips or
 retries. Browser fixtures cover all five providers, the experiment off/on and
 file-batch delivery states. They mock provider HTTP and are not live accounts.
-The superseded v5/v6 surface notes are recoverable through immutable Git links
-in `wireframes-archive.md`; current specs and tests remain in the worktree.
+The superseded v5 surface note is recoverable through an immutable Git link
+in `wireframes-archive.md`; v6, current specs and tests remain in the worktree.
+
+The fix was pushed as `55b91bedd`. Its quality gate correctly rejected the
+accidentally committed locally generated lockfile: feature PRs must leave that
+file to CI's regeneration/upload step. The packaging-only correction restores
+origin/master's exact lockfile without reinstalling or changing any tested
+production bytes. Manifest/patch configuration remains. Local frozen-install
+proof refers to the generated verification copy, not the checked-in baseline.
+Restoring the exact v6 historical note uses the freed slot; the PR stays 500
+files. Push the correction and renew exact-head CI/Greptile; do not count the
+failed policy run as passed or try to bypass it.
 
 Server 56 loaded the patched dependencies at **20:13:21.244 UTC**, became ready
 at **20:13:26.601**, and connected the real Discord Gateway. Its base is c52 plus
-the frozen uncommitted repair. A final clean-head restart is still required.
+the frozen uncommitted repair. Server 57 then started clean `55b91bedd` at
+**20:24:00.769 UTC**, ready **20:24:05.493**, and connected the real Gateway.
 The old Slack thread remained stuck loading in Slack, with no composer and no
 input sent. Root instead submitted one fresh root mention in the same QA
 channel and visually confirmed exactly `SLACK-PATCH-READY` plus a usable reply
