@@ -7,6 +7,17 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Landing status
 
+- Current continuation: documentation head `179fb5a53` received Greptile
+  **5/5**, with no open finding. Its CI `34257833081` failed the runner Build
+  lane: the real-transport 1,024-event suffix test rejected its first close
+  with `NativeSessionCloseUnrecoverableError`. This is a test failure, not a
+  dependency-restore or PostgreSQL bootstrap failure. Investigate the stop,
+  drain and suspension boundaries without weakening fail-closed assertions.
+  The completed CI run has only that failed lane and its failed aggregate;
+  the remaining lanes passed. Merge `7401e6a72`
+  then incorporated master `db85bf4b7` (simpler production GitHub repository
+  controls) cleanly. The six-file UI compatibility cohort passed **221/221**,
+  and all four token gates passed. Final-head gates remain required.
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
@@ -75,12 +86,14 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current deployed state and evidence
 
-The live server was restarted at **17:23:07.133 UTC**, log
-`.paperclip-runtime/chat-adapters-live/server-experimental-landing-49.log`.
-It runs production head `aaa74597f`, including the final malformed-response
-guard, turn-admission patch and accessible-company navigation. The only dirty
-source at startup was the integration-test cleanup. The restart had zero
-active/queued runs; startup recovery became ready at **17:23:10.159 UTC**.
+The live server was restarted at **17:39:47.681 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-50.log`.
+It started from clean head `179fb5a53`; its native production code remains
+`aaa74597f`, including the final malformed-response guard and turn-admission
+patch. The restart followed the controlled GitHub source-change test below,
+with zero active/queued runs before shutdown. UI files use Vite development
+middleware; root reloaded and checked the experimental/tool entry points after
+the later GitHub repository-controls merge without changing the backend process.
 Only runner TypeScript was rebuilt; the signed runner binary is unchanged.
 The same native production code on server 47 passed Slack/GitHub/Telegram
 continuation smoke checks, returning exact answers in **14.741 / 18.018 /
@@ -195,8 +208,12 @@ switch to Terra. The signed/staged runner SHA-256 is
   The corrected canonical single-worker run finished **478 passed / one
   failed**: a source/target embedded-PostgreSQL bootstrap still could not
   start with the host at 30 of 32 shared-memory segments. No global setting
-  or unrelated process was changed. The serialized server group is running
-  once under the documented wrapper; do not repeatedly retry unchanged limits.
+  or unrelated process was changed. The serialized group then stopped at
+  suite **97/143**, with **1,504 passed / 21 skipped** and no assertion
+  failures. Queued-comments route fixture bootstrap failed; **46 suites were
+  not reached**. Captured PostgreSQL stderr was `shmget ... No space left on
+  device`, with host usage at **32/32** segments. No positively identified
+  current-task cluster remained to clean up. Do not retry unchanged limits.
   These failed command results remain failed; serial reruns are separate
   evidence. Do not change global IPC limits or stop unrelated databases.
 - New server-48 live file checks passed on native Luna: a new GitHub private
@@ -211,6 +228,18 @@ switch to Terra. The signed/staged runner SHA-256 is
   **31.028 seconds**, with exact new source/root/body/asset and stored-byte
   matching. A post-restart Slack continuation returned its exact answer in
   **17.297 seconds**. Both used native Luna and one attempt per publication.
+- A real signed GitHub **changed-source** replay passed on server 50. Root
+  uploaded a new private image, changed only its source comment while ingress
+  was unavailable, then redelivered the exact original failed event through
+  the App's supported webhook API. The canonical body mismatch rejected the
+  image before signed-target selection. There were no imported/generated
+  attachments or view events; one native Luna run replied truthfully that the
+  exact image was unavailable, **17.755 seconds from ingress**. This is not
+  deleted-source or in-flight revocation proof. A separate bot-created callback
+  received a **502 in 0.1 seconds**, before reaching the instrumented local
+  proxy. Its destination exactly matched the App configuration and adjacent
+  successful deliveries; its cause remains unproven. Do not call it a safely
+  filtered self-event or a fixed transport defect.
 
 ## Remaining work
 

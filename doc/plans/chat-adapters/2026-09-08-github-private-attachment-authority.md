@@ -165,3 +165,47 @@ provider-rendered response HTML, and no internal identifier in the final text.
 This extends live proof to new private images in **both** main conversations
 and review threads on the deployed authority implementation. It is not a
 changed/deleted-source test or an interrupted-download/revocation stress test.
+
+### Live changed-source rejection
+
+Root uploaded a fresh private image in the authorized PR conversation and
+submitted `PRIVATE-SOURCE-CHANGE-0908` at **17:38:59.379 UTC**. Paperclip was
+deliberately offline after a zero-active-run shutdown, so the original created
+delivery failed without entering the local delivery ledger. Root edited only
+that synthetic source comment at **17:39:33.981 UTC**, preserving its new image
+URL and appending a revision marker. The edit delivery also failed while the
+server was offline. Neither delivery had been admitted before restart.
+
+After server 50 became ready, root used the existing App identity and GitHub's
+supported [App webhook redelivery API](https://docs.github.com/en/rest/apps/webhooks#redeliver-a-delivery-for-an-app-webhook)
+to redeliver **only the original created event**, once. The new signed
+delivery reached Paperclip and retained the original source digest
+`1ac24a2833edef198dd4d6dfa6155414f93dff5d6e01902f9ef65b6e7902244b`.
+The current canonical comment instead hashed to
+`6c47240d26bf98e6561479a9c01ac6c5e111766a46ba01182397aea4845c5514`.
+The unchanged new asset did not override this mismatch.
+
+The closed diagnostic was `github_attachment_canonical_body_mismatch`, before
+signed-target selection. The original ingress action was processed and its
+retained body was redacted. No edited ingress action existed. The exact
+current input had one `download_unavailable` omission, zero imported or
+generated files, and no artifact-view event. One native Luna run took
+**14.881 seconds**. Its final publication used one attempt and arrived
+**17.755 seconds after ingress**: “The exact new image is unavailable because
+it could not be imported.” Root verified that visible answer in the provider
+conversation; the task remained open. The deliberate outage is not counted as
+ordinary response latency.
+
+An independent scoped audit of 52 run events and the associated delivery,
+action, source, wake, run, result and publication found no signed-target/JWT
+or provider-rendered-HTML markers, and no internal UUID in the final output.
+This proves rejection of a **changed body** for a real redelivered event. It
+does not prove deleted-source or in-flight download revocation behavior.
+
+Separately, the bot-created reply callback received a 502 before reaching the
+instrumented local proxy or Paperclip. GitHub reported the exact configured
+destination, a 0.1-second duration, no response headers and an empty body.
+Adjacent original-redelivery and bot-edit callbacks used that same destination
+and received 202. The bot-edit was correctly filtered as outbound/self; the
+missing created callback was not. The pre-proxy transport cause is unconfirmed
+and must not be described as harmless self-event filtering or a repaired bug.

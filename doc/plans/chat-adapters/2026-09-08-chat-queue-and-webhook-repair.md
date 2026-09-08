@@ -1283,7 +1283,12 @@ noncanonical `/tmp` and hit 14 path guards; correcting the wrapper yielded
 CLI pass. Host usage remained 30 of 32 shared-memory segments. No positively
 identified database from these completed test roots remained to clean up.
 Global IPC limits, unknown segments and unrelated databases were untouched.
-The documented serialized group is continuing once separately.
+The documented serialized group then stopped at suite **97/143** with
+**1,504 passed / 21 skipped** and no assertion failures. The queued-comments
+route fixture could not bootstrap PostgreSQL; **46 suites were not reached**.
+Captured stderr reported `shmget ... No space left on device`, and host
+shared-memory usage reached **32/32** segments. No positively identified
+current-task cluster remained to clean up; no further unchanged retry was run.
 
 ### Reasoning-effort evidence correction
 
@@ -1309,3 +1314,57 @@ through the closed provider contract, persisted execution identity and provider
 request, test new and resumed sessions, and verify it with the live provider.
 Do not silently inject legacy configuration into the closed native boundary
 or expand the chat landing patch into an unreviewed runner protocol change.
+
+### Changed GitHub source and renewed landing gates
+
+The real private-image source-change journey now passes on isolated server
+**50**, started from clean documentation head `179fb5a53` at
+**17:39:47.681 UTC**. The native production code and signed binary are unchanged
+from server 49. Root stopped the prior server only after zero active/queued
+runs, uploaded a new synthetic private image through the GitHub browser while
+ingress was offline, and edited that same source before recovery. The supported
+App webhook API then redelivered only the exact original created event once.
+The [attachment authority record](2026-09-08-github-private-attachment-authority.md)
+records the exact source hashes and bounded proof.
+
+Paperclip rejected the canonical body mismatch before selecting a signed image
+target. The current input had one unavailable omission and no attachment or
+view event. Native Luna took **14.881 seconds**; one final publication arrived
+**17.755 seconds after ingress** and truthfully said the exact image could not
+be imported. Root saw the final reply in GitHub. This is changed-body rejection,
+not deleted-source or in-flight revocation qualification.
+
+The test also exposed a separate callback failure: GitHub reported a bot-created
+event **502 in 0.1 seconds**, with an empty response and no headers. Its
+destination exactly matched the current App webhook and successful neighboring
+deliveries. No matching request reached the local proxy or Paperclip. The later
+bot-edit callback reached Paperclip and was correctly filtered, but that does
+not explain the missing created callback. A bounded Tailscale/system-log query
+found no matching failure diagnostic. Its pre-proxy cause remains open.
+
+Greptile reviewed exact head `179fb5a53` at **5/5**, with zero new findings and
+the previous thread resolved. CI **34257833081** failed its runner Build lane:
+the real-transport **1,024-event suffix** case rejected the first close with
+`NativeSessionCloseUnrecoverableError`. The runner cohort had **1,702 passed /
+three skipped / one failed**; this was not an artifact-restore or database
+bootstrap failure. Preserve stop/drain/suspension and ownership assertions
+while investigating. Both remaining general-server shards subsequently passed;
+the completed run failed only this lane and its aggregate gate. The preceding
+production head's green CI does not erase this failure.
+
+Merge `7401e6a72` then incorporated master `db85bf4b7`, preserving the simpler
+production GitHub repository list and configuration link. The merge was clean;
+the experimental entry-point gate is separate. Its six-file UI compatibility
+cohort passed **221/221**, and all four token gates passed across 961 files.
+Fresh final-head verification is still required before merge to master.
+
+Root also repeated the real UI entry-point journey after this merge: account
+menu → Settings → Experimental → Chat connectors off → Back to app →
+Connectors → GitHub. It opened normal tool account setup directly, without
+the chat/tool choice. Cancel created no connection. After restoring the flag,
+all four active chat connections reappeared and GitHub offered the exact two
+chat/tool choices. The UI uses Vite middleware and was reloaded; the backend
+process stayed on server 50. Root inspected the rendered setup and chooser.
+The flow was understandable and showed no error banner or unexpected sign-in
+redirect. This is entry-point proof, not live permission-list population: that
+upstream rendering has the separate automated coverage above.
