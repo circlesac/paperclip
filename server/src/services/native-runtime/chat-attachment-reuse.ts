@@ -29,6 +29,7 @@ import {
 import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
 import { issueService } from "../issues.js";
+import { resolveExternalChatQuestionResponse } from "./external-chat-question-response.js";
 
 export const LIST_CHAT_ATTACHMENTS_TOOL_NAME = "list_chat_attachments";
 export const REUSE_CHAT_ATTACHMENT_TOOL_NAME = "reuse_chat_attachment";
@@ -366,7 +367,12 @@ export async function authorizeChatConversationForBoundRun(
   contextSnapshot: unknown,
   lockMode: AuthorizationLockMode = "blocking",
 ): Promise<AuthorizedConversation> {
-  const context = record(contextSnapshot);
+  let context = record(contextSnapshot);
+  if (context.source === "issue.interaction.respond") {
+    const answer = await resolveExternalChatQuestionResponse(tx, binding, context, lockMode);
+    if (!answer) throw new Error("paperclip_runner_chat_attachment_binding_denied");
+    context = answer.authorizationContext;
+  }
   const source = typeof context.source === "string" ? context.source : "";
   const provider = [
     "slack",
@@ -579,8 +585,27 @@ export async function resolveExternalChatResponseWaitAuthorizationInTransaction(
     : lockMode === "nonblocking"
       ? runQuery.for("update", { noWait: true }).limit(1)
       : runQuery.for("update").limit(1));
+  const answerContext =
+    run && record(run.contextSnapshot).source === "issue.interaction.respond"
+      ? await resolveExternalChatQuestionResponse(
+          tx,
+          binding,
+          run.contextSnapshot,
+          lockMode,
+        )
+      : null;
+  if (
+    run &&
+    record(run.contextSnapshot).source === "issue.interaction.respond" &&
+    record(run.contextSnapshot).paperclipExternalChatQuestionResponse &&
+    !answerContext
+  )
+    return "revoked";
   const candidate = run
-    ? externalChatWaitCandidate(run.contextSnapshot, binding)
+    ? externalChatWaitCandidate(
+        answerContext?.authorizationContext ?? run.contextSnapshot,
+        binding,
+      )
     : null;
   if (!candidate) return "not_applicable";
 

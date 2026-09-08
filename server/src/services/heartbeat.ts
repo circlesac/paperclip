@@ -223,6 +223,10 @@ import {
   isExternalChatWaitAuthorizationContention,
 } from "./native-runtime/chat-attachment-reuse.js";
 import {
+  EXTERNAL_CHAT_QUESTION_RESPONSE_KEY,
+  resolveExternalChatQuestionResponse,
+} from "./native-runtime/external-chat-question-response.js";
+import {
   NativeRunnerOwnershipUnverifiedError,
   isNativeRunnerOwnershipHeld,
   nativeRunnerOwnershipNotHeldCondition,
@@ -7000,6 +7004,7 @@ export function mergeCoalescedContextSnapshot(
   // Only executeRun can mint this proof. Coalescence may retain an unchanged
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
+  delete merged[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
   const mergedAttachmentOmissions = mergeExternalAttachmentOmissions(
     existing,
     incoming,
@@ -7080,9 +7085,25 @@ export async function resolveExternalChatWakeProvider(input: {
   db: Db;
   companyId: string;
   agentId?: string | null;
+  runId?: string | null;
   issueId: string | null;
   contextSnapshot: Record<string, unknown>;
 }): Promise<ChatProvider | null> {
+  if (input.contextSnapshot.source === "issue.interaction.respond") {
+    if (!input.runId || !input.agentId || !input.issueId) return null;
+    const answer = await resolveExternalChatQuestionResponse(
+      input.db,
+      {
+        companyId: input.companyId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+        runId: input.runId,
+      },
+      input.contextSnapshot,
+      "read",
+    );
+    return answer?.provider ?? null;
+  }
   const source = readNonEmptyString(input.contextSnapshot.source);
   const provider = CHAT_PROVIDERS.find(
     (candidate) =>
@@ -7141,7 +7162,7 @@ export async function resolveExternalChatWakeProvider(input: {
     : null;
 }
 
-/** Bind an already-claimed review turn without checking out or approving it. */
+/** Bind an already-claimed chat/reply turn without checking out or approving it. */
 export async function attestReviewedExternalChatRun(input: {
   db: Db;
   companyId: string;
@@ -7192,7 +7213,9 @@ export async function attestReviewedExternalChatRun(input: {
           !issue ||
           !run ||
           !actor ||
-          issue.status !== "in_review" ||
+          !(issue.status === "in_review" ||
+            (input.contextSnapshot.source === "issue.interaction.respond" &&
+              issue.status === "in_progress")) ||
           issue.assigneeAgentId !== input.agentId ||
           issue.executionRunId !== input.runId ||
           run.status !== "running" ||
@@ -7215,6 +7238,18 @@ export async function attestReviewedExternalChatRun(input: {
         )
           return false;
         try {
+          const answer =
+            admittedContext.source === "issue.interaction.respond"
+              ? await resolveExternalChatQuestionResponse(
+                  tx,
+                  input,
+                  admittedContext,
+                  "nonblocking",
+                  true,
+                )
+              : null;
+          if (admittedContext.source === "issue.interaction.respond" && !answer)
+            return false;
           // The marker is built here only after proving the real execution owner.
           // The shared boundary then verifies current provider/resource/principal
           // access for every admitted message; no lifecycle state is mutated.
@@ -7222,12 +7257,14 @@ export async function attestReviewedExternalChatRun(input: {
             tx,
             input,
             {
-              ...admittedContext,
+              ...(answer?.authorizationContext ?? admittedContext),
               [PAPERCLIP_HARNESS_CHECKOUT_KEY]: false,
               [PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY]: true,
             },
             "nonblocking",
           );
+          if (answer)
+            input.contextSnapshot[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY] = answer.marker;
           return true;
         } catch (error) {
           if (
@@ -7308,6 +7345,7 @@ export async function buildPaperclipWakePayload(input: {
   db: Db;
   companyId: string;
   agentId?: string | null;
+  runId?: string | null;
   contextSnapshot: Record<string, unknown>;
   continuationSummary?: {
     key: string;
@@ -7695,6 +7733,7 @@ export async function buildPaperclipWakePayload(input: {
     db: input.db,
     companyId: input.companyId,
     agentId: input.agentId,
+    runId: input.runId,
     issueId: issueSummary?.id === issueId ? issueId : null,
     contextSnapshot: input.contextSnapshot,
   });
@@ -7786,6 +7825,11 @@ export async function buildPaperclipWakePayload(input: {
         : null,
     interactionKind,
     interactionStatus,
+    interactionId,
+    sourceRunId: readNonEmptyString(input.contextSnapshot.sourceRunId),
+    externalChatQuestionResponse: externalChatProvider
+      ? input.contextSnapshot[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY] ?? null
+      : null,
     externalInteractionContinuation,
     checkboxSelection:
       Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
@@ -18858,6 +18902,7 @@ export function heartbeatService(
       // Never adopt a chat-execution attestation supplied in a wake payload.
       // Reviewed chat turns rebuild it from the current durable owner below.
       delete context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
+      delete context[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
       const providerTraceRequested =
         parseObject(context.debug).providerTrace === "raw";
       if (providerTraceRequested) {
@@ -18972,12 +19017,16 @@ export function heartbeatService(
       }
       if (
         issueId &&
-        issueContext?.status === "in_review" &&
-        CHAT_PROVIDERS.some(
-          (provider) =>
-            context.source === `chat:${provider}` ||
-            context.source === `chat:${provider}:recovery`,
-        )
+        ((issueContext?.status === "in_review" &&
+          CHAT_PROVIDERS.some(
+            (provider) =>
+              context.source === `chat:${provider}` ||
+              context.source === `chat:${provider}:recovery`,
+          )) ||
+          (context.source === "issue.interaction.respond" &&
+            context.externalChatContinuation === true &&
+            context.interactionKind === "ask_user_questions" &&
+            ["in_progress", "in_review"].includes(issueContext?.status ?? "")))
       ) {
         const attested = await attestReviewedExternalChatRun({
           db,
@@ -19310,6 +19359,7 @@ export function heartbeatService(
         db,
         companyId: agent.companyId,
         agentId: agent.id,
+        runId: run.id,
         contextSnapshot: context,
         continuationSummary,
         issueSummary: issueRef

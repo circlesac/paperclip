@@ -4,6 +4,121 @@ import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
 describe("native execution input external-chat framing", () => {
+  it.each([false, true])(
+    "projects the authoritative selected answer into an attested native chat prompt (resumed: %s)",
+    (resumedSession) => {
+      const interactionId = "80000000-0000-4000-8000-000000000008";
+      const sourceRunId = "90000000-0000-4000-8000-000000000009";
+      const wakePayload = {
+        reason: "issue_commented",
+        externalChatProvider: "telegram",
+        externalChatExecutionBound: true,
+        interactionId,
+        sourceRunId,
+        interactionKind: "ask_user_questions",
+        interactionStatus: "answered",
+        externalInteractionContinuation: true,
+        issue: {
+          id: "20000000-0000-4000-8000-000000000002",
+          workMode: "standard",
+          status: "in_review",
+        },
+        externalChatQuestionResponse: {
+          schema: "paperclip.external_chat_question_response.v1",
+          interactionId,
+          sourceRunId,
+          responseDeliveryId: "10000000-0000-4000-8000-000000000011",
+          sourceCommentId: "10000000-0000-4000-8000-000000000012",
+          endpointId: "10000000-0000-4000-8000-000000000013",
+          conversationId: "10000000-0000-4000-8000-000000000014",
+          bindingSha256: "a".repeat(64),
+        },
+        commentIds: ["10000000-0000-4000-8000-000000000012"],
+        latestCommentId: "10000000-0000-4000-8000-000000000012",
+        comments: [
+          {
+            id: "10000000-0000-4000-8000-000000000012",
+            body: "Ask for a color, then tell me the selected color.",
+          },
+        ],
+        commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+        fallbackFetchNeeded: false,
+      };
+      const args: Parameters<typeof buildNativeExecutionInput>[0] = {
+        companyId: "10000000-0000-4000-8000-000000000001",
+        runId: "50000000-0000-4000-8000-000000000005",
+        agentId: "30000000-0000-4000-8000-000000000003",
+        issue: {
+          id: "20000000-0000-4000-8000-000000000002",
+          identifier: "CHAT-5",
+          title: "Old exact-output request",
+          description: null,
+          workMode: "standard",
+        },
+        taskPrompt:
+          "Continue the user's original request with their selected answer.",
+        wakePayload,
+        resumedSession,
+        workspace: {
+          id: "50000000-0000-4000-8000-000000000005",
+          cwd: "/workspace",
+          repoUrl: null,
+          repoRef: null,
+          branchName: null,
+        },
+        normalizedSessionId: "60000000-0000-4000-8000-000000000006",
+        provider: "codex",
+        completionContract: {
+          id: "70000000-0000-4000-8000-000000000007",
+          sha256: `sha256:${"a".repeat(64)}`,
+          schemaVersion: "paperclip.run-result.v1",
+          contract: {
+            revision: "1",
+            objective: "Answer the user's selected choice",
+            criteria: [
+              { id: "answer", requirement: "Return the actual color." },
+            ],
+          },
+        },
+        runtimeContext: nativeRuntimeContextFixture(),
+        interactionResponses: [
+          {
+            interactionId,
+            kind: "ask_user_questions",
+            response: {
+              status: "answered",
+              result: {
+                version: 1,
+                answers: [{ questionId: "color", optionIds: ["amber"] }],
+                summaryMarkdown:
+                  "Resolved questions and answers:\n- Choose a color: Amber",
+              },
+            },
+          },
+        ],
+      };
+      const input = buildNativeExecutionInput(args);
+      expect(input.task.title).toBe("External chat follow-up");
+      expect(input.task.prompt).toContain("Amber");
+      expect(input.task.prompt).toContain(
+        "semantic completion summary is the user-visible final answer",
+      );
+      expect(input.task.prompt).not.toContain(
+        "including marking the task done",
+      );
+      expect(wakePayload).not.toHaveProperty("questionResponse");
+      const unbound = buildNativeExecutionInput({
+        ...args,
+        interactionResponses: [
+          {
+            ...args.interactionResponses![0]!,
+            interactionId: "10000000-0000-4000-8000-000000000019",
+          },
+        ],
+      });
+      expect(unbound.task.title).toBe("Old exact-output request");
+    },
+  );
   it("uses neutral framing and the closed reader for an authenticated overflow chat turn", () => {
     const staleRootTitle = "Reply with exactly STALE-OVERFLOW-MARKER";
     const input = buildNativeExecutionInput({

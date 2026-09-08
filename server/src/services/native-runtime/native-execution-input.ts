@@ -15,6 +15,7 @@ import {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   isPaperclipExternalChatContractTurn,
+  isPaperclipExternalChatQuestionResponseTurn,
   renderPaperclipWakePrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 
@@ -90,14 +91,42 @@ export function buildNativeExecutionInput(input: {
         input.model ?? "",
       )
     : null;
-  const wakePrompt = renderPaperclipWakePrompt(input.wakePayload, {
+  // Answers are materialized from the authoritative interaction only for this
+  // invocation; do not persist a duplicate answer in the durable wake snapshot.
+  const wake =
+    input.wakePayload &&
+    typeof input.wakePayload === "object" &&
+    !Array.isArray(input.wakePayload)
+      ? (input.wakePayload as Record<string, unknown>)
+      : null;
+  const question = wake?.externalChatQuestionResponse
+    ? input.interactionResponses?.find(
+        (response) =>
+          response.interactionId === wake.interactionId &&
+          response.kind === "ask_user_questions" &&
+          response.response.status === "answered",
+      )
+    : null;
+  const answerResult = question?.response.result as
+    Record<string, unknown> | undefined;
+  const wakePayload =
+    question && typeof answerResult?.summaryMarkdown === "string"
+      ? {
+          ...wake,
+          questionResponse: {
+            interactionId: question.interactionId,
+            summaryMarkdown: answerResult.summaryMarkdown,
+          },
+        }
+      : input.wakePayload;
+  const wakePrompt = renderPaperclipWakePrompt(wakePayload, {
     resumedSession: input.resumedSession === true,
     suppressIssueDescription: input.taskPrompt.trim().length > 0,
     nativeWakeReaderAvailable: true,
   });
-  const externalChatTurn = isPaperclipExternalChatContractTurn(
-    input.wakePayload,
-  );
+  const externalChatTurn =
+    isPaperclipExternalChatContractTurn(wakePayload) ||
+    isPaperclipExternalChatQuestionResponseTurn(wakePayload);
   const taskPrompt = [wakePrompt, input.taskPrompt.trim()]
     .filter((section) => section.length > 0)
     .join("\n\n");

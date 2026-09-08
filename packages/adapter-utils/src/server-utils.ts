@@ -741,6 +741,17 @@ type PaperclipWakeQuestionResponse = {
   truncated: boolean;
 };
 
+type PaperclipWakeExternalChatQuestionResponse = {
+  schema: "paperclip.external_chat_question_response.v1";
+  interactionId: string;
+  responseDeliveryId: string;
+  sourceRunId: string;
+  sourceCommentId: string;
+  endpointId: string;
+  conversationId: string;
+  bindingSha256: string;
+};
+
 type PaperclipWakeExecutionWorkspace = {
   branchName: string | null;
 };
@@ -772,6 +783,7 @@ type PaperclipWakePayload = {
   checkedOutByHarness: boolean;
   externalChatExecutionBound: boolean;
   externalChatProvider: PaperclipExternalChatProvider | null;
+  externalChatQuestionResponse: PaperclipWakeExternalChatQuestionResponse | null;
   skillTest: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
   // Technical English with brief decision context.
@@ -787,6 +799,8 @@ type PaperclipWakePayload = {
   documentReviewContext: PaperclipWakeDocumentReviewContext | null;
   livenessContinuation: PaperclipWakeLivenessContinuation | null;
   taskWatchdog: PaperclipWakeTaskWatchdogContext | null;
+  interactionId: string | null;
+  sourceRunId: string | null;
   interactionKind: string | null;
   interactionStatus: string | null;
   externalInteractionContinuation: boolean;
@@ -1628,6 +1642,46 @@ function normalizePaperclipExternalChatProvider(
     : null;
 }
 
+function normalizePaperclipExternalChatQuestionResponse(
+  value: unknown,
+): PaperclipWakeExternalChatQuestionResponse | null {
+  const marker = parseObject(value);
+  const idFields = [
+    "interactionId",
+    "responseDeliveryId",
+    "sourceRunId",
+    "sourceCommentId",
+    "endpointId",
+    "conversationId",
+  ] as const;
+  const fields = new Set<string>(["schema", ...idFields, "bindingSha256"]);
+  if (
+    marker.schema !== "paperclip.external_chat_question_response.v1" ||
+    Object.keys(marker).length !== fields.size ||
+    Object.keys(marker).some((field) => !fields.has(field)) ||
+    idFields.some(
+      (field) =>
+        typeof marker[field] !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+          marker[field],
+        ),
+    ) ||
+    typeof marker.bindingSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(marker.bindingSha256)
+  )
+    return null;
+  return {
+    schema: "paperclip.external_chat_question_response.v1",
+    interactionId: marker.interactionId as string,
+    responseDeliveryId: marker.responseDeliveryId as string,
+    sourceRunId: marker.sourceRunId as string,
+    sourceCommentId: marker.sourceCommentId as string,
+    endpointId: marker.endpointId as string,
+    conversationId: marker.conversationId as string,
+    bindingSha256: marker.bindingSha256,
+  };
+}
+
 export function normalizePaperclipWakePayload(
   value: unknown,
 ): PaperclipWakePayload | null {
@@ -1768,6 +1822,9 @@ export function normalizePaperclipWakePayload(
     externalChatProvider: normalizePaperclipExternalChatProvider(
       payload.externalChatProvider,
     ),
+    externalChatQuestionResponse: normalizePaperclipExternalChatQuestionResponse(
+      payload.externalChatQuestionResponse,
+    ),
     skillTest,
     simplifiedEnglishInteractions: asBoolean(
       payload.simplifiedEnglishInteractions,
@@ -1788,6 +1845,8 @@ export function normalizePaperclipWakePayload(
     annotationDeltas,
     livenessContinuation,
     taskWatchdog,
+    interactionId: asString(payload.interactionId, "").trim() || null,
+    sourceRunId: asString(payload.sourceRunId, "").trim() || null,
     interactionKind: asString(payload.interactionKind, "").trim() || null,
     interactionStatus: asString(payload.interactionStatus, "").trim() || null,
     externalInteractionContinuation: asBoolean(
@@ -1932,6 +1991,72 @@ function isNormalizedPaperclipExternalChatReaderTurn(
   );
 }
 
+function isNormalizedPaperclipExternalChatQuestionResponseTurn(
+  normalized: PaperclipWakePayload | null,
+): normalized is PaperclipWakePayload & {
+  externalChatProvider: PaperclipExternalChatProvider;
+  externalChatQuestionResponse: PaperclipWakeExternalChatQuestionResponse;
+} {
+  const marker = normalized?.externalChatQuestionResponse;
+  if (
+    !normalized ||
+    !marker ||
+    !normalized.externalChatProvider ||
+    (!normalized.checkedOutByHarness &&
+      !normalized.externalChatExecutionBound) ||
+    !normalized.issue?.id ||
+    (normalized.issue.workMode !== "standard" &&
+      normalized.issue.workMode !== "ask") ||
+    normalized.reason !== "issue_commented" ||
+    normalized.interactionId !== marker.interactionId ||
+    normalized.sourceRunId !== marker.sourceRunId ||
+    normalized.interactionKind !== "ask_user_questions" ||
+    normalized.interactionStatus !== "answered" ||
+    !normalized.externalInteractionContinuation ||
+    normalized.questionResponse?.interactionId !== marker.interactionId ||
+    normalized.questionResponse.truncated
+  )
+    return false;
+  return !(
+    normalized.recovery ||
+    normalized.dependencyBlockedInteraction ||
+    normalized.treeHoldInteraction ||
+    normalized.activeTreeHold ||
+    normalized.unresolvedBlockerIssueIds.length > 0 ||
+    normalized.unresolvedBlockerSummaries.length > 0 ||
+    normalized.executionStage ||
+    normalized.continuationSummary?.bodyTruncated ||
+    normalized.planReviewContext ||
+    normalized.documentReviewContext ||
+    normalized.livenessContinuation ||
+    normalized.taskWatchdog ||
+    normalized.skillTest ||
+    normalized.checkboxSelection ||
+    normalized.agentMessage ||
+    normalized.annotationDeltas.length > 0 ||
+    normalized.childIssueSummaries.length > 0 ||
+    normalized.childIssueSummaryTruncated ||
+    normalized.issue.descriptionTruncated ||
+    normalized.comments.some((comment) => comment.bodyTruncated) ||
+    normalized.missingCount > 0 ||
+    normalized.truncated ||
+    normalized.fallbackFetchNeeded
+  );
+}
+
+/**
+ * Recognize only the closed, server-attested answered-chat shape for prompting.
+ * The server must independently authorize the marker against durable state;
+ * this shape check is not a grant of publication, task, or tool authority.
+ */
+export function isPaperclipExternalChatQuestionResponseTurn(
+  value: unknown,
+): boolean {
+  return isNormalizedPaperclipExternalChatQuestionResponseTurn(
+    normalizePaperclipWakePayload(value),
+  );
+}
+
 /**
  * Returns true only for an ordinary external-chat task wake that the trusted
  * Paperclip harness has already authenticated, bound to a concrete issue, and
@@ -2029,7 +2154,12 @@ export function renderPaperclipWakePrompt(
   const externalChatReaderTurn =
     options.nativeWakeReaderAvailable === true &&
     isNormalizedPaperclipExternalChatReaderTurn(normalized);
-  const externalChatContract = externalChatTurn || externalChatReaderTurn;
+  const externalChatQuestionResponseTurn =
+    isNormalizedPaperclipExternalChatQuestionResponseTurn(normalized);
+  const externalChatContract =
+    externalChatTurn ||
+    externalChatReaderTurn ||
+    externalChatQuestionResponseTurn;
   // The heartbeat prompt template already carries the execution contract on
   // fresh sessions; only resume deltas (which replace the template) and
   // template-less adapters need the wake-payload copy.
@@ -2105,11 +2235,15 @@ export function renderPaperclipWakePrompt(
 
   const executionContractLines = externalChatContract
     ? [
-        "## External chat response contract",
+        externalChatQuestionResponseTurn
+          ? "## External chat answered-question contract"
+          : "## External chat response contract",
         "",
-        normalized.checkedOutByHarness
-          ? `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip already authorized and bound the provider message, assigned this immutable agent, and checked out the issue for this run.`
-          : `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip verified the provider message and this agent's current execution binding. The task remains in review: this binding is not a checkout, approval, or permission to change its status or bypass any review gate.`,
+        externalChatQuestionResponseTurn
+          ? `This is a server-authenticated ${normalized.externalChatProvider} answer to the exact question in this task. Paperclip verified its source run, accepted answer delivery, provider conversation and this agent's current execution binding.`
+          : normalized.checkedOutByHarness
+            ? `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip already authorized and bound the provider message, assigned this immutable agent, and checked out the issue for this run.`
+            : `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip verified the provider message and this agent's current execution binding. The task remains in review: this binding is not a checkout, approval, or permission to change its status or bypass any review gate.`,
         ...(externalChatReaderTurn
           ? [
               "The inline comment batch is incomplete. Before answering, call `read_current_wake_comments` without a cursor, then pass each returned `nextCursor` until `complete` is true. That closed reader exposes only the exact comments accepted for this run. Attachment entries marked `metadata_only` are not readable bytes; state that limitation instead of inferring their contents.",
@@ -2120,6 +2254,13 @@ export function renderPaperclipWakePrompt(
             ]),
         "The harness owns task state and persists your final assistant response. If the runtime offers a semantic completion operation, emit exactly one semantic completion and do not duplicate that response in a Paperclip comment or status update.",
         "The semantic completion summary is the user-visible final answer. Include every requested answer, exact value, description, and any actionable file-access or delivery limitation there; a statement that you read, checked, or prepared something is not a substitute. Private progress commentary is not delivered as the final answer.",
+        "In a normal successful answer, omit routine file-preparation, unconfirmed-delivery, and waiting-for-next-message status; end after the requested content or a neutral file label. Report a genuine failure or required user action plainly, without claiming a delivery that has not been confirmed.",
+        ...(externalChatQuestionResponseTurn
+          ? [
+              "Use the authoritative answer below to complete the original request; do not repeat or re-ask the resolved question. Preserve the original request's exact-output constraints literally. Put the requested result, including the chosen value, in the semantic completion summary—not an acknowledgment that the answer was received or that the task was updated.",
+              "This answer resolves only the named question, not a separate approval or completion review. Report the work disposition truthfully in the semantic control fields; do not change task status, clear a review, or manufacture a new wait or monitor to force a reply. Paperclip independently preserves genuine pending review gates.",
+            ]
+          : []),
         "If the user explicitly asks to keep this current chat task open and wait for their next provider message without scheduling more work, report `yielded` with continuation kind `response_wake`; do not report `done`. Use that wait only after completing this turn's requested response, and never use it to defer unfinished work or for an ordinary completed request. Paperclip independently verifies the current chat binding before preserving the task.",
         `File-delivery contract: ${paperclipChatFilePreparationDelivery(normalized.externalChatProvider).guidance}`,
         "When the request genuinely requires files, investigation, external access, or mutations, use the appropriate tools and complete every required permission, approval, execution-policy, containment, budget, pause/cancel, and company-boundary check. This response shortcut grants no new authority.",
@@ -2174,6 +2315,7 @@ export function renderPaperclipWakePrompt(
       : []),
   ];
   const externalInteractionContinuationLines =
+    !externalChatQuestionResponseTurn &&
     normalized.externalInteractionContinuation &&
     (normalized.interactionStatus === "answered" ||
       normalized.interactionStatus === "accepted")

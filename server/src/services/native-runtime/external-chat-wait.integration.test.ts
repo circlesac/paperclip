@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
   agents,
   approvals,
+  chatActions,
   chatConversations,
   chatDeliveries,
   chatEndpointResources,
@@ -22,6 +23,7 @@ import {
   issueComments,
   issueApprovals,
   issueThreadInteractions,
+  issueQuestionResponseDeliveries,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -46,7 +48,10 @@ import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publi
 import { resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import { issueService } from "../issues.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
-import { isExternalChatWaitAuthorizationContention } from "./chat-attachment-reuse.js";
+import { authorizeChatConversationForBoundRun, isExternalChatWaitAuthorizationContention } from "./chat-attachment-reuse.js";
+import { attestReviewedExternalChatRun, buildPaperclipWakePayload } from "../heartbeat.js";
+import { questionResponseDeliveryValues } from "../question-response-delivery.js";
+import type { AskUserQuestionsInteraction } from "@paperclipai/shared";
 
 describe("native external-chat response wait", () => {
   let temporary: Awaited<
@@ -353,8 +358,600 @@ describe("native external-chat response wait", () => {
       issueId,
       runId,
       userId,
+      commentId,
+      principalId,
     };
   }
+
+  async function seedAnsweredChatTurn(
+    provider: "telegram" | "discord" = "telegram",
+  ) {
+    const fixture = await seedWaitTurn(provider);
+    const gate = await seedPriorCompletionReview(fixture);
+    const [current] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    const sourceRunId = randomUUID();
+    const interactionId = randomUUID();
+    const wakeId = randomUUID();
+    const publicationId = randomUUID();
+    const actionId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      status: "succeeded",
+      runtimeMode: "native",
+      nativeIssueId: fixture.issueId,
+      contextSnapshot: current!.contextSnapshot,
+    });
+    const [interaction] = await db
+      .insert(issueThreadInteractions)
+      .values({
+        id: interactionId,
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        kind: "ask_user_questions",
+        status: "answered",
+        sourceRunId,
+        createdByAgentId: fixture.agentId,
+        resolvedByUserId: fixture.userId,
+        resolvedAt: new Date(),
+        idempotencyKey: `color-${interactionId}`,
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "color",
+              prompt: "Choose a color",
+              selectionMode: "single",
+              required: true,
+              allowOther: false,
+              options: [
+                { id: "cobalt", label: "Cobalt" },
+                { id: "amber", label: "Amber" },
+              ],
+            },
+          ],
+        },
+        result: {
+          version: 1,
+          answers: [{ questionId: "color", optionIds: ["cobalt"] }],
+        },
+      })
+      .returning();
+    const [responseDelivery] = await db
+      .insert(issueQuestionResponseDeliveries)
+      .values({
+        ...questionResponseDeliveryValues(
+          interaction! as unknown as AskUserQuestionsInteraction,
+        ),
+        status: "fallback_queued",
+        deliveryMode: "wake_fallback",
+        targetRunId: fixture.runId,
+        attemptCount: 1,
+        acknowledgedAt: new Date(),
+      })
+      .returning();
+    await db.insert(chatPublications).values({
+      id: publicationId,
+      companyId: fixture.companyId,
+      endpointId: fixture.endpointId,
+      conversationId: fixture.conversationId,
+      issueId: fixture.issueId,
+      state: "published",
+      idempotencyKey: `card-${interactionId}`,
+      providerMessageId: "question-card",
+      publishedAt: new Date(),
+      payload: { interactionId } as never,
+    });
+    await db.insert(chatActions).values({
+      id: actionId,
+      companyId: fixture.companyId,
+      endpointId: fixture.endpointId,
+      conversationId: fixture.conversationId,
+      principalId: fixture.principalId,
+      kind: "question_answer",
+      status: "processed",
+      providerActionId: `answer-${interactionId}`,
+      payload: {
+        version: 1,
+        interactionId,
+        publicationId,
+        questionId: "color",
+        optionId: "cobalt",
+      },
+      result: { interactionId, interactionStatus: "answered" },
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      requestedByActorType: "user",
+      requestedByActorId: fixture.userId,
+      idempotencyKey: `question-response:${interactionId}`,
+      status: "claimed",
+      runId: fixture.runId,
+      payload: {
+        issueId: fixture.issueId,
+        interactionId,
+        sourceRunId,
+        sourceCommentId: fixture.commentId,
+        mutation: "interaction",
+        externalChatContinuation: true,
+      },
+    });
+    const context: Record<string, unknown> = {
+      issueId: fixture.issueId,
+      taskId: fixture.issueId,
+      source: "issue.interaction.respond",
+      wakeReason: "issue_commented",
+      interactionId,
+      interactionKind: "ask_user_questions",
+      interactionStatus: "answered",
+      sourceRunId,
+      sourceCommentId: fixture.commentId,
+      wakeCommentId: fixture.commentId,
+      wakeCommentIds: [fixture.commentId],
+      externalChatContinuation: true,
+    };
+    await db
+      .update(heartbeatRuns)
+      .set({ wakeupRequestId: wakeId, contextSnapshot: context })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    return {
+      ...fixture,
+      gate,
+      context,
+      interactionId,
+      sourceRunId,
+      responseDeliveryId: responseDelivery!.id,
+      wakeId,
+      publicationId,
+      actionId,
+    };
+  }
+
+  async function attestAnswer(
+    fixture: Awaited<ReturnType<typeof seedAnsweredChatTurn>>,
+  ) {
+    expect(
+      await attestReviewedExternalChatRun({
+        db,
+        ...fixture,
+        contextSnapshot: fixture.context,
+      }),
+    ).toBe(true);
+    expect(fixture.context.paperclipExternalChatQuestionResponse).toMatchObject(
+      {
+        schema: "paperclip.external_chat_question_response.v1",
+        interactionId: fixture.interactionId,
+        sourceRunId: fixture.sourceRunId,
+        responseDeliveryId: fixture.responseDeliveryId,
+      },
+    );
+    fixture.context.paperclipExternalChatExecutionBound = true;
+    fixture.context.paperclipWake = await buildPaperclipWakePayload({
+      db,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      runId: fixture.runId,
+      contextSnapshot: fixture.context,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: fixture.context })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+  }
+
+  it.each(["telegram", "discord"] as const)(
+    "retains authenticated %s answer continuation presentation without resolving prior review",
+    async (provider) => {
+      const fixture = await seedAnsweredChatTurn(provider);
+      await attestAnswer(fixture);
+      const resultJson = await finishReviewResponse(fixture);
+      expect(resultJson.externalChatReviewPresentation).toMatchObject({
+        gateId: fixture.gate.id,
+      });
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          resultJson,
+        }),
+      ).toBe(true);
+      const [gate] = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, fixture.gate.id));
+      expect(gate!.status).toBe("pending");
+    },
+  );
+
+  it.each([
+    "wake_actor",
+    "different_responder",
+    "revoked_link",
+    "wrong_option",
+    "wrong_digest",
+    "wrong_target",
+    "wrong_wake_target",
+    "missing_wake_receipt",
+    "unprocessed_action",
+    "duplicate_action",
+    "source_issue",
+    "source_batch",
+    "execution_owner",
+  ] as const)(
+    "does not attest an unbound answered-chat continuation: %s",
+    async (kind) => {
+      const fixture = await seedAnsweredChatTurn();
+      if (kind === "wake_actor")
+        await db
+          .update(agentWakeupRequests)
+          .set({ requestedByActorId: "another-user" })
+          .where(eq(agentWakeupRequests.id, fixture.wakeId));
+      if (kind === "different_responder") {
+        // A legitimate linked second responder must not inherit the original author's scope.
+        const principalId = randomUUID();
+        await db
+          .insert(chatExternalPrincipals)
+          .values({
+            id: principalId,
+            companyId: fixture.companyId,
+            provider: "telegram",
+            providerAccountId: "telegram-bot",
+            externalId: "second-user",
+            kind: "user",
+          });
+        await db
+          .insert(chatIdentityLinks)
+          .values({
+            companyId: fixture.companyId,
+            endpointId: fixture.endpointId,
+            principalId,
+            paperclipUserId: "second-user",
+            status: "linked",
+          });
+        await db
+          .insert(companyMemberships)
+          .values({
+            companyId: fixture.companyId,
+            principalType: "user",
+            principalId: "second-user",
+            status: "active",
+            membershipRole: "member",
+          });
+        await db
+          .update(chatActions)
+          .set({ principalId })
+          .where(eq(chatActions.id, fixture.actionId));
+        await db
+          .update(issueThreadInteractions)
+          .set({ resolvedByUserId: "second-user" })
+          .where(eq(issueThreadInteractions.id, fixture.interactionId));
+        await db
+          .update(agentWakeupRequests)
+          .set({ requestedByActorId: "second-user" })
+          .where(eq(agentWakeupRequests.id, fixture.wakeId));
+      }
+      if (kind === "revoked_link")
+        await db
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.principalId, fixture.principalId));
+      if (kind === "wrong_option") {
+        const [action] = await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, fixture.actionId));
+        await db
+          .update(chatActions)
+          .set({ payload: { ...action!.payload, optionId: "amber" } })
+          .where(eq(chatActions.id, fixture.actionId));
+      }
+      if (kind === "wrong_digest")
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({ payloadSha256: "b".repeat(64) })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+          );
+      if (kind === "wrong_target")
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({ targetRunId: fixture.sourceRunId })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+          );
+      if (kind === "wrong_wake_target")
+        await db
+          .update(agentWakeupRequests)
+          .set({ runId: fixture.sourceRunId })
+          .where(eq(agentWakeupRequests.id, fixture.wakeId));
+      if (kind === "missing_wake_receipt")
+        await db
+          .update(heartbeatRuns)
+          .set({ wakeupRequestId: null })
+          .where(eq(heartbeatRuns.id, fixture.runId));
+      if (kind === "unprocessed_action")
+        await db
+          .update(chatActions)
+          .set({ status: "issued" })
+          .where(eq(chatActions.id, fixture.actionId));
+      if (kind === "duplicate_action") {
+        const [action] = await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, fixture.actionId));
+        await db
+          .insert(chatActions)
+          .values({
+            ...action!,
+            id: randomUUID(),
+            providerActionId: "duplicate-response",
+          });
+      }
+      if (kind === "source_issue" || kind === "source_batch") {
+        const [source] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, fixture.sourceRunId));
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: {
+              ...source!.contextSnapshot,
+              ...(kind === "source_issue"
+                ? { issueId: randomUUID() }
+                : { wakeCommentIds: [randomUUID(), fixture.commentId] }),
+            },
+          })
+          .where(eq(heartbeatRuns.id, fixture.sourceRunId));
+      }
+      if (kind === "execution_owner")
+        await db
+          .update(issues)
+          .set({ executionRunId: fixture.sourceRunId })
+          .where(eq(issues.id, fixture.issueId));
+      expect(
+        await attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: fixture.context,
+        }),
+      ).toBe(false);
+      expect(
+        fixture.context.paperclipExternalChatQuestionResponse,
+      ).toBeUndefined();
+      expect(
+        await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, fixture.gate.id)),
+      ).toEqual([expect.objectContaining({ status: "pending" })]);
+    },
+  );
+
+  it.each([
+    "revoked_link",
+    "revoked_membership",
+    "demoted_membership",
+    "changed_generation",
+    "changed_answer",
+    "changed_gate",
+  ] as const)(
+    "revalidates answered-chat presentation at dispatch: %s",
+    async (kind) => {
+      const fixture = await seedAnsweredChatTurn();
+      await attestAnswer(fixture);
+      const resultJson = await finishReviewResponse(fixture);
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          resultJson,
+        }),
+      ).toBe(true);
+      if (kind === "revoked_link")
+        await db
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.principalId, fixture.principalId));
+      if (kind === "revoked_membership")
+        await db
+          .update(companyMemberships)
+          .set({ status: "suspended" })
+          .where(
+            and(
+              eq(companyMemberships.companyId, fixture.companyId),
+              eq(companyMemberships.principalId, fixture.userId),
+            ),
+          );
+      if (kind === "demoted_membership")
+        await db
+          .update(companyMemberships)
+          .set({ membershipRole: "viewer" })
+          .where(
+            and(
+              eq(companyMemberships.companyId, fixture.companyId),
+              eq(companyMemberships.principalId, fixture.userId),
+            ),
+          );
+      if (kind === "changed_generation")
+        await db
+          .update(chatConversations)
+          .set({ sessionGeneration: 2 })
+          .where(eq(chatConversations.id, fixture.conversationId));
+      if (kind === "changed_answer")
+        await db
+          .update(issueThreadInteractions)
+          .set({
+            result: {
+              version: 1,
+              answers: [{ questionId: "color", optionIds: ["amber"] }],
+            },
+          })
+          .where(eq(issueThreadInteractions.id, fixture.interactionId));
+      if (kind === "changed_gate")
+        await db
+          .update(issueThreadInteractions)
+          .set({ status: "accepted" })
+          .where(eq(issueThreadInteractions.id, fixture.gate.id));
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          resultJson,
+        }),
+      ).toBe(false);
+    },
+  );
+
+  it("does not register a fallback after an answered-chat principal is revoked without a review gate", async () => {
+    const fixture = await seedAnsweredChatTurn();
+    await attestAnswer(fixture);
+    await db
+      .update(issueThreadInteractions)
+      .set({ status: "accepted" })
+      .where(eq(issueThreadInteractions.id, fixture.gate.id));
+    await db
+      .update(issues)
+      .set({ status: "in_progress" })
+      .where(eq(issues.id, fixture.issueId));
+    await db
+      .update(chatIdentityLinks)
+      .set({ status: "revoked" })
+      .where(eq(chatIdentityLinks.principalId, fixture.principalId));
+    await finishReviewResponse(fixture);
+    expect(
+      await db
+        .select()
+        .from(statusDecisions)
+        .where(eq(statusDecisions.runId, fixture.runId)),
+    ).toEqual([
+      expect.objectContaining({
+        reasonCode: "external_chat_response_wait_authorization_lost",
+        decisionJson: expect.objectContaining({ effects: [] }),
+      }),
+    ]);
+    expect(
+      await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, fixture.companyId)),
+    ).toHaveLength(1);
+  });
+
+  it("accepts the exact admitted answer while its post-wakeup delivery receipt is still finishing", async () => {
+    const fixture = await seedAnsweredChatTurn();
+    await db
+      .update(issueQuestionResponseDeliveries)
+      .set({ status: "delivering", deliveryMode: null, targetRunId: null })
+      .where(
+        eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+      );
+    await attestAnswer(fixture);
+    await db
+      .update(issueQuestionResponseDeliveries)
+      .set({
+        status: "fallback_queued",
+        deliveryMode: "wake_fallback",
+        targetRunId: fixture.runId,
+      })
+      .where(
+        eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+      );
+    const resultJson = await finishReviewResponse(fixture);
+    expect(
+      await authorizeNativeChatReviewPresentation(db, {
+        ...fixture,
+        resultJson,
+      }),
+    ).toBe(true);
+  });
+
+  it("takes the answered-chat identity advisory before identity rows during concurrent revocation", async () => {
+    const fixture = await seedAnsweredChatTurn();
+    await attestAnswer(fixture);
+    let release!: () => void;
+    let acquired!: () => void;
+    let revoke!: () => void;
+    let confirmRevoked!: () => void;
+    let rejectRevoked!: (error: unknown) => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      acquired = resolve;
+    });
+    const shouldRevoke = new Promise<void>((resolve) => {
+      revoke = resolve;
+    });
+    const revoked = new Promise<void>((resolve, reject) => {
+      confirmRevoked = resolve;
+      rejectRevoked = reject;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${fixture.companyId}:${fixture.principalId}`}, 0))`,
+      );
+      acquired();
+      await shouldRevoke;
+      try {
+        await tx
+          .select()
+          .from(chatIdentityLinks)
+          .where(eq(chatIdentityLinks.principalId, fixture.principalId))
+          .for("update", { noWait: true });
+        await tx
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.principalId, fixture.principalId));
+        confirmRevoked();
+      } catch (error) {
+        rejectRevoked(error);
+        throw error;
+      } finally {
+        await released;
+      }
+    });
+    await ready;
+    let readerPid = 0;
+    const reader = db
+      .transaction(async (tx) => {
+        const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+        readerPid = Number(backend!.pid);
+        return authorizeChatConversationForBoundRun(
+          tx as unknown as typeof db,
+          fixture,
+          fixture.context,
+        );
+      })
+      .then(
+        () => "unexpectedly_authorized",
+        (error: Error) => error.message,
+      );
+    try {
+      await vi.waitFor(async () => {
+        expect(readerPid).toBeGreaterThan(0);
+        const [waiting] = await db.execute(
+          sql`select exists(select 1 from pg_locks where pid = ${readerPid} and locktype = 'advisory' and not granted) as waiting`,
+        );
+        expect(waiting!.waiting).toBe(true);
+      });
+      revoke();
+      await Promise.race([revoked, holder]);
+    } finally {
+      revoke();
+      release();
+      await Promise.allSettled([holder, reader]);
+    }
+    expect(await reader).toBe(
+      "paperclip_runner_chat_attachment_binding_denied",
+    );
+  });
 
   async function seedPriorCompletionReview(
     fixture: Awaited<ReturnType<typeof seedWaitTurn>>,
