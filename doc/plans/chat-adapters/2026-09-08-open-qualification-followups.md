@@ -5,6 +5,101 @@ are fixed or moved into permanent verification documentation.** It is not a
 release-completion claim. Completed work and historical failures are recorded
 in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md).
 
+## Current work: missed GitHub callbacks and exact-request retry
+
+This section supersedes the older in-flight CI snapshot below. Documentation
+head `5988fb475` passed CI `34263294210`, including both required aggregates,
+and Greptile reviewed all 500 files at **5/5** with no new finding. PR #13038
+is open and mergeable, but requires CODEOWNER review; it is **not merged**.
+
+The subsequent live GitHub queue probe exposed a pre-ingress failure: a real
+user comment received a GitHub 502 and never reached the local proxy or durable
+inbox. One supported redelivery also failed before ingress. Later fresh
+GitHub and Telegram in-flight pairs passed exact-request isolation, deferred
+admission, nonoverlapping native Luna runs and single-message progress/finals.
+Those passes do **not** repair the missing callback or establish the cause of
+the intermittent proxy/Funnel failure. Passive connection diagnostics were
+added to the ignored qualification proxy without changing routing or timeouts.
+
+Implemented recovery and retry safeguards (final-head CI still required):
+
+- Use GitHub's App delivery-history/redelivery API to recover recent missed
+  created comments. Keep genuine HMAC ingress authoritative; never synthesize
+  a callback from historical JSON. Persist a content-free current-generation
+  floor and immutable per-GUID denial/attempt ledger. Missing state starts at
+  now; old history is not silently imported after deploy/reconnect.
+- Check the exact App, callback, installation, enabled repository and canonical
+  current comment. Existing local receipts, including terminal failures and
+  content-free filtered receipts, suppress automatic remote requests. Delayed
+  callbacks cannot cross endpoint/generation/credential changes or reset the
+  local retry budget. Lossless decimal IDs avoid GitHub delivery-ID rounding.
+- Bound recovery to one hour, three pages of 100 recent attempts, five detail
+  inspections per scan and three redelivery requests per GUID. Request again
+  only after a distinct newly failed provider attempt; an unchanged/ambiguous
+  result is not evidence for replay. A separate joined coordinator lane must
+  prevent a slow GitHub scan from delaying other providers' inbound retries.
+- Activity must distinguish requested redelivery from actual receipt and expose
+  scan failure/volume limits. Old message order cannot be retroactively
+  restored after later turns already ran. Lifecycle/edit/delete recovery and
+  higher-volume scans remain separate qualification work.
+- Generic manual `retry_failed_run` admitted a contextless run with the issue
+  UUID session instead of the original chat task key. A narrow guard now
+  rejects it before mutations, including retired conversations and forged
+  caller context; the real-heartbeat regression went red to green and its
+  four-file cohort passed **304/304**. Positive exact-request retry still needs
+  a server-authorized failed-run intent and deduplication. Re-reading the
+  immutable admission receipt corrected an earlier attribution: historical
+  Telegram CHA-24 was admitted by `retry_failed_run` at 16:35:06.982Z, with an
+  issue-only payload. Its `native_status_decision` / `issue_status_changed`
+  context was overlaid by a later coalesced intent at 16:35:30.999Z; it was not
+  the original trigger. The guard covers that admission class. The separate
+  recovery-action `restore` path had a separate pre-mutation gap. It now
+  rejects unsupported chat `restored` → `todo` resolutions inside the locked
+  transaction, before changing the task or clearing its recovery action.
+  Five route cases went red to green; **153/153** adjacent route tests pass.
+  Ordinary non-chat restoration and `done` / `in_review` resolutions remain
+  available. This is safe refusal, not positive exact-request retry.
+
+Live proof on server 52: a browser-submitted GitHub message at **19:12:08.074
+UTC** received one deliberate pre-ingress **503**. No inbox row was created.
+The normal background scan requested genuine redelivery at **19:12:44.032**;
+signed ingress returned **202** and produced one exact-comment wake and one
+native Codex app-server / `gpt-5.6-luna` run. One provider message changed from
+working to the exact final at **19:13:07.462**: **59.388 seconds** including
+the missed-callback delay, **19.255 seconds** of native execution. No operator
+redelivery, manual input resend, or manufactured admission was used. The
+one-shot ignored proxy fixture is disabled again; public Board routes remain 404. The older naturally lost callback remains outside this epoch and is not
+claimed recovered. This mitigation does not establish the cause of Funnel's
+intermittent 502s.
+
+Automated checks passed: full chat integration **421/421**, helper/coordinator
+**97/97**, independent helper/coordinator/Activity/API/OpenAPI **127/127**,
+heartbeat retry cohort **304/304**, full workspace typecheck and build. These
+PostgreSQL fixtures use mocked provider HTTP; the browser proof above is real.
+A new-generation checkpoint blocked behind its old 24-hour backoff went red
+to green. Live Activity then exposed a separate false-pending label after
+receipt; the alias-join regression went red to green, including same-GUID
+foreign-endpoint isolation. A subsequent review reproduced a same-secret
+pause/resume race during staged replay; carrying its captured runtime fence
+through both leased preflight and selected SDK runtime now prevents retargeting.
+Cancelled minimal recovery tombstones also terminate without network calls or
+retrying retained content. Both regressions went red to green before the final
+**421/421** fresh-PostgreSQL run. Final server typecheck and build passed;
+the deterministic browser suite passed **10/10**. Server 53 loaded all source
+fixes at **19:22:49.015 UTC**. Root visually verified Activity's **received**
+status and correct receipt-only explanation after restart. A normal GitHub
+continuation on that final source returned exactly `GH-FINAL-CHECK-READY` in
+**23.380 seconds**, including **18.478 seconds** of native Luna execution.
+One exact-comment wake produced one run and one working→final provider reply;
+both publication operations used one attempt. Root inspected the rendered
+answer. Fresh exact-head CI/Greptile are still required; prior green gates do
+not validate this slice.
+
+Never claim the existing unanswered historical comment was recovered if it is
+older than the new epoch floor. Continue other providers while real login or
+tenant gates remain; keep this temporary note until the remaining defects are
+fixed or moved to permanent documentation.
+
 ## Landing status
 
 - Code head `ea8e45e17` is pushed and mergeable in PR #13038, **500 files**.
@@ -281,7 +376,7 @@ switch to Terra. The signed/staged runner SHA-256 is
   suite **97/143**, with **1,504 passed / 21 skipped** and no assertion
   failures. Queued-comments route fixture bootstrap failed; **46 suites were
   not reached**. Captured PostgreSQL stderr was `shmget ... No space left on
-  device`, with host usage at **32/32** segments. No positively identified
+device`, with host usage at **32/32** segments. No positively identified
   current-task cluster remained to clean up. Do not retry unchanged limits.
   These failed command results remain failed; serial reruns are separate
   evidence. Do not change global IPC limits or stop unrelated databases.

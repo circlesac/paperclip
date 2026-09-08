@@ -990,8 +990,13 @@ However, this is **not** successful damaged-session recovery:
 - The new run used the task UUID as its session key and resumed older provider
   session `01a0802c-06af-7671-b96d-d63d2f5e9b8f`. The damaged run used key
   `CHA-24` and provider session `01a08152-4af9-75a0-bbcb-f40b2f67115d`.
-- The new wake reason was `issue_status_changed`, with no `retry_of_run_id`.
-  The model acted on the original photo-resend description, not the latest
+- The original immutable wake was `on_demand` / `manual` /
+  `retry_failed_run`, with an issue-only payload and no failed-comment or
+  retry lineage. The earlier record incorrectly inferred its trigger from
+  mutable run context: a separate `native_status_decision` /
+  `issue_status_changed` intent was coalesced at 16:35:30.999, after the run
+  started at 16:35:06.982. The model acted on the original photo-resend
+  description, not the latest
   failed 900-word request. It reported attachment-binding denial and did not
   resend the photo. A successful run status does not mean the user goal was
   achieved.
@@ -1586,3 +1591,144 @@ in delivery records, not caught in the sampled screenshots. The final flow was
 clear and usable: each request had its own answer and no recovery intervention
 was needed. This proves the particular same-thread in-flight sequence, not
 every provider, ownership-takeover or permission-revocation permutation.
+
+## Automatic recovery of a missed GitHub callback
+
+The later natural failure was a real user comment whose original attempt and
+one operator-requested redelivery both received an empty 502 before the local
+qualification proxy. Successful neighboring queue tests did not fix that
+missing input. GitHub does not automatically retry these failed callbacks.
+The new worker requests genuine App webhook redelivery; it does not forge a
+signed request from delivery-history JSON.
+
+Recovery is bounded to the current endpoint/runtime/credential/callback epoch,
+one hour of history, three pages of 100 attempts, five detail inspections per
+scan and three requests per GUID. Missing state starts at the current time.
+Reconnect establishes its new floor without inheriting an old epoch's backoff.
+The worker checks the installation, enabled repository, unchanged current
+human comment and exact source tuple. Existing local receipts suppress remote
+requests, including filtered and terminal records. A persisted denial/attempt
+ledger precedes transport; uncertainty does not justify another request without
+a distinct newly failed provider attempt. Delayed callbacks cannot reset local
+retry budgets or move across runtime epochs. The worker runs independently of
+other providers' inbound retry scans and joins normal shutdown.
+
+### Real browser failure and recovery
+
+Server 52 loaded the source at **19:11:40.934 UTC** after the previous server
+drained with zero active/queued runs. Startup completed at **19:11:45.064**.
+The signed native runner retained SHA-256
+`e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
+The recovery floor initialized at **19:11:42.322**. No older lost input was
+adopted or repaired manually.
+
+Root used the existing signed-in GitHub PR conversation to submit
+`GH-AUTO-RECOVERY-0908` at **19:12:08.074**. An explicit ignored proxy fixture
+failed only the next `issue_comment` on this exact QA endpoint, once, with a
+two-minute expiry. The callback received **503 at 19:12:10.912**, before any
+upstream forwarding; an immediate scoped query found no new inbox row.
+The fixture's nine tests cover exact route/event scope, single consumption,
+expiry, unchanged HTTP parsing/routing and closed diagnostic fields. It is
+not production fault-injection code.
+
+The normal background worker requested redelivery at **19:12:44.032** for
+lossless original attempt `3841622183075921920`, GUID
+`30986830-abb9-11f1-8fe9-cb257831704b`. GitHub's genuine signed callback reached
+the proxy at **19:12:44.614** and received **202 in 125.004 milliseconds**.
+The durable worker processed it once. One exact-comment wake started native
+run `df20e1e9-86a9-4095-82db-eaee0b167a10` at **19:12:47.515**, on the existing
+task key `CHA-9`, using Codex app-server and **`gpt-5.6-luna`**. The run completed
+at **19:13:06.770**: **19.255 seconds** of native execution.
+
+GitHub displayed one eyes reaction and one bot reply, `5590453600`. Root
+visually observed **Maya E2E is working…**, then the same reply edited to
+exactly **GH-RECOVERED-AUTOMATICALLY**. Its working and final publications
+each used one attempt; final delivery completed at **19:13:07.462**. End to
+end was **59.388 seconds**, including waiting for the recovery scan. The
+original browser comment was `5590445656`; it was not resent or edited.
+Subsequent scans retained one recovery request, one admitted wake and one run.
+No operator redelivery, fabricated receipt or direct database repair was used.
+The proxy was restarted without fault injection and a public Board health
+request remained **404**. Existing local Board access stayed available.
+
+Functionally, this specific lost-callback journey succeeded. It remains slower
+than normal chat, since Paperclip cannot acknowledge an input it never received.
+The intermittent upstream/Funnel 502 cause remains unproven. Automatic recovery
+does not retroactively restore message order after later requests have run,
+recover edited/deleted/lifecycle events, or scan unbounded high-volume history.
+
+The hands-on check also found a misleading Activity row: it still said
+**redelivery requested / pending** after authenticated receipt. A correlated
+query's unqualified fields bound to its inner table instead of the recovery
+row. An explicit alias join now keys receipt status by company, endpoint,
+kind and GUID. The PostgreSQL regression went red to green; a processed
+same-GUID receipt on another endpoint cannot mark this one received. Server 53
+loaded the final source at **19:22:49.015 UTC**, became ready at
+**19:22:54.389**, and retained the signed runner bytes. Root reopened Activity
+after restart, scrolled to the recovery row and visually confirmed **received**
+with the receipt-only explanation. The original row and recovery count persisted;
+the screen no longer suggests an unanswered redelivery after confirmed receipt.
+
+A normal GitHub continuation then checked all final source on server 53.
+Root submitted `GH-RECOVERY-FINAL-CHECK-0908` at **19:23:27.406 UTC**, creating
+comment `5590582825`. The exact-comment wake started run
+`bd88474f-52be-4281-aa77-fcc394e559d9` at **19:23:31.421**, using the native
+runner, Codex app-server and `gpt-5.6-luna` on the existing task. It completed
+at **19:23:49.899**, after **18.478 seconds**. Working and final publications
+each used one attempt and the same bot message, `5590584027`. The exact final
+`GH-FINAL-CHECK-READY` was published at **19:23:50.786**: **23.380 seconds**
+from browser submission. Root inspected the rendered answer. This ordinary
+successful input does not need the recovery scan or a manual retry.
+
+Final review also reproduced a staged-ingress race with the original webhook
+secret unchanged. Pausing/resuming during a worker barrier previously admitted
+old content through a newer runtime. The worker now carries its captured epoch
+through both leased credential preflights and compares it with the selected SDK
+runtime before dispatch. Existing callback transactions fence any later pause.
+Explicit supersession cancels/redacts the receipt without mislabeling a legitimate
+lifecycle event that itself changes generation. A cancelled minimal recovery
+tombstone also stops immediately, before reading missing source metadata or
+making network calls. Both real-PostgreSQL cases went red to green: zero SDK
+dispatch, normalized work or wake for the stale generation; zero HTTP or retries
+for the cancelled tombstone. Independent review found no remaining blocker in
+this scoped change.
+
+### Retry refusal is not successful failed-request recovery
+
+The immutable wake audit corrected the historical Telegram Try again
+attribution above. Generic manual retry lacked the exact failed comment/task
+lineage and resumed an older session. A heartbeat admission guard now rejects
+that unsupported chat path before writes, including retired conversation
+bindings and forged caller context. Its real-heartbeat regression went red
+to green and the four-file cohort passed **304/304**.
+
+A separate generic recovery-action restore route committed task/action changes
+before its best-effort wake, also without exact failed-request lineage. Five
+route regressions first reproduced misleading success and mutations. A new
+company-scoped guard rejects only unsupported chat `restored` → `todo` inside
+the locked transaction, before task update or recovery resolution. The changed
+route suite and adjacent recovery/comment routes passed **153/153**, with
+ordinary non-chat hand-back and `done` / `in_review` resolutions preserved.
+Positive exact-request retry and actual recovery of the damaged historical
+session remain unqualified; the safe outcome here is an actionable refusal.
+
+Root revisited the historical Telegram task through Board Tasks and clicked
+its normal **Try again** at **19:18:47.586 UTC** on server 52. The UI reported
+**Run retry failed** with the exact-current-request/access explanation and
+directed the user to resend in the current connected conversation. No new
+wake was created; the run count stayed **34**, status stayed `in_review`,
+execution ownership stayed empty and the task's update timestamp was unchanged.
+No native completion approval or other recovery action was selected. The
+refusal text was captured through accessibility state; the later screenshot
+shows the unchanged task after the toast expired. The guard prevents the
+previous misleading rerun; a convenient exact-request retry is still missing.
+
+The helper/coordinator cohort passed **97/97**, the independent combined
+helper/coordinator/Activity/API/OpenAPI cohort **127/127**, and the full chat
+integration file **421/421** on fresh PostgreSQL after all fixes. The latter uses mocked
+provider HTTP and the existing durable wake stub; it does not substitute for
+the real browser/native run above. Workspace typecheck and build passed, as
+did the final server typecheck/build. The deterministic five-provider UI and
+file-send browser suite passed **10/10**. Existing CI/Greptile green at
+`5988fb475` precedes this slice;
+new exact-head gates and required CODEOWNER approval remain necessary.

@@ -24841,6 +24841,31 @@ export function heartbeatService(
             throw new Error("chat_inbound_wakeup_binding_denied");
           await durableRequest.authorize(tx as unknown as Db);
         } else {
+          if (
+            source === "on_demand" &&
+            triggerDetail === "manual" &&
+            reason === "retry_failed_run"
+          ) {
+            // Generic Board retry does not carry server-authorized failed-run
+            // lineage. Caller-supplied source/comment/retry markers cannot
+            // restore it, including for a retired conversation generation.
+            const [chatBinding] = await tx
+              .select({ id: chatConversations.id })
+              .from(chatConversations)
+              .where(
+                and(
+                  eq(chatConversations.companyId, agent.companyId),
+                  eq(chatConversations.issueId, issueId),
+                ),
+              )
+              .limit(1);
+            if (chatBinding) {
+              throw conflict(
+                "Retry needs the exact failed chat request and current access. Send the request again in the current connected conversation.",
+                { code: "chat_failed_run_retry_requires_authorized_context" },
+              );
+            }
+          }
           const [held] = await tx
             .select({ id: issues.id })
             .from(issues)

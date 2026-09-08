@@ -25,6 +25,7 @@ import {
   agentWakeupRequests,
   agents,
   approvals,
+  chatConversations,
   chatPublications,
   companyMemberships,
   documents,
@@ -9035,6 +9036,28 @@ export function issueRoutes(
           activeRecoveryAction,
           { source: "recovery_action_resolution" },
         );
+
+        if (outcome === "restored" && sourceIssueStatus === "todo") {
+          // This route restores generic issue execution, not an exact admitted
+          // chat request. Refuse before changing either record: the post-commit
+          // wake is best-effort and cannot roll back a misleading restoration.
+          const [chatBinding] = await tx
+            .select({ id: chatConversations.id })
+            .from(chatConversations)
+            .where(
+              and(
+                eq(chatConversations.companyId, lockedIssue.companyId),
+                eq(chatConversations.issueId, lockedIssue.id),
+              ),
+            )
+            .limit(1);
+          if (chatBinding) {
+            throw conflict(
+              "Restoring this task needs the exact failed chat request and current access. Send the request again in the current connected conversation; this recovery action has not been resolved.",
+              { code: "chat_recovery_requires_authorized_context" },
+            );
+          }
+        }
 
         let issue = lockedIssue;
         const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;

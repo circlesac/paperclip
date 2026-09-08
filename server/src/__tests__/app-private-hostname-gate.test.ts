@@ -6,6 +6,90 @@ import {
 } from "../app.ts";
 
 describe("createChatReconciliationCoordinator", () => {
+  it.each([false, true])(
+    "keeps later inbound sweeps independent of GitHub recovery and joins shutdown (rejects: %s)",
+    async (rejects) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const failure = new Error("GitHub recovery unavailable");
+      const processFailedGitHubWebhookDeliveries = vi.fn(async () => {
+        await held;
+        if (rejects) throw failure;
+      });
+      const processPendingDeliveries = vi.fn(async () => undefined);
+      const flushPublications = vi.fn(async () => undefined);
+      const onError = vi.fn();
+      const input = {
+        processFailedGitHubWebhookDeliveries,
+        processPendingDeliveries,
+        flushPublications,
+        reconcileProviderRuntimes: async () => undefined,
+        projectRunMilestones: async () => 0,
+        processPendingSlackFileUploadReceipts: async () => undefined,
+        processPendingSlackSessionSyncs: async () => undefined,
+        onError,
+      };
+      const coordinator = createChatReconciliationCoordinator(input);
+      let draining: Promise<void> | undefined;
+      try {
+        coordinator.reconcile();
+        await vi.waitFor(() => {
+          expect(processFailedGitHubWebhookDeliveries).toHaveBeenCalledOnce();
+          expect(processPendingDeliveries).toHaveBeenCalledTimes(1);
+        });
+        // A second sweep must admit work arriving AFTER the first sweep while
+        // remote GitHub recovery remains held. Same-sweep parallelism is not enough.
+        coordinator.reconcile();
+        await vi.waitFor(() => {
+          expect(processPendingDeliveries).toHaveBeenCalledTimes(2);
+          expect(flushPublications).toHaveBeenCalledTimes(2);
+        });
+        expect(processFailedGitHubWebhookDeliveries).toHaveBeenCalledOnce();
+        coordinator.stop();
+        let drained = false;
+        draining = coordinator.drain().then(() => {
+          drained = true;
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(drained).toBe(false);
+        coordinator.reconcile();
+        release();
+        await draining;
+        expect(drained).toBe(true);
+        expect(processFailedGitHubWebhookDeliveries).toHaveBeenCalledOnce();
+        expect(processPendingDeliveries).toHaveBeenCalledTimes(2);
+        expect(onError).toHaveBeenCalledTimes(rejects ? 1 : 0);
+        if (rejects)
+          expect(onError).toHaveBeenCalledWith(
+            "GitHub webhook recovery",
+            failure,
+          );
+      } finally {
+        release();
+        coordinator.stop();
+        await (draining ?? coordinator.drain());
+      }
+    },
+  );
+
+  it("wires GitHub recovery into its independent lane", () => {
+    const source = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
+    expect(source).toContain(
+      "chatChannels.processFailedGitHubWebhookDeliveries()",
+    );
+    const service = readFileSync(
+      new URL("../services/chat-channels.ts", import.meta.url),
+      "utf8",
+    );
+    const ordinary = service.slice(
+      service.indexOf("async function processPendingDeliveries("),
+      service.indexOf("async function listResources("),
+    );
+    expect(ordinary).not.toContain("processFailedGitHubWebhookDeliveries()");
+  });
+
   it("wires periodic publication reconciliation to bounded scheduled refill rather than awaiting provider sends", () => {
     const source = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
     const flush = source.slice(

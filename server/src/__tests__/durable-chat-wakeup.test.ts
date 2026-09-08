@@ -15,7 +15,14 @@ import {
   createDb,
   heartbeatRuns,
   agentWakeupRequests,
+  chatConversations,
+  chatEndpoints,
+  chatMessageLinks,
+  chatPublications,
+  issueComments,
   issues,
+  toolApplications,
+  toolConnections,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -314,5 +321,252 @@ describe("durable inbound chat scheduler receipts", () => {
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.agentId, f.agentId)),
     ).toEqual([]);
+  });
+
+  it.each([
+    { provider: "slack", state: "active", callerMarkers: false },
+    { provider: "telegram", state: "completed", callerMarkers: false },
+    { provider: "slack", state: "active", callerMarkers: true },
+  ] as const)(
+    "rejects generic failed-chat retry before admission ($provider/$state; caller markers: $callerMarkers)",
+    async ({ provider, state, callerMarkers }) => {
+      // Keep the fixture-owned unrelated run occupying the only execution slot.
+      // This exercises real heartbeat admission without starting an adapter.
+      const f = await fixture();
+      const applicationId = randomUUID();
+      const connectionId = randomUUID();
+      const endpointId = randomUUID();
+      const conversationId = randomUUID();
+      const originalCommentId = randomUUID();
+      const failedCommentId = randomUUID();
+      const taskKey = `D${f.companyId.slice(0, 7)}-1`;
+      await db
+        .update(issues)
+        .set({
+          identifier: taskKey,
+          description: "Original request A: describe the original photo.",
+        })
+        .where(eq(issues.id, f.issueId));
+      await db.insert(toolApplications).values({
+        id: applicationId,
+        companyId: f.companyId,
+        name: "Failed chat retry",
+        type: "chat",
+      });
+      await db.insert(toolConnections).values({
+        id: connectionId,
+        companyId: f.companyId,
+        applicationId,
+        name: `${provider} failed chat retry`,
+        uid: `chat-retry-${connectionId}`,
+        connectionPurpose: "channel",
+        transport: "chat_sdk",
+        enabled: true,
+        status: "active",
+      });
+      await db.insert(chatEndpoints).values({
+        id: endpointId,
+        companyId: f.companyId,
+        connectionId,
+        provider,
+        publicId: randomUUID(),
+        assignedAgentId: f.agentId,
+        status: "active",
+      });
+      await db.insert(chatConversations).values({
+        id: conversationId,
+        companyId: f.companyId,
+        endpointId,
+        issueId: f.issueId,
+        externalConversationId: `${provider}-retry-dm`,
+        externalThreadId: `${provider}-retry-thread`,
+        externalLabel: `${provider} retry fixture`,
+        sessionGeneration: 1,
+        isDirectMessage: true,
+        state: "active",
+      });
+      await db.insert(issueComments).values([
+        {
+          id: originalCommentId,
+          companyId: f.companyId,
+          issueId: f.issueId,
+          authorUserId: "board-user",
+          body: "Original request A: describe the original photo.",
+        },
+        {
+          id: failedCommentId,
+          companyId: f.companyId,
+          issueId: f.issueId,
+          authorUserId: "board-user",
+          body: "Later request B: explain the new queue behavior, not the photo.",
+        },
+      ]);
+      await db.insert(chatMessageLinks).values(
+        [originalCommentId, failedCommentId].map((commentId, index) => ({
+          companyId: f.companyId,
+          endpointId,
+          conversationId,
+          commentId,
+          providerMessageId: `${provider}-retry-${index}`,
+          direction: "inbound",
+        })),
+      );
+      const request = f.request(failedCommentId);
+      await queueIssueAssignmentWakeup({
+        heartbeat: f.heartbeat,
+        issue: {
+          id: f.issueId,
+          assigneeAgentId: f.agentId,
+          status: "in_progress",
+        },
+        reason: "External chat message received",
+        mutation: "chat_message_received",
+        contextSource: `chat:${provider}`,
+        taskKey,
+        requestedByActorType: request.requestedByActorType,
+        requestedByActorId: request.requestedByActorId,
+        wakeCommentId: failedCommentId,
+        durableChatRequest: request,
+        rethrowOnError: true,
+      });
+      const [admitted] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.wakeupRequestId, request.id));
+      expect(admitted).toMatchObject({
+        status: "queued",
+        contextSnapshot: {
+          taskKey,
+          source: `chat:${provider}`,
+          wakeCommentId: failedCommentId,
+          wakeCommentIds: [failedCommentId],
+        },
+      });
+      // Simulate a transient execution failure, not an integrity fault or a
+      // manual edit to any live runner root. The admitted request stays intact.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, admitted.id));
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "failed", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, request.id));
+      await db
+        .update(issues)
+        .set({
+          status: "blocked",
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, f.issueId));
+      if (state === "completed") {
+        await db
+          .update(chatConversations)
+          .set({ state: "completed" })
+          .where(eq(chatConversations.id, conversationId));
+      }
+      const snapshot = async () => ({
+        runs: await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, f.agentId))
+          .orderBy(heartbeatRuns.id),
+        receipts: await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, f.agentId))
+          .orderBy(agentWakeupRequests.id),
+        issue: await db.select().from(issues).where(eq(issues.id, f.issueId)),
+        conversation: await db
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.id, conversationId)),
+        publications: await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.conversationId, conversationId)),
+      });
+      const before = await snapshot();
+      // This is the existing IssueDetail/Inbox generic wakeup API, deliberately
+      // lacking a failed-run ID. It must not silently retry A in a UUID-keyed
+      // session after losing B's exact chat comment and admission authority.
+      const rejection = await f.heartbeat
+        .wakeup(f.agentId, {
+          source: "on_demand",
+          triggerDetail: "manual",
+          reason: "retry_failed_run",
+          payload: {
+            issueId: f.issueId,
+            ...(callerMarkers
+              ? {
+                  retryOfRunId: admitted.id,
+                  taskKey,
+                  commentId: failedCommentId,
+                }
+              : {}),
+          },
+          ...(callerMarkers
+            ? {
+                contextSnapshot: {
+                  source: `chat:${provider}`,
+                  retryOfRunId: admitted.id,
+                  wakeCommentId: failedCommentId,
+                  wakeCommentIds: [failedCommentId],
+                },
+              }
+            : {}),
+          requestedByActorType: "user",
+          requestedByActorId: "board-user",
+        })
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      expect.soft(rejection).toMatchObject({
+        status: 409,
+        details: { code: "chat_failed_run_retry_requires_authorized_context" },
+      });
+      const after = await snapshot();
+      expect.soft(after.receipts).toEqual(before.receipts);
+      expect.soft(after.runs).toEqual(before.runs);
+      expect.soft(after.issue).toEqual(before.issue);
+      expect.soft(after.conversation).toEqual(before.conversation);
+      expect.soft(after.publications).toEqual(before.publications);
+      expect(f.authorize).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("preserves ordinary non-chat manual retry admission", async () => {
+    const f = await fixture();
+    const retry = await f.heartbeat.wakeup(f.agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "retry_failed_run",
+      payload: { issueId: f.issueId },
+      requestedByActorType: "user",
+      requestedByActorId: "board-user",
+    });
+    expect(retry).toMatchObject({
+      status: "queued",
+      contextSnapshot: {
+        issueId: f.issueId,
+        taskKey: f.issueId,
+        wakeReason: "retry_failed_run",
+      },
+    });
+    const receipts = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, f.agentId));
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ status: "queued", runId: retry!.id });
+    expect(
+      await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, f.agentId)),
+    ).toHaveLength(2);
   });
 });

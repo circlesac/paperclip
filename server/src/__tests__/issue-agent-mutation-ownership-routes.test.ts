@@ -1,6 +1,8 @@
 import { Readable } from "node:stream";
 import express from "express";
 import request from "supertest";
+import { getTableName, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
@@ -302,7 +304,9 @@ function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
+  chatBindings: Array<{ id: string; companyId: string; issueId: string; state: string }> = [],
 ) {
+  const chatBindingQueries: ReturnType<PgDialect["sqlToQuery"]>[] = [];
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
     : [{
@@ -315,7 +319,8 @@ function createRunContextDb(
   const firstRun = runRows[0] ?? {};
   const runAgentId = typeof firstRun.agentId === "string" ? firstRun.agentId : ownerAgentId;
   const runAgentCompanyId = typeof firstRun.agentCompanyId === "string" ? firstRun.agentCompanyId : companyId;
-  const rowsForSelection = async (selection: Record<string, unknown>) => {
+  const rowsForSelection = async (selection: Record<string, unknown>, chatBindingQuery = false) => {
+    if (chatBindingQuery) return chatBindings;
     const keys = Object.keys(selection);
     if (keys.includes("entityId")) return [];
     if (keys.includes("contextSnapshot")) return runRows;
@@ -326,27 +331,32 @@ function createRunContextDb(
     }
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
-  const buildQuery = (selection: Record<string, unknown>) => {
+  const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false) => {
     const whereResult = {
       orderBy: vi.fn(async () => []),
       limit: vi.fn(() => ({
-        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection)),
+        then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery)),
       })),
       for: vi.fn(() => ({
-        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection)),
+        then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery)),
       })),
-      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection)),
+      then: async (resolve: (selectedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery)),
     };
     const query = {
       innerJoin: vi.fn(() => query),
-      where: vi.fn(() => whereResult),
+      where: vi.fn((condition: SQL) => {
+        if (chatBindingQuery) chatBindingQueries.push(new PgDialect().sqlToQuery(condition));
+        return whereResult;
+      }),
     };
     return query;
   };
   const dbStub = {
+    chatBindingQueries,
     transaction: async (callback: (tx: typeof dbStub) => Promise<unknown>) => callback(dbStub),
     select: vi.fn((selection: Record<string, unknown> = {}) => ({
-      from: vi.fn(() => buildQuery(selection)),
+      from: vi.fn((table: Parameters<typeof getTableName>[0]) =>
+        buildQuery(selection, getTableName(table) === "chat_conversations")),
     })),
     insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
   };
@@ -1956,6 +1966,85 @@ describe("agent issue mutation checkout ownership", () => {
       }),
     );
   });
+
+  it.each(["active", "waiting", "completed", "unavailable", "endpoint_removed"])(
+    "rejects restoring a %s chat task before changing its issue or recovery action",
+    async (state) => {
+      const sourceIssue = makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId });
+      mockIssueService.getById.mockResolvedValue(sourceIssue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...sourceIssue,
+        ...patch,
+      }));
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId,
+        status: "active",
+        ownerType: "board",
+        ownerAgentId: null,
+        returnOwnerAgentId: ownerAgentId,
+        evidence: { runId: ownerRunId },
+      });
+      const db = createRunContextDb({}, ownerAgentId, ownerRunId, [{
+        id: "88888888-8888-4888-8888-888888888888",
+        companyId,
+        issueId,
+        state,
+      }]);
+
+      const res = await request(await createApp(boardActor(), db))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+
+      expect.soft(res.status).toBe(409);
+      expect.soft(res.body.details?.code).toBe("chat_recovery_requires_authorized_context");
+      expect.soft(mockIssueService.update).not.toHaveBeenCalled();
+      expect.soft(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+      expect.soft(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect.soft(mockLogActivity).not.toHaveBeenCalled();
+      // This is a route-boundary test, not a fake SQL engine: inspect the
+      // actual compiled predicate so a global or active-only query cannot pass.
+      expect(db.chatBindingQueries).toHaveLength(1);
+      expect(db.chatBindingQueries[0].sql).toBe(
+        '("chat_conversations"."company_id" = $1 and "chat_conversations"."issue_id" = $2)',
+      );
+      expect(db.chatBindingQueries[0].params).toEqual([companyId, issueId]);
+    },
+  );
+
+  it.each(["done", "in_review"])(
+    "keeps non-retry %s recovery resolution available for chat tasks",
+    async (sourceIssueStatus) => {
+      const sourceIssue = makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId });
+      mockIssueService.getById.mockResolvedValue(sourceIssue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...sourceIssue,
+        ...patch,
+      }));
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId,
+        status: "active",
+        ownerType: "board",
+        ownerAgentId: null,
+        returnOwnerAgentId: ownerAgentId,
+      });
+      const db = createRunContextDb({}, ownerAgentId, ownerRunId, [{
+        id: "88888888-8888-4888-8888-888888888888",
+        companyId,
+        issueId,
+        state: "completed",
+      }]);
+
+      const res = await request(await createApp(boardActor(), db))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(db.chatBindingQueries).toEqual([]);
+    },
+  );
 
   it.each([
     ["checkoutRunId", ownerRunId],

@@ -264,6 +264,7 @@ export function shouldEnablePrivateHostnameGuard(opts: {
 type ChatReconciliationLane =
   | "provider runtimes"
   | "deliveries"
+  | "GitHub webhook recovery"
   | "run milestones"
   | "publications"
   | "Slack file receipts"
@@ -277,6 +278,7 @@ type ChatReconciliationLane =
 export function createChatReconciliationCoordinator(input: {
   reconcileProviderRuntimes: () => Promise<unknown>;
   processPendingDeliveries: () => Promise<unknown>;
+  processFailedGitHubWebhookDeliveries?: () => Promise<unknown>;
   projectRunMilestones: () => Promise<number>;
   flushPublications: () => Promise<unknown>;
   processPendingSlackFileUploadReceipts: () => Promise<unknown>;
@@ -318,6 +320,12 @@ export function createChatReconciliationCoordinator(input: {
       if (stopped) return;
       start("provider runtimes", input.reconcileProviderRuntimes);
       start("deliveries", input.processPendingDeliveries);
+      if (input.processFailedGitHubWebhookDeliveries) {
+        start(
+          "GitHub webhook recovery",
+          input.processFailedGitHubWebhookDeliveries,
+        );
+      }
       milestoneReconciliation.poll();
       publicationReconciliation.poll();
       start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
@@ -1107,6 +1115,8 @@ export async function createApp(
   const chatReconciliation = createChatReconciliationCoordinator({
     reconcileProviderRuntimes: () => chatChannels.reconcileProviderRuntimes(),
     processPendingDeliveries: () => chatChannels.processPendingDeliveries(),
+    processFailedGitHubWebhookDeliveries: () =>
+      chatChannels.processFailedGitHubWebhookDeliveries(),
     projectRunMilestones: () =>
       enqueueChatRunMilestones(db, {
         publicBaseUrl: opts.authPublicBaseUrl,
