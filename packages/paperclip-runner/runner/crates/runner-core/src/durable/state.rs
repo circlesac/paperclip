@@ -1743,8 +1743,16 @@ fn redact_sensitive_text_values(input: &str) -> String {
                                 .is_none_or(|next| next.is_ascii_whitespace()))
                 })
         };
+        let token_phrase_follows_list_delimiter = || {
+            let before = &normalized[..start];
+            start == 0
+                || [", ", "; ", ": ", "\n", "- "]
+                    .iter()
+                    .any(|delimiter| before.ends_with(delimiter))
+        };
+        let has_hyphenated_count_lead = token_phrase_has_lead("one-");
         let is_benign_token_noun_phrase = key == "token"
-            && !key_is_compound
+            && (!key_is_compound || has_hyphenated_count_lead)
             && whitespace_start == start + key.len()
             && !has_assignment_separator
             && bytes[whitespace_start..separator]
@@ -1764,9 +1772,30 @@ fn redact_sensitive_text_values(input: &str) -> String {
                 .iter()
                 .any(|lead| token_phrase_has_lead(lead)))
                 || (token_phrase_has_tail("economy")
-                    && ["a balanced ", "the balanced "]
+                    && ["a balanced ", "the balanced ", "the "]
                         .iter()
                         .any(|lead| token_phrase_has_lead(lead)))
+                || (["station", "rules"]
+                    .iter()
+                    .any(|tail| token_phrase_has_tail(tail))
+                    && token_phrase_has_lead("the "))
+                || (["design", "values"]
+                    .iter()
+                    .any(|tail| token_phrase_has_tail(tail))
+                    && ["a jade ", "the "]
+                        .iter()
+                        .any(|lead| token_phrase_has_lead(lead)))
+                || (token_phrase_has_tail("exchanges") && token_phrase_has_lead("standard "))
+                || (["count", "limits"]
+                    .iter()
+                    .any(|tail| token_phrase_has_tail(tail))
+                    && token_phrase_has_lead("and "))
+                || (["limit", "rule"]
+                    .iter()
+                    .any(|tail| token_phrase_has_tail(tail))
+                    && has_hyphenated_count_lead)
+                || (token_phrase_has_tail("reconciliation, and cleanup")
+                    && token_phrase_follows_list_delimiter())
                 || (["for", "per"]
                     .iter()
                     .any(|tail| token_phrase_has_tail(tail))
@@ -2556,9 +2585,11 @@ mod tests {
     fn semantic_redaction_preserves_benign_token_system_prose() {
         let prose = "Offer a simple token system so guests can exchange items even when their contributions differ in quantity.";
         let game_prose = "Use a balanced token economy. Award one token for each accepted game, with an optional second token for especially large or complex games.";
+        let observed_prose = "The token economy. Name the token station the Cobalt Counter. Close with a last selection round, token reconciliation, and cleanup. Collect suggestions about accessibility, and token limits without changing the token rules. A jade token design can include a large printed symbol. Ask whether the token values felt fair. Plan standard token exchanges. Record each participant’s name and token count. Set a one-token limit per household and ask whether the one-token rule felt fair.";
         for text in [
             prose,
             game_prose,
+            observed_prose,
             "Use a token system.",
             "Describe the token system clearly.",
             "The simple token system is fair.",
@@ -2568,6 +2599,18 @@ mod tests {
             "Describe the transparent token system clearly.",
             "One token can equal one standard game.",
             "Award one token per accepted game.",
+            "The token economy",
+            "Name the token station the Cobalt Counter and provide tokens in unusual titles.",
+            "Close with a last selection round, token reconciliation, and cleanup.",
+            "Collect suggestions about accessibility, and token limits.",
+            "Avoid changing the token rules.",
+            "A jade token design can include a large printed symbol and a serial number.",
+            "Ask whether the token values felt fair.",
+            "Plan standard token exchanges.",
+            "The token design should be difficult to copy.",
+            "Record each participant’s name and token count on a simple public tally sheet.",
+            "Set a one-token limit per household.",
+            "Ask whether the one-token rule felt fair.",
         ] {
             assert_eq!(redact_text(text), text);
             assert_eq!(
@@ -2580,12 +2623,12 @@ mod tests {
         let command = command("command_token_prose", 1);
         state.begin_command(&command).unwrap();
         let result = json!({
-            "result": {"schema": "paperclip.prp.run_result.v1", "summary": game_prose},
+            "result": {"schema": "paperclip.prp.run_result.v1", "summary": observed_prose},
             "nested": {"token": "system", "diagnostic": "token=system"},
         });
         state.complete_command(&command, result).unwrap();
         let completed = state.processed_commands.get(&command.command_id).unwrap();
-        assert_eq!(completed.result["result"]["summary"], json!(game_prose));
+        assert_eq!(completed.result["result"]["summary"], json!(observed_prose));
         assert_eq!(completed.result["nested"]["token"], json!("[REDACTED]"));
         assert_eq!(
             completed.result["nested"]["diagnostic"],
@@ -2620,6 +2663,36 @@ mod tests {
                 "a balanced token economy-secret",
                 "a balanced token [REDACTED]",
             ),
+            ("the token economy-secret", "the token [REDACTED]"),
+            ("the token station-secret", "the token [REDACTED]"),
+            ("the token rules-secret", "the token [REDACTED]"),
+            ("and token limits-secret", "and token [REDACTED]"),
+            ("a jade token design-secret", "a jade token [REDACTED]"),
+            ("the token values-secret", "the token [REDACTED]"),
+            (
+                "standard token exchanges-secret",
+                "standard token [REDACTED]",
+            ),
+            ("and token count-secret", "and token [REDACTED]"),
+            ("one-token limit-secret", "one-token [REDACTED]"),
+            ("one-token rule-secret", "one-token [REDACTED]"),
+            ("one-token secret-value", "one-token [REDACTED]"),
+            ("the token design=secret", "the token [REDACTED]"),
+            ("token design", "token [REDACTED]"),
+            (
+                "token reconciliation-secret, and cleanup",
+                "token [REDACTED], and cleanup",
+            ),
+            (
+                "after token reconciliation, and cleanup-secret",
+                "after token [REDACTED], and cleanup-secret",
+            ),
+            ("token rules", "token [REDACTED]"),
+            ("token limits", "token [REDACTED]"),
+            ("the token=rules", "the token=[REDACTED]"),
+            ("the token \"rules\"", "the token \"[REDACTED]\""),
+            ("the --token rules", "the --token [REDACTED]"),
+            ("the access_token rules", "the access_token [REDACTED]"),
             (
                 "a balanced token system-secret",
                 "a balanced token [REDACTED]",
