@@ -628,12 +628,25 @@ async function awaitRunnerSuspensionBarrier(input: {
   deadline: number;
   pollIntervalMs?: number;
 }): Promise<boolean> {
-  const existing = [...input.commands()]
+  let existing = [...input.commands()]
     .reverse()
     .find(
       (command) =>
-        command.type === "runner.suspend" && command.status === "pending",
+        command.type === "runner.suspend" &&
+        (command.status === "pending" || command.status === "completed"),
     );
+  if (existing?.status === "completed") {
+    // A retained authority may have resumed since this command completed.
+    // Reuse its receipt only when the current exact durable state is already
+    // suspended; otherwise issue a new command rather than waiting on history.
+    try {
+      if ((await input.readRunnerState()).lifecycle === "suspended")
+        return Date.now() < input.deadline;
+    } catch {
+      // The normal bounded barrier below handles unavailable state.
+    }
+    existing = undefined;
+  }
   const commandId =
     existing?.commandId ??
     `command_close_suspend_${randomUUID().replaceAll("-", "")}`;
@@ -658,7 +671,11 @@ async function awaitRunnerSuspensionBarrier(input: {
       // A remote filesystem can lag the command-result delivery by a small
       // amount. Keep the single close deadline as the fail-closed bound.
     }
-    if (command?.status === "completed" && lifecycle === "suspended") {
+    if (
+      command?.status === "completed" &&
+      lifecycle === "suspended" &&
+      Date.now() < input.deadline
+    ) {
       return true;
     }
     // Process completion alone is not a suspension proof. The durable state
@@ -670,6 +687,24 @@ async function awaitRunnerSuspensionBarrier(input: {
     );
   }
   return false;
+}
+
+function runnerCloseDeadlines(
+  startedAtMs: number,
+  graceMs: number,
+): {
+  preparationDeadline: number;
+  closeDeadline: number;
+} {
+  // Stopping a still-finishing provider and draining its suffix are best-effort
+  // preparation. Neither may consume the entire budget and enqueue suspend
+  // immediately before force-killing the runner. The suspension proof itself
+  // must retain a finite opportunity to cross the durable command boundary.
+  const suspensionReserveMs = Math.min(2_500, Math.ceil(graceMs / 2));
+  return {
+    preparationDeadline: startedAtMs + graceMs - suspensionReserveMs,
+    closeDeadline: startedAtMs + graceMs,
+  };
 }
 
 async function awaitAdoptedRunnerAuthentication(input: {
@@ -2796,46 +2831,42 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // A terminal provider frame can become visible one control loop before
       // its durable provider suffix is ACKed. Drain it before suspension so a
       // fresh run authority never inherits the prior run's pending events.
-      const closeDeadline = Date.now() + (this.options.closeGraceMs ?? 10_000);
+      const { preparationDeadline, closeDeadline } = runnerCloseDeadlines(
+        Date.now(),
+        this.options.closeGraceMs ?? 10_000,
+      );
       if (!(await this.#runnerHasExited())) {
         const stoppedActiveTurn =
-          await this.#stopActiveProviderTurnBeforeSuspend(closeDeadline);
+          await this.#stopActiveProviderTurnBeforeSuspend(preparationDeadline);
         await this.#drainSettledProviderEventsBeforeSuspend(
           Math.min(
             stoppedActiveTurn ? 5_000 : 1_000,
-            Math.max(0, closeDeadline - Date.now()),
+            Math.max(0, preparationDeadline - Date.now()),
           ),
         );
       }
-      suspensionRequired = this.#controlPlaneCheckpoint !== null;
-      if (suspensionRequired) {
-        runnerSuspended = await awaitRunnerSuspensionBarrier({
-          commands: () => this.#core?.store.state.commands ?? [],
-          queueSuspend: (commandId) => {
-            this.#core?.queueCommand("runner.suspend", {}, commandId, true);
-          },
-          readRunnerState: () => this.#readDurableRunnerState(),
-          runnerHasExited: () => this.#runnerHasExited(),
-          pump: () => this.#pumpEventsSafely(),
-          deadline: closeDeadline,
-        });
-        if (!runnerSuspended) {
-          this.#diagnostic(
-            "runner did not prove durable suspension before checkpoint",
-          );
-        }
-      } else {
-        const runnerAlreadyStopping =
-          (await this.#runnerHasExited()) ||
-          this.#core.store.state.commands.some(
-            (command) =>
-              (command.type === "runner.suspend" ||
-                command.type === "runner.shutdown") &&
-              command.status === "pending",
-          );
-        if (!runnerAlreadyStopping) {
-          this.#core.queueCommand("runner.suspend", {}, undefined, true);
-        }
+      // Local durable roots are reused too. Process exit alone cannot prove
+      // their authority is safe to rotate; require the same exact suspension
+      // barrier even when there is no remote checkpoint callback.
+      suspensionRequired = true;
+      runnerSuspended = await awaitRunnerSuspensionBarrier({
+        commands: () => this.#core?.store.state.commands ?? [],
+        queueSuspend: (commandId) => {
+          this.#core?.queueCommand("runner.suspend", {}, commandId, true);
+        },
+        readRunnerState: async () => {
+          const state = await this.#readDurableRunnerState();
+          assertSuspendedRunnerState(state, this.#core!.store.state.identity);
+          return state;
+        },
+        runnerHasExited: () => this.#runnerHasExited(),
+        pump: () => this.#pumpEventsSafely(),
+        deadline: closeDeadline,
+      });
+      if (!runnerSuspended) {
+        this.#diagnostic(
+          "runner did not prove durable suspension before checkpoint",
+        );
       }
       try {
         if (this.#handle) {
@@ -4846,6 +4877,7 @@ export const runnerdRecoveryInternals = Object.freeze({
   providerTurnIsActiveFromCommittedEvents,
   recoveredRunAttachment,
   releaseRunnerProcessOwnership,
+  runnerCloseDeadlines,
   rotatedRunAttachPayload,
   rotateExternalAuthorityEpoch,
   turnStartCommandResultValid,

@@ -625,6 +625,62 @@ it("does not accept process exit without durable suspension", async () => {
   ).resolves.toBe(false);
 });
 
+it("reserves a bounded suspension window after close preparation", () => {
+  expect(runnerdRecoveryInternals.runnerCloseDeadlines(1_000, 10_000)).toEqual({
+    preparationDeadline: 8_500,
+    closeDeadline: 11_000,
+  });
+  expect(runnerdRecoveryInternals.runnerCloseDeadlines(1_000, 400)).toEqual({
+    preparationDeadline: 1_200,
+    closeDeadline: 1_400,
+  });
+});
+
+it("joins an already-completed suspension without queuing a command to an exited runner", async () => {
+  const commands = [
+    { commandId: "exact-suspend", type: "runner.suspend", status: "completed" },
+  ];
+  const queueSuspend = vi.fn();
+  await expect(
+    runnerdRecoveryInternals.awaitRunnerSuspensionBarrier({
+      commands: () => commands,
+      queueSuspend,
+      readRunnerState: async () => ({ lifecycle: "suspended" }),
+      runnerHasExited: async () => true,
+      pump: () => undefined,
+      deadline: Date.now() + 1_000,
+    }),
+  ).resolves.toBe(true);
+  expect(queueSuspend).not.toHaveBeenCalled();
+});
+
+it("queues a fresh suspension when a completed old command belongs to a resumed ready runner", async () => {
+  const commands = [
+    { commandId: "old-suspend", type: "runner.suspend", status: "completed" },
+  ];
+  let lifecycle = "ready";
+  const queueSuspend = vi.fn((commandId: string) => {
+    commands.push({ commandId, type: "runner.suspend", status: "pending" });
+  });
+  await expect(
+    runnerdRecoveryInternals.awaitRunnerSuspensionBarrier({
+      commands: () => commands,
+      queueSuspend,
+      readRunnerState: async () => ({ lifecycle }),
+      runnerHasExited: async () => false,
+      pump: () => {
+        if (commands.length === 2) {
+          commands[1]!.status = "completed";
+          lifecycle = "suspended";
+        }
+      },
+      deadline: Date.now() + 1_000,
+    }),
+  ).resolves.toBe(true);
+  expect(queueSuspend).toHaveBeenCalledOnce();
+  expect(commands[1]!.commandId).not.toBe("old-suspend");
+});
+
 it("keeps ACPX terminal tools under the reserved runner-owned catalog", () => {
   const tools = [
     {
@@ -1762,6 +1818,182 @@ it("continues rehydrating events after the committed-event window slides", async
     await rm(stateDirectory, { recursive: true, force: true });
   }
 }, 30_000);
+
+it("proves local suspension after an event backlog before rebinding the next run", async () => {
+  const stateDirectory = await mkdtemp(
+    join(tmpdir(), "runnerd-local-close-backlog-"),
+  );
+  const identity = {
+    runnerInstanceId: "runner-close-backlog",
+    environmentLeaseId: "lease-close-backlog",
+    runId: "run-close-first",
+    normalizedSessionId: "session-close-backlog",
+    turnId: "turn-close-first",
+    itemId: "item-close-first",
+  };
+  const readRunnerState = vi.fn(
+    async () =>
+      JSON.parse(
+        await readFile(
+          join(stateDirectory, "runner", "runner-state.json"),
+          "utf8",
+        ),
+      ) as Record<string, unknown>,
+  );
+  const options = {
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: fakeCodexArgs(
+      stateDirectory,
+      "--split-event-burst",
+      "--durable-turn-ids",
+    ),
+    stateDirectory,
+    lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
+    readRunnerState,
+  };
+  const first = createCapabilityRunnerdCodexTransport({
+    ...options,
+    prpIdentity: identity,
+  });
+  first.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
+  let second:
+    ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+  try {
+    const opened = await first.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the current task.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    await first.transport.request("turn/start", {
+      input: [
+        {
+          type: "text",
+          text: "Emit a split event burst before the queued follow-up.",
+        },
+      ],
+    });
+    let deltas = 0;
+    for await (const event of first.transport.notifications()) {
+      if (event.method === "item/agentMessage/delta") deltas += 1;
+      if (event.method === "turn/completed") break;
+    }
+    expect(deltas).toBe(144);
+    await first.transport.close();
+    // Local transports have no remote checkpoint callback. They must still
+    // verify suspension rather than treating process termination as proof.
+    expect(readRunnerState).toHaveBeenCalled();
+    expect(await readRunnerState()).toMatchObject({
+      ...identity,
+      lifecycle: "suspended",
+    });
+    const control = JSON.parse(
+      await readFile(
+        join(stateDirectory, "control-plane", "control-plane-state.json"),
+        "utf8",
+      ),
+    );
+    expect(control.commands).toContainEqual(
+      expect.objectContaining({ type: "runner.suspend", status: "completed" }),
+    );
+    second = createCapabilityRunnerdCodexTransport({
+      ...options,
+      readRunnerState: undefined,
+      prpIdentity: {
+        ...identity,
+        runId: "run-close-second",
+        turnId: "turn-close-second",
+        itemId: "item-close-second",
+      },
+    });
+    second.transport.setServerRequestHandler(async () => ({
+      success: true,
+      contentItems: [],
+    }));
+    const resumed = await second.transport.request("thread/read", {});
+    expect(resumed.thread).toMatchObject({
+      id: (opened.thread as Record<string, unknown>).id,
+    });
+    expect(second.evidence().diagnostics).toContain(
+      "runnerd attached the durable provider session to a fresh PRP run authority",
+    );
+  } finally {
+    await Promise.allSettled([
+      first.transport.close(),
+      second?.transport.close(),
+    ]);
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it.each(["not_suspended", "wrong_identity"] as const)(
+  "does not report local runner close healthy with %s durable evidence",
+  async (mode) => {
+    const stateDirectory = await mkdtemp(
+      join(tmpdir(), "runnerd-local-close-unproven-"),
+    );
+    const identity = {
+      runnerInstanceId: "runner-close-unproven",
+      environmentLeaseId: "lease-close-unproven",
+      runId: "run-close-unproven",
+      normalizedSessionId: "session-close-unproven",
+      turnId: "turn-close-unproven",
+      itemId: "item-close-unproven",
+    };
+    const bundle = createCapabilityRunnerdCodexTransport({
+      runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: fakeCodex,
+      codexArgs: fakeCodexArgs(stateDirectory),
+      stateDirectory,
+      closeGraceMs: 400,
+      lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+      prpIdentity: identity,
+      readRunnerState: async () => ({
+        schema: "paperclip.runner.durable.state.v1",
+        ...identity,
+        ...(mode === "wrong_identity" ? { runId: "some-other-run" } : {}),
+        lifecycle: mode === "not_suspended" ? "ready" : "suspended",
+      }),
+    });
+    bundle.transport.setServerRequestHandler(async () => ({
+      success: true,
+      contentItems: [],
+    }));
+    try {
+      await bundle.transport.request("thread/start", {
+        cwd: tmpdir(),
+        dynamicTools: [],
+      });
+      await expect(bundle.transport.close()).rejects.toThrow(
+        "runner did not durably suspend before checkpoint",
+      );
+      const control = JSON.parse(
+        await readFile(
+          join(stateDirectory, "control-plane", "control-plane-state.json"),
+          "utf8",
+        ),
+      );
+      expect(control.identity).toEqual(identity);
+      expect(await readdir(stateDirectory)).toContain("runner");
+    } finally {
+      await bundle.transport.close().catch(() => undefined);
+      await rm(stateDirectory, { recursive: true, force: true });
+    }
+  },
+  10_000,
+);
 
 it("binds an immediately failed durable turn before exposing its terminal", async () => {
   const stateDirectory = await mkdtemp(
@@ -3467,6 +3699,7 @@ it("rejects the notification stream promptly when runnerd exits after accepting 
     codexCommand: fakeCodex,
     codexArgs: fakeCodexArgs(stateDirectory, "--linger-after-turn-start"),
     stateDirectory,
+    closeGraceMs: 400,
   });
   bundle.transport.setServerRequestHandler(async () => ({
     success: true,
@@ -3510,8 +3743,20 @@ it("rejects the notification stream promptly when runnerd exits after accepting 
       ]),
     ).rejects.toThrow("native_runner_process_exited");
   } finally {
-    await bundle.transport.close();
-    await rm(stateDirectory, { recursive: true, force: true });
+    try {
+      await expect(bundle.transport.close()).rejects.toThrow(
+        "runner did not durably suspend before checkpoint",
+      );
+      const runnerState = JSON.parse(
+        await readFile(
+          join(stateDirectory, "runner", "runner-state.json"),
+          "utf8",
+        ),
+      );
+      expect(runnerState.lifecycle).not.toBe("suspended");
+    } finally {
+      await rm(stateDirectory, { recursive: true, force: true });
+    }
   }
 }, 30_000);
 
