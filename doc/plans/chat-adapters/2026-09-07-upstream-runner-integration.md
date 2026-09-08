@@ -725,3 +725,63 @@ Supporting verification on the combined source snapshot:
 
 These checks do not qualify the still-failing visible photo/file and final-reply
 journeys. The next deployment and live provider outcomes are recorded separately.
+
+### Live results on `78caec9f6` (September 8, 06:27 UTC)
+
+The clean committed/pushed revision restarted at 06:27:37.664 UTC and reported
+ready at 06:27:45.434 UTC. No Maya runs were active at restart. The historical
+seven native recovery holds were left intact rather than rewriting old evidence.
+
+- Slack `b3d8f284-36fe-4817-b556-3971246f0e75` completed in **14.71s** and
+  displayed the exact `SLACK-LUNA-READY` reply, replacing its working message.
+  [Visible reply](https://papercliplabs.slack.com/archives/C0BUT55N9RV/p1788848899973669?thread_ts=1788838921.759279&cid=C0BUT55N9RV).
+- GitHub `2c41782e-cef3-4f6d-af68-a1d1c647a1d3` completed in **13.65s** and
+  displayed `GITHUB-LUNA-READY` in the same inline thread, still present after
+  reload. [Visible reply](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/pull/3#discussion_r3954971454).
+  Both used `external_chat_response_waiting`, materialized one authorized final
+  comment, and published into the existing working message. Their actual native
+  execution inputs have separate task-owned cwd paths outside the agent home.
+- Telegram `7aaded5c-2e90-40f7-bf2f-1a656afdcb69` finished in **32.53s** and
+  reported successful original-photo inspection and exact-file preparation.
+  However, its decision was `governed_response_waiting`; its visible message was
+  still only “Maya E2E completed this turn,” with no delivered image. Discord's
+  `485d2467-67f0-4f2c-9f01-0c5e131a2cf4` likewise displayed only completion and
+  no files. Neither media journey passes. The current wait gate is being
+  investigated without bypassing genuine approval or review authority.
+
+The three-message Slack burst preserved order and delivered each marker exactly
+once across two turns. Its wall time is not a valid awake latency benchmark:
+macOS power logs record 174 seconds of sleep from 06:31:08 UTC, then 931 seconds
+from 06:34:47 UTC. Those pauses account for most of the observed long waits.
+At 06:51:46 UTC a 30-minute, process-scoped `caffeinate -is` assertion was started
+for testing; it does not keep the display unlocked or change persistent settings.
+The next two immediate Slack messages produced ordered, nonduplicate responses
+with run durations **11.86s** and **13.08s** (`519f8c91-97d5-47fe-9b56-f004d4d2761c`
+and `baff6436-526b-45a7-abdf-f75307ca2842`). The durable wake ledger contains one
+receipt per input, including deferred and coalesced aliases; no input was lost
+across the host sleep.
+
+Independent tool evidence confirms actual `turn_context.model=gpt-5.6-luna` in
+both new Telegram and Discord provider rollouts, not just saved configuration.
+Telegram's historical reader returned the exact verified staged JPEG, and its
+`view_image` call opened that same path. Reuse prepared attachment
+`07e93350-24da-417b-a5f0-680e98815129` with unchanged source hash and size.
+Discord read and inspected both original fixtures and prepared a 128-byte note
+and 2,111,878-byte PNG with the original hashes. Its v8 calls used valid list
+bounds, both read identifiers, all four reuse fields and stable idempotency
+keys; native completion succeeded on the first try. Neither channel queued an
+attachment publication. Both remained in review with no scheduled extra turn.
+
+The blocking gate is a genuine pre-existing system-native completion review
+whose `supersedeOnUserComment` is explicitly false. New chat input must not erase
+or approve it. The follow-up fix separates permission to present the current
+chat answer/files from permission to resolve that review.
+
+The successful Slack run was also opened through the Board's native Runner
+Inspector. Canonical events and final-presentation decisions are available with
+raw capture off. The overview incorrectly labeled this state “Expired” beneath
+a successful run. It now says “Raw capture off”; the live hot-reload retest,
+UI typecheck and token gates pass. All **8/8** inspector tests pass after
+explicitly selecting Overview before asserting its label
+(`native-inspector-status-root-03.log`). No raw capture or credential exposure
+was enabled.
