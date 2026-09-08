@@ -83,7 +83,7 @@ describe("native external-chat response wait", () => {
   });
 
   async function seedWaitTurn(
-    provider: "telegram" | "discord" = "telegram",
+    provider: "telegram" | "discord" | "slack" = "telegram",
     attentionRequests: PrpStructuredRunResult["attentionRequests"] = [],
   ) {
     const companyId = randomUUID();
@@ -376,8 +376,12 @@ describe("native external-chat response wait", () => {
   }
 
   async function seedAnsweredChatTurn(
-    provider: "telegram" | "discord" = "telegram",
-    target?: { fixture: Awaited<ReturnType<typeof seedWaitTurn>>; gate: Awaited<ReturnType<typeof seedPriorCompletionReview>> },
+    provider: "telegram" | "discord" | "slack" = "telegram",
+    target?: {
+      fixture: Awaited<ReturnType<typeof seedWaitTurn>>;
+      gate: Awaited<ReturnType<typeof seedPriorCompletionReview>>;
+    },
+    responseKind: "button" | "form" = "button",
   ) {
     const fixture = target?.fixture ?? await seedWaitTurn(provider);
     const gate = target?.gate ?? await seedPriorCompletionReview(fixture);
@@ -390,6 +394,73 @@ describe("native external-chat response wait", () => {
     const wakeId = randomUUID();
     const publicationId = randomUUID();
     const actionId = randomUUID();
+    const formActionId = `pcfs:${"A".repeat(22)}`;
+    const selectFieldId = `pcff:${"B".repeat(22)}`;
+    const textFieldId = `pcff:${"C".repeat(22)}`;
+    const selectValue = `pcfo:${"D".repeat(22)}`;
+    const formExpiresAt = new Date(Date.now() + 60_000).toISOString();
+    const interactionPayload =
+      responseKind === "form"
+        ? {
+            version: 1 as const,
+            questions: [
+              {
+                id: "environment",
+                prompt: "Choose an environment",
+                selectionMode: "single" as const,
+                required: true,
+                allowOther: false,
+                options: [{ id: "cedar", label: "Cedar" }],
+              },
+              {
+                id: "note",
+                prompt: "Enter a release note",
+                selectionMode: "single" as const,
+                required: true,
+                allowOther: true,
+                options: [
+                  {
+                    id: "__paperclip_text__",
+                    label: "Type an answer",
+                    freeText: true,
+                  },
+                ],
+              },
+            ],
+          }
+        : {
+            version: 1 as const,
+            questions: [
+              {
+                id: "color",
+                prompt: "Choose a color",
+                selectionMode: "single" as const,
+                required: true,
+                allowOther: false,
+                options: [
+                  { id: "cobalt", label: "Cobalt" },
+                  { id: "amber", label: "Amber" },
+                ],
+              },
+            ],
+          };
+    const interactionResult =
+      responseKind === "form"
+        ? {
+            version: 1 as const,
+            answers: [
+              { questionId: "environment", optionIds: ["cedar"] },
+              {
+                questionId: "note",
+                optionIds: [],
+                otherText: "cobalt lantern82",
+              },
+            ],
+          }
+        : {
+            version: 1 as const,
+            answers: [{ questionId: "color", optionIds: ["cobalt"] }],
+          };
     await db.insert(heartbeatRuns).values({
       id: sourceRunId,
       companyId: fixture.companyId,
@@ -412,26 +483,8 @@ describe("native external-chat response wait", () => {
         resolvedByUserId: fixture.userId,
         resolvedAt: new Date(),
         idempotencyKey: `color-${interactionId}`,
-        payload: {
-          version: 1,
-          questions: [
-            {
-              id: "color",
-              prompt: "Choose a color",
-              selectionMode: "single",
-              required: true,
-              allowOther: false,
-              options: [
-                { id: "cobalt", label: "Cobalt" },
-                { id: "amber", label: "Amber" },
-              ],
-            },
-          ],
-        },
-        result: {
-          version: 1,
-          answers: [{ questionId: "color", optionIds: ["cobalt"] }],
-        },
+        payload: interactionPayload,
+        result: interactionResult,
       })
       .returning();
     const [responseDelivery] = await db
@@ -465,17 +518,49 @@ describe("native external-chat response wait", () => {
       endpointId: fixture.endpointId,
       conversationId: fixture.conversationId,
       principalId: fixture.principalId,
-      kind: "question_answer",
+      kind:
+        responseKind === "form" ? "question_form_submit" : "question_answer",
       status: "processed",
-      providerActionId: `answer-${interactionId}`,
-      payload: {
-        version: 1,
-        interactionId,
-        publicationId,
-        questionId: "color",
-        optionId: "cobalt",
-      },
-      result: { interactionId, interactionStatus: "answered" },
+      providerActionId:
+        responseKind === "form" ? formActionId : `answer-${interactionId}`,
+      payload:
+        responseKind === "form"
+          ? {
+              version: 1,
+              publicationId,
+              interactionId,
+              formActionId,
+              expiresAt: formExpiresAt,
+              fields: [
+                {
+                  fieldId: selectFieldId,
+                  kind: "single_select",
+                  questionId: "environment",
+                  required: true,
+                  options: [{ optionId: "cedar", value: selectValue }],
+                },
+                {
+                  fieldId: textFieldId,
+                  kind: "text",
+                  questionId: "note",
+                  required: true,
+                  minLength: 0,
+                  maxLength: 3_000,
+                  inputType: "text",
+                },
+              ],
+            }
+          : {
+              version: 1,
+              interactionId,
+              publicationId,
+              questionId: "color",
+              optionId: "cobalt",
+            },
+      result:
+        responseKind === "form"
+          ? { code: "question_form_answered", interactionId }
+          : { interactionId, interactionStatus: "answered" },
     });
     await db.insert(agentWakeupRequests).values({
       id: wakeId,
@@ -636,6 +721,134 @@ describe("native external-chat response wait", () => {
       await rm(root, { recursive: true, force: true });
     }
   }
+
+  it("attests a genuine Slack mixed-question modal answer for its native continuation", async () => {
+    const fixture = await seedAnsweredChatTurn("slack", undefined, "form");
+    await expect(
+      attestReviewedExternalChatRun({
+        db,
+        ...fixture,
+        contextSnapshot: fixture.context,
+      }),
+    ).resolves.toBe(true);
+    expect(fixture.context.paperclipExternalChatQuestionResponse).toMatchObject({
+      schema: "paperclip.external_chat_question_response.v1",
+      interactionId: fixture.interactionId,
+      responseDeliveryId: fixture.responseDeliveryId,
+      sourceRunId: fixture.sourceRunId,
+    });
+  });
+
+  it("attests an accepted Slack modal answer after its opaque token expires", async () => {
+    const fixture = await seedAnsweredChatTurn("slack", undefined, "form");
+    const answeredAt = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+    const [interaction] = await db
+      .update(issueThreadInteractions)
+      .set({ resolvedAt: answeredAt })
+      .where(eq(issueThreadInteractions.id, fixture.interactionId))
+      .returning();
+    const [action] = await db
+      .select()
+      .from(chatActions)
+      .where(eq(chatActions.id, fixture.actionId));
+    if (!interaction || !action) throw new Error("Expected modal answer state");
+    await db
+      .update(chatActions)
+      .set({
+        payload: {
+          ...action.payload,
+          expiresAt: new Date(
+            answeredAt.getTime() + 60 * 60 * 1_000,
+          ).toISOString(),
+        },
+      })
+      .where(eq(chatActions.id, action.id));
+    await db
+      .update(issueQuestionResponseDeliveries)
+      .set({
+        payloadSha256: questionResponseDeliveryValues(
+          interaction as unknown as AskUserQuestionsInteraction,
+        ).payloadSha256,
+      })
+      .where(eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId));
+    await expect(
+      attestReviewedExternalChatRun({
+        db,
+        ...fixture,
+        contextSnapshot: fixture.context,
+      }),
+    ).resolves.toBe(true);
+  });
+
+  it("does not attest a Slack modal answer after current principal authorization is revoked", async () => {
+    const fixture = await seedAnsweredChatTurn("slack", undefined, "form");
+    await db
+      .update(companyMemberships)
+      .set({ status: "suspended" })
+      .where(
+        and(
+          eq(companyMemberships.companyId, fixture.companyId),
+          eq(companyMemberships.principalId, fixture.userId),
+        ),
+      );
+    await expect(
+      attestReviewedExternalChatRun({
+        db,
+        ...fixture,
+        contextSnapshot: fixture.context,
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it.each(["result", "field", "expiry"] as const)(
+    "does not attest a Slack modal answer with a tampered %s receipt",
+    async (mutation) => {
+      const fixture = await seedAnsweredChatTurn("slack", undefined, "form");
+      const [action] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, fixture.actionId));
+      if (!action) throw new Error("Expected modal answer action");
+      if (mutation === "result") {
+        await db
+          .update(chatActions)
+          .set({
+            result: {
+              code: "question_form_answered",
+              interactionId: randomUUID(),
+            },
+          })
+          .where(eq(chatActions.id, action.id));
+      } else {
+        const payload = structuredClone(action.payload);
+        if (mutation === "expiry") {
+          payload.expiresAt = new Date(0).toISOString();
+        } else {
+          const fields = Array.isArray(payload.fields) ? payload.fields : [];
+          const first = fields[0] as
+            | { options?: Array<{ optionId?: string }> }
+            | undefined;
+          if (!first?.options?.[0])
+            throw new Error("Expected modal select field");
+          first.options[0].optionId = "forged-option";
+        }
+        await db
+          .update(chatActions)
+          .set({ payload })
+          .where(eq(chatActions.id, action.id));
+      }
+      await expect(
+        attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: fixture.context,
+        }),
+      ).resolves.toBe(false);
+      expect(fixture.context).not.toHaveProperty(
+        "paperclipExternalChatQuestionResponse",
+      );
+    },
+  );
 
   it.each([
     ["telegram", "register_deliverable"],

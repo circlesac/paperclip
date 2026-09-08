@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -15,6 +15,10 @@ import {
   issueThreadInteractions,
 } from "@paperclipai/db";
 import type { AskUserQuestionsInteraction } from "@paperclipai/shared";
+import {
+  parseChatQuestionFormSubmitTokenPayload,
+  validateChatQuestionFormSubmission,
+} from "../chat-question-forms.js";
 import { questionResponseDeliveryValues } from "../question-response-delivery.js";
 import { nativeSha256 } from "./canonical.js";
 
@@ -63,6 +67,89 @@ const ids = (value: unknown): string[] =>
   Array.isArray(value)
     ? value.filter((id): id is string => typeof id === "string")
     : [];
+
+function completedQuestionFormMatchesInteraction(
+  interaction: AskUserQuestionsInteraction,
+  action: typeof chatActions.$inferSelect,
+): boolean {
+  const payload = parseChatQuestionFormSubmitTokenPayload(action.payload);
+  const result = record(action.result);
+  const answers = record(interaction.result).answers;
+  const resolvedAt =
+    interaction.resolvedAt instanceof Date
+      ? interaction.resolvedAt
+      : new Date(interaction.resolvedAt ?? Number.NaN);
+  if (
+    !payload ||
+    interaction.status !== "answered" ||
+    action.providerActionId !== payload.formActionId ||
+    payload.interactionId !== interaction.id ||
+    result.code !== "question_form_answered" ||
+    result.interactionId !== interaction.id ||
+    !Number.isFinite(resolvedAt.getTime()) ||
+    !Array.isArray(answers) ||
+    answers.length !== payload.fields.length
+  )
+    return false;
+
+  const answerByQuestionId = new Map<string, Record<string, unknown>>();
+  for (const value of answers) {
+    const answer = record(value);
+    const questionId =
+      typeof answer.questionId === "string" ? answer.questionId : null;
+    if (!questionId || answerByQuestionId.has(questionId)) return false;
+    answerByQuestionId.set(questionId, answer);
+  }
+  const values: Record<string, string> = {};
+  for (const field of payload.fields) {
+    const answer = answerByQuestionId.get(field.questionId);
+    if (!answer) return false;
+    const optionIds = ids(answer.optionIds);
+    if (
+      !Array.isArray(answer.optionIds) ||
+      optionIds.length !== answer.optionIds.length
+    )
+      return false;
+    if (field.kind === "single_select") {
+      if (
+        optionIds.length > 1 ||
+        (answer.otherText !== undefined &&
+          answer.otherText !== null &&
+          answer.otherText !== "")
+      )
+        return false;
+      const option = optionIds[0]
+        ? field.options.find((candidate) => candidate.optionId === optionIds[0])
+        : null;
+      if (optionIds.length === 1 && !option) return false;
+      values[field.fieldId] = option?.value ?? "";
+      continue;
+    }
+    if (
+      optionIds.length !== 0 ||
+      (answer.otherText !== undefined &&
+        answer.otherText !== null &&
+        typeof answer.otherText !== "string")
+    )
+      return false;
+    values[field.fieldId] =
+      typeof answer.otherText === "string" ? answer.otherText : "";
+  }
+  const validation = validateChatQuestionFormSubmission({
+    callbackId: payload.formActionId,
+    privateMetadata: payload.formActionId,
+    interaction: { ...interaction, status: "pending" },
+    payload,
+    values,
+    // Recheck the durable answer time against the opaque token's lifetime;
+    // continuing later must not depend on the current wall clock.
+    now: resolvedAt,
+  });
+  return (
+    validation.ok &&
+    nativeSha256(validation.answers) === nativeSha256(answers)
+  );
+}
 
 /**
  * Resolve the durable provider answer, not a caller-supplied wake marker. This
@@ -397,11 +484,13 @@ async function resolveQuestionResponseChain(
     .where(
       and(
         eq(chatActions.companyId, binding.companyId),
-        eq(chatActions.kind, "question_answer"),
+        inArray(chatActions.kind, [
+          "question_answer",
+          "question_form_submit",
+        ]),
         eq(chatActions.status, "processed"),
         sql`${chatActions.payload}->>'interactionId' = ${interaction.id}`,
         sql`${chatActions.result}->>'interactionId' = ${interaction.id}`,
-        sql`${chatActions.result}->>'interactionStatus' = 'answered'`,
       ),
     );
   let expectedPrincipalId: string | null = null;
@@ -459,30 +548,40 @@ async function resolveQuestionResponseChain(
       parent.marker.conversationId !== conversation.id)
   )
     return null;
-  const answers = record(interaction.result).answers;
-  const selectedAnswer = Array.isArray(answers)
-    ? answers
-        .map(record)
-        .find((answer) => answer.questionId === action.payload.questionId)
-    : null;
-  const questions = record(interaction.payload).questions;
-  const selectedQuestion = Array.isArray(questions)
-    ? questions
-        .map(record)
-        .find((question) => question.id === action.payload.questionId)
-    : null;
-  if (
-    !selectedAnswer ||
-    !selectedQuestion ||
-    selectedQuestion.selectionMode !== "single" ||
-    ids(selectedAnswer.optionIds).length !== 1 ||
-    ids(selectedAnswer.optionIds)[0] !== action.payload.optionId ||
-    !Array.isArray(selectedQuestion.options) ||
-    !selectedQuestion.options.some(
-      (option) => record(option).id === action.payload.optionId,
+  if (action.kind === "question_answer") {
+    const answers = record(interaction.result).answers;
+    const selectedAnswer = Array.isArray(answers)
+      ? answers
+          .map(record)
+          .find((answer) => answer.questionId === action.payload.questionId)
+      : null;
+    const questions = record(interaction.payload).questions;
+    const selectedQuestion = Array.isArray(questions)
+      ? questions
+          .map(record)
+          .find((question) => question.id === action.payload.questionId)
+      : null;
+    if (
+      record(action.result).interactionStatus !== "answered" ||
+      !selectedAnswer ||
+      !selectedQuestion ||
+      selectedQuestion.selectionMode !== "single" ||
+      ids(selectedAnswer.optionIds).length !== 1 ||
+      ids(selectedAnswer.optionIds)[0] !== action.payload.optionId ||
+      !Array.isArray(selectedQuestion.options) ||
+      !selectedQuestion.options.some(
+        (option) => record(option).id === action.payload.optionId,
+      )
     )
-  )
+      return null;
+  } else if (
+    !completedQuestionFormMatchesInteraction(
+      interaction as unknown as AskUserQuestionsInteraction,
+      action,
+    )
+  ) {
     return null;
+  }
   if (
     inbound.state !== "processed" ||
     comment.deletedAt !== null ||
