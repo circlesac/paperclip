@@ -1248,6 +1248,8 @@ export async function createApp(
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
     appServicesShutdown = (async () => {
+      // The scheduler tick queries the database. Stop it here, inside the
+      // awaited teardown, so no tick runs after the caller ends the pool.
       scheduler.stop();
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
