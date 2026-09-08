@@ -3236,6 +3236,7 @@ describe("Codex app-server Codex driver", () => {
       "thread/resume",
       "thread/goal/get",
       "thread/read",
+      "thread/read",
     ]);
     expect((await recovery?.session?.snapshot())?.activeTurnId).toBe("turn-1");
   });
@@ -3524,15 +3525,11 @@ describe("Codex app-server Codex driver", () => {
       const snapshot = await original.snapshot();
       await original.close({ reason: "transport lost" });
       const recovery = await driver.recoverSession?.(snapshot);
-      expect(recovery?.session).toBeDefined();
-      await expect(
-        recovery!.session!.reconcile!(),
-      ).rejects.toMatchObject<HarnessReconciliationError>({
-        name: "HarnessReconciliationError",
-        recoverable: true,
-        message: expect.stringContaining(testCase.message),
+      expect(recovery).toMatchObject({
+        recovered: false,
+        reason: expect.stringContaining(testCase.message),
       });
-      await recovery!.session!.close({ reason: "test complete" });
+      expect(recovery?.session).toBeUndefined();
     }
   });
 

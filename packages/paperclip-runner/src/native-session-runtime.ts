@@ -1769,12 +1769,17 @@ export async function executeNativeSession(
     const recoveredActiveTurnId = recovered
       ? (recoveredSnapshot.activeTurnId ?? null)
       : (persistedSession?.activeTurnId ?? null);
-    const adoptedDispositionTerminal = Boolean(
+    const adoptedProviderTerminal = Boolean(
       recovered &&
-      recoveredSnapshot.dispositionOnlyRecoveryConsumed &&
       !recoveredActiveTurnId &&
-      (recoveredSnapshot.terminalTurns?.length ?? 0) >
-        (persistedSession?.terminalTurns?.length ?? 0),
+      recoveredSnapshot.terminalTurns?.some(
+        (terminal) =>
+          !persistedSession?.terminalTurns?.some(
+            (persistedTerminal) => persistedTerminal.turnId === terminal.turnId,
+          ) &&
+          (terminal.turnId === persistedSession?.activeTurnId ||
+            recoveredSnapshot.dispositionOnlyRecoveryConsumed),
+      ),
     );
     if (continuityBreak) {
       await options.onContinuityBreak?.({
@@ -1790,7 +1795,7 @@ export async function executeNativeSession(
     // first, retaining the older checkpoint lets the next recovery adopt and
     // emit the same provider terminal again instead of reconstructing a closed
     // session with no event to finalize.
-    if (!adoptedDispositionTerminal) {
+    if (!adoptedProviderTerminal) {
       await persistCheckpoint(recoveredSnapshot);
     }
 
@@ -1910,7 +1915,7 @@ export async function executeNativeSession(
         if (
           !recovered ||
           (!recoveredActiveTurnId &&
-            !adoptedDispositionTerminal &&
+            !adoptedProviderTerminal &&
             !checkpointedDispositionTerminal &&
             !dispositionRecoveryStillOwned)
         ) {

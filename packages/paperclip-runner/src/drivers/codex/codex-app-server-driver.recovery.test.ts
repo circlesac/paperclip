@@ -44,6 +44,47 @@ import {
 } from "./codex-app-server-driver.test-support.js";
 
 describe("Codex app-server Codex driver", () => {
+  it.each(["completed", "interrupted", "failed", "cancelled"])(
+    "adopts a checkpointed active turn that became %s while disconnected",
+    async (status) => {
+      const first = new FakeCodexTransport();
+      const second = new FakeCodexTransport();
+      second.readResponse = {
+        thread: {
+          id: "thread-1",
+          sessionId: "provider-session-1",
+          cwd: WORKSPACE,
+          turns: [{ id: "turn-1", status, items: [] }],
+        },
+      };
+      const driver = makeDriver([first, second]);
+      const original = await driver.openSession({
+        runId: "run-disconnected-terminal",
+        normalizedSessionId: "normalized-disconnected-terminal",
+        workingDirectory: WORKSPACE,
+      });
+      await original.startTurn({ message: { role: "user", text: "Work." } });
+      const checkpoint = await original.snapshot();
+      await original.close({ reason: "transport disconnected" });
+
+      const recovery = await driver.recoverSession!(checkpoint);
+      expect(recovery.recovered).toBe(true);
+      const recovered = recovery.session!;
+      expect(await recovered.snapshot()).toMatchObject({
+        activeTurnId: null,
+        terminalTurns: [{ turnId: "turn-1" }],
+      });
+      const events = await collectUntilTerminal(recovered.events());
+      expect(
+        events.filter((event) => event.eventType === `turn.${status}`),
+      ).toHaveLength(1);
+      expect(second.calls.some((call) => call.method === "turn/start")).toBe(
+        false,
+      );
+      await recovered.close({ reason: "test complete" });
+    },
+  );
+
   it("persists and verifies the tagged runnerd provider identity on recovery", async () => {
     const providerIdentity = {
       kind: "acpx",
@@ -106,6 +147,7 @@ describe("Codex app-server Codex driver", () => {
       "thread/read",
       "thread/resume",
       "thread/goal/get",
+      "thread/read",
       "thread/read",
     ]);
     expect((await recovery?.session?.snapshot())?.activeTurnId).toBe("turn-1");
@@ -1014,15 +1056,11 @@ describe("Codex app-server Codex driver", () => {
       const snapshot = await original.snapshot();
       await original.close({ reason: "transport lost" });
       const recovery = await driver.recoverSession?.(snapshot);
-      expect(recovery?.session).toBeDefined();
-      await expect(
-        recovery!.session!.reconcile!(),
-      ).rejects.toMatchObject<HarnessReconciliationError>({
-        name: "HarnessReconciliationError",
-        recoverable: true,
-        message: expect.stringContaining(testCase.message),
+      expect(recovery).toMatchObject({
+        recovered: false,
+        reason: expect.stringContaining(testCase.message),
       });
-      await recovery!.session!.close({ reason: "test complete" });
+      expect(recovery?.session).toBeUndefined();
     }
   });
 

@@ -424,3 +424,58 @@ Prettier-formatted; whole-file Prettier reports existing mixed-style formatting
 in several touched modules (also reproduced against the pre-change
 `server-utils.ts`), so that broader check is not claimed as a pass. The lockfile
 remains unchanged. Live verification of these combined changes is still pending.
+
+### Live native Luna qualification on `205c0ca99` (September 8 UTC)
+
+The combined changes were built, committed and deployed at 04:43:39 UTC; health
+reports `2026.831.0+419.git.205c0ca99`. Deterministic browser coverage also passed
+**9/9** in 2.7 minutes (`chat-ui-root-hardening-01.log`). This is supporting
+fixture coverage, separate from the signed-in provider journeys below.
+
+Maya's runtime settings visibly select **Paperclip Runner → Codex →
+`gpt-5.6-luna`**, with automatic isolated permissions and turn-by-turn lifecycle.
+The actual native run/model records agree. No Terra substitution was made.
+
+- **Slack structured question: passed.** A real thread message requested an
+  Amber/Cobalt choice. Run `d305f396-3257-4665-afc4-36fab64a0c60` produced the
+  native question in 15.14 seconds. Clicking Cobalt once settled the card to
+  “Answered: Cobalt.” One durable response delivery woke one continuation,
+  `3d9cf547-d0fd-4a6b-9e23-eab8d3533c74`; its single final “cobalt” was published
+  14.92 seconds after the answer. A later DB check found no duplicate response,
+  continuation or final. [Visible reply](https://papercliplabs.slack.com/archives/C0BUT55N9RV/p1788842861244389?thread_ts=1788838921.759279&cid=C0BUT55N9RV).
+- **GitHub file-location wording/storage: passed.** Inline review run
+  `e903e64c-a91d-404e-ab27-cc3483f8b95d` completed in 50.43 seconds. The result
+  correctly says the file is on the private Paperclip task, not attached in
+  GitHub. Independent inspection verified the stored 21 bytes are exactly
+  `LUNA-FILE-LOCATION-OK`; SHA-256
+  `907f14d2edb054321688372f2e96d43ee50f7f4093bf7a912ea675238de2d633`.
+  [Visible reply](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/pull/3#discussion_r3954401548).
+  This does **not** qualify native GitHub binary uploads, which the App does not
+  support.
+- **Telegram photo inspection: passed; wait/history follow-up: failed.** Run
+  `53501280-d5b3-491b-9372-17e70fdbe839` correctly described the real uploaded
+  orange cat photo in 23.23 seconds, but created a native completion review
+  despite the explicit request to keep the task open and wait. Follow-up
+  `7cfd468c-c29d-4099-9380-b05e834141f1` could not read/resend that stored photo:
+  `list_chat_attachments` correctly rejected a missing authenticated chat
+  execution binding. The upstream dispatch omitted that binding for
+  `in_review` issues. The visible response honestly reported failure; the
+  journey is not qualified.
+- **Discord historical file inspection: not qualified.** Run
+  `91cba10c-0fe2-4154-a831-a88cb5b4ee44` encountered the same reviewed-task binding
+  problem. macOS then slept from 04:49:57 to 05:05:00 (903 seconds). Timeout
+  cleanup durably interrupted the provider turn, but recovery at 05:06 retained
+  its stale active-turn checkpoint and waited without progress. Rust provider
+  state and authenticated PRP event 89 both record the exact interruption;
+  there was no second active task execution. This wall time is not a valid Luna
+  latency sample. The driver recovery and attempt-local timing defects are
+  being corrected, not counted as a successful recovery.
+
+The live failures expose gaps in otherwise-green fixtures. Follow-up work must
+preserve real review/approval gates, add current-execution attestation without
+pretending a reviewed task was checked out, accept an explicitly yielded chat
+wait at the native completion boundary, and reconcile an already-terminal
+provider turn without replaying its work. Retest these exact provider journeys
+after deploying those fixes. Teams still needs the previously documented
+work/school tenant and bot-registration/admin setup; personal Teams login is
+not qualification.

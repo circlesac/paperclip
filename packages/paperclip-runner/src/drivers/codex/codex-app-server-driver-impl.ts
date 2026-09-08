@@ -552,7 +552,16 @@ export class CodexAppServerDriver implements HarnessDriver {
         lineage: snapshot.lineage,
         sourceSequence: snapshot.lastSourceSequence ?? 0,
       });
-      if (reconcileUncheckpointedDispositionTurn) {
+      // A provider may settle the checkpointed turn while this controller is
+      // disconnected (including during timeout cleanup). Reopening a thread
+      // does not replay that terminal notification. Reconcile the exact turn
+      // before exposing the session so callers neither wait on a dead turn
+      // nor submit the original work again. Missing/conflicting history still
+      // fails closed in reconcile().
+      if (
+        recoveredActiveTurnId !== null ||
+        reconcileUncheckpointedDispositionTurn
+      ) {
         await cancellation.wait(session.reconcile?.() ?? Promise.resolve({}));
       }
       return {
