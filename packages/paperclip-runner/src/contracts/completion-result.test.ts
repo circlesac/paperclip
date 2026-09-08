@@ -1,9 +1,12 @@
 import Ajv2020 from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 import {
+  PRP_BLOCK_RESULT_OUTPUT_SCHEMA,
+  PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
   PRP_COMPLETION_RESULT_OUTPUT_SCHEMA,
   PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
 } from "./completion-result.js";
+import { codexSemanticToolSpecs } from "../drivers/codex/codex-driver-values.js";
 
 const baseResult = {
   schema: "paperclip.run_result.v1",
@@ -27,6 +30,59 @@ describe("provider-neutral completion result schema", () => {
 
   it("allows done with no verification and no actionable attention", () => {
     expect(validate(structuredClone(baseResult))).toBe(true);
+  });
+
+  it("distinguishes user-facing answer content from the internal response-wake reason", () => {
+    for (const schema of [
+      PRP_COMPLETION_RESULT_OUTPUT_SCHEMA,
+      PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
+      PRP_BLOCK_RESULT_OUTPUT_SCHEMA,
+      PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
+    ]) {
+      const summary = schema.properties.summary;
+      expect(summary.description).toContain("complete user-facing answer");
+      expect(summary.description).toContain(
+        "genuine actionable failure, limitation, or required user action",
+      );
+      expect(summary.description).toContain(
+        "Unless explicitly requested, omit routine preparation, unconfirmed-delivery, and wait/review status",
+      );
+      expect(summary.description).toContain(
+        "Never claim delivery without a confirmed receipt",
+      );
+    }
+    for (const schema of [
+      PRP_COMPLETION_RESULT_OUTPUT_SCHEMA,
+      PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
+    ]) {
+      const summary = schema.properties.continuation.properties.summary;
+      expect(summary.description).toContain("Internal control-plane reason");
+      expect(summary.description).toContain(
+        "not in the top-level user-facing summary",
+      );
+      expect(summary.description).toContain("not the answer to the user's request");
+    }
+  });
+
+  it("propagates answer and wait descriptions into the actual Codex semantic tool schemas", () => {
+    const tools = JSON.parse(JSON.stringify(codexSemanticToolSpecs()));
+    const finish = tools.find(
+      (tool: { name: string }) => tool.name === "paperclip_finish",
+    );
+    const block = tools.find(
+      (tool: { name: string }) => tool.name === "paperclip_block",
+    );
+    expect(finish.inputSchema.properties.summary.description).toContain(
+      "complete user-facing answer",
+    );
+    expect(
+      finish.inputSchema.properties.continuation.properties.summary.description,
+    ).toContain("not in the top-level user-facing summary");
+    expect(block.inputSchema.properties.summary.description).toContain(
+      "genuine actionable failure, limitation, or required user action",
+    );
+    expect(finish.inputSchema).toEqual(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA);
+    expect(block.inputSchema).toEqual(PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA);
   });
 
   it("allows only a response-wake continuation when completion explicitly yields", () => {

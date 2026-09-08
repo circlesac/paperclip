@@ -23,7 +23,7 @@ export function nativeToolContractFingerprintForTarget(
   return `sha256:${createHash("sha256")
     .update(
       JSON.stringify({
-        schema: "paperclip.native-tool-contract.v8",
+        schema: "paperclip.native-tool-contract.v9",
         executionTargetKind,
         advertisementPolicy: {
           // Direct provider threads retain declarations from thread/start.
@@ -36,7 +36,7 @@ export function nativeToolContractFingerprintForTarget(
           readChatAttachment: "always_advertised_run_scope_local_staging.v1",
           structuredHumanInput:
             "always_advertised_run_issue_agent_binding_gated.v1",
-          semanticCompletion: "finish_response_wake_concrete_object.v2",
+          semanticCompletion: "finish_response_wake_user_facing_summary.v3",
         },
         tools: [
           ...(executionTargetKind === "local"

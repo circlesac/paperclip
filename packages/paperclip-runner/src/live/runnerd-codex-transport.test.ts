@@ -647,6 +647,25 @@ it("keeps ACPX terminal tools under the reserved runner-owned catalog", () => {
   });
 });
 
+it("preserves answer and internal wait descriptions in the serialized native tool catalog", () => {
+  const catalog = JSON.parse(
+    JSON.stringify(authorizedToolSetForProvider("codex", codexSemanticToolSpecs())),
+  );
+  const finish = catalog.operations.find(
+    (operation: { operationId: string }) =>
+      operation.operationId === "paperclip_finish",
+  );
+  expect(finish.inputSchema.properties.summary.description).toContain(
+    "complete user-facing answer",
+  );
+  expect(finish.inputSchema.properties.summary.description).toContain(
+    "genuine actionable failure, limitation, or required user action",
+  );
+  expect(
+    finish.inputSchema.properties.continuation.properties.summary.description,
+  ).toContain("not in the top-level user-facing summary");
+});
+
 it("defaults runnerd ACPX permissions to approve reads", () => {
   expect(resolveRunnerdAcpxPermissionMode(undefined)).toBe("approve-reads");
   expect(resolveRunnerdAcpxPermissionMode("deny-all")).toBe("deny-all");
