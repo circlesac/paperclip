@@ -243,8 +243,14 @@ export class CodexHarnessSession
     this.assertProtocolIntegrity();
     const turn = record(response.turn);
     const turnId = text(turn.id);
-    if (turnId.length === 0)
+    if (turnId.length === 0) {
+      // A start notification is only optimistic until the response validates.
+      // Clear it before released semantic/terminal waiters can observe an
+      // active turn for a request that was never accepted.
+      this.activeTurnId = null;
+      this.turnStarted = false;
       throw new Error("Codex turn response omitted turn.id");
+    }
     if (this.activeTurnId !== null && this.activeTurnId !== turnId) {
       this.failProtocol(
         "turn_start_mismatch",

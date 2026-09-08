@@ -13,15 +13,25 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   merged. Keep one PR: published head `5aa2ac46c` is **497 files**, below 500.
   CI `34252696878` passed every lane. Greptile reviewed this exact head at
   **5/5** with no outstanding finding. A subsequently reproduced early-turn
-  semantic-call race has been fixed and verified before the next push; recount
-  and renew final-head gates. New master `be6bb768b` (accessible-company
-  navigation) must also be incorporated before that final push.
+  semantic-call race is fixed in `46a946aae`. Master `be6bb768b`
+  (accessible-company navigation) is incorporated in `49de75691`; the diff
+  remains **497 files** with no lockfile delta. Renew final-head gates after
+  pushing these changes and the qualification record.
+  A final direct-driver malformed-response edge is also fixed: clear the
+  optimistic turn before rejecting a response without `turn.id`. Its
+  deterministic repro went red to green; **178/178** focused driver tests
+  (including 17 integrity/composition cases) and runner no-emit typecheck pass.
+  The native transport already rejects this malformed response; the additional
+  driver defense still needs build/deployment after the current broad run.
 - The default-off **Experimental > Chat connectors** setting is implemented.
   Production GitHub tools remain visible and open directly without the
   chat/tool choice when disabled. Default-off and enabled browser flows passed.
   This is a UI visibility gate: active connections continue delivering until
   explicitly paused.
-- Master is incorporated through `5752d6bd9` in merge `48767c1c0`. The newest
+- Master is incorporated through `be6bb768b` in merge `49de75691`. Its
+  accessible-company compatibility check passed **256 UI + 32 server tests**;
+  full workspace typecheck and build passed again on the merged branch.
+  Previously, master `5752d6bd9` was incorporated in `48767c1c0`. Its
   sandbox startup/recovery compatibility cohort passed **246/246**. Full
   workspace typecheck/build also passed with the integrity production changes.
   Previously, master through `023e640a7` was merged in `21061f4de`. Full
@@ -63,11 +73,13 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current deployed state and evidence
 
-The live server was restarted at **16:57:20 UTC**, log
-`.paperclip-runtime/chat-adapters-live/server-experimental-landing-47.log`.
-It runs `5aa2ac46c` plus the verified turn-admission production patch. The
-restart had zero active/queued runs. Slack/GitHub/Telegram continuation smoke
-checks returned exact answers in **14.741 / 18.018 / 15.940 seconds**, on the
+The live server was restarted at **17:03:55.700 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-48.log`.
+It runs merged head `49de75691`, including the turn-admission patch and
+accessible-company navigation. The restart had zero active/queued runs.
+The same native production code on server 47 passed Slack/GitHub/Telegram
+continuation smoke checks, returning exact answers in **14.741 / 18.018 /
+15.940 seconds**, on the
 same tasks using native Luna. The earlier server-46 restart applied migration
 0256 normally and its smoke returned in 13.146 / 17.148 / 16.602 seconds.
 Each working/final operation used one attempt and updated one provider message.
@@ -148,7 +160,10 @@ switch to Terra. The signed/staged runner SHA-256 is
   Do not substitute a timing delay or weaken the old-owner/archive/result
   assertions. Failure-only fixture logs remain bounded and contain synthetic
   fixture state only. A new complete `pnpm test:run` started after the final
-  build in `admission-workspace-tests-final-0908.log`; it is not yet complete.
+  admission build in `admission-workspace-tests-final-0908.log`; it is not yet
+  complete. It began before the small accessible-company master merge and
+  final malformed-response defense; those changes have separate 288-test
+  compatibility/typecheck/build and 178-test driver/typecheck proof.
 
 ## Remaining work
 

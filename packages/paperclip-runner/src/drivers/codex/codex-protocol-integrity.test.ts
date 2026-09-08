@@ -286,12 +286,18 @@ describe("Codex protocol integrity propagation", () => {
     },
   );
 
-  it.each(["start-rejected", "integrity-fault"] as const)(
+  it.each([
+    "start-rejected",
+    "invalid-start-response",
+    "integrity-fault",
+  ] as const)(
     "does not admit a queued semantic result after %s while turn admission is pending",
     async (failure) => {
       const transport = new FakeCodexTransport();
       let rejectStart!: (error: Error) => void;
-      transport.turnStartResponse = new Promise((_resolve, reject) => {
+      let resolveStart!: (response: Record<string, unknown>) => void;
+      transport.turnStartResponse = new Promise((resolve, reject) => {
+        resolveStart = resolve;
         rejectStart = reject;
       });
       const session = await makeDriver([transport]).openSession({
@@ -341,8 +347,15 @@ describe("Codex protocol integrity propagation", () => {
           transport.queue.fail(fault);
           await vi.waitFor(() => expect(session.protocolFailed).toBe(true));
         }
-        rejectStart(fault);
-        expect(await started).toBe(fault);
+        if (failure === "invalid-start-response") {
+          resolveStart({ turn: { status: "inProgress", items: [] } });
+          expect(await started).toMatchObject({
+            message: "Codex turn response omitted turn.id",
+          });
+        } else {
+          rejectStart(fault);
+          expect(await started).toBe(fault);
+        }
         if (failure === "integrity-fault") expect(await semantic).toBe(fault);
         else expect(await semantic).toMatchObject({ success: false });
         expect(

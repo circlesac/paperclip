@@ -1119,3 +1119,43 @@ Discord still requires renewed browser login; Teams still requires a tenant.
 Before this admission fix, PR head `5aa2ac46c` passed all CI lanes in
 `34252696878` and Greptile at **5/5**. Those gates must run again for the new
 patch and latest master `be6bb768b`, which arrived during final qualification.
+
+### Accessible-company master merge and final landing pass
+
+Merge `49de75691` incorporates master `be6bb768b` after admission fix
+`46a946aae`. The only manual conflict retained both the chat OpenAPI assertions
+and upstream accessible-company query assertions. The review diff remains
+**497 files** and has no lockfile delta. The merged compatibility cohort passed
+**256 UI + 32 server tests**, covering company selection, catalog routes,
+production GitHub tools, experimental chat visibility, authorization and
+OpenAPI. Full workspace typecheck and build passed again after this merge.
+
+Isolated server **48** started at **17:03:55.700 UTC** from `49de75691`,
+with zero active/queued heartbeats before shutdown. Server 47's three live
+native continuations above cover the unchanged native admission code; this
+restart additionally loads the merged company route. The broad local test
+invocation began before this small master merge and is still running; its
+earlier failed invocations remain recorded. New final-head CI and Greptile
+review are required before merge, even though the preceding published head
+passed both.
+
+Root reloaded the existing Board catalog. It showed the expected company,
+all four configured connections as active, and the enabled experimental chat
+surfaces without an error banner. The initial loading screen resolved and
+the server health became ready. This is a catalog smoke on the merged server,
+not a repeat of the separately qualified default-off or provider journeys.
+
+Final independent driver review found one additional direct-transport edge.
+An optimistic `turn/started` notification could set the active identity, then
+a start response without `turn.id` threw without clearing it. An already
+queued semantic call could consequently succeed despite failed admission.
+The deterministic case failed before the fix. Clearing the provisional active
+turn and started state before the existing throw now rejects that call and
+preserves the original omitted-id error. The focused Codex cohort passed
+**178/178** across nine files, including 17 integrity/composition cases;
+runner no-emit TypeScript checks passed. No accepted/result/terminal completion
+event escaped the failed start. The native transport has its own malformed
+response guard; this closes the driver layer too. No further admission-fence
+blocker was found. Build/deployment of this final small defense is pending;
+server 48 still contains the preceding verified driver source. The broad run
+started before this follow-up and is not exact-final-head proof for this hunk.
