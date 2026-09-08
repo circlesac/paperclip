@@ -137,6 +137,7 @@ import {
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { safeChatTaskUrl } from "./chat-task-url.js";
+import { resyncGitHubAppWebhook } from "./chat-github-webhook-config.js";
 import {
   GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS,
   GitHubAttachmentUnavailableError,
@@ -185,6 +186,12 @@ import {
   enqueueChatRunMilestones,
   safeMilestoneText,
 } from "./chat-run-publications.js";
+import {
+  inboundWakePublicationKey,
+  inboundWakePublicationText,
+  parseInboundWakePublicationKey,
+  resolveInboundWakeReceipt,
+} from "./chat-inbound-wakeup-publications.js";
 import {
   normalizeMicrosoftTeamsCredentialIds,
   normalizeMicrosoftTeamsExternalPrincipalId,
@@ -661,7 +668,7 @@ type LifecycleRuntimeFence = Pick<
   "credentialFingerprint" | "generation"
 >;
 type InboundRuntimeContext = LifecycleRuntimeFence &
-  Pick<RuntimeContext, "endpointRuntime">;
+  Pick<RuntimeContext, "discordGatewayOwned" | "endpointRuntime">;
 type VerifiedProviderIdentity = {
   providerAccountId?: string | null;
   providerAccountLabel?: string | null;
@@ -1210,6 +1217,8 @@ export interface ChatChannelServiceOptions {
   discordGatewayEventBarrier?: (
     event: DiscordGatewayCallbackEvent,
   ) => Promise<void>;
+  /** Testable boundary after initial Gateway ownership and before admission. */
+  discordGatewayMessageAdmissionBarrier?: () => Promise<void>;
   /** Testable barrier before the credential-leased Discord root creation. */
   discordRootThreadTransportBarrier?: () => Promise<void>;
   /** Testable boundary after a Slack task-admission worker claims its attempt. */
@@ -2777,6 +2786,54 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ownership.expiresAt = expiresAt;
       return true;
     });
+  }
+
+  async function renewDiscordGatewayOwnershipForMessageAdmission(
+    tx: DbTransaction,
+    endpointId: string,
+    context: InboundRuntimeContext,
+  ): Promise<
+    | {
+        kind: "owned";
+        expiresAt: Date;
+        ownership: DiscordGatewayOwnership;
+      }
+    | { kind: "lost"; ownership: DiscordGatewayOwnership | null }
+  > {
+    const ownership = discordGatewayOwnerships.get(endpointId);
+    if (
+      !ownership ||
+      ownership.stopping ||
+      ownership.context !== context ||
+      context.discordGatewayOwned !== true ||
+      context.endpointRuntime === undefined ||
+      runtime.get(endpointId) !== context.endpointRuntime
+    ) {
+      return {
+        kind: "lost",
+        ownership: ownership?.context === context ? ownership : null,
+      };
+    }
+    const now = new Date();
+    const expiresAt = new Date(
+      now.getTime() +
+        (options.discordGatewayLeaseTtlMs ?? DISCORD_GATEWAY_LEASE_TTL_MS),
+    );
+    const renewed = await tx
+      .update(chatEndpointLeases)
+      .set({ expiresAt, updatedAt: now })
+      .where(
+        and(
+          eq(chatEndpointLeases.companyId, ownership.companyId),
+          eq(chatEndpointLeases.endpointId, ownership.endpointId),
+          eq(chatEndpointLeases.leaseKey, ownership.leaseKey),
+          eq(chatEndpointLeases.token, ownership.token),
+        ),
+      )
+      .returning({ id: chatEndpointLeases.id });
+    return renewed.length
+      ? { kind: "owned", expiresAt, ownership }
+      : { kind: "lost", ownership };
   }
 
   function refreshDiscordGatewayOwnership(
@@ -7795,6 +7852,36 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const next = await endpointRecord(endpoint.id);
       if (!next) throw notFound("Chat endpoint not found");
       await invalidateRuntime(endpoint.id);
+      if (endpoint.provider === "github" && input.action === "reconnect") {
+        // The immutable App and its installation were verified above. Repair
+        // only its callback using the stored secret; never reinstall it or
+        // change repository access. Keep historical signed-ping evidence, but
+        // require the fresh test round trip established above before activation.
+        const auditWebhookSync = async (action: string) => {
+          await db.transaction(async (tx) => {
+            await credentialLease.assertOwned(tx);
+            await logActivity(tx as unknown as Db, {
+              companyId: endpoint.companyId,
+              actorType: "user",
+              actorId: actorUserId ?? "board",
+              action,
+              entityType: "tool_connection",
+              entityId: endpoint.connectionId,
+              details: { endpointId: endpoint.id, provider: "github" },
+            });
+            await credentialLease.assertOwned(tx);
+          });
+        };
+        await auditWebhookSync("chat_endpoint.webhook_sync_started");
+        await credentialLease.assertOwned();
+        await resyncGitHubAppWebhook({
+          fetch: fetchImpl,
+          appToken: githubAppJwt(credentials.appId, credentials.privateKey),
+          webhookUrl: `${webhookPublicBaseUrl}/api/chat-webhooks/${endpoint.publicId}/github`,
+          webhookSecret: credentials.webhookSecret,
+        });
+        await auditWebhookSync("chat_endpoint.webhook_synced");
+      }
       await runtimeFor(next.endpoint, {
         requireDiscordOwnership: next.endpoint.provider === "discord",
         waitForDiscordOwnership: next.endpoint.provider === "discord",
@@ -9263,6 +9350,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function authorizeInboundWakeup(
     tx: DbOrTransaction,
     action: typeof chatActions.$inferSelect,
+    notice?: { nonblocking: true; terminal: boolean },
   ) {
     const payload = action.payload;
     const deny = () =>
@@ -9291,13 +9379,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           eq(issues.id, payload.issueId),
         ),
       )
-      .for("update")
+      .for("update", notice ? { noWait: true } : undefined)
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (
       !issue ||
       issue.assigneeAgentId !== payload.agentId ||
-      ["backlog", "done", "cancelled"].includes(issue.status)
+      (!notice?.terminal &&
+        ["backlog", "done", "cancelled"].includes(issue.status))
     )
       throw deny();
     // The scheduler already owns the issue lock. Do not wait in the opposite
@@ -9380,7 +9469,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       action.principalId,
     );
     const expectedUserId =
-      payload.requestedByActorType === "user" ? payload.requestedByActorId : null;
+      payload.requestedByActorType === "user"
+        ? payload.requestedByActorId
+        : null;
     if (
       !(conversation.isDirectMessage
         ? endpoint.allowDirectMessages
@@ -9417,9 +9508,373 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    if (!source || source.deletedAt || source.authorUserId !== expectedUserId)
+    if (
+      !source ||
+      (source.deletedAt && !notice?.terminal) ||
+      source.authorUserId !== expectedUserId
+    )
       throw deny();
     return { issue, delivery, endpoint, conversation };
+  }
+
+  function inboundWakeScope(action: typeof chatActions.$inferSelect) {
+    return JSON.stringify([
+      action.companyId,
+      action.endpointId,
+      action.conversationId,
+      action.deliveryId,
+      action.principalId,
+      action.kind,
+      ...[
+        "version",
+        "issueId",
+        "agentId",
+        "commentId",
+        "sessionGeneration",
+        "requestedByActorType",
+        "requestedByActorId",
+      ].map((key) => action.payload[key]),
+    ]);
+  }
+
+  async function currentInboundWakeNotice(
+    tx: DbOrTransaction,
+    action: typeof chatActions.$inferSelect,
+    terminal: boolean,
+  ) {
+    const identityLock = await tx.execute(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${`chat-identity:${action.companyId}:${action.principalId}`}, 0)) as locked`,
+    );
+    if (!identityLock[0]?.locked)
+      throw new NativeChatReviewPresentationContentionError();
+    const authorized = await authorizeInboundWakeup(tx, action, {
+      nonblocking: true,
+      terminal,
+    });
+    // The policy locks above serialize destination/identity changes. Re-read
+    // both receipts under NOWAIT locks: cancellation can update them without
+    // taking the policy locks, and must win if it committed first.
+    const [delivery] = await tx
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.id, action.deliveryId!))
+      .for("update", { noWait: true });
+    const [currentAction] = await tx
+      .select()
+      .from(chatActions)
+      .where(eq(chatActions.id, action.id))
+      .for("update", { noWait: true });
+    if (
+      !currentAction ||
+      inboundWakeScope(currentAction) !== inboundWakeScope(action) ||
+      !["processed", "failed"].includes(currentAction.status) ||
+      !delivery ||
+      delivery.state !== "processed" ||
+      delivery.companyId !== action.companyId ||
+      delivery.endpointId !== action.endpointId ||
+      delivery.conversationId !== action.conversationId ||
+      delivery.principalId !== action.principalId
+    )
+      return null;
+    const [comment] = await tx
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.id, String(action.payload.commentId)),
+          eq(issueComments.companyId, action.companyId),
+          eq(issueComments.issueId, authorized.issue.id),
+        ),
+      )
+      .for("share", { noWait: true });
+    if (
+      !comment ||
+      (comment.deletedAt && !terminal) ||
+      comment.authorUserId !==
+        (action.payload.requestedByActorType === "user"
+          ? action.payload.requestedByActorId
+          : null)
+    )
+      return null;
+    const [receipt] = await tx
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, action.id))
+      .for("update", { noWait: true });
+    const ownerId =
+      receipt?.payload?.coalescedIntoWakeupRequestId ?? receipt?.id;
+    if (typeof ownerId !== "string" || !isUuidLike(ownerId)) return null;
+    const owner =
+      ownerId === receipt?.id
+        ? receipt
+        : await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, ownerId))
+            .for("update", { noWait: true })
+            .then((rows) => rows[0]);
+    const resolved = resolveInboundWakeReceipt(
+      currentAction,
+      receipt ?? null,
+      owner ?? null,
+      terminal && comment.deletedAt !== null,
+    );
+    return resolved ? { ...resolved, ...authorized } : null;
+  }
+
+  let inboundWakeNoticeCursor: { createdAt: Date; id: string } | null = null;
+
+  async function inboundQueueNoticeStillVisible(
+    tx: DbOrTransaction,
+    publication: typeof chatPublications.$inferSelect,
+  ) {
+    if (publication.state !== "published" || !publication.providerMessageId)
+      return false;
+    const [link] = await tx
+      .select({ id: chatMessageLinks.id })
+      .from(chatMessageLinks)
+      .where(
+        and(
+          eq(chatMessageLinks.companyId, publication.companyId),
+          eq(chatMessageLinks.endpointId, publication.endpointId),
+          eq(chatMessageLinks.conversationId, publication.conversationId),
+          eq(chatMessageLinks.publicationId, publication.id),
+          eq(chatMessageLinks.providerMessageId, publication.providerMessageId),
+          eq(chatMessageLinks.direction, "outbound"),
+          isNull(chatMessageLinks.commentId),
+        ),
+      )
+      .for("update", { noWait: true });
+    return Boolean(link);
+  }
+
+  async function enqueueInboundWakeupPublications(limit = 50): Promise<number> {
+    if (shuttingDown) return 0;
+    const owner = alias(agentWakeupRequests, "chat_notice_owner");
+    const cursor = inboundWakeNoticeCursor;
+    const sourceRemoved = sql`exists (select 1 from issue_comments removed_comment
+      where removed_comment.company_id = ${chatActions.companyId}
+        and removed_comment.issue_id::text = ${chatActions.payload}->>'issueId'
+        and removed_comment.id::text = ${chatActions.payload}->>'commentId'
+        and removed_comment.deleted_at is not null)`;
+    const hasVisibleQueue = sql`exists (select 1 from chat_publications queued_notice
+      join chat_message_links visible_queue on visible_queue.publication_id = queued_notice.id
+        and visible_queue.company_id = queued_notice.company_id
+        and visible_queue.endpoint_id = queued_notice.endpoint_id
+        and visible_queue.conversation_id = queued_notice.conversation_id
+        and visible_queue.provider_message_id = queued_notice.provider_message_id
+        and visible_queue.direction = 'outbound' and visible_queue.comment_id is null
+      where queued_notice.company_id = ${chatActions.companyId}
+        and queued_notice.comment_id::text = ${chatActions.payload}->>'commentId'
+        and queued_notice.state = 'published'
+        and queued_notice.idempotency_key = 'wake:' || ${owner.id}::text || ':queued:' ||
+          ${chatActions.endpointId}::text || ':' || ${chatActions.conversationId}::text)`;
+    // A bounded keyset sweep, not an in-memory work queue. Advancing even past
+    // revoked candidates prevents an inaccessible old message starving others.
+    const candidates = await db
+      .select({ action: chatActions })
+      .from(chatActions)
+      .innerJoin(
+        agentWakeupRequests,
+        eq(agentWakeupRequests.id, chatActions.id),
+      )
+      .innerJoin(
+        owner,
+        sql`${owner.id}::text = coalesce(${agentWakeupRequests.payload}->>'coalescedIntoWakeupRequestId', ${agentWakeupRequests.id}::text)`,
+      )
+      .where(
+        and(
+          eq(chatActions.kind, "inbound_wakeup"),
+          inArray(chatActions.status, ["processed", "failed"]),
+          eq(owner.companyId, chatActions.companyId),
+          or(
+            and(
+              isNull(owner.runId),
+              inArray(owner.status, [
+                "deferred_issue_execution",
+                "cancelled",
+                "failed",
+                "skipped",
+              ]),
+            ),
+            and(sourceRemoved, hasVisibleQueue),
+          ),
+          sql`(( ${owner.status} = 'deferred_issue_execution'
+          and ${agentWakeupRequests.status} not in ('cancelled','failed','skipped') and not (${sourceRemoved}))
+          or ${hasVisibleQueue})`,
+          cursor
+            ? sql`(${chatActions.createdAt}, ${chatActions.id}) > (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+            : undefined,
+          sql`not exists (select 1 from chat_publications notice
+          where notice.company_id = ${chatActions.companyId}
+            and notice.idempotency_key = 'wake:' || ${owner.id}::text || ':' ||
+              (case when ${sourceRemoved} then 'removed' when ${owner.status} = 'deferred_issue_execution'
+                and ${agentWakeupRequests.status} not in ('cancelled','failed','skipped')
+                then 'queued' else 'not_started' end) || ':' ||
+              ${chatActions.endpointId}::text || ':' || ${chatActions.conversationId}::text)`,
+        ),
+      )
+      .orderBy(asc(chatActions.createdAt), asc(chatActions.id))
+      .limit(Math.max(1, Math.min(limit, 200)));
+    const last = candidates.at(-1)?.action;
+    inboundWakeNoticeCursor =
+      candidates.length >= Math.max(1, Math.min(limit, 200)) && last
+        ? { createdAt: last.createdAt, id: last.id }
+        : null;
+    let inserted = 0;
+    for (const { action } of candidates) {
+      try {
+        inserted += await db.transaction(async (tx) => {
+          const [receipt] = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, action.id));
+          const ownerId =
+            receipt?.payload?.coalescedIntoWakeupRequestId ?? receipt?.id;
+          if (
+            typeof ownerId !== "string" ||
+            !isUuidLike(ownerId) ||
+            !action.conversationId
+          )
+            return 0;
+          const queuedKey = inboundWakePublicationKey(
+            ownerId,
+            "queued",
+            action.endpointId,
+            action.conversationId,
+          );
+          const [prior] = await tx
+            .select()
+            .from(chatPublications)
+            .where(
+              and(
+                eq(chatPublications.companyId, action.companyId),
+                eq(chatPublications.idempotencyKey, queuedKey),
+              ),
+            );
+          // Only the exact original notice may be retired; never post a failure
+          // notice for input which never received a provider queue acknowledgement.
+          if (
+            prior &&
+            (prior.state !== "published" ||
+              prior.commentId !== action.payload.commentId)
+          )
+            return 0;
+          const context = await currentInboundWakeNotice(
+            tx,
+            action,
+            Boolean(prior),
+          );
+          if (
+            !context ||
+            context.ownerId !== ownerId ||
+            context.state === "promoted" ||
+            (context.state !== "queued" && !prior) ||
+            (context.state === "queued" && prior)
+          )
+            return 0;
+          if (prior && !(await inboundQueueNoticeStillVisible(tx, prior)))
+            return 0;
+          const rows = await tx
+            .insert(chatPublications)
+            .values({
+              companyId: action.companyId,
+              endpointId: action.endpointId,
+              conversationId: action.conversationId,
+              issueId: context.issue.id,
+              commentId: String(action.payload.commentId),
+              idempotencyKey: inboundWakePublicationKey(
+                ownerId,
+                context.state,
+                action.endpointId,
+                action.conversationId,
+              ),
+              payload: projectSafeChatPublication({
+                classification: "external",
+                source: "safe_milestone",
+                text: inboundWakePublicationText(context.state),
+                progressState: context.state === "queued" ? "queued" : "failed",
+              }),
+            })
+            .onConflictDoNothing()
+            .returning({ id: chatPublications.id });
+          return rows.length;
+        });
+      } catch (error) {
+        if (
+          !isExternalActionAuthorizationChange(error) &&
+          !isExternalChatWaitAuthorizationContention(error) &&
+          !(error instanceof NativeChatReviewPresentationContentionError)
+        )
+          throw error;
+      }
+    }
+    return inserted;
+  }
+
+  async function authorizeInboundWakePublication(
+    tx: DbOrTransaction,
+    publication: typeof chatPublications.$inferSelect,
+  ) {
+    const key = parseInboundWakePublicationKey(publication.idempotencyKey);
+    if (
+      !key ||
+      key.endpointId !== publication.endpointId ||
+      key.conversationId !== publication.conversationId ||
+      !publication.commentId
+    )
+      return false;
+    const actions = await tx
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, publication.companyId),
+          eq(chatActions.endpointId, publication.endpointId),
+          eq(chatActions.conversationId, publication.conversationId),
+          eq(chatActions.kind, "inbound_wakeup"),
+          sql`${chatActions.payload}->>'issueId' = ${publication.issueId}`,
+          sql`${chatActions.payload}->>'commentId' = ${publication.commentId}`,
+        ),
+      )
+      .limit(2);
+    if (actions.length !== 1) return false;
+    if (key.state !== "queued") {
+      const [prior] = await tx
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.companyId, publication.companyId),
+            eq(chatPublications.commentId, publication.commentId),
+            eq(chatPublications.state, "published"),
+            eq(
+              chatPublications.idempotencyKey,
+              inboundWakePublicationKey(
+                key.wakeId,
+                "queued",
+                key.endpointId,
+                key.conversationId,
+              ),
+            ),
+          ),
+        );
+      if (!prior || !(await inboundQueueNoticeStillVisible(tx, prior)))
+        return false;
+    }
+    try {
+      const context = await currentInboundWakeNotice(
+        tx,
+        actions[0]!,
+        key.state !== "queued",
+      );
+      return context?.ownerId === key.wakeId && context.state === key.state;
+    } catch (error) {
+      if (isExternalActionAuthorizationChange(error)) return false;
+      if (isExternalChatWaitAuthorizationContention(error))
+        throw new NativeChatReviewPresentationContentionError();
+      throw error;
+    }
   }
 
   async function acceptInboundWakeup(
@@ -9933,6 +10388,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             conversationDrainKey(endpoint.id, thread.id),
           ) ?? Date.now() + reorderWindow)
         : null;
+    const discordGatewayAdmissionState: {
+      lost?: DiscordGatewayOwnership;
+      renewed?: {
+        expiresAt: Date;
+        ownership: DiscordGatewayOwnership;
+      };
+    } = {};
     const admission = await db.transaction(async (tx) => {
       const currentEndpoint = await tx
         .select({
@@ -9971,6 +10433,31 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const endpointAccepting =
         ["verifying", "active"].includes(currentEndpoint.status) &&
         !staleActivation;
+      if (
+        endpointAccepting &&
+        endpoint.provider === "discord" &&
+        runtimeContext &&
+        !admittedDeliveryId
+      ) {
+        // The first process-local ownership check can precede a host pause.
+        // Reclaim the same durable token while the endpoint admission row is
+        // locked so a standby takeover cannot be followed by an obsolete
+        // callback write. This renews only the exact token that authenticated
+        // the callback; generation and credential checks above remain intact.
+        const gatewayOwnership =
+          await renewDiscordGatewayOwnershipForMessageAdmission(
+            tx,
+            endpoint.id,
+            runtimeContext,
+          );
+        if (gatewayOwnership.kind === "lost") {
+          if (gatewayOwnership.ownership) {
+            discordGatewayAdmissionState.lost = gatewayOwnership.ownership;
+          }
+          return null;
+        }
+        discordGatewayAdmissionState.renewed = gatewayOwnership;
+      }
       let provisionalTeamsSetupReply = false;
       let destinationAccepting = true;
       if (endpointAccepting && thread.isDM) {
@@ -10266,6 +10753,28 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         provisionalTeamsSetupReply,
       };
     });
+    // The database token is authoritative. Publish its new expiry to the
+    // process-local fast path only after the admission transaction commits.
+    // Conversely, synchronously fence an obsolete local owner after a failed
+    // token CAS, then stop it without awaiting the callback it may be serving.
+    const renewedDiscordOwnership = discordGatewayAdmissionState.renewed;
+    if (
+      renewedDiscordOwnership &&
+      discordGatewayOwnerships.get(endpoint.id) ===
+        renewedDiscordOwnership.ownership &&
+      !renewedDiscordOwnership.ownership.stopping
+    ) {
+      renewedDiscordOwnership.ownership.expiresAt =
+        renewedDiscordOwnership.expiresAt;
+    }
+    const lostDiscordOwnership = discordGatewayAdmissionState.lost;
+    if (
+      lostDiscordOwnership &&
+      discordGatewayOwnerships.get(endpoint.id) === lostDiscordOwnership
+    ) {
+      lostDiscordOwnership.stopping = true;
+      void stopDiscordGatewayOwnership(lostDiscordOwnership);
+    }
     if (!admittedDeliveryId && admission?.candidate) {
       recordChatWebhookReceipt(
         endpoint.id,
@@ -12388,6 +12897,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         )))
     ) {
       return;
+    }
+    if (event.provider === "discord") {
+      await options.discordGatewayMessageAdmissionBarrier?.();
     }
     const record = await endpointRecord(event.endpointId);
     if (!record) throw notFound("Chat endpoint not found");
@@ -23886,6 +24398,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return null;
       }
       let authorizationActionId: string | null = null;
+      if (
+        input.publication.idempotencyKey.startsWith("wake:") &&
+        !(await authorizeInboundWakePublication(tx, input.publication))
+      )
+        return null;
       // A native response alongside an older completion review has its own
       // narrow authorization. Recheck that exact proof, review and original
       // requester at the transport claim, including file publications whose
@@ -24190,6 +24707,146 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return isUuidLike(runId) ? runId : null;
     }
     return null;
+  }
+
+  async function inboundWakePublicationToReplace(
+    publication: typeof chatPublications.$inferSelect,
+    payload: SafeChatPublicationPayload,
+  ): Promise<string | null> {
+    if (payload.attachmentIds?.length) return null;
+    const notice = parseInboundWakePublicationKey(publication.idempotencyKey);
+    let wakeId: string | null =
+      notice && notice.state !== "queued" ? notice.wakeId : null;
+    let runId = runIdFromMilestonePublication(publication);
+    if (
+      !notice &&
+      !runId &&
+      payload.interactionId &&
+      publication.idempotencyKey ===
+        `interaction:${payload.interactionId}:${publication.endpointId}`
+    ) {
+      const [interaction] = await db
+        .select({ runId: issueThreadInteractions.sourceRunId })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.id, payload.interactionId),
+            eq(issueThreadInteractions.companyId, publication.companyId),
+            eq(issueThreadInteractions.issueId, publication.issueId),
+            inArray(issueThreadInteractions.kind, [
+              "ask_user_questions",
+              "request_confirmation",
+            ]),
+          ),
+        );
+      runId = interaction?.runId ?? null;
+    }
+    if (!notice && !runId && publication.commentId) {
+      const [comment] = await db
+        .select({ runId: issueComments.createdByRunId })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.id, publication.commentId),
+            eq(issueComments.companyId, publication.companyId),
+            eq(issueComments.issueId, publication.issueId),
+          ),
+        );
+      runId = comment?.runId ?? null;
+    }
+    let runContext: Record<string, unknown> | null = null;
+    if (runId) {
+      if (publication.commentId) {
+        const [priorAnswer] = await db
+          .select({ id: chatPublications.id })
+          .from(chatPublications)
+          .innerJoin(
+            issueComments,
+            eq(issueComments.id, chatPublications.commentId),
+          )
+          .where(
+            and(
+              eq(chatPublications.companyId, publication.companyId),
+              eq(chatPublications.endpointId, publication.endpointId),
+              eq(chatPublications.conversationId, publication.conversationId),
+              eq(chatPublications.state, "published"),
+              eq(issueComments.createdByRunId, runId),
+              sql`${chatPublications.payload}->>'progressState' is null`,
+            ),
+          )
+          .limit(1);
+        if (priorAnswer) return null;
+      }
+      const [run] = await db
+        .select({
+          wakeId: heartbeatRuns.wakeupRequestId,
+          context: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .innerJoin(
+          agentWakeupRequests,
+          and(
+            eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
+            eq(agentWakeupRequests.runId, heartbeatRuns.id),
+            eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
+            eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
+            // Failed/cancelled is the admitted run's outcome, not loss of
+            // its original admission. Its terminal milestone still owns
+            // this exact lane even if no working update was sent first.
+            ne(agentWakeupRequests.status, "skipped"),
+          ),
+        )
+        .where(
+          and(
+            eq(heartbeatRuns.id, runId),
+            eq(heartbeatRuns.companyId, publication.companyId),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${publication.issueId}`,
+          ),
+        );
+      wakeId = run?.wakeId ?? null;
+      runContext = run?.context ?? null;
+    }
+    if (!wakeId) return null;
+    const [queued] = await db
+      .select({
+        commentId: chatPublications.commentId,
+        providerMessageId: chatPublications.providerMessageId,
+      })
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, publication.companyId),
+          eq(chatPublications.endpointId, publication.endpointId),
+          eq(chatPublications.conversationId, publication.conversationId),
+          eq(chatPublications.issueId, publication.issueId),
+          eq(chatPublications.state, "published"),
+          isNotNull(chatPublications.providerMessageId),
+          eq(
+            chatPublications.idempotencyKey,
+            inboundWakePublicationKey(
+              wakeId,
+              "queued",
+              publication.endpointId,
+              publication.conversationId,
+            ),
+          ),
+        ),
+      );
+    if (!queued?.commentId) return null;
+    if (notice && notice.state !== "queued")
+      return queued.commentId === publication.commentId
+        ? queued.providerMessageId
+        : null;
+    // A deferred owner can be a Board wake into which the exact external
+    // comment coalesced. The run must actually contain that source comment;
+    // wake ID alone cannot authorize a different successor's edit lane.
+    return runContext &&
+      (runContext.wakeCommentId === queued.commentId ||
+        runContext.commentId === queued.commentId ||
+        (Array.isArray(runContext.wakeCommentIds) &&
+          runContext.wakeCommentIds.includes(queued.commentId)))
+      ? queued.providerMessageId
+      : null;
   }
 
   async function stageDiscordReceiptReactionRemovals(
@@ -26072,6 +26729,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   eq(chatPublications.state, "published"),
                   sql`${chatPublications.idempotencyKey} not like 'explicit%'`,
                   sql`${chatPublications.idempotencyKey} not like 'control:status:%'`,
+                  sql`${chatPublications.idempotencyKey} not like 'wake:%'`,
                 ),
               )
               .orderBy(
@@ -26636,6 +27294,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               payload,
             )) ??
             (await runPublicationToReplace(publication, payload)) ??
+            (await inboundWakePublicationToReplace(publication, payload)) ??
             (await taskStatusPublicationToReplace(publication, payload)))
           : null;
         await withCredentialMutationLease(
@@ -26792,12 +27451,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                       !publication.idempotencyKey.startsWith("control:status:"),
                   });
                 } else {
+                  // A queue notice references its causal inbound comment for
+                  // authorization, but is not an authored copy of that comment.
+                  // Reactions/readers must not attribute bot status to the user.
+                  const linkedCommentId = parseInboundWakePublicationKey(
+                    publication.idempotencyKey,
+                  )
+                    ? null
+                    : publication.commentId;
                   const messageLinkInsert = tx.insert(chatMessageLinks).values({
                     companyId: publication.companyId,
                     endpointId: publication.endpointId,
                     conversationId: publication.conversationId,
                     publicationId: publication.id,
-                    commentId: publication.commentId,
+                    commentId: linkedCommentId,
                     providerMessageId: sent.id,
                     direction: "outbound",
                   });
@@ -26810,7 +27477,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                       ],
                       set: {
                         publicationId: publication.id,
-                        commentId: publication.commentId,
+                        commentId: linkedCommentId,
                       },
                     });
                   } else {
@@ -26861,6 +27528,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   !slackFileReceiptActionId &&
                   authorizationClaim.endpoint.provider === "slack" &&
                   !isExplicitOperatorPublication(publication) &&
+                  !parseInboundWakePublicationKey(publication.idempotencyKey) &&
                   !publication.idempotencyKey.startsWith("control:status:")
                 ) {
                   await stageSlackSessionSync(tx, {
@@ -26921,6 +27589,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     { waitForCompletion = true }: { waitForCompletion?: boolean } = {},
   ) {
     if (shuttingDown) return 0;
+    await enqueueInboundWakeupPublications();
     await reconcileTerminalConfirmationActions(limit);
     const now = new Date();
     const staleBefore = new Date(now.getTime() - 60_000);
@@ -27186,6 +27855,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publishBoardMessage,
     reconcileProviderRuntimes,
     processPendingPublications,
+    enqueueInboundWakeupPublications,
     schedulePendingPublications,
     processPendingDeliveries,
     processPendingGitHubWebhookIngress,

@@ -227,7 +227,7 @@ test-results/chat-adapters-live/<run-id>/<provider>/
 
 ### Provider lifecycle boundary
 
-Reconnect always retains the endpoint's immutable provider bot identity. It revalidates or replaces credentials for that identity; it does not silently install an app, expand provider access, or switch bots. Telegram additionally refreshes its Paperclip webhook and command menu during reconnect.
+Reconnect always retains the endpoint's immutable provider bot identity. It revalidates or replaces credentials for that identity; it does not silently install an app, expand provider access, or switch bots. Telegram additionally refreshes its Paperclip webhook and command menu during reconnect. GitHub reconnect uses the already-verified App's JWT to restore its current Paperclip webhook URL, stored secret, JSON encoding, and TLS verification. It does not change event subscriptions, repository permissions, installations, or GitHub's **Webhooks · Active** toggle. A successful configuration response is not connectivity proof: historical signed-ping evidence is retained, while a fresh inbound conversation, follow-up, and agent final remain required before activation.
 
 Removing a connection archives the Paperclip endpoint, stops its runtime, marks retained conversation history `endpoint_removed`, and retires endpoint-owned credentials. It is not a provider uninstall. Slack, GitHub, Discord, and Microsoft resources remain installed or registered until an operator removes them at the provider. Telegram is the one automated provider-cleanup exception: Paperclip durably removes the bot webhook and command menu before retiring the saved token, but the BotFather bot and its chat memberships still remain.
 

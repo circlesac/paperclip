@@ -131,7 +131,7 @@ const PROVIDER_LIFECYCLE_COPY: Record<
   },
   github: {
     reconnect:
-      "Reconnect verifies this same GitHub App and installation. It does not reinstall the App or change repository access.",
+      "Reconnect verifies this same App and installation, then updates its webhook URL, secret, and secure delivery settings. It does not reinstall the App or change repository access.",
     remove: "It does not uninstall the GitHub App",
   },
   discord: {
@@ -1643,7 +1643,9 @@ test.describe.serial("native chat adapter UI", () => {
       );
       expect(new URL(page.url()).searchParams.get("reconnect")).toBe("1");
       await expect(
-        page.getByRole("heading", { name: provider.setupHeading }),
+        page.getByRole("heading", {
+          name: provider.provider === "github" ? "Reconnect GitHub App" : provider.setupHeading,
+        }),
       ).toBeVisible();
       await expect(
         page.getByRole("button", { name: "Choose an active agent" }),
@@ -1653,6 +1655,16 @@ test.describe.serial("native chat adapter UI", () => {
         const connectButton = page.getByRole("button", {
           name: provider.setupButton,
         });
+        await expect(
+          page.getByText(
+            /Under the target user or organization, create a new GitHub App/,
+          ),
+        ).toHaveCount(0);
+        await expect(
+          page.getByText(
+            /Leave App ID and private key blank to reuse saved credentials/,
+          ),
+        ).toBeVisible();
         await page.getByLabel("GitHub App ID").fill("123456");
         await page
           .getByLabel("Private key (PEM)")
@@ -1700,7 +1712,7 @@ test.describe.serial("native chat adapter UI", () => {
           .getByRole("button", { name: "Reconnect", exact: true })
           .click();
         await expect(
-          page.getByRole("heading", { name: provider.setupHeading }),
+          page.getByRole("heading", { name: "Reconnect GitHub App" }),
         ).toBeVisible();
         await page.getByLabel("GitHub App ID").fill("123456");
         await page

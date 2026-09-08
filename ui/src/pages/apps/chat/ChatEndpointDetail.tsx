@@ -64,7 +64,7 @@ const providerLifecycleGuidance: Record<
   },
   github: {
     reconnect:
-      "Reconnect verifies this same GitHub App and installation. It does not reinstall the App or change repository access.",
+      "Reconnect verifies this same App and installation, then updates its webhook URL, secret, and secure delivery settings. It does not reinstall the App or change repository access.",
     remove:
       "Paperclip archives the endpoint, stops new ingress, and retires its saved App key and webhook secret. It does not uninstall the GitHub App: the App, its installations, and its webhook settings remain until you remove or update them on GitHub.",
   },

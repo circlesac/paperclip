@@ -1085,44 +1085,51 @@ settings:
     return (
       <div className="space-y-5">
         <div>
-          <h1 className="text-xl font-bold">Create or connect a GitHub App</h1>
+          <h1 className="text-xl font-bold">
+            {repairing
+              ? "Reconnect GitHub App"
+              : "Create or connect a GitHub App"}
+          </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {repairing
-              ? "Reconnect verifies this same GitHub App and installation. It does not reinstall the App or change repository access. Leave App ID and private key blank to reuse saved credentials."
+              ? "Reconnect verifies this same App and installation, then updates its webhook URL, secret, and secure delivery settings. It does not reinstall the App or change repository access. Leave App ID and private key blank to reuse saved credentials. Keep Webhooks · Active enabled in GitHub; send a test conversation after reconnecting."
               : "Configure its webhook and permissions, then verify the App with Paperclip."}
           </p>
         </div>
-        <ol className="list-decimal space-y-2 pl-5 text-sm">
-          <li>
-            Under the target user or organization, create a new GitHub App. Give
-            it a globally unique name (34 characters or fewer), use the
-            Paperclip homepage URL below, and leave user authorization off.
-          </li>
-          <li>
-            Keep <strong>Webhooks · Active</strong> on. Enter the Paperclip
-            webhook URL and the Paperclip-generated webhook secret below, and
-            keep <strong>Enable SSL verification</strong> selected.
-          </li>
-          <li>
-            Under Repository permissions, set <strong>Issues</strong> and{" "}
-            <strong>Pull requests</strong> to <strong>Read &amp; write</strong>.
-            Leave every other permission at its default; Metadata remains
-            read-only.
-          </li>
-          <li>
-            Subscribe to <strong>Issue comment</strong> (
-            <code>issue_comment</code>),{" "}
-            <strong>Pull request review comment</strong> (
-            <code>pull_request_review_comment</code>). GitHub sends{" "}
-            <code>installation</code> and <code>installation_repositories</code>{" "}
-            to every GitHub App automatically; they are not selectable here.
-          </li>
-          <li>
-            Choose <strong>Only on this account</strong>, create the App, copy
-            its App ID, generate one private key, then install it on the
-            selected repositories.
-          </li>
-        </ol>
+        {!repairing && (
+          <ol className="list-decimal space-y-2 pl-5 text-sm">
+            <li>
+              Under the target user or organization, create a new GitHub App.
+              Give it a globally unique name (34 characters or fewer), use the
+              Paperclip homepage URL below, and leave user authorization off.
+            </li>
+            <li>
+              Keep <strong>Webhooks · Active</strong> on. Enter the Paperclip
+              webhook URL and the Paperclip-generated webhook secret below, and
+              keep <strong>Enable SSL verification</strong> selected.
+            </li>
+            <li>
+              Under Repository permissions, set <strong>Issues</strong> and{" "}
+              <strong>Pull requests</strong> to{" "}
+              <strong>Read &amp; write</strong>. Leave every other permission at
+              its default; Metadata remains read-only.
+            </li>
+            <li>
+              Subscribe to <strong>Issue comment</strong> (
+              <code>issue_comment</code>),{" "}
+              <strong>Pull request review comment</strong> (
+              <code>pull_request_review_comment</code>). GitHub sends{" "}
+              <code>installation</code> and{" "}
+              <code>installation_repositories</code> to every GitHub App
+              automatically; they are not selectable here.
+            </li>
+            <li>
+              Choose <strong>Only on this account</strong>, create the App, copy
+              its App ID, generate one private key, then install it on the
+              selected repositories.
+            </li>
+          </ol>
+        )}
         {endpointValue(
           "Paperclip homepage URL",
           publicOrigin(endpoint.setup?.webhookUrl),

@@ -1039,6 +1039,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "credentialMutationLeaseRenewalIntervalMs"
         | "deferWebhookProcessing"
         | "discordGatewayEventBarrier"
+        | "discordGatewayMessageAdmissionBarrier"
         | "discordRootThreadTransportBarrier"
         | "discordGatewayLeaseRenewalIntervalMs"
         | "discordGatewayLeaseTtlMs"
@@ -1661,6 +1662,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       "issue_comment",
       "pull_request_review_comment",
     ];
+    const webhookSyncRequests: Array<Record<string, unknown>> = [];
+    let webhookSyncResponse: (() => Promise<Response>) | null = null;
     const appRegistrationId = Number.parseInt(
       fixture.companyId.replaceAll("-", "").slice(0, 8),
       16,
@@ -1668,8 +1671,28 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
       .privateKey.export({ type: "pkcs8", format: "pem" })
       .toString();
-    const providerFetch = (async (input: string | URL | Request) => {
+    const providerFetch = (async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
       const url = String(input);
+      if (url === "https://api.github.com/app/hook/config") {
+        expect(init?.method).toBe("PATCH");
+        const config = JSON.parse(String(init?.body)) as Record<
+          string,
+          unknown
+        >;
+        webhookSyncRequests.push(config);
+        if (webhookSyncResponse) return webhookSyncResponse();
+        return new Response(
+          JSON.stringify({
+            url: config.url,
+            content_type: config.content_type,
+            insecure_ssl: config.insecure_ssl,
+          }),
+          { status: 200 },
+        );
+      }
       if (url === "https://api.github.com/app") {
         return new Response(
           JSON.stringify({
@@ -1792,6 +1815,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       callbacks,
       webhookSecret,
       providerFetch,
+      webhookSyncRequests,
+      setWebhookSyncResponse(value: (() => Promise<Response>) | null) {
+        webhookSyncResponse = value;
+      },
       setInstallationId(value: number) {
         installationId = value;
       },
@@ -3762,6 +3789,190 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       webhookVerifiedAt: verifiedAt,
       runtimeGeneration: expect.any(Number),
     });
+  });
+
+  it("repairs the same GitHub App webhook on reconnect without claiming a fresh signed ping or chat round trip", async () => {
+    const fixture = await seedCompany();
+    const { endpoint, service, webhookSecret, webhookSyncRequests } =
+      await configuredGitHubEndpoint(fixture);
+    const before = await service.get(endpoint.id);
+    expect(webhookSyncRequests).toHaveLength(0);
+    const [storedBefore] = await db
+      .select({ setup: chatEndpoints.setup })
+      .from(chatEndpoints)
+      .where(eq(chatEndpoints.id, endpoint.id));
+    const refsBefore = await db
+      .select({ refs: toolConnections.credentialSecretRefs })
+      .from(toolConnections)
+      .where(eq(toolConnections.id, endpoint.connectionId));
+    const repaired = await service.configure(
+      endpoint.id,
+      { action: "reconnect" },
+      "owner-user",
+    );
+    expect(webhookSyncRequests).toEqual([
+      {
+        url: before.setup.webhookUrl,
+        content_type: "json",
+        insecure_ssl: "0",
+        secret: webhookSecret,
+      },
+    ]);
+    expect(repaired).toMatchObject({
+      id: endpoint.id,
+      assignedAgentId: fixture.assignedAgentId,
+      botExternalId: before.botExternalId,
+      status: "verifying",
+      setup: {
+        step: "test",
+        webhookVerifiedAt: before.setup.webhookVerifiedAt,
+      },
+    });
+    const [storedRepair] = await db
+      .select({
+        lastEventAt: chatEndpoints.lastEventAt,
+        setup: chatEndpoints.setup,
+      })
+      .from(chatEndpoints)
+      .where(eq(chatEndpoints.id, endpoint.id));
+    expect(storedRepair?.lastEventAt).toBeNull();
+    expect(storedRepair?.setup?.testStartedAt).not.toBe(
+      storedBefore?.setup?.testStartedAt,
+    );
+    expect(storedRepair?.setup?.runtimeGeneration).toBe(
+      Number(storedBefore?.setup?.runtimeGeneration) + 1,
+    );
+    await expect(service.test(endpoint.id)).rejects.toMatchObject({
+      details: { code: "chat_test_message_missing" },
+    });
+    expect(
+      await db
+        .select({ refs: toolConnections.credentialSecretRefs })
+        .from(toolConnections)
+        .where(eq(toolConnections.id, endpoint.connectionId)),
+    ).toEqual(refsBefore);
+    const audits = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, endpoint.connectionId));
+    expect(audits).toContainEqual({
+      action: "chat_endpoint.webhook_sync_started",
+      details: { endpointId: endpoint.id, provider: "github" },
+    });
+    expect(audits).toContainEqual({
+      action: "chat_endpoint.webhook_synced",
+      details: { endpointId: endpoint.id, provider: "github" },
+    });
+    expect(JSON.stringify({ repaired, audits })).not.toContain(webhookSecret);
+    await service.configure(endpoint.id, { action: "reconnect" }, "owner-user");
+    expect(webhookSyncRequests).toHaveLength(2);
+    expect(webhookSyncRequests[1]).toEqual(webhookSyncRequests[0]);
+  });
+
+  it.each(["http", "transport", "malformed", "mismatch", "oversized"])(
+    "leaves GitHub reconnect unqualified after a %s webhook repair failure",
+    async (failure) => {
+      const fixture = await seedCompany();
+      const {
+        endpoint,
+        service,
+        runtime,
+        webhookSecret,
+        setWebhookSyncResponse,
+      } = await configuredGitHubEndpoint(fixture);
+      setWebhookSyncResponse(async () => {
+        if (failure === "transport")
+          throw new Error(`private provider echo ${webhookSecret}`);
+        if (failure === "http")
+          return new Response(webhookSecret, { status: 403 });
+        if (failure === "oversized") return new Response(" ".repeat(32_769));
+        if (failure === "malformed") return new Response(webhookSecret);
+        return new Response(
+          JSON.stringify({
+            url: `https://bad.example/${webhookSecret}`,
+            content_type: "json",
+            insecure_ssl: "0",
+          }),
+        );
+      });
+      await expect(
+        service.configure(endpoint.id, { action: "reconnect" }, "owner-user"),
+      ).rejects.toMatchObject({
+        details: { code: "chat_provider_setup_failed" },
+      });
+      expect(runtime.endpoints.has(endpoint.id)).toBe(false);
+      const failed = await service.get(endpoint.id);
+      expect(failed).toMatchObject({ status: "attention" });
+      const audits = await db
+        .select({ action: activityLog.action, details: activityLog.details })
+        .from(activityLog)
+        .where(eq(activityLog.entityId, endpoint.connectionId));
+      expect(audits.map((row) => row.action)).toContain(
+        "chat_endpoint.webhook_sync_started",
+      );
+      expect(audits.map((row) => row.action)).not.toContain(
+        "chat_endpoint.webhook_synced",
+      );
+      expect(audits.map((row) => row.action)).not.toContain(
+        "chat_endpoint.reconnected",
+      );
+      expect(JSON.stringify({ failed, audits })).not.toContain(webhookSecret);
+      await expect(service.test(endpoint.id)).rejects.toMatchObject({
+        details: { code: "chat_endpoint_not_testing" },
+      });
+    },
+  );
+
+  it("does not complete GitHub webhook repair or overwrite a new credential lease owner after remote success", async () => {
+    const fixture = await seedCompany();
+    const {
+      endpoint,
+      service,
+      runtime,
+      setWebhookSyncResponse,
+      webhookSyncRequests,
+    } = await configuredGitHubEndpoint(fixture);
+    setWebhookSyncResponse(async () => {
+      await db
+        .update(chatEndpointLeases)
+        .set({ token: randomUUID() })
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, endpoint.id),
+            eq(chatEndpointLeases.leaseKey, "credentials"),
+          ),
+        );
+      await db
+        .update(chatEndpoints)
+        .set({ status: "attention", healthMessage: "Winning lease state" })
+        .where(eq(chatEndpoints.id, endpoint.id));
+      const config = webhookSyncRequests.at(-1)!;
+      return new Response(
+        JSON.stringify({
+          url: config.url,
+          content_type: "json",
+          insecure_ssl: "0",
+        }),
+      );
+    });
+    await expect(
+      service.configure(endpoint.id, { action: "reconnect" }, "owner-user"),
+    ).rejects.toMatchObject({ code: "CHAT_CREDENTIAL_LEASE_LOST" });
+    expect(runtime.endpoints.has(endpoint.id)).toBe(false);
+    await expect(service.get(endpoint.id)).resolves.toMatchObject({
+      status: "attention",
+      healthMessage: "Winning lease state",
+    });
+    const audits = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, endpoint.connectionId));
+    expect(audits.map((row) => row.action)).not.toContain(
+      "chat_endpoint.webhook_synced",
+    );
+    expect(audits.map((row) => row.action)).not.toContain(
+      "chat_endpoint.reconnected",
+    );
   });
 
   it("serializes concurrent GitHub setup-secret requests without losing stored credentials", async () => {
@@ -6948,6 +7159,279 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ),
     ).resolves.toHaveLength(1);
     await Promise.all([owner.service.shutdown(), standby.service.shutdown()]);
+  });
+
+  it("fences message and reaction callbacks that resume after Discord Gateway takeover", async () => {
+    const fixture = await seedCompany();
+    const applicationId = uniqueDiscordApplicationId();
+    const guildId = "1457808928258658549";
+    const channelId = "333333333333333334";
+    let holdOldCallbacks = false;
+    let releaseOldCallbacks!: () => void;
+    let messageAdmissionEntered!: () => void;
+    let reactionAdmissionEntered!: () => void;
+    const oldCallbacksReleased = new Promise<void>((resolve) => {
+      releaseOldCallbacks = resolve;
+    });
+    const messageAdmissionReached = new Promise<void>((resolve) => {
+      messageAdmissionEntered = resolve;
+    });
+    const reactionAdmissionReached = new Promise<void>((resolve) => {
+      reactionAdmissionEntered = resolve;
+    });
+    const providerFetch = fakeDiscordFetch(
+      applicationId,
+      guildId,
+    ) as typeof globalThis.fetch;
+    const ownerRuntime = new FakeChatSdkRuntime();
+    const owner = createService(ownerRuntime, providerFetch, {
+      discordGatewayLeaseRenewalIntervalMs: 60_000,
+      discordGatewayLeaseTtlMs: 200,
+      discordGatewayMessageAdmissionBarrier: async () => {
+        if (!holdOldCallbacks) return;
+        messageAdmissionEntered();
+        await oldCallbacksReleased;
+      },
+      reactionLinkPreflightBarrier: async () => {
+        if (!holdOldCallbacks) return;
+        reactionAdmissionEntered();
+        await oldCallbacksReleased;
+      },
+    });
+    const endpoint = await owner.service.create(
+      fixture.companyId,
+      { provider: "discord", assignedAgentId: fixture.assignedAgentId },
+      "owner-user",
+    );
+    await owner.service.configure(
+      endpoint.id,
+      {
+        action: "configure",
+        credentials: {
+          applicationId,
+          botToken: "discord-secret",
+          guildId,
+        },
+      },
+      "owner-user",
+    );
+    const rootMessageId = "555555555555555603";
+    const channel = makeThread({
+      channelId,
+      id: `discord:${guildId}:${channelId}:${rootMessageId}`,
+      name: "discord-callback-takeover",
+    });
+    const rootMessage = makeMessage({
+      id: rootMessageId,
+      mentioned: true,
+      text: "@maya establish the takeover fixture",
+      userId: "444444444444444445",
+    });
+    const setupCallbacks = ownerRuntime.configurations.get(
+      endpoint.id,
+    )?.callbacks;
+    if (!setupCallbacks) throw new Error("Expected owner Discord callbacks");
+    await deliverMessage({
+      callbacks: setupCallbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message: rootMessage,
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(
+      owner.service,
+      endpoint.id,
+      rootMessage.author.userId,
+    );
+    await owner.service.test(endpoint.id, "owner-user");
+    const staleRuntime = ownerRuntime.endpoints.get(endpoint.id);
+    const staleCallbacks = ownerRuntime.configurations.get(
+      endpoint.id,
+    )?.callbacks;
+    if (!staleRuntime || !staleCallbacks?.onReaction) {
+      throw new Error("Expected active owner Discord callbacks");
+    }
+    const [leaseBeforeTakeover] = await db
+      .select({ token: chatEndpointLeases.token })
+      .from(chatEndpointLeases)
+      .where(
+        and(
+          eq(chatEndpointLeases.endpointId, endpoint.id),
+          eq(chatEndpointLeases.leaseKey, "discord_gateway_runtime"),
+        ),
+      );
+    if (!leaseBeforeTakeover) throw new Error("Expected owner Gateway lease");
+
+    const messageId = "555555555555555604";
+    const bufferedMessage = makeMessage({
+      id: messageId,
+      text: "continue this once after takeover",
+      userId: rootMessage.author.userId,
+    });
+    const emoji = {
+      name: "thumbsup",
+      toJSON: () => "👍",
+      toString: () => "👍",
+    };
+    const reaction = {
+      endpointId: endpoint.id,
+      provider: "discord" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji,
+        message: rootMessage,
+        messageId: rootMessageId,
+        raw: {
+          channel_id: channelId,
+          emoji: { id: null, name: "👍" },
+          gateway_dispatch: {
+            eventType: "MESSAGE_REACTION_ADD",
+            sequence: 802,
+            sessionFingerprint: "d".repeat(24),
+            shardId: 0,
+          },
+          guild_id: guildId,
+          message_id: rootMessageId,
+          user_id: rootMessage.author.userId,
+        },
+        rawEmoji: "👍",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: rootMessage.author,
+      },
+    };
+    const commentCountBefore = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.companyId, fixture.companyId))
+      .then((rows) => rows.length);
+    const wakeupCountBefore = owner.wakeup.mock.calls.length;
+    holdOldCallbacks = true;
+    const staleMessage = deliverMessage({
+      callbacks: staleCallbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message: bufferedMessage,
+      trigger: "subscribed_message",
+    });
+    const staleReaction = staleCallbacks.onReaction(reaction);
+    await Promise.all([messageAdmissionReached, reactionAdmissionReached]);
+
+    const standbyRuntime = new FakeChatSdkRuntime();
+    const standby = createService(standbyRuntime, providerFetch);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const reconciled = await standby.service.reconcileProviderRuntimes();
+      expect(reconciled).toMatchObject({ ownedElsewhere: 0, failed: 0 });
+      const freshCallbacks = standbyRuntime.configurations.get(
+        endpoint.id,
+      )?.callbacks;
+      if (!freshCallbacks?.onReaction) {
+        throw new Error("Expected standby Discord callbacks");
+      }
+      const [leaseAfterTakeover] = await db
+        .select({ token: chatEndpointLeases.token })
+        .from(chatEndpointLeases)
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, endpoint.id),
+            eq(chatEndpointLeases.leaseKey, "discord_gateway_runtime"),
+          ),
+        );
+      expect(leaseAfterTakeover?.token).toBeTruthy();
+      expect(leaseAfterTakeover?.token).not.toBe(leaseBeforeTakeover.token);
+
+      releaseOldCallbacks();
+      await Promise.all([staleMessage, staleReaction]);
+      await expect(
+        db
+          .select({ id: chatDeliveries.id })
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              or(
+                eq(
+                  chatDeliveries.providerEventId,
+                  `${channel.thread.id}:${messageId}`,
+                ),
+                and(
+                  eq(chatDeliveries.eventKind, "reaction_added"),
+                  sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${rootMessageId}`,
+                ),
+              ),
+            ),
+          ),
+      ).resolves.toEqual([]);
+      await vi.waitFor(() => {
+        expect(staleRuntime.shutdown).toHaveBeenCalledOnce();
+      });
+
+      await deliverMessage({
+        callbacks: freshCallbacks,
+        endpointId: endpoint.id,
+        provider: "discord",
+        thread: channel.thread,
+        message: bufferedMessage,
+        trigger: "subscribed_message",
+      });
+      await freshCallbacks.onReaction(reaction);
+      await deliverMessage({
+        callbacks: freshCallbacks,
+        endpointId: endpoint.id,
+        provider: "discord",
+        thread: channel.thread,
+        message: bufferedMessage,
+        trigger: "subscribed_message",
+      });
+      await freshCallbacks.onReaction(reaction);
+
+      await expect(
+        db
+          .select({ state: chatDeliveries.state })
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              eq(
+                chatDeliveries.providerEventId,
+                `${channel.thread.id}:${messageId}`,
+              ),
+            ),
+          ),
+      ).resolves.toEqual([{ state: "processed" }]);
+      await expect(
+        db
+          .select({ state: chatDeliveries.state })
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              eq(chatDeliveries.eventKind, "reaction_added"),
+              sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${rootMessageId}`,
+            ),
+          ),
+      ).resolves.toEqual([{ state: "processed" }]);
+      expect(
+        await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.companyId, fixture.companyId))
+          .then((rows) => rows.length),
+      ).toBe(commentCountBefore + 1);
+      expect(owner.wakeup).toHaveBeenCalledTimes(wakeupCountBefore);
+      expect(standby.wakeup).toHaveBeenCalledOnce();
+    } finally {
+      releaseOldCallbacks();
+      await Promise.allSettled([staleMessage, staleReaction]);
+      await Promise.allSettled([
+        owner.service.shutdown(),
+        standby.service.shutdown(),
+      ]);
+    }
   });
 
   it("releases Discord ownership when runtime construction fails", async () => {
@@ -10786,7 +11270,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const guestRunId = randomUUID();
     // The stub scheduler's initial admission is now represented by the
     // running run seeded below, not an extra queued target for Slack Stop.
-    await db.update(agentWakeupRequests).set({ status: "claimed", runId: guestRunId })
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "claimed", runId: guestRunId })
       .where(eq(agentWakeupRequests.companyId, fixture.companyId));
     await db.insert(heartbeatRuns).values({
       id: guestRunId,
@@ -14410,7 +14896,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           issue_url:
             "https://api.github.com/repos/paperclipai/paperclip/issues/93",
           body,
-          body_html: `<a href="${["signed_anchor", "ambiguous_anchor"].includes(revokeAt) ? signedUrl : sourceUrl}"><img src="${signedUrl}"></a>`.repeat(revokeAt === "ambiguous_anchor" ? 2 : 1),
+          body_html:
+            `<a href="${["signed_anchor", "ambiguous_anchor"].includes(revokeAt) ? signedUrl : sourceUrl}"><img src="${signedUrl}"></a>`.repeat(
+              revokeAt === "ambiguous_anchor" ? 2 : 1,
+            ),
         });
       const warning = vi.spyOn(chatAttachmentLogger, "warn");
       let receiptMutation: Promise<unknown> | undefined;
@@ -14862,7 +15351,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         },
         payload: { issueId: pendingIntent.payload.issueId },
       }),
-    ).rejects.toMatchObject({ status: 409, details: { code: "chat_inbound_wakeup_unadmitted" } });
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "chat_inbound_wakeup_unadmitted" },
+    });
     expect(
       await db
         .select()
@@ -14946,7 +15438,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           const [delivery] = await db
             .select({ state: chatDeliveries.state })
             .from(chatDeliveries)
-            .innerJoin(chatActions, eq(chatActions.deliveryId, chatDeliveries.id))
+            .innerJoin(
+              chatActions,
+              eq(chatActions.deliveryId, chatDeliveries.id),
+            )
             .where(eq(chatActions.id, request.id));
           expect(delivery?.state).toBe("processed");
           if (failAdmission) {
@@ -14966,7 +15461,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         callbacks,
         endpointId: endpoint.id,
         thread,
-        message: makeMessage({ id, text: "@maya durable wake test", mentioned }),
+        message: makeMessage({
+          id,
+          text: "@maya durable wake test",
+          mentioned,
+        }),
         trigger: mentioned ? "mention" : "subscribed_message",
       });
       await db
@@ -15337,7 +15836,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const service = chatChannelService(db, {
       deferWebhookProcessing: true,
       fetch: fakeSlackFetch("U-BOT-DURABILITY") as typeof globalThis.fetch,
-      heartbeat: { wakeup: receiptBackedWakeup(vi.fn(async () => ({ accepted: true }))) },
+      heartbeat: {
+        wakeup: receiptBackedWakeup(vi.fn(async () => ({ accepted: true }))),
+      },
       publicBaseUrl: "https://paperclip.example",
     });
     const endpoint = await service.create(
@@ -15392,7 +15893,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       );
 
     const timingEvents: ChatWebhookDiagnosticEvent[] = [];
-    const observedApp = webhookApp(service, (event) => timingEvents.push(event));
+    const observedApp = webhookApp(service, (event) =>
+      timingEvents.push(event),
+    );
     const observedRequest = (retry = false, signatureOverride?: string) =>
       request(observedApp)
         .post(`/api/chat-webhooks/${endpoint.publicId}/slack`)
@@ -27333,7 +27836,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     globalThis.fetch = telegramFetch;
     const service = chatChannelService(db, {
       fetch: telegramFetch,
-      heartbeat: { wakeup: receiptBackedWakeup(vi.fn(async () => ({ accepted: true }))) },
+      heartbeat: {
+        wakeup: receiptBackedWakeup(vi.fn(async () => ({ accepted: true }))),
+      },
       publicBaseUrl: "https://paperclip.example",
     });
     try {
@@ -32949,15 +33454,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
     expect(runtime.endpoints.get(endpoint.id)?.reactions).toEqual([]);
     await vi.waitFor(async () => {
-      expect(await db.select({
-        state: chatDeliveries.state, redactedError: chatDeliveries.redactedError,
-        normalizedEvent: chatDeliveries.normalizedEvent,
-      }).from(chatDeliveries).where(eq(chatDeliveries.endpointId, endpoint.id))).toEqual([
+      expect(
+        await db
+          .select({
+            state: chatDeliveries.state,
+            redactedError: chatDeliveries.redactedError,
+            normalizedEvent: chatDeliveries.normalizedEvent,
+          })
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id)),
+      ).toEqual([
         {
-          state: "processed", redactedError: null,
+          state: "processed",
+          redactedError: null,
           normalizedEvent: expect.objectContaining({
             acknowledgement: { receiptReactionSupported: false },
-            message: expect.objectContaining({ text: "investigate the command path" }),
+            message: expect.objectContaining({
+              text: "investigate the command path",
+            }),
           }),
         },
       ]);
@@ -38120,12 +38634,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       endpointId: endpoint.id,
       provider: "telegram",
       thread: dm.thread,
-      message: makeMessage({ id: `${chatId}:101`, text: "Recover this turn safely", userId: chatId }),
+      message: makeMessage({
+        id: `${chatId}:101`,
+        text: "Recover this turn safely",
+        userId: chatId,
+      }),
       trigger: "direct_message",
     });
     await qualifySetupRoundTrip(service, endpoint.id, chatId);
     await service.test(endpoint.id, "owner-user");
-    const [conversation] = await db.select().from(chatConversations)
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
     if (!conversation) throw new Error("Expected Telegram conversation");
     const runId = randomUUID();
@@ -38143,11 +38663,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
     await expect(enqueueChatRunMilestones(db)).resolves.toBe(1);
     await service.processPendingPublications();
-    await db.update(heartbeatRuns).set({
-      errorCode: "native_execution_ownership_unverified",
-      error: "Private runner PID and executable authentication diagnostic",
-      updatedAt: new Date(),
-    }).where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        errorCode: "native_execution_ownership_unverified",
+        error: "Private runner PID and executable authentication diagnostic",
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId));
     await expect(enqueueChatRunMilestones(db)).resolves.toBe(1);
     await service.processPendingPublications();
     await expect(enqueueChatRunMilestones(db)).resolves.toBe(0);
@@ -38156,13 +38679,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(providerRuntime?.posts).toEqual([
       { threadId: dm.thread.id, text: "Maya is working…" },
     ]);
-    expect(providerRuntime?.edits).toEqual([{
-      threadId: dm.thread.id,
-      messageId: "outbound-2",
-      text: "Maya needs a Paperclip admin to safely recover this turn before more work can start. Open the task in Paperclip for details.",
-    }]);
-    expect(JSON.stringify(providerRuntime?.edits)).not.toContain("Private runner");
-    const [retainedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(providerRuntime?.edits).toEqual([
+      {
+        threadId: dm.thread.id,
+        messageId: "outbound-2",
+        text: "Maya needs a Paperclip admin to safely recover this turn before more work can start. Open the task in Paperclip for details.",
+      },
+    ]);
+    expect(JSON.stringify(providerRuntime?.edits)).not.toContain(
+      "Private runner",
+    );
+    const [retainedRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
     expect(retainedRun).toMatchObject({ status: "running", finishedAt: null });
   });
 
@@ -38548,8 +39078,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   );
 
   async function safeNativeProgressFixture(
-    provider: "slack" | "github" | "discord" | "telegram",
+    provider: ChatProvider,
     suffix: string,
+    teamsSurface: "channel" | "personal" = "channel",
   ) {
     const fixture = await seedCompany();
     const configured =
@@ -38559,9 +39090,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ? await configuredGitHubEndpoint(fixture)
           : provider === "discord"
             ? await configuredDiscordEndpoint(fixture)
-            : await configuredTelegramEndpoint(fixture);
+            : provider === "microsoft-teams"
+              ? await configuredTeamsEndpoint(fixture)
+              : await configuredTelegramEndpoint(fixture);
     const { callbacks, endpoint, runtime, service } = configured;
     const telegramChatId = `77113${suffix.padStart(3, "0")}`;
+    const teamsConversationId = `19:safe-progress-${suffix}@thread.${teamsSurface === "channel" ? "tacv2" : "v2"}`;
+    const teamsServiceUrl = "https://smba.trafficmanager.net/amer/";
     const messageId =
       provider === "slack"
         ? `1789000${suffix}.100001`
@@ -38569,7 +39104,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ? `9900${suffix}`
           : provider === "discord"
             ? `55555555555556${suffix.padStart(3, "0")}`
-            : `${telegramChatId}:101`;
+            : provider === "microsoft-teams"
+              ? `17400000${suffix.padStart(5, "0")}`
+              : `${telegramChatId}:101`;
     const thread =
       provider === "slack"
         ? makeThread({
@@ -38589,12 +39126,30 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
                 id: `discord:1457808928258658549:33333333333334${suffix.padStart(3, "0")}:${messageId}`,
                 name: `safe-progress-${suffix}`,
               })
-            : makeThread({
-                channelId: telegramChatId,
-                id: `telegram:${telegramChatId}`,
-                isDM: true,
-                name: `safe-progress-${suffix}`,
-              });
+            : provider === "microsoft-teams"
+              ? makeThread({
+                  channelId: `teams:${Buffer.from(teamsConversationId).toString("base64url")}:${Buffer.from(teamsServiceUrl).toString("base64url")}`,
+                  id: `teams:${Buffer.from(`${teamsConversationId}${teamsSurface === "channel" ? `;messageid=${messageId}` : ""}`).toString("base64url")}:${Buffer.from(teamsServiceUrl).toString("base64url")}`,
+                  isDM: teamsSurface === "personal",
+                  name: `safe-progress-${suffix}`,
+                })
+              : makeThread({
+                  channelId: telegramChatId,
+                  id: `telegram:${telegramChatId}`,
+                  isDM: true,
+                  name: `safe-progress-${suffix}`,
+                });
+    if (provider === "microsoft-teams" && teamsSurface === "channel") {
+      await db.insert(chatEndpointResources).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        type: "channel",
+        providerResourceId: teamsConversationId,
+        label: "Native progress channel",
+        availability: "available",
+        enabled: true,
+      });
+    }
     await deliverMessage({
       callbacks,
       endpointId: endpoint.id,
@@ -38602,14 +39157,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       thread: thread.thread,
       message: makeMessage({
         id: messageId,
-        mentioned: provider !== "telegram",
-        text:
-          provider === "telegram"
-            ? "Show safe progress"
-            : "@maya show safe progress",
+        mentioned: !thread.thread.isDM,
+        text: thread.thread.isDM
+          ? "Show safe progress"
+          : "@maya show safe progress",
         userId: provider === "telegram" ? telegramChatId : "U-SAFE-PROGRESS",
       }),
-      trigger: provider === "telegram" ? "direct_message" : "mention",
+      trigger: thread.thread.isDM ? "direct_message" : "mention",
     });
     const [conversation] = await db
       .select()
@@ -38641,7 +39195,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         conversationId: conversation.id,
         issueId: conversation.issueId,
         idempotencyKey: `run:${runId}:working:${endpoint.id}`,
-        payload: { text: `Maya is working on ${label}…`, progressState: "working" },
+        payload: {
+          text: `Maya is working on ${label}…`,
+          progressState: "working",
+        },
         state: "pending",
         createdAt: baseCreatedAt,
         updatedAt: baseCreatedAt,
@@ -38860,12 +39417,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     },
   );
 
-  it.each(["slack", "github", "discord", "telegram"] as const)(
-    "coalesces closed native progress on %s without projecting event content",
-    async (provider, index) => {
+  it.each([
+    ["slack", "1", "channel"],
+    ["github", "2", "channel"],
+    ["discord", "3", "channel"],
+    ["telegram", "4", "personal"],
+    ["microsoft-teams", "5", "channel"],
+    ["microsoft-teams", "6", "personal"],
+  ] as const)(
+    "coalesces closed native progress on %s fixture %s (%s) without projecting event content",
+    async (provider, suffix, surface) => {
       const context = await safeNativeProgressFixture(
         provider,
-        String(index + 1),
+        suffix,
+        surface,
       );
       const run = await context.createRun(`${provider} work`);
       await context.addEvent(run);
@@ -39090,7 +39655,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect.arrayContaining([
         expect.objectContaining({
           idempotencyKey: `run:${run.runId}:working:${context.endpoint.id}:native:using_tools:1`,
-          redactedError: "Run reached a terminal state before progress delivery",
+          redactedError:
+            "Run reached a terminal state before progress delivery",
           state: "cancelled",
         }),
       ]),
@@ -39235,138 +39801,164 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       db
         .select({ state: chatPublications.state })
         .from(chatPublications)
-        .where(
-          inArray(
-            chatPublications.commentId,
-            finalCommentIds,
-          ),
-        ),
+        .where(inArray(chatPublications.commentId, finalCommentIds)),
     ).resolves.toEqual([{ state: "published" }, { state: "published" }]);
     await restarted.service.shutdown();
   });
 
-  it("keeps native progress behind question, final, and current reach authority", async () => {
-    const context = await safeNativeProgressFixture("telegram", "9");
-
-    const questionRun = await context.createRun("a question");
-    await context.addEvent(questionRun);
-    await db.insert(issueThreadInteractions).values({
-      companyId: context.fixture.companyId,
-      issueId: context.conversation.issueId,
-      kind: "ask_user_questions",
-      continuationPolicy: "wake_assignee",
-      createdByAgentId: context.fixture.assignedAgentId,
-      sourceRunId: questionRun.runId,
-      status: "pending",
-      payload: {
-        version: 1,
-        prompt: "Choose one",
-        questions: [
-          {
-            id: "choice",
-            prompt: "Choose one",
-            options: [
-              { id: "a", label: "A" },
-              { id: "b", label: "B" },
-            ],
-          },
-        ],
-      },
-    });
-    await expect(
-      enqueueChatRunMilestones(db, { since: new Date(0) }),
-    ).resolves.toBe(0);
-
-    const revokedRun = await context.createRun("revoked reach");
-    await context.addEvent(revokedRun);
-    await expect(
-      enqueueChatRunMilestones(db, { since: new Date(0) }),
-    ).resolves.toBe(1);
-    await db
-      .update(chatEndpoints)
-      .set({ allowDirectMessages: false, updatedAt: new Date() })
-      .where(eq(chatEndpoints.id, context.endpoint.id));
-    await context.service.processPendingPublications(100);
-    const [revokedProgress] = await db
-      .select()
-      .from(chatPublications)
-      .where(
-        like(
-          chatPublications.idempotencyKey,
-          `run:${revokedRun.runId}:working:${context.endpoint.id}:native:%`,
-        ),
+  it.each([
+    ["telegram", "9", "personal"],
+    ["microsoft-teams", "10", "personal"],
+    ["microsoft-teams", "11", "channel"],
+  ] as const)(
+    "keeps native progress behind question, final, and current reach authority on %s fixture %s (%s)",
+    async (provider, suffix, surface) => {
+      const context = await safeNativeProgressFixture(
+        provider,
+        suffix,
+        surface,
       );
-    expect(revokedProgress).toMatchObject({ state: "cancelled", attempts: 1 });
-    await db
-      .update(chatEndpoints)
-      .set({ allowDirectMessages: true, updatedAt: new Date() })
-      .where(eq(chatEndpoints.id, context.endpoint.id));
+      const setReachEnabled = async (enabled: boolean) => {
+        if (context.conversation.isDirectMessage) {
+          await db
+            .update(chatEndpoints)
+            .set({ allowDirectMessages: enabled, updatedAt: new Date() })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        } else {
+          expect(context.conversation.resourceId).toBeTruthy();
+          await db
+            .update(chatEndpointResources)
+            .set({ enabled, updatedAt: new Date() })
+            .where(
+              and(
+                eq(chatEndpointResources.endpointId, context.endpoint.id),
+                eq(chatEndpointResources.id, context.conversation.resourceId!),
+              ),
+            );
+        }
+      };
 
-    const finalRun = await context.createRun("a final answer");
-    await context.addEvent(finalRun);
-    await expect(
-      enqueueChatRunMilestones(db, { since: new Date(0) }),
-    ).resolves.toBe(1);
-    const finalComment = await addSelectedChatFinal({
-      agentId: context.fixture.assignedAgentId,
-      body: "Authoritative final answer",
-      companyId: context.fixture.companyId,
-      issueId: context.conversation.issueId,
-      runId: finalRun.runId,
-    });
-    await db
-      .update(heartbeatRuns)
-      .set({
-        status: "succeeded",
-        resultJson: {
-          presentationDecision: {
-            chosenSource: "existing_issue_comment",
-            commentAction: "none",
-          },
+      const questionRun = await context.createRun("a question");
+      await context.addEvent(questionRun);
+      await db.insert(issueThreadInteractions).values({
+        companyId: context.fixture.companyId,
+        issueId: context.conversation.issueId,
+        kind: "ask_user_questions",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: context.fixture.assignedAgentId,
+        sourceRunId: questionRun.runId,
+        status: "pending",
+        payload: {
+          version: 1,
+          prompt: "Choose one",
+          questions: [
+            {
+              id: "choice",
+              prompt: "Choose one",
+              options: [
+                { id: "a", label: "A" },
+                { id: "b", label: "B" },
+              ],
+            },
+          ],
         },
-        updatedAt: new Date(),
-      })
-      .where(eq(heartbeatRuns.id, finalRun.runId));
-    await context.service.processPendingPublications(100);
+      });
+      await expect(
+        enqueueChatRunMilestones(db, { since: new Date(0) }),
+      ).resolves.toBe(0);
 
-    expect(context.providerRuntime.edits.at(-1)).toEqual({
-      threadId: context.thread.thread.id,
-      messageId: expect.any(String),
-      text: "Authoritative final answer",
-    });
-    expect(JSON.stringify(context.providerRuntime.edits)).not.toContain(
-      "PRIVATE native event prose",
-    );
-    const finalPublications = await db
-      .select({
-        idempotencyKey: chatPublications.idempotencyKey,
-        state: chatPublications.state,
-      })
-      .from(chatPublications)
-      .where(
-        and(
-          eq(chatPublications.endpointId, context.endpoint.id),
-          like(chatPublications.idempotencyKey, `run:${finalRun.runId}:%`),
-        ),
-      );
-    expect(finalPublications).toContainEqual(
-      expect.objectContaining({
-        idempotencyKey: expect.stringMatching(
-          new RegExp(
-            `^run:${finalRun.runId}:working:${context.endpoint.id}:native:`,
-          ),
-        ),
-        state: "cancelled",
-      }),
-    );
-    await expect(
-      db
-        .select({ state: chatPublications.state })
+      const revokedRun = await context.createRun("revoked reach");
+      await context.addEvent(revokedRun);
+      await expect(
+        enqueueChatRunMilestones(db, { since: new Date(0) }),
+      ).resolves.toBe(1);
+      await setReachEnabled(false);
+      const postsBeforeRevocation = context.providerRuntime.posts.length;
+      const editsBeforeRevocation = context.providerRuntime.edits.length;
+      await context.service.processPendingPublications(100);
+      expect(context.providerRuntime.posts).toHaveLength(postsBeforeRevocation);
+      expect(context.providerRuntime.edits).toHaveLength(editsBeforeRevocation);
+      const [revokedProgress] = await db
+        .select()
         .from(chatPublications)
-        .where(eq(chatPublications.commentId, finalComment.id)),
-    ).resolves.toEqual([{ state: "published" }]);
-    await context.service.shutdown();
-  });
+        .where(
+          like(
+            chatPublications.idempotencyKey,
+            `run:${revokedRun.runId}:working:${context.endpoint.id}:native:%`,
+          ),
+        );
+      expect(revokedProgress).toMatchObject({
+        state: "cancelled",
+        attempts: 1,
+      });
+      await setReachEnabled(true);
+
+      const finalRun = await context.createRun("a final answer");
+      await context.addEvent(finalRun);
+      await expect(
+        enqueueChatRunMilestones(db, { since: new Date(0) }),
+      ).resolves.toBe(1);
+      const finalComment = await addSelectedChatFinal({
+        agentId: context.fixture.assignedAgentId,
+        body: "Authoritative final answer",
+        companyId: context.fixture.companyId,
+        issueId: context.conversation.issueId,
+        runId: finalRun.runId,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "succeeded",
+          resultJson: {
+            presentationDecision: {
+              chosenSource: "existing_issue_comment",
+              commentAction: "none",
+            },
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, finalRun.runId));
+      await context.service.processPendingPublications(100);
+
+      expect(context.providerRuntime.edits.at(-1)).toEqual({
+        threadId: context.thread.thread.id,
+        messageId: expect.any(String),
+        text: "Authoritative final answer",
+      });
+      expect(JSON.stringify(context.providerRuntime.edits)).not.toContain(
+        "PRIVATE native event prose",
+      );
+      const finalPublications = await db
+        .select({
+          idempotencyKey: chatPublications.idempotencyKey,
+          state: chatPublications.state,
+        })
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.endpointId, context.endpoint.id),
+            like(chatPublications.idempotencyKey, `run:${finalRun.runId}:%`),
+          ),
+        );
+      expect(finalPublications).toContainEqual(
+        expect.objectContaining({
+          idempotencyKey: expect.stringMatching(
+            new RegExp(
+              `^run:${finalRun.runId}:working:${context.endpoint.id}:native:`,
+            ),
+          ),
+          state: "cancelled",
+        }),
+      );
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, finalComment.id)),
+      ).resolves.toEqual([{ state: "published" }]);
+      await context.service.shutdown();
+    },
+  );
 
   it("coalesces one Telegram run into one provider message", async () => {
     const fixture = await seedCompany();
@@ -42580,10 +43172,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .select({ kind: chatActions.kind, status: chatActions.status })
         .from(chatActions)
         .where(eq(chatActions.deliveryId, delivery.id)),
-    ).resolves.toEqual(expect.arrayContaining([
-      { kind: "inbound_wakeup", status: "failed" },
-      { kind: "provider_effect", status: "processed" },
-    ]));
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        { kind: "inbound_wakeup", status: "failed" },
+        { kind: "provider_effect", status: "processed" },
+      ]),
+    );
   });
 
   it("defers a rate-limited Telegram receipt reaction for the full provider interval without blocking the inbound turn", async () => {
@@ -42941,7 +43535,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
-    if (!conversation) throw new Error("Expected review transport conversation");
+    if (!conversation)
+      throw new Error("Expected review transport conversation");
     const inbound = await db
       .select({
         commentId: chatMessageLinks.commentId,
@@ -43473,5 +44068,675 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toBe(0);
     expect(committed.providerRuntime.posts).toHaveLength(3);
     expect(committed.providerRuntime.slackFilePublicationAttempts).toBe(2);
+  });
+
+  async function deferredChatQueueFixture(admissionFails = false) {
+    const fixture = await seedCompany();
+    let ownerId: string | null = null;
+    const configured = await configuredSlackEndpoint(fixture, {
+      wakeup: async (agentId, opts) => {
+        if (admissionFails)
+          throw new Error("PRIVATE admission failure token=do-not-publish");
+        const request = opts.durableChatRequest!;
+        await db.transaction(async (tx) => {
+          await request.authorize(
+            tx as unknown as Parameters<typeof request.authorize>[0],
+          );
+          const [owner] = ownerId
+            ? await tx
+                .select()
+                .from(agentWakeupRequests)
+                .where(eq(agentWakeupRequests.id, ownerId))
+            : [];
+          const existingContext = owner?.payload?._paperclipWakeContext as
+            Record<string, unknown> | undefined;
+          const commentIds = [
+            ...(Array.isArray(existingContext?.wakeCommentIds)
+              ? existingContext.wakeCommentIds
+              : []),
+            request.commentId,
+          ];
+          const payload = {
+            ...opts.payload,
+            _paperclipWakeContext: {
+              ...opts.contextSnapshot,
+              wakeCommentIds: commentIds,
+            },
+          };
+          if (owner)
+            await tx
+              .update(agentWakeupRequests)
+              .set({ payload, coalescedCount: owner.coalescedCount + 1 })
+              .where(eq(agentWakeupRequests.id, owner.id));
+          await tx.insert(agentWakeupRequests).values({
+            id: request.id,
+            companyId: fixture.companyId,
+            agentId,
+            source: "assignment",
+            reason: "issue_execution_deferred",
+            status: owner ? "coalesced" : "deferred_issue_execution",
+            payload: owner
+              ? { ...opts.payload, coalescedIntoWakeupRequestId: owner.id }
+              : payload,
+            requestedByActorType: request.requestedByActorType,
+            requestedByActorId: request.requestedByActorId,
+            requestedAt: request.requestedAt,
+            idempotencyKey: request.idempotencyKey,
+          });
+          ownerId ??= request.id;
+        });
+        return { accepted: true };
+      },
+    });
+    const thread = makeThread({
+      channelId: "C-DEFERRED-NOTICE",
+      id: "slack:C-DEFERRED-NOTICE:1999000.1",
+    });
+    const send = async (id = "1999000.1") =>
+      deliverMessage({
+        callbacks: configured.callbacks,
+        endpointId: configured.endpoint.id,
+        thread: thread.thread,
+        message: makeMessage({
+          id,
+          text: "@maya exact queued request",
+          mentioned: id === "1999000.1",
+        }),
+        trigger: id === "1999000.1" ? "mention" : "subscribed_message",
+      });
+    await send();
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, configured.endpoint.id));
+    const [action] = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.endpointId, configured.endpoint.id),
+          eq(chatActions.kind, "inbound_wakeup"),
+        ),
+      );
+    const promote = async () => {
+      const [owner] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, ownerId!));
+      const runId = randomUUID();
+      const contextSnapshot = owner.payload!._paperclipWakeContext as Record<
+        string,
+        unknown
+      >;
+      await db.transaction(async (tx) => {
+        await tx.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          status: "running",
+          runtimeMode: "native",
+          wakeupRequestId: owner.id,
+          contextSnapshot,
+        });
+        await tx
+          .update(agentWakeupRequests)
+          .set({ runId, status: "claimed" })
+          .where(eq(agentWakeupRequests.id, owner.id));
+      });
+      return runId;
+    };
+    return {
+      ...configured,
+      action,
+      conversation,
+      fixture,
+      promote,
+      send,
+      thread,
+    };
+  }
+
+  it("keeps one durable pre-run FIFO notice across coalescing and restart, then reuses only its successor lane", async () => {
+    const context = await deferredChatQueueFixture();
+    let restarted: ChatChannelService | null = null;
+    try {
+      const { service, endpoint, conversation, fixture, action } = context;
+      await expect(
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.companyId, fixture.companyId)),
+      ).resolves.toEqual([]);
+      await expect(service.enqueueInboundWakeupPublications()).resolves.toBe(1);
+      await service.processPendingPublications();
+      const [queued] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.endpointId, endpoint.id));
+      expect(queued).toMatchObject({
+        commentId: action.payload.commentId,
+        state: "published",
+        payload: { text: "Your follow-up is queued.", progressState: "queued" },
+      });
+      await expect(
+        db
+          .select({ commentId: chatMessageLinks.commentId })
+          .from(chatMessageLinks)
+          .where(eq(chatMessageLinks.publicationId, queued.id)),
+      ).resolves.toEqual([{ commentId: null }]);
+      await expect(
+        db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.kind, "slack_session_sync"),
+            ),
+          ),
+      ).resolves.toEqual([]);
+      await context.send("1999000.2");
+      await expect(service.enqueueInboundWakeupPublications()).resolves.toBe(0);
+      await service.processPendingPublications();
+      expect(context.runtime.endpoints.get(endpoint.id)?.posts).toHaveLength(1);
+      await service.shutdown();
+      const fresh = createService();
+      restarted = fresh.service;
+      await expect(restarted.enqueueInboundWakeupPublications()).resolves.toBe(
+        0,
+      );
+      fresh.runtime.initializeHook = async () => {
+        fresh.runtime.endpoints
+          .get(endpoint.id)!
+          .postResultIds.push(
+            "predecessor-provider-message",
+            "second-answer-provider-message",
+          );
+      };
+      const runId = await context.promote();
+      // A predecessor's own lane cannot claim the deferred successor's notice.
+      const predecessor = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: predecessor,
+        companyId: fixture.companyId,
+        agentId: fixture.assignedAgentId,
+        status: "running",
+        contextSnapshot: { issueId: conversation.issueId },
+      });
+      await db.insert(chatPublications).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        issueId: conversation.issueId,
+        idempotencyKey: `run:${predecessor}:working:${endpoint.id}`,
+        payload: {
+          text: "Predecessor still working",
+          progressState: "working",
+        },
+      });
+      await restarted.processPendingPublications();
+      const runtime = fresh.runtime.endpoints.get(endpoint.id)!;
+      expect(runtime.posts).toHaveLength(1);
+      expect(runtime.edits).toEqual([]);
+      await db.insert(chatPublications).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        issueId: conversation.issueId,
+        idempotencyKey: `run:${runId}:working:${endpoint.id}`,
+        payload: { text: "Successor working", progressState: "working" },
+      });
+      await restarted.processPendingPublications();
+      expect(runtime.edits).toEqual([
+        {
+          threadId: context.thread.thread.id,
+          messageId: queued.providerMessageId,
+          text: "Successor working",
+        },
+      ]);
+      await addSelectedChatFinal({
+        agentId: fixture.assignedAgentId,
+        body: "The exact successor answer",
+        companyId: fixture.companyId,
+        issueId: conversation.issueId,
+        runId,
+      });
+      await restarted.processPendingPublications();
+      expect(runtime.edits.at(-1)).toMatchObject({
+        messageId: queued.providerMessageId,
+        text: "The exact successor answer",
+      });
+      await addSelectedChatFinal({
+        agentId: fixture.assignedAgentId,
+        body: "A separate second answer",
+        companyId: fixture.companyId,
+        issueId: conversation.issueId,
+        runId,
+      });
+      await restarted.processPendingPublications();
+      expect(runtime.posts.at(-1)?.text).toBe("A separate second answer");
+      expect(runtime.edits).toHaveLength(2);
+      await expect(restarted.processPendingPublications()).resolves.toBe(0);
+    } finally {
+      await restarted?.shutdown();
+      await context.service.shutdown();
+    }
+  });
+
+  it("reuses a pre-run FIFO notice when the successor asks before its working milestone", async () => {
+    const context = await deferredChatQueueFixture();
+    try {
+      await context.service.processPendingPublications();
+      const [queued] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.endpointId, context.endpoint.id));
+      const runId = await context.promote();
+      const interactionId = randomUUID();
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId: context.fixture.companyId,
+        issueId: context.conversation.issueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        sourceRunId: runId,
+        title: "Pick one",
+        requestedByActorType: "agent",
+        requestedByActorId: context.fixture.assignedAgentId,
+        payload: {
+          questions: [
+            {
+              id: "color",
+              prompt: "Pick one",
+              options: [{ id: "amber", label: "Amber" }],
+            },
+          ],
+        },
+      });
+      await db.insert(chatPublications).values({
+        companyId: context.fixture.companyId,
+        endpointId: context.endpoint.id,
+        conversationId: context.conversation.id,
+        issueId: context.conversation.issueId,
+        idempotencyKey: `interaction:${interactionId}:${context.endpoint.id}`,
+        payload: { text: "Pick one: Amber", interactionId },
+      });
+      await context.service.processPendingPublications();
+      const runtime = context.runtime.endpoints.get(context.endpoint.id)!;
+      expect(runtime.posts).toHaveLength(1);
+      expect(runtime.edits).toEqual([
+        {
+          threadId: context.thread.thread.id,
+          messageId: queued.providerMessageId,
+          text: "Pick one: Amber",
+        },
+      ]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it.each(["failed", "cancelled"] as const)(
+    "retires a pre-run FIFO notice with the exact promoted %s run even before a working update",
+    async (status) => {
+      const context = await deferredChatQueueFixture();
+      try {
+        await context.service.processPendingPublications();
+        const [queued] = await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id));
+        const runId = await context.promote();
+        await db.transaction(async (tx) => {
+          await tx
+            .update(agentWakeupRequests)
+            .set({ status })
+            .where(eq(agentWakeupRequests.id, context.action.id));
+          await tx
+            .update(heartbeatRuns)
+            .set({ status, finishedAt: new Date(), updatedAt: new Date() })
+            .where(eq(heartbeatRuns.id, runId));
+        });
+        await db
+          .insert(chatPublications)
+          .values({
+            companyId: context.fixture.companyId,
+            endpointId: context.endpoint.id,
+            conversationId: context.conversation.id,
+            issueId: context.conversation.issueId,
+            idempotencyKey: `run:${runId}:failed:${context.endpoint.id}`,
+            payload: {
+              text: "Maya stopped before completing this turn. Open the task in Paperclip for details.",
+              progressState: "failed",
+            },
+          });
+        await context.service.processPendingPublications();
+        await expect(
+          context.service.processPendingPublications(),
+        ).resolves.toBe(0);
+        const runtime = context.runtime.endpoints.get(context.endpoint.id)!;
+        expect(runtime.posts).toHaveLength(1);
+        expect(runtime.edits).toEqual([
+          {
+            threadId: context.thread.thread.id,
+            messageId: queued.providerMessageId,
+            text: "Maya stopped before completing this turn. Open the task in Paperclip for details.",
+          },
+        ]);
+        expect(JSON.stringify(runtime.edits)).not.toContain("was not started");
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
+
+  it.each([
+    "promotion",
+    "cancelled",
+    "reach",
+    "source_deleted",
+    "actor",
+    "generation",
+    "guest_access",
+  ] as const)(
+    "suppresses a pending pre-run FIFO notice after %s wins",
+    async (change) => {
+      const context = await deferredChatQueueFixture();
+      try {
+        await expect(
+          context.service.enqueueInboundWakeupPublications(),
+        ).resolves.toBe(1);
+        if (change === "promotion") await context.promote();
+        if (change === "cancelled")
+          await db
+            .update(agentWakeupRequests)
+            .set({ status: "cancelled" })
+            .where(eq(agentWakeupRequests.id, context.action.id));
+        if (change === "reach")
+          await db
+            .update(chatEndpointResources)
+            .set({ enabled: false })
+            .where(eq(chatEndpointResources.endpointId, context.endpoint.id));
+        if (change === "source_deleted")
+          await db
+            .update(issueComments)
+            .set({ deletedAt: new Date() })
+            .where(
+              eq(issueComments.id, String(context.action.payload.commentId)),
+            );
+        if (change === "actor")
+          await db
+            .update(agentWakeupRequests)
+            .set({ requestedByActorId: "forged-actor" })
+            .where(eq(agentWakeupRequests.id, context.action.id));
+        if (change === "generation")
+          await db
+            .update(chatConversations)
+            .set({
+              sessionGeneration: context.conversation.sessionGeneration + 1,
+            })
+            .where(eq(chatConversations.id, context.conversation.id));
+        if (change === "guest_access")
+          await db
+            .update(chatEndpoints)
+            .set({ allowUnlinkedPeople: false })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        await context.service.processPendingPublications();
+        expect(
+          context.runtime.endpoints.get(context.endpoint.id)?.posts ?? [],
+        ).toEqual([]);
+        const publications = await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id));
+        expect(publications).toHaveLength(1);
+        expect(publications[0]?.state).toBe("cancelled");
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
+
+  it("retires an already-visible pre-run FIFO notice once without publishing scheduler failures", async () => {
+    const context = await deferredChatQueueFixture();
+    try {
+      await context.service.processPendingPublications();
+      const [queued] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.endpointId, context.endpoint.id));
+      await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "failed",
+          error: "PRIVATE token=secret scheduler detail",
+        })
+        .where(eq(agentWakeupRequests.id, context.action.id));
+      await context.service.processPendingPublications();
+      await expect(context.service.processPendingPublications()).resolves.toBe(
+        0,
+      );
+      const runtime = context.runtime.endpoints.get(context.endpoint.id)!;
+      expect(runtime.posts).toHaveLength(1);
+      expect(runtime.edits).toEqual([
+        {
+          threadId: context.thread.thread.id,
+          messageId: queued.providerMessageId,
+          text: "This follow-up was not started. Open the task in Paperclip for details.",
+        },
+      ]);
+      expect(JSON.stringify(runtime.edits)).not.toMatch(
+        /PRIVATE|token=|scheduler/,
+      );
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it("never promises a queued follow-up before durable admission succeeds", async () => {
+    const context = await deferredChatQueueFixture(true);
+    try {
+      await context.service.processPendingPublications();
+      expect(context.action.status).toBe("issued");
+      expect(
+        context.runtime.endpoints.get(context.endpoint.id)?.posts ?? [],
+      ).toEqual([]);
+      await expect(
+        db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id)),
+      ).resolves.toEqual([]);
+      await expect(
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.companyId, context.fixture.companyId)),
+      ).resolves.toEqual([]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it("retires only the removed source's pre-run FIFO notice after its surviving batch promotes", async () => {
+    const context = await deferredChatQueueFixture();
+    try {
+      await context.service.processPendingPublications();
+      const [queued] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.endpointId, context.endpoint.id));
+      await context.send("1999000.2");
+      const [second] = await db
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.endpointId, context.endpoint.id),
+            eq(chatActions.kind, "inbound_wakeup"),
+            sql`${chatActions.id} <> ${context.action.id}`,
+          ),
+        );
+      const [owner] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, context.action.id));
+      const remainingContext = {
+        ...(owner.payload!._paperclipWakeContext as Record<string, unknown>),
+        wakeCommentId: second.payload.commentId,
+        commentId: second.payload.commentId,
+        wakeCommentIds: [second.payload.commentId],
+      };
+      await db.transaction(async (tx) => {
+        await tx
+          .update(issueComments)
+          .set({ deletedAt: new Date() })
+          .where(
+            eq(issueComments.id, String(context.action.payload.commentId)),
+          );
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: {
+              ...owner.payload,
+              wakeCommentId: second.payload.commentId,
+              commentId: second.payload.commentId,
+              _paperclipWakeContext: remainingContext,
+            },
+          })
+          .where(eq(agentWakeupRequests.id, owner.id));
+      });
+      const runId = await context.promote();
+      await addSelectedChatFinal({
+        agentId: context.fixture.assignedAgentId,
+        body: "Answer to the surviving second message",
+        companyId: context.fixture.companyId,
+        issueId: context.conversation.issueId,
+        runId,
+      });
+      await context.service.processPendingPublications();
+      await expect(context.service.processPendingPublications()).resolves.toBe(
+        0,
+      );
+      const runtime = context.runtime.endpoints.get(context.endpoint.id)!;
+      expect(runtime.posts.map((post) => post.text)).toEqual([
+        "Your follow-up is queued.",
+        "Answer to the surviving second message",
+      ]);
+      expect(runtime.edits).toEqual([
+        {
+          threadId: context.thread.thread.id,
+          messageId: queued.providerMessageId,
+          text: "This queued message was removed.",
+        },
+      ]);
+      expect(JSON.stringify(runtime.edits)).not.toContain("not started");
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it("does not let removed-input cleanup overwrite a pre-run FIFO lane already replaced by its answer", async () => {
+    const context = await deferredChatQueueFixture();
+    try {
+      await context.service.processPendingPublications();
+      const runId = await context.promote();
+      await addSelectedChatFinal({
+        agentId: context.fixture.assignedAgentId,
+        body: "Already answered",
+        companyId: context.fixture.companyId,
+        issueId: context.conversation.issueId,
+        runId,
+      });
+      await db
+        .update(issueComments)
+        .set({ deletedAt: new Date() })
+        .where(eq(issueComments.id, String(context.action.payload.commentId)));
+      // Final is already ordered before the cleanup, but neither was sent
+      // when cleanup was selected. Its transport claim must re-read the link.
+      await expect(
+        context.service.enqueueInboundWakeupPublications(),
+      ).resolves.toBe(1);
+      await context.service.processPendingPublications();
+      await expect(context.service.processPendingPublications()).resolves.toBe(
+        0,
+      );
+      const runtime = context.runtime.endpoints.get(context.endpoint.id)!;
+      expect(runtime.posts).toHaveLength(1);
+      expect(runtime.edits).toHaveLength(1);
+      expect(runtime.edits[0]?.text).toBe("Already answered");
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              like(chatPublications.idempotencyKey, "wake:%:removed:%"),
+            ),
+          ),
+      ).resolves.toEqual([{ state: "cancelled" }]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it("retries a contended pre-run FIFO receipt before I/O and observes cancellation after the lock releases", async () => {
+    const context = await deferredChatQueueFixture();
+    let release!: () => void;
+    let locked!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const observed = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    let holder: Promise<unknown> | null = null;
+    try {
+      await context.service.enqueueInboundWakeupPublications();
+      holder = db.transaction(async (tx) => {
+        await tx
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, context.action.id))
+          .for("update");
+        locked();
+        await held;
+        await tx
+          .update(agentWakeupRequests)
+          .set({ status: "cancelled" })
+          .where(eq(agentWakeupRequests.id, context.action.id));
+      });
+      await observed;
+      await context.service.processPendingPublications();
+      const [queued] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.endpointId, context.endpoint.id));
+      expect(queued).toMatchObject({ state: "retry", providerMessageId: null });
+      expect(
+        context.runtime.endpoints.get(context.endpoint.id)?.posts ?? [],
+      ).toEqual([]);
+      release();
+      await holder;
+      await db
+        .update(chatPublications)
+        .set({ nextAttemptAt: new Date(0) })
+        .where(eq(chatPublications.id, queued.id));
+      await context.service.processPendingPublications();
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, queued.id)),
+      ).resolves.toEqual([{ state: "cancelled" }]);
+      expect(
+        context.runtime.endpoints.get(context.endpoint.id)?.posts ?? [],
+      ).toEqual([]);
+    } finally {
+      release?.();
+      await holder;
+      await context.service.shutdown();
+    }
   });
 });
