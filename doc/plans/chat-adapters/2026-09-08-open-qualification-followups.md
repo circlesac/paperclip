@@ -72,9 +72,28 @@ authenticated snapshot. A bounded event wait keeps the exact count/identity
 assertions; the final full transport cohort passed **88/88**. Workspace
 typecheck passed. The full fresh PostgreSQL chat suite was **474/475**: the
 existing joined-recovery drain test counted seven global wakes instead of
-three. Boole is diagnosing fixture spillover versus a real lifecycle race;
-do not call the complete integration suite passed. The retry/finalizer slice
-remains uncommitted while the independently verified native fix is checkpointed.
+three. Boole reproduced four valid retry intents left by earlier fixtures,
+then added a precondition drain before the join test stages controlled work.
+All original assertions remain. The six-case fresh-database reproduction went
+from 5 passed / 1 failed to 6 passed. The complete combined integration suite
+still needs a fresh run. The root route/API/UI contract cohort passed 195/195
+on an unchanged rerun after one earlier transient socket hang-up; UI typecheck
+and token gates pass. The retry/finalizer slice remains uncommitted; the
+independently verified native control-first repair is pushed as `b810d60be`.
+
+GitHub's real PR-level continuation at 21:29 UTC exposed the scope of the
+Telegram cleanup quarantine: it blocks every execution in the same company
+and backend, including Maya's other channels. CHA-9's first new message failed
+with `native_session_cleanup_quarantined`; its next message failed with
+`reviewed_chat_execution_binding_not_authorized`. Neither reached a provider
+turn, so this is not live qualification of the rebuilt runner. Both displayed
+the same generic failure/task link in GitHub. Stop feeding blocked conversations
+until the exact old cleanup is settled. James is implementing a bounded
+control-only recovery path with exact old authority and process-absence proof;
+Boole is investigating the second message's reviewed-binding failure.
+Do not clear quarantine, reset a task, or restart solely to erase the in-memory
+gate. The accepted Telegram answer can be presented independently, but that
+does not prove its provider session is safe to reuse.
 
 ## Earlier work: Discord restart repair and final landing gates
 
@@ -565,10 +584,12 @@ device`, with host usage at **32/32** segments. No positively identified
 
 ## Remaining work
 
-1. **Finish landing verification.** Update/push the verified fixes and PR
-   description, then obtain green CI and Greptile review. The final fresh chat
-   rerun is **421/421**; fix any new CI findings without weakening assertions.
-   Leave checklist items unchecked while their evidence is missing.
+1. **Finish real qualification before PR tending.** Commit and push coherent
+   verified fixes along the way, but follow the active goal: repair and test
+   the channels before tending PR reviews or merge gates. The newer combined
+   retry/presentation slice needs fresh full integration and live recovery
+   proof; earlier 421/421 evidence does not cover it. Leave completion claims
+   and checklist items unfulfilled while their evidence is missing.
 2. **Protocol-fault follow-through.** The original
    authenticated digest mismatch can leave “using tools” visible until the
    900-second deadline. Commit `d886f52c0` adds the typed, latched fault

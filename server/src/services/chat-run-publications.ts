@@ -164,7 +164,9 @@ export function safeMilestoneText(input: {
           ? `${input.agentName} couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying.`
           : input.errorCode === "native_event_replay_conflict"
             ? `${input.agentName} couldn't safely continue this turn. A Paperclip admin needs to review the run before it can be retried.`
-            : `${input.agentName} stopped before completing this turn.`;
+            : input.errorCode === "native_session_cleanup_quarantined"
+              ? `${input.agentName} couldn't start this turn because an earlier session needs recovery. Your request is saved. Ask a Paperclip admin to recover that session before retrying; sending the request again won't repair it.`
+              : `${input.agentName} stopped before completing this turn.`;
   return `${recovery}${
     taskUrl
       ? ` Open the task in Paperclip: ${taskUrl}`

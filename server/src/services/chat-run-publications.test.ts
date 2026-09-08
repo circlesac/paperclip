@@ -76,6 +76,40 @@ describe("chat run milestone projection", () => {
     );
   });
 
+  it.each([
+    [null, " Open the task in Paperclip for details."],
+    [
+      "https://paperclip.example",
+      " Open the task in Paperclip: https://paperclip.example/issues/issue-1",
+    ],
+  ])(
+    "explains retained-session recovery without encouraging duplicate requests (%s)",
+    (publicBaseUrl, suffix) => {
+      const text = safeMilestoneText({
+        agentName: "Maya",
+        errorCode: "native_session_cleanup_quarantined",
+        milestone: "failed",
+        issueId: "issue-1",
+        publicBaseUrl,
+      });
+      expect(text).toBe(
+        "Maya couldn't start this turn because an earlier session needs recovery. Your request is saved. Ask a Paperclip admin to recover that session before retrying; sending the request again won't repair it." +
+          suffix,
+      );
+      expect(text).not.toMatch(
+        /quarantin|checkpoint|process|native_session|runnerId|reset/i,
+      );
+      expect(
+        projectSafeChatPublication({
+          classification: "external",
+          source: "safe_milestone",
+          text,
+          progressState: "failed",
+        }),
+      ).toEqual({ text, progressState: "failed" });
+    },
+  );
+
   it("describes ownership recovery without claiming the retained process stopped", () => {
     expect(
       safeMilestoneText({

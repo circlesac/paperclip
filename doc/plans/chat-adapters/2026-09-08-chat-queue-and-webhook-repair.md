@@ -2053,3 +2053,47 @@ The final full transport run passed **88/88** in 64.01 seconds, including
 48/1,024-delta backlog suspension and active-checkpoint rejection. Workspace
 typecheck passed. This is staged-binary/fixture evidence, not a successful
 retest of the damaged live Telegram conversation.
+
+### GitHub continuation reveals cross-channel cleanup quarantine
+
+At 21:29 UTC root used the signed-in GitHub browser on the dedicated QA
+repository's PR #3. Message `CONTROL-FIRST-0908-A` requested a 500-word seed-swap
+plan; a separate `CONTROL-FIRST-0908-B` requested one exact short response.
+The first comment was visibly accepted before the second was sent. Both stayed
+in the existing PR conversation, CHA-9, issue
+`5329b4bf-6b16-40d5-ad69-65bcbeac2ab3`, conversation
+`6f313c48-e684-421f-a730-dd68112c1e2c`.
+
+| Evidence | A | B |
+| --- | --- | --- |
+| GitHub comment | `5592125256` | `5592126853` |
+| Delivery | `fee9ddbe-9fa1-466a-b049-97b51a3ba568` | `69cb52ff-00e5-45c6-b746-f9df5deae2f4` |
+| Source comment | `a0d072be-b9ee-4781-84cb-1d2d054a889a` | `906ecf81-67df-45ab-ba24-395a87e2662c` |
+| Run | `75758d19-9680-4083-a0b6-2d5598d21bae` | `38dfc3ec-4fa7-4ed4-8563-7650dfce3d47` |
+| Started → finished UTC | 21:29:33.515 → 21:29:33.835 | 21:29:41.069 → 21:29:41.079 |
+| Failure | `native_session_cleanup_quarantined` | `setup_failed`: `reviewed_chat_execution_binding_not_authorized` |
+
+A failed before B was submitted: **no queued execution was exercised**. The
+runtime cleanup domain is company plus backend kind/name, so Telegram A's
+retained operator-required cleanup also blocks GitHub. This does not establish
+a second damaged GitHub checkpoint. B's reviewed execution binding needs a
+separate diagnosis. Neither request reached native provider execution; the new
+binary's presence alone is not live proof of its control-first repair.
+
+Each input produced one published failure notice in one attempt (GitHub
+`5592126063` and `5592127485`), respectively 1.812 and 2.274 seconds after local
+receipt. Root read both actual rendered messages: **Maya E2E stopped before
+completing this turn. Open the task in Paperclip:** with the correct CHA-9 URL.
+There was no plan or requested short answer. The functional outcome failed;
+the experience needs improvement because identical generic notices conceal
+different setup/recovery causes and provide no usable in-channel recovery.
+No repository changes, merge, session reset or quarantine deletion were made.
+
+The shared external milestone copy now recognizes only the typed cleanup
+quarantine code. It explains that an earlier session needs admin recovery,
+the request is saved, and resending will not repair it. Unknown errors remain
+generic, and neither checkpoint/process details nor private error text leave
+Paperclip. Two exact-copy regressions failed against the old projection;
+the final milestone/task-link/safe-projection cohort passed **43/43**. This
+copy change is not deployed or visually retested yet, and it is not the
+session recovery implementation itself.
