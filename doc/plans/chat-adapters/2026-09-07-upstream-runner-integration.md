@@ -1733,3 +1733,56 @@ native PRP progress events enter through a different durable port and still
 depend on polling. A short observed publication interval is not proof that
 those progress updates were event-triggered. Neither finding is hidden by
 the passing consecutive-turn test.
+
+The additional timing audit distinguishes a future optimization from a
+failed safety check. The two longer Discord answers used the native runtime's
+intentional five-second semantic-result terminal grace, then consumed the
+7.5-second stop-preparation budget while their final-output suffix drained.
+Codex's recorded task completion preceded the runner terminal event by
+approximately 3.4–3.9 seconds. In contrast, the short correction completed
+naturally and closed in 241ms. A bounded burst benchmark for per-event durable
+persistence and cumulative ACK processing is the next performance target;
+removing the exact suspension proof or blindly shortening the semantic grace
+is not justified by these measurements. The busy correction's 42.358-second
+pre-run FIFO wait is separate from its 12ms created-to-started queue span.
+
+Commit `d0b7638fa` fixes the confirmed prose redaction at its source in the
+Rust runner, before canonical result storage. It recognizes only a bounded,
+determiner-led “token system” noun phrase. Explicit assignments, quoted or
+compound/CLI keys and values, attached credential suffixes, nested sensitive
+fields, and independent credential-prefix/Bearer/JWT scanning remain protected.
+The actual structured durable-command test and protected negative cases passed
+with the full **214/214** Rust library cohort. The release build and staged
+binary passed; SHA-256 is
+`e33d464cba6766becf9fb536182976c0359a78e4250301a5c86874f8212c9963`.
+The frozen staged binary then passed **85/85** real-process transport tests.
+
+The running instance subsequently launched that rebuilt binary for a new
+Discord request at 10:37:20.329Z. Run
+`3b2fa76f-42c2-4ad8-9f0c-91b9261e485c` succeeded, and publication
+`e5625593-db8f-4d3f-997f-f17978f5904f` edited `1546831811294920754`
+once at 10:37:33.976Z: **13.647s** end to end. The browser displayed exactly
+“Use a simple token system so guests can exchange plants.” The old corrupted
+historical answer was not rewritten. This proves the narrow repaired prose
+case through the real native runner, not merely through a chat-only formatter.
+Independent inspection confirms this binary-upgrade retest resumed the same
+`01a0808d-fe51-7e00-b6c5-e032a49f4e3d` provider session, used Luna in actual
+rollout context, and closed with the exact new run identity suspended and its
+drain/suspend commands completed. No fresh continuity hold was introduced.
+
+Commit `04315aea1` closes the native progress signal gap. The PRP port emits
+only fixed event types and company/issue/run/agent/sequence identifiers after
+its event row commits. Duplicate replays and unsupported event types do not
+signal. Recovered final presentation emits only after its authorized comment
+transaction commits. Optional synchronous listener failures are contained;
+they cannot reject committed native work or skip its callback, and the
+existing recovery poll remains. Database, schema, and permission failures
+are outside that exception boundary.
+
+The frozen bridge passed **135/135** tests across the full native port,
+external-chat wait, reconciliation, and safe-progress files, plus server
+typecheck. Independent review passed **44/44** overlapping tests, including
+real PostgreSQL row visibility from a separate connection, payload exclusion,
+replay behavior, and throwing-listener callback continuity. No full-file
+formatting churn, lockfile edit, raw trace broadcast, or authority relaxation
+was retained.
