@@ -832,3 +832,57 @@ direct synchronous SDK callbacks and verifies the durable queue drains.
   (`native-review-presentation-09.log`) and server typechecking; changed causal
   wake data still denies publication.
   Live media qualification remains pending until the new server is restarted.
+
+### Live media passes on `3ab1384f9` (September 8, 07:25 UTC)
+
+The clean committed/pushed revision started at 07:25:36.405 UTC and was ready at
+07:25:40.416 UTC. There were no active Maya runs at restart; all seven historical
+recovery holds remained intact. The final emitted server compile also passed
+(`native-review-emitted-tsc-root-02.log`).
+
+- Telegram run `7a26a46f-931e-4394-b6a5-3596393c39d0` completed in **31.005s**
+  on actual Codex `gpt-5.6-luna`. The original JPEG was read, viewed and reused
+  with its unchanged 221,327 bytes and SHA-256. The canonical reply and image
+  each published once to messages `417200359:76` and `417200359:77`, with durable
+  outbound message links. Request-to-image delivery took about **36s**. The
+  in-app browser visibly rendered the original orange tabby photo. The genuine
+  completion review remains pending and the task remains `in_review`.
+- Discord run `a4d3e502-9f49-4ae8-a639-9888f37e81e8` completed in **62.412s**
+  on actual Luna. All six dynamic tool calls succeeded without malformed
+  inputs. The 128-byte note and 2,111,878-byte PNG matched their original hashes
+  and published to Discord messages `1546783913744146503` and
+  `1546783919049809982`. The browser showed the native text-file preview,
+  correct verification phrase and rendered cat PNG. The original human-only
+  review remains unresolved; no additional run or monitor was scheduled.
+  Power logs show no sleep in this interval: this is an awake latency result.
+  Recorded tool execution accounts for 2.818s; the runner turn is 59.163s, with
+  the remainder between tool calls attributable only to combined model/provider
+  orchestration from the available evidence, not pure model inference.
+- GitHub's post-deployment inline smoke run
+  `ac222e50-07b3-4e30-a92c-97dfbe2324d0` completed in **12.75s** and the browser
+  showed `GITHUB-LUNA-VERIFIED` after reload in the existing fixture thread.
+
+Both media answers still include the model-time phrase “provider delivery is
+not confirmed,” although transport confirms and displays the files seconds
+later. This is not a delivery failure, but it is a remaining wording issue:
+prefer neutral file labels and actual content over transport implementation
+details, without asserting delivery before it happens. The native Runner
+Inspector for the successful Telegram run shows 88 canonical events with raw
+capture off; no private reasoning or raw provider trace was sent to chat.
+
+The final Slack post-deployment smoke encountered a separate ingress delay:
+provider message `1788852525.310329` is timestamped 07:28:45, but its Paperclip
+delivery was not created until 07:30:23.026 and was processed at 07:30:23.794.
+The final reply was displayed once as `SLACK-LUNA-VERIFIED` at bot message
+`1788852624.382399`. Native run `7c2e2e0c-7522-428f-b5da-ca2e760cfb80` took
+**11.305s**, with **12ms** queue time. The event was `subscribed_message`, proving
+the subscription survived restart. The approximately 98-second gap precedes
+durable admission, but that does not establish HTTP-arrival time: development
+logs omit request duration/start and Slack retry headers. The gap remains
+unattributed, not proven to be Slack or Paperclip initialization. The 07:34:06
+repeat did not reproduce it: ingress took **0.526s**, queue time **10ms**, native
+Luna run `abda130f-c886-4e39-b2fc-ceb921ebf136` **12.439s**, and total
+message-to-final **15.004s**. `SLACK-LUNA-QUICK` published once on existing working
+message `1788852848.668699`, with one delivery/wake/eyes action. The in-app browser
+confirmed the exact final reply. Request-start/duration and retry metadata are
+still needed to attribute a future pre-receipt outlier reliably.
