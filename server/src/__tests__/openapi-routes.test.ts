@@ -246,6 +246,14 @@ describe("openapi routes", () => {
     expect(
       res.body.paths["/api/mcp/gateways/{gatewayPublicId}"],
     ).toBeUndefined();
+    expect(res.body.paths["/api/companies"].get.parameters).toContainEqual({
+      name: "scope",
+      in: "query",
+      required: false,
+      schema: { type: "string", enum: ["accessible"] },
+    });
+    expect(res.body.paths["/api/companies"].get.responses["403"]).toBeDefined();
+    expect(res.body.paths["/api/companies"].get.responses["400"]).toBeDefined();
     expect(
       res.body.paths["/api/companies"].post.responses["201"],
     ).toBeDefined();
