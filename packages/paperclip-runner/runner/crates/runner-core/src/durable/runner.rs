@@ -46,6 +46,7 @@ enum CommandLifecycle {
 }
 
 const TERMINAL_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const CUMULATIVE_ACK_PERSIST_INTERVAL: usize = 16;
 
 fn sleep_for_reconnect(base: Duration, max_delay: Duration, attempt: &mut u32) {
     let multiplier = 1_u128 << (*attempt).min(5);
@@ -254,6 +255,39 @@ pub trait CommandExecutor {
     }
 }
 
+#[derive(Default)]
+struct CumulativeAckPersistence {
+    advanced_since_save: usize,
+}
+
+impl CumulativeAckPersistence {
+    fn apply(
+        &mut self,
+        state: &mut DurableState,
+        store: &DurableStateStore,
+        acked_source_seq: u64,
+    ) -> Result<(), DurableRunnerError> {
+        let previous = state.acked_source_seq;
+        state.apply_ack(acked_source_seq)?;
+        if acked_source_seq == previous {
+            return Ok(());
+        }
+        self.advanced_since_save = self.advanced_since_save.saturating_add(1);
+        // ACKs are cumulative and replay-safe: after a crash, an older durable
+        // cursor only causes the controller to deduplicate the retained suffix
+        // and return the same or a newer ACK. Persist often enough to bound that
+        // replay, but do not rewrite a large outbox once for every frame in a
+        // burst. Command and lifecycle mutations independently save the full
+        // current state before authority can change; an incomplete batch may
+        // safely replay from its older durable cursor.
+        if self.advanced_since_save >= CUMULATIVE_ACK_PERSIST_INTERVAL || state.outbox.is_empty() {
+            store.save(state)?;
+            self.advanced_since_save = 0;
+        }
+        Ok(())
+    }
+}
+
 pub fn run_durable_runner<E: CommandExecutor>(
     mut config: DurableRunnerConfig,
     bootstrap_ticket: BootstrapTicket,
@@ -404,6 +438,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
         state.recoverable_failure = None;
         store.save(&state)?;
         let mut sent_source_seq = state.acked_source_seq;
+        let mut ack_persistence = CumulativeAckPersistence::default();
 
         let mut lifecycle_after_reply = CommandLifecycle::Continue;
         let mut authority_rotation = None;
@@ -551,8 +586,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                         .pointer("/payload/ackedSourceSeq")
                         .and_then(Value::as_u64)
                         .ok_or_else(|| DurableRunnerError::invalid("ACK cursor is required"))?;
-                    state.apply_ack(acked)?;
-                    store.save(&state)?;
+                    ack_persistence.apply(&mut state, &store, acked)?;
                 }
                 Some("command") => {
                     let command: Command =
@@ -761,6 +795,7 @@ fn wait_for_terminal_result_ack(
     result: &StoredCommandResult,
 ) -> Result<(), DurableRunnerError> {
     let deadline = Instant::now() + TERMINAL_RESULT_ACK_TIMEOUT;
+    let mut ack_persistence = CumulativeAckPersistence::default();
     while Instant::now() < deadline {
         let Some(message) = transport.receive_json()? else {
             continue;
@@ -795,8 +830,7 @@ fn wait_for_terminal_result_ack(
                     .pointer("/payload/ackedSourceSeq")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| DurableRunnerError::invalid("ACK cursor is required"))?;
-                state.apply_ack(acked)?;
-                store.save(state)?;
+                ack_persistence.apply(state, store, acked)?;
             }
             Some("ping") => transport.send_json(&control_envelope(
                 state,
@@ -905,8 +939,8 @@ fn poll_executor_events_after_controller_ack<E: CommandExecutor>(
     // Polling another provider batch before consuming that already-sent prefix
     // makes the ACK/stop queue grow faster than this loop can read it. Keep
     // provider events at their durable owner while draining control frames in
-    // order. Command handling, authentication and every ACK save remain live;
-    // unsent outbox events must not fence their own first delivery.
+    // order. Command handling, authentication and cumulative ACK processing
+    // remain live; unsent outbox events must not fence their own first delivery.
     if state.acked_source_seq < sent_source_seq {
         return executor.maintain_backpressured_provider();
     }
@@ -1420,6 +1454,99 @@ mod tests {
         assert!(existed);
         assert_eq!(recovered.lifecycle, "suspended");
         assert!(recovered.pending_terminal_delivery.is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cumulative_ack_bursts_checkpoint_without_blocking_the_next_command() {
+        struct AckObservingExecutor {
+            config: DurableRunnerConfig,
+            acked_before_effect: Option<u64>,
+        }
+        impl CommandExecutor for AckObservingExecutor {
+            fn execute(
+                &mut self,
+                _command: &Command,
+            ) -> Result<CommandExecution, DurableRunnerError> {
+                let store = DurableStateStore::new(&self.config.state_dir)?;
+                let (persisted, _) = store.load_or_create(&self.config)?;
+                self.acked_before_effect = Some(persisted.acked_source_seq);
+                Ok(CommandExecution::result(json!({"status": "completed"})))
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-ack-checkpoint-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = config(directory.clone());
+        config.max_outbox_bytes = 2 * 1024 * 1024;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        for index in 1..=128 {
+            state
+                .enqueue_event(
+                    &config,
+                    "item.delta",
+                    EventPriority::P1,
+                    json!({"index": index}),
+                )
+                .unwrap();
+        }
+        store.save(&state).unwrap();
+
+        let mut persistence = CumulativeAckPersistence::default();
+        for ack in 1..CUMULATIVE_ACK_PERSIST_INTERVAL as u64 {
+            persistence.apply(&mut state, &store, ack).unwrap();
+        }
+        let (before_checkpoint, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(before_checkpoint.acked_source_seq, 0);
+        assert_eq!(before_checkpoint.outbox.len(), 128);
+
+        persistence
+            .apply(&mut state, &store, CUMULATIVE_ACK_PERSIST_INTERVAL as u64)
+            .unwrap();
+        let (first_checkpoint, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(
+            first_checkpoint.acked_source_seq,
+            CUMULATIVE_ACK_PERSIST_INTERVAL as u64
+        );
+        assert_eq!(
+            first_checkpoint.outbox.len(),
+            128 - CUMULATIVE_ACK_PERSIST_INTERVAL
+        );
+
+        persistence
+            .apply(
+                &mut state,
+                &store,
+                CUMULATIVE_ACK_PERSIST_INTERVAL as u64 + 1,
+            )
+            .unwrap();
+        let mut next_command = command("runner.drain");
+        next_command.controller_seq = 1;
+        let mut executor = AckObservingExecutor {
+            config: config.clone(),
+            acked_before_effect: None,
+        };
+        process_command(&mut state, &store, &config, &mut executor, &next_command).unwrap();
+        let (after_command, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(
+            after_command.acked_source_seq,
+            CUMULATIVE_ACK_PERSIST_INTERVAL as u64 + 1
+        );
+        assert_eq!(
+            executor.acked_before_effect,
+            Some(CUMULATIVE_ACK_PERSIST_INTERVAL as u64 + 1)
+        );
+
+        for ack in CUMULATIVE_ACK_PERSIST_INTERVAL as u64 + 2..=128 {
+            persistence.apply(&mut state, &store, ack).unwrap();
+        }
+        let (fully_acked, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(fully_acked.acked_source_seq, 128);
+        assert!(fully_acked.outbox.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
