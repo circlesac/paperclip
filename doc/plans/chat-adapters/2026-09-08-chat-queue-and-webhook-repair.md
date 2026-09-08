@@ -2382,3 +2382,53 @@ the Connectors heading timed out after 30 seconds, before any provider setup.
 Root inspected the blank screenshot. This run retained no trace, so the cause
 is not established. A fresh diagnostic run enables tracing without changing
 timeouts, assertions or retries; its result must be recorded separately.
+
+The diagnostic browser run passed **21/21** (3.6 minutes), with tracing enabled,
+no retries and no skips, on another fresh database. All five mocked-provider
+setup flows and the Board delivery/exact retry cases completed. The original
+blank navigation was not reproduced; its cause remains unverified. The chat
+UX fix is pushed as `93d958946`, but live server 59 remains on the prior
+maintenance checkpoint until the physical-cleanup and deletion fixes are ready.
+
+The parallel Slack review then reproduced a separate authorization defect for
+both PNG and text attachments: after admission, disable the resource, receive
+its verified deletion, re-enable, then invoke native `reuse_chat_attachment`.
+Both calls incorrectly succeeded. A content-free, exact-source processed
+deletion tombstone is being added so known deletion survives re-enable without
+allowing disabled reach to fetch content, add comments, react or wake an agent.
+This is deterministic real-service evidence, not a new live Slack deletion test.
+
+### Cleanup and source-revocation deployment candidate
+
+The normalized/raw journal binding and exact-empty-directory activation repair
+passed **200/200** executor tests and **36/36** resume tests, plus server
+typecheck and independent review. A real staged runner/driver/database fixture
+proves that maintenance receipts use a separate source namespace, remain
+idempotent, reject conflicting evidence, and do not emit chat progress. The
+original raw journal is retained. The production-shaped read-only check against
+the original Telegram run passes with all three relevant database rows; a
+shortened diagnostic omitted the two control-plane rows needed for its accepted
+result digest. No predicate was loosened to accommodate that diagnostic.
+
+The disabled-reach deletion cohort passed **13/13**, including native PNG/text
+read and reuse, exact retry rejection, no provider/storage side effects, runtime
+fencing, and provider-time ordering. The complete fresh suite was **541/542**:
+the ownership-attention test expected one globally queued milestone and got
+four. Inspection identified the exact three new fixtures left eligible by the
+deletion tests. The fix must retire those fixture conversations after their
+assertions, keeping the original one-message expectation intact. Full fresh
+verification is still required before deployment.
+
+Live preflight still finds no running or queued runs, no maintenance events,
+the same accepted result for Telegram A, and the untouched failed B requests.
+All three original quarantine hashes remain unchanged; original runner/provider
+PIDs and groups are absent. The canonical directory remains the same empty,
+non-symlink inode. Server 59 still serves the earlier checkpoint. Browser entry
+continues to report the Mac locked, so there is no new live UI result yet.
+
+The fixture-only correction reproduced the exact `expected 1, got 4` failure
+before passing the joint **7/7** cohort. Only the new fixture conversations are
+retired after assertions; their run/audit records and the existing ownership
+expectation are unchanged. The final complete fresh-database integration suite
+passed **542/542**, and server typecheck passed again. This clears the scoped
+deployment gate, not the still-missing original-request browser retests.

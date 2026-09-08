@@ -86,6 +86,8 @@ import type {
   ChatSdkRuntime,
 } from "../services/chat-sdk-runtime.js";
 import { issueService } from "../services/issues.js";
+import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
+import { NativeChatAttachmentReadScope } from "../services/native-runtime/chat-attachment-read.js";
 import { logActivity } from "../services/activity-log.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
@@ -38842,6 +38844,408 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toEqual([]);
   });
 
+  it.each(["image/png", "text/plain"] as const)(
+    "keeps a verified disabled-channel Slack deletion authoritative for %s read and reuse after re-enable",
+    async (contentType) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const { callbacks, endpoint, runtime, service, wakeup } =
+        await configuredSlackEndpoint(fixture, { storage: storage.storage });
+      const workspaceRoot = mkdtempSync(
+        path.join(os.tmpdir(), "slack-deleted-source-"),
+      );
+      let reader: NativeChatAttachmentReadScope | undefined;
+      try {
+        const channel = makeThread({
+          channelId: "C-DELETED-FILE",
+          id: "slack:C-DELETED-FILE:7060.1",
+          name: "deleted-file",
+        });
+        const body =
+          contentType === "image/png"
+            ? Buffer.from(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3XcAAAAASUVORK5CYII=",
+                "base64",
+              )
+            : Buffer.from(
+                "A deleted source must not become reusable when access returns.\n",
+              );
+        const original = makeMessage({
+          id: "7060.1",
+          text: "@maya retain this exact file",
+          mentioned: true,
+          attachments: [
+            {
+              type: contentType === "image/png" ? "image" : "file",
+              name: contentType === "image/png" ? "source.png" : "source.txt",
+              mimeType: contentType,
+              size: body.length,
+              fetchData: async () => body,
+              fetchMetadata: { testRecoveryKey: "slack-deleted-file" },
+            } as Attachment,
+          ],
+        });
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          thread: channel.thread,
+          message: original,
+          trigger: "mention",
+        });
+        await qualifySetupRoundTrip(service, endpoint.id);
+        await service.test(endpoint.id, "owner-user");
+        const [conversation] = await service.listConversations(endpoint.id);
+        const [attachment] = await db
+          .select()
+          .from(issueAttachments)
+          .where(eq(issueAttachments.issueId, conversation.issueId));
+        expect(attachment?.issueCommentId).toBeTruthy();
+        const runId = randomUUID();
+        const binding = {
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation.issueId,
+          runId,
+        };
+        const context = {
+          ...(await chatWakeContext({
+            endpointId: endpoint.id,
+            issueId: conversation.issueId,
+            provider: "slack",
+            providerMessageId: original.id,
+          })),
+          paperclipHarnessCheckedOut: true,
+          paperclipWake: {
+            reason: "External chat message received",
+            externalChatProvider: "slack",
+            checkedOutByHarness: true,
+            issue: { id: conversation.issueId, workMode: "standard" },
+            commentIds: [attachment.issueCommentId!],
+          },
+        };
+        await db
+          .insert(heartbeatRuns)
+          .values({
+            ...binding,
+            nativeIssueId: conversation.issueId,
+            id: runId,
+            runtimeMode: "native",
+            status: "running",
+            contextSnapshot: context,
+          });
+        await db
+          .update(issues)
+          .set({ executionRunId: runId, status: "in_progress" })
+          .where(eq(issues.id, conversation.issueId));
+        reader = new NativeChatAttachmentReadScope({
+          db,
+          binding,
+          workspaceRoot,
+          executionTargetKind: "local",
+          storage: storage.storage,
+        });
+        const authority = new PaperclipRunnerToolAuthority(db, {
+          ...binding,
+          workspaceRoot,
+          storage: storage.storage,
+          chatAttachmentReadScope: reader,
+        });
+        const selection = {
+          sourceCommentId: attachment.issueCommentId!,
+          attachmentId: attachment.id,
+        };
+        await expect(
+          authority.execute({
+            tool: "list_chat_attachments",
+            callId: "before-deletion",
+            arguments: { sourceCommentId: selection.sourceCommentId },
+          }),
+        ).resolves.toMatchObject({
+          attachments: [expect.objectContaining(selection)],
+        });
+        const beforeComments = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation.issueId));
+        const beforeWakes = wakeup.mock.calls.length;
+        const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+        const beforeProvider = {
+          posts: providerRuntime.posts.length,
+          reactions: providerRuntime.reactions.length,
+        };
+        await service.replaceResources(endpoint.id, [
+          { id: conversation.resourceId!, enabled: false },
+        ]);
+        await callbacks.onMessageDeleted!({
+          endpointId: endpoint.id,
+          provider: "slack",
+          event: {
+            adapter: {} as never,
+            channelId: channel.thread.channelId,
+            deletedAt: new Date(),
+            messageId: original.id,
+            platform: "slack",
+            raw: {},
+            threadId: channel.thread.id,
+          },
+        });
+        await service.replaceResources(endpoint.id, [
+          { id: conversation.resourceId!, enabled: true },
+        ]);
+        const readsBefore = vi.mocked(storage.storage.getObject).mock.calls
+          .length;
+        await expect(
+          authority.execute({
+            tool: "reuse_chat_attachment",
+            callId: "deleted-source-reuse",
+            arguments: {
+              ...selection,
+              idempotencyKey: "deleted-source-reuse",
+              title: "Must remain unavailable",
+            },
+          }),
+        ).rejects.toThrow("paperclip_runner_chat_attachment_source_denied");
+        await expect(
+          authority.execute({
+            tool: "read_chat_attachment",
+            callId: "deleted-source-read",
+            arguments: selection,
+          }),
+        ).rejects.toThrow("paperclip_runner_chat_attachment_source_denied");
+        await expect(
+          authority.execute({
+            tool: "list_chat_attachments",
+            callId: "after-deletion",
+            arguments: { sourceCommentId: selection.sourceCommentId },
+          }),
+        ).resolves.toEqual({
+          attachments: [],
+          nextCursor: null,
+          complete: true,
+        });
+        expect(vi.mocked(storage.storage.getObject).mock.calls.length).toBe(
+          readsBefore,
+        );
+        expect(storage.putFile).toHaveBeenCalledTimes(1);
+        await expect(
+          db
+            .select({ id: issueComments.id })
+            .from(issueComments)
+            .where(eq(issueComments.issueId, conversation.issueId)),
+        ).resolves.toEqual(beforeComments);
+        expect(wakeup.mock.calls.length).toBe(beforeWakes);
+        expect({
+          posts: providerRuntime.posts.length,
+          reactions: providerRuntime.reactions.length,
+        }).toEqual(beforeProvider);
+        const [tombstone] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              eq(chatDeliveries.eventKind, "message_deleted"),
+            ),
+          );
+        expect(tombstone).toMatchObject({
+          state: "processed",
+          conversationId: conversation.id,
+          principalId: null,
+          normalizedEvent: { filtering: { contentRetained: false } },
+        });
+        expect(tombstone.normalizedEvent.message).not.toHaveProperty("text");
+      } finally {
+        await reader?.close();
+        // Global milestone scans include paused endpoints. Retire this exact
+        // fixture's conversation without rewriting its asserted run/audit rows.
+        await db
+          .update(chatConversations)
+          .set({ state: "completed" })
+          .where(
+            and(
+              eq(chatConversations.companyId, fixture.companyId),
+              eq(chatConversations.endpointId, endpoint.id),
+            ),
+          );
+        await retirePublicationFixture(service, endpoint.id);
+        rmSync(workspaceRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("refuses an otherwise eligible exact Slack retry after deletion while channel reach was disabled", async () => {
+    const context = await failedChatRetryFixture("slack");
+    try {
+      const input = {
+        companyId: context.fixture.companyId,
+        issueId: context.issue.id,
+        agentId: context.fixture.assignedAgentId,
+        failedRunId: context.runId,
+        initiatedByUserId: "owner-user",
+      };
+      const rollbackProbe = new Error(
+        "rollback authorized pre-deletion retry probe",
+      );
+      await expect(
+        db.transaction(async (tx) => {
+          await expect(
+            context.service.prepareFailedChatRunRetry(tx, input),
+          ).resolves.toMatchObject({ issueId: context.issue.id });
+          throw rollbackProbe;
+        }),
+      ).rejects.toBe(rollbackProbe);
+      const before = await db
+        .select({ id: chatActions.id })
+        .from(chatActions)
+        .where(eq(chatActions.endpointId, context.endpoint.id));
+      await context.service.replaceResources(context.endpoint.id, [
+        { id: context.conversation.resourceId!, enabled: false },
+      ]);
+      const callbacks = context.runtime.configurations.get(
+        context.endpoint.id,
+      )!.callbacks;
+      await callbacks.onMessageDeleted!({
+        endpointId: context.endpoint.id,
+        provider: "slack",
+        event: {
+          adapter: {} as never,
+          channelId: context.thread.thread.channelId,
+          deletedAt: new Date(),
+          messageId: context.messageId,
+          platform: "slack",
+          raw: {},
+          threadId: context.thread.thread.id,
+        },
+      });
+      await context.service.replaceResources(context.endpoint.id, [
+        { id: context.conversation.resourceId!, enabled: true },
+      ]);
+      await expect(
+        db.transaction((tx) =>
+          context.service.prepareFailedChatRunRetry(tx, input),
+        ),
+      ).rejects.toMatchObject({
+        details: { code: "chat_failed_run_retry_not_authorized" },
+      });
+      await expect(
+        db
+          .select({ id: chatActions.id })
+          .from(chatActions)
+          .where(eq(chatActions.endpointId, context.endpoint.id)),
+      ).resolves.toEqual(before);
+    } finally {
+      await db
+        .update(chatConversations)
+        .set({ state: "completed" })
+        .where(
+          and(
+            eq(chatConversations.companyId, context.fixture.companyId),
+            eq(chatConversations.id, context.conversation.id),
+          ),
+        );
+      await retirePublicationFixture(context.service, context.endpoint.id);
+    }
+  });
+
+  it.each(["unknown_target", "stale_runtime", "edit"] as const)(
+    "does not turn disabled-channel Slack %s into an authorized deletion tombstone",
+    async (mutation) => {
+      const context = await safeNativeProgressFixture("slack", "97");
+      try {
+        const callbacks = context.runtime.configurations.get(
+          context.endpoint.id,
+        )!.callbacks;
+        const before = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, context.conversation.issueId));
+        const wakeCount = context.wakeup.mock.calls.length;
+        await context.service.replaceResources(context.endpoint.id, [
+          { id: context.conversation.resourceId!, enabled: false },
+        ]);
+        if (mutation === "stale_runtime")
+          await db
+            .update(chatEndpoints)
+            .set({
+              setup: sql`jsonb_set(${chatEndpoints.setup}, '{runtimeGeneration}', to_jsonb(coalesce((${chatEndpoints.setup}->>'runtimeGeneration')::int, 0) + 1))`,
+            })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        if (mutation === "edit") {
+          const original = makeMessage({
+            id: context.messageId,
+            text: "@maya original",
+            userId: "U-SAFE-PROGRESS",
+          });
+          await callbacks.onMessageUpdated!({
+            endpointId: context.endpoint.id,
+            provider: "slack",
+            thread: context.thread.thread,
+            message: {
+              ...original,
+              text: "PRIVATE_DISABLED_EDIT_MUST_NOT_PERSIST",
+            },
+            previousMessage: original,
+          });
+        } else {
+          await callbacks.onMessageDeleted!({
+            endpointId: context.endpoint.id,
+            provider: "slack",
+            event: {
+              adapter: {} as never,
+              channelId: context.thread.thread.channelId,
+              deletedAt: new Date(),
+              messageId:
+                mutation === "unknown_target"
+                  ? "unknown-message"
+                  : context.messageId,
+              platform: "slack",
+              raw: {},
+              threadId: context.thread.thread.id,
+            },
+          });
+        }
+        const lifecycle = await db
+          .select()
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, context.endpoint.id),
+              inArray(chatDeliveries.eventKind, [
+                "message_updated",
+                "message_deleted",
+              ]),
+            ),
+          );
+        expect(lifecycle).toHaveLength(mutation === "stale_runtime" ? 0 : 1);
+        expect(lifecycle.some((row) => row.state === "processed")).toBe(false);
+        expect(lifecycle.every((row) => row.conversationId === null)).toBe(
+          true,
+        );
+        expect(JSON.stringify(lifecycle)).not.toContain(
+          "PRIVATE_DISABLED_EDIT_MUST_NOT_PERSIST",
+        );
+        await expect(
+          db
+            .select({ id: issueComments.id })
+            .from(issueComments)
+            .where(eq(issueComments.issueId, context.conversation.issueId)),
+        ).resolves.toEqual(before);
+        expect(context.wakeup.mock.calls.length).toBe(wakeCount);
+      } finally {
+        await db
+          .update(chatConversations)
+          .set({ state: "completed" })
+          .where(
+            and(
+              eq(chatConversations.companyId, context.fixture.companyId),
+              eq(chatConversations.id, context.conversation.id),
+            ),
+          );
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    },
+  );
+
   it("retries lifecycle mutation atomically and reclaims it after restart", async () => {
     const fixture = await seedCompany();
     const deferred: Array<() => void | Promise<void>> = [];
@@ -39887,6 +40291,99 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         },
       ]),
     );
+    // The shared deletion-only tombstone path must not authorize a restore or
+    // let an older delete override the current provider revision while disabled.
+    const commentsBeforeDisabledLifecycle = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, conversation.issueId));
+    const priorLifecycleIds = new Set(
+      (
+        await db
+          .select({ id: chatDeliveries.id })
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id))
+      ).map((row) => row.id),
+    );
+    await service.replaceResources(endpoint.id, [
+      { id: conversation.resourceId!, enabled: false },
+    ]);
+    await sendLifecycle({
+      ...restorePayload,
+      timestamp: "2026-09-06T14:06:00.000Z",
+      text: "DISABLED_RESTORE_MUST_NOT_PERSIST",
+    });
+    await sendLifecycle({
+      ...deletePayload,
+      timestamp: "2026-09-06T14:02:45.000Z",
+    });
+    const latestLifecycle = (
+      await db
+        .select()
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id))
+    ).filter((row) => !priorLifecycleIds.has(row.id));
+    expect(latestLifecycle).toHaveLength(2);
+    expect(latestLifecycle.every((row) => row.state === "filtered")).toBe(true);
+    expect(JSON.stringify(latestLifecycle)).not.toContain(
+      "DISABLED_RESTORE_MUST_NOT_PERSIST",
+    );
+    await sendLifecycle({
+      ...deletePayload,
+      timestamp: "2026-09-06T14:07:00.000Z",
+    });
+    await service.replaceResources(endpoint.id, [
+      { id: conversation.resourceId!, enabled: true },
+    ]);
+    await sendLifecycle({
+      ...restorePayload,
+      timestamp: "2026-09-06T14:06:30.000Z",
+      text: "OLDER_RESTORE_MUST_NOT_PERSIST",
+    });
+    const afterDisabledDelete = (
+      await db
+        .select()
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id))
+    ).filter((row) => !priorLifecycleIds.has(row.id));
+    expect(
+      afterDisabledDelete.filter((row) => row.state === "processed"),
+    ).toEqual([
+      expect.objectContaining({
+        eventKind: "message_deleted",
+        conversationId: conversation.id,
+        normalizedEvent: {
+          providerEventId: expect.any(String),
+          kind: "message_deleted",
+          runtimeContext: expect.objectContaining({
+            generation: expect.any(Number),
+            credentialFingerprint: expect.any(String),
+          }),
+          conversation: {
+            externalThreadId: `teams:${Buffer.from(conversationId).toString("base64url")}`,
+          },
+          message: {
+            providerMessageId: messageId,
+            targetProviderEventId: expect.any(String),
+            providerSentAt: "2026-09-06T14:07:00.000Z",
+          },
+          filtering: { contentRetained: false },
+        },
+      }),
+    ]);
+    expect(afterDisabledDelete).toHaveLength(4);
+    expect(
+      afterDisabledDelete.filter((row) => row.state === "filtered"),
+    ).toHaveLength(3);
+    expect(JSON.stringify(afterDisabledDelete)).not.toContain(
+      "OLDER_RESTORE_MUST_NOT_PERSIST",
+    );
+    await expect(
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, conversation.issueId)),
+    ).resolves.toEqual(commentsBeforeDisabledLifecycle);
     await service.shutdown();
   });
 

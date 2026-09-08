@@ -23,7 +23,13 @@ import {
   issues,
   nativeRunResults,
 } from "@paperclipai/db";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import {
+  CodexAppServerDriver,
+  HarnessDriverBackend,
+  createCodexTaskEnvelope,
+  createRunnerdCodexTransport as createCapabilityRunnerdCodexTransport,
+} from "@paperclipai/paperclip-runner";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -40,7 +46,12 @@ import {
   runnerPrpWebSocketInternals,
   setupRunnerPrpWebSocketServer,
 } from "../../realtime/runner-prp-ws.js";
-import { createRunnerdBackend } from "./native-session-executor.js";
+import {
+  appendRetainedNativeCleanupEvent,
+  createRunnerdBackend,
+  retainedNativeCleanupJournalMatches,
+} from "./native-session-executor.js";
+import * as publicationSignals from "../chat-publication-reconciliation.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import {
   LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION,
@@ -421,6 +432,239 @@ const embeddedSupport = await getEmbeddedPostgresTestSupport();
 const recoveryFakeCodex = resolve(
   import.meta.dirname,
   "../../../../packages/paperclip-runner/test/fixtures/fake-final-burst-codex-app-server.mjs",
+);
+
+(embeddedSupport.supported && existsSync(defaultCapabilityRunnerdBinary())
+  ? it
+  : it.skip)(
+  "keeps actual normalized driver events separate from raw maintenance receipts",
+  async () => {
+    const database = await startEmbeddedPostgresTestDatabase(
+      "native-cleanup-topology-",
+    );
+    const db = createDb(database.connectionString);
+    const scratch = await mkdtemp(join(tmpdir(), "native-cleanup-topology-"));
+    const root = join(scratch, "state");
+    const home = join(scratch, "home");
+    const workspace = join(scratch, "workspace");
+    const companyId = randomUUID(),
+      agentId = randomUUID(),
+      issueId = randomUUID(),
+      runId = randomUUID();
+    const runnerInstanceId = randomUUID(),
+      normalizedSessionId = randomUUID();
+    let session: NativeSession | undefined;
+    const signal = vi.spyOn(
+      publicationSignals,
+      "publishChatPublicationCommitSignal",
+    );
+    let bundle:
+      ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+    try {
+      await mkdir(home);
+      await mkdir(workspace);
+      await db
+        .insert(companies)
+        .values({
+          id: companyId,
+          name: "Cleanup topology",
+          issuePrefix: "NCT",
+        });
+      await db
+        .insert(agents)
+        .values({
+          id: agentId,
+          companyId,
+          name: "Fixture",
+          status: "active",
+          adapterType: "paperclip_runner",
+        });
+      await db
+        .insert(issues)
+        .values({
+          id: issueId,
+          companyId,
+          title: "Exact topology",
+          assigneeAgentId: agentId,
+          status: "in_progress",
+        });
+      await db
+        .insert(heartbeatRuns)
+        .values({
+          id: runId,
+          companyId,
+          agentId,
+          status: "running",
+          runtimeMode: "native",
+          nativeIssueId: issueId,
+          nativeSessionId: normalizedSessionId,
+          runnerInstanceId,
+        });
+      bundle = createCapabilityRunnerdCodexTransport({
+        stateDirectory: root,
+        sourceCodexHome: home,
+        codexCommand: resolve(
+          import.meta.dirname,
+          "../../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server",
+        ),
+        codexArgs: ["--state-file", join(scratch, "fake.json"), "--hold-turn"],
+        prpIdentity: {
+          runId,
+          runnerInstanceId,
+          normalizedSessionId,
+          environmentLeaseId: runId,
+          turnId: `turn-${runId}`,
+          itemId: `item-${runId}`,
+        },
+      });
+      const backend = new HarnessDriverBackend(
+        new CodexAppServerDriver({
+          runnerInstanceId,
+          approvalPolicy: "never",
+          taskEnvelope: createCodexTaskEnvelope({
+            objective: "Open only the fixture session",
+          }),
+          transportFactory: () => bundle!.transport,
+          environment: { HOME: home, CODEX_HOME: home },
+          requireProviderSessionIdentity: true,
+        }),
+      );
+      session = await backend.openSession({
+        identity: {
+          companyId,
+          issueId,
+          agentId,
+          runId,
+          sessionId: normalizedSessionId,
+        },
+        workingDirectory: workspace,
+      });
+      const stream = session.events()[Symbol.asyncIterator]();
+      const normalized = (await stream.next()).value;
+      expect(normalized).toMatchObject({
+        sourceInstanceId: runnerInstanceId,
+        sourceSeq: 1,
+      });
+      expect(normalized.sourceEventId).toBe(`${runnerInstanceId}:${runId}:1`);
+      expect(normalized.payload).not.toHaveProperty("processId");
+      const port = new PaperclipControlPlanePort(db, {
+        companyId,
+        issueId,
+        agentId,
+        runId,
+        sessionId: normalizedSessionId,
+        sourceInstanceId: runnerInstanceId,
+        controlPlaneSourceInstanceId: `${runnerInstanceId}:control`,
+        completionContractId: randomUUID(),
+        completionContractSha256: "fixture-contract",
+      });
+      await port.appendEvent(normalized);
+      const original = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(original).toHaveLength(1);
+      const control = JSON.parse(
+        await readFile(
+          join(root, "control-plane/control-plane-state.json"),
+          "utf8",
+        ),
+      );
+      const raw = control.committedEvents
+        .map(
+          (entry: { envelope: { payload: Record<string, unknown> } }) =>
+            entry.envelope.payload,
+        )
+        .find((event: Record<string, unknown>) =>
+          ["session.started", "session.resumed"].includes(
+            String(event.eventType),
+          ),
+        );
+      expect(raw).toMatchObject({
+        sourceInstanceId: runnerInstanceId,
+        sourceSeq: 1,
+        payload: {
+          providerSessionId: normalized.payload.driverSessionId,
+          providerAccountSessionId: normalized.payload.providerSessionId,
+        },
+      });
+      expect(raw.payload.processId).toBeGreaterThan(0);
+      expect(raw.sourceEventId).not.toBe(normalized.sourceEventId);
+      // The original normalized seq=1 is already durable. Reusing that
+      // namespace for the raw wire seq=1 must remain an integrity violation.
+      await expect(port.appendEvent(raw)).rejects.toMatchObject({
+        code: "native_event_replay_conflict",
+      });
+      signal.mockClear();
+      const input = {
+        companyId,
+        agentId,
+        runId,
+        nativeSessionId: normalizedSessionId,
+        runnerInstanceId,
+        requestId: `fixture:${randomUUID()}`,
+        event: raw,
+      };
+      await appendRetainedNativeCleanupEvent(db, input);
+      await appendRetainedNativeCleanupEvent(db, input);
+      const rows = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(rows).toHaveLength(2);
+      expect(rows.find((row) => row.id === original[0]!.id)).toEqual(
+        original[0],
+      );
+      const receipt = rows.find(
+        (row) => row.eventType === "native.cleanup.event",
+      )!;
+      expect(receipt.sourceSeq).toBe(1);
+      expect(receipt.sourceInstanceId).not.toBe(runnerInstanceId);
+      expect(receipt.payload).not.toHaveProperty("prpEvent");
+      expect(
+        Object.keys(
+          receipt.payload!.nativeCleanupEvent as Record<string, unknown>,
+        ).sort(),
+      ).toEqual([
+        "rawCanonicalSha256",
+        "rawEventType",
+        "rawSourceEventId",
+        "rawSourceInstanceId",
+        "rawSourceSeq",
+        "requestId",
+        "schema",
+      ]);
+      await expect(
+        appendRetainedNativeCleanupEvent(db, {
+          ...input,
+          event: {
+            ...raw,
+            payload: {
+              ...raw.payload,
+              privateData: "MUST_NOT_REACH_MAINTENANCE_RECEIPTS",
+            },
+          },
+        }),
+      ).rejects.toMatchObject({ code: "native_event_replay_conflict" });
+      expect(
+        await db
+          .select()
+          .from(heartbeatRunEvents)
+          .where(eq(heartbeatRunEvents.runId, runId)),
+      ).toHaveLength(2);
+      expect(JSON.stringify(receipt.payload)).not.toContain("MUST_NOT_REACH");
+      expect(signal).not.toHaveBeenCalled();
+    } finally {
+      signal.mockRestore();
+      await session
+        ?.close({ reason: "Dispose exact test session" })
+        .catch(() => undefined);
+      await bundle?.transport.close().catch(() => undefined);
+      await database.cleanup();
+      await rm(scratch, { recursive: true, force: true });
+    }
+  },
+  30_000,
 );
 
 (embeddedSupport.supported &&
@@ -837,6 +1081,46 @@ const recoveryFakeCodex = resolve(
         .from(nativeRunResults)
         .where(eq(nativeRunResults.runId, currentRunId));
       expect(results).toHaveLength(1);
+      // Prove the maintenance anchor against an actual completed composition:
+      // the DB owns normalized driver events and the accepted result, whereas
+      // the retained controller owns distinct raw provider/tool event IDs.
+      const [completedRun] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, currentRunId));
+      const anchorEvents = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, currentRunId));
+      const control = JSON.parse(
+        await readFile(
+          join(root, "control-plane", "control-plane-state.json"),
+          "utf8",
+        ),
+      );
+      const rawIdentity = control.committedEvents
+        .map(
+          (entry: { envelope: { payload: Record<string, unknown> } }) =>
+            entry.envelope.payload,
+        )
+        .find((event: Record<string, unknown>) =>
+          ["session.started", "session.resumed"].includes(
+            String(event.eventType),
+          ),
+        );
+      expect(rawIdentity).toBeDefined();
+      expect(
+        retainedNativeCleanupJournalMatches({
+          run: completedRun!,
+          execution: currentExecution,
+          accepted: results[0]!,
+          control,
+          providerSessionId: rawIdentity.payload.providerSessionId,
+          providerAccountSessionId:
+            rawIdentity.payload.providerAccountSessionId,
+          persistedEvents: anchorEvents,
+        }),
+      ).toBe(true);
       expect(results[0]).toMatchObject({
         companyId,
         issueId,

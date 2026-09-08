@@ -5,6 +5,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -22,10 +23,15 @@ import {
 } from "@paperclipai/db";
 import {
   acpxRuntimeSessionDirectoryName,
+  createPrpSemanticToolInputEnvelope,
+  createPrpSemanticToolResultEnvelope,
+  validatePrpStructuredRunResult,
+  validatePrpEvent,
   type NativeExecutionInputV1,
   type PrpEvent,
 } from "@paperclipai/paperclip-runner";
 import { createHash } from "node:crypto";
+import { nativeSha256 } from "./canonical.js";
 import {
   NativeSessionCleanupQuarantinedError,
   NativeSessionProtocolIntegrityError,
@@ -227,6 +233,7 @@ import {
   nativeFailedRunRetryStateIsSafe,
   nativePreProviderRetryAfterCleanupStateIsSafe,
   reconcileRetainedNativeSessionCleanup,
+  retainedNativeCleanupJournalMatches,
   nativeProviderUsageLimitFromEvent,
   nativeSessionFailureSourceCode,
   nativeSessionRecoveryProjection,
@@ -2103,6 +2110,19 @@ describe("retained native cleanup activation", () => {
     "maintenance_failure",
     "activation_commit_failure",
     "activation_commit_stalled",
+    "empty_root",
+    "nonempty_root",
+    "changed_empty_root",
+    "replaced_empty_root",
+    "distinct_provider_account",
+    "wrong_provider_account",
+    "wrong_result_digest",
+    "wrong_semantic_input",
+    "wrong_contract",
+    "wrong_turn",
+    "missing_result_command",
+    "bad_identity_hash",
+    "foreign_semantic_scope",
   ])("preserves exact original evidence for %s", async (mode) => {
     const directory = await mkdtemp(
       join(tmpdir(), "paperclip-maintenance-activation-"),
@@ -2148,14 +2168,171 @@ describe("retained native cleanup activation", () => {
       turnId: "turn-cleanup",
       itemId: "item-cleanup",
     };
+    const providerAccountSessionId = [
+      "distinct_provider_account",
+      "wrong_provider_account",
+    ].includes(mode)
+      ? "exact-account"
+      : "exact-thread";
     const event = {
+      schema: "paperclip.prp.event.v1",
+      schemaVersion: 1,
+      sourceKind: "runner",
+      sourceSeq: 1,
+      priority: 0,
+      emittedAt: new Date().toISOString(),
+      turnId: identity.turnId,
+      itemId: identity.itemId,
       sourceEventId: "original-provider-identity",
       sourceInstanceId: identity.runnerInstanceId,
       runId: identity.runId,
       normalizedSessionId: identity.normalizedSessionId,
       eventType: "session.resumed",
-      payload: { providerSessionId: "exact-thread", processId: 99_999_998 },
+      payload: {
+        providerSessionId: "exact-thread",
+        providerAccountSessionId,
+        processId: 99_999_998,
+      },
     };
+    const normalizedIdentity = {
+      ...event,
+      sourceEventId: `${identity.runnerInstanceId}:${identity.runId}:1`,
+      priority: 1,
+      ...(mode === "foreign_event" ? { runId: "foreign" } : {}),
+      payload: {
+        driverSessionId: "exact-thread",
+        providerSessionId:
+          mode === "wrong_provider_account"
+            ? "foreign-account"
+            : providerAccountSessionId,
+        context: {},
+      },
+    };
+    const identityRow = {
+      eventType: event.eventType,
+      sourceInstanceId: identity.runnerInstanceId,
+      sourceEventId: normalizedIdentity.sourceEventId,
+      sourceSeq: 1,
+      payload: { prpEvent: normalizedIdentity },
+      sourcePayloadSha256:
+        mode === "bad_identity_hash" ? "bad" : nativeSha256(normalizedIdentity),
+    };
+    const semanticResult = nativeGovernedWaitResult({
+      interaction: { id: "answered", title: "Next response", summary: null },
+      completionContract: execution.completionContract.contract,
+    });
+    const validatedResult = validatePrpStructuredRunResult(semanticResult);
+    expect(validatedResult.ok).toBe(true);
+    const accepted = {
+      schemaStatus: "accepted",
+      resultJson: {
+        result: validatedResult.result,
+        terminal: {
+          schema: "paperclip.prp.terminal.v1",
+          turnTerminalState: "completed",
+          runTerminalState: "succeeded",
+          reportedWorkDisposition: "yielded",
+        },
+      },
+      turnId: "provider-turn",
+      canonicalSha256: "",
+      serverFingerprint: "",
+    };
+    accepted.canonicalSha256 = `sha256:${nativeSha256({ ...accepted.resultJson, turnId: accepted.turnId })}`;
+    accepted.serverFingerprint = `sha256:${nativeSha256({ runId: identity.runId, completionContractSha256: "sha", canonicalSha256: accepted.canonicalSha256 })}`;
+    if (mode === "wrong_result_digest") accepted.canonicalSha256 = "wrong";
+    const correlation = {
+      runId: identity.runId,
+      normalizedSessionId: identity.normalizedSessionId!,
+      turnId:
+        mode === "foreign_semantic_scope" ? "another-turn" : identity.turnId,
+      itemId: identity.itemId,
+    };
+    const semanticInput =
+      mode === "wrong_semantic_input"
+        ? { ...semanticResult, summary: "Different accepted request" }
+        : semanticResult;
+    const semantic = {
+      ...createPrpSemanticToolInputEnvelope({
+        callId: "finish-call",
+        operationId: "paperclip_finish",
+        correlation,
+        content: semanticInput,
+      }),
+      input: semanticInput,
+    };
+    const rawInput = {
+      ...event,
+      sourceEventId: "raw-finish-input",
+      sourceSeq: 3,
+      eventType: "semantic_tool.input",
+      turnId: correlation.turnId,
+      payload: { semantic_tool: semantic },
+    };
+    const rawResult = {
+      ...event,
+      sourceEventId: "raw-finish-result",
+      sourceSeq: 4,
+      eventType: "semantic_tool.result",
+      turnId: correlation.turnId,
+      payload: {
+        semantic_tool: createPrpSemanticToolResultEnvelope({
+          callId: "finish-call",
+          operationId: "paperclip_finish",
+          correlation,
+          content: semanticInput,
+          outcome: "succeeded",
+          code: "semantic_tool_succeeded",
+          operationReceiptId: "operation_finish-call",
+          retryable: false,
+          authorizationBoundary: "active_task",
+        }),
+      },
+    };
+    const commands = [
+      {
+        type: "run.attach",
+        status: "completed",
+        payload: {
+          completionContract: {
+            revision:
+              mode === "wrong_contract"
+                ? "wrong"
+                : execution.completionContract.contract.revision,
+            criterionIds: execution.completionContract.contract.criteria.map(
+              (criterion) => criterion.id,
+            ),
+          },
+        },
+      },
+      {
+        type: "turn.start",
+        status: "completed",
+        result: {
+          result: {
+            providerTurnId: mode === "wrong_turn" ? "wrong" : "provider-turn",
+          },
+        },
+      },
+      ...(mode === "missing_result_command"
+        ? []
+        : [
+            {
+              type: "semantic_tool.result",
+              status: "completed",
+              payload: {
+                callId: semantic.callId,
+                operationId: semantic.operationId,
+                input: semanticInput,
+                correlation,
+                sourceEventId: rawInput.sourceEventId,
+                sourceEventType: rawInput.eventType,
+                isError: false,
+              },
+              result: { result: { callId: semantic.callId } },
+            },
+          ]),
+    ];
     const run = {
       id: identity.runId,
       ...execution.binding,
@@ -2203,18 +2380,9 @@ describe("retained native cleanup activation", () => {
               : table === nativeRunFinalizations
                 ? [coordinator]
                 : table === nativeRunResults
-                  ? [{ schemaStatus: "accepted" }]
+                  ? [accepted]
                   : table === heartbeatRunEvents
-                    ? [
-                        {
-                          payload: {
-                            prpEvent:
-                              mode === "foreign_event"
-                                ? { ...event, runId: "foreign" }
-                                : event,
-                          },
-                        },
-                      ]
+                    ? [identityRow]
                     : [];
           const query = {
             where: () => query,
@@ -2264,6 +2432,18 @@ describe("retained native cleanup activation", () => {
       },
     };
     try {
+      if (
+        [
+          "empty_root",
+          "nonempty_root",
+          "changed_empty_root",
+          "replaced_empty_root",
+        ].includes(mode)
+      ) {
+        await mkdir(root);
+        if (mode === "nonempty_root")
+          await writeFile(join(root, "existing-owner"), "preserved");
+      }
       await mkdir(join(quarantine, "runner"), { recursive: true });
       await mkdir(join(quarantine, "control-plane"), { recursive: true });
       const source = [
@@ -2271,7 +2451,22 @@ describe("retained native cleanup activation", () => {
           "control-plane/control-plane-state.json",
           {
             ...durableControlPlaneState(identity),
-            committedEvents: [{ envelope: { payload: event } }],
+            commands,
+            committedEvents: [
+              event,
+              {
+                ...event,
+                sourceEventId: "raw-turn",
+                sourceSeq: 2,
+                eventType: "turn.accepted",
+                payload: {
+                  providerSessionId: "exact-thread",
+                  providerTurnId: "provider-turn",
+                },
+              },
+              rawInput,
+              rawResult,
+            ].map((payload) => ({ envelope: { payload } })),
           },
         ],
         ["runner/runner-state.json", durableRunnerState(identity, "ready")],
@@ -2288,6 +2483,31 @@ describe("retained native cleanup activation", () => {
           },
         ],
       ] as const;
+      expect(validatePrpEvent(rawInput).ok).toBe(true);
+      expect(validatePrpEvent(rawResult).ok).toBe(true);
+      expect(
+        retainedNativeCleanupJournalMatches({
+          run,
+          execution,
+          accepted,
+          control: source[0][1],
+          providerSessionId: "exact-thread",
+          providerAccountSessionId,
+          persistedEvents: [identityRow],
+        }),
+      ).toBe(
+        ![
+          "foreign_event",
+          "wrong_result_digest",
+          "wrong_semantic_input",
+          "wrong_contract",
+          "wrong_turn",
+          "missing_result_command",
+          "bad_identity_hash",
+          "foreign_semantic_scope",
+          "wrong_provider_account",
+        ].includes(mode),
+      );
       for (const [file, data] of source)
         await writeFile(join(quarantine, file), JSON.stringify(data));
       const original = await Promise.all(
@@ -2297,6 +2517,15 @@ describe("retained native cleanup activation", () => {
       state.retireCleanup.mockReset();
       state.cleanup.mockImplementation(async (input) => {
         await input.authorize();
+        if (mode === "changed_empty_root") {
+          await writeFile(join(root, "late-owner"), "preserved");
+          await input.authorize();
+        }
+        if (mode === "replaced_empty_root") {
+          await rename(root, `${root}.original-empty`);
+          await mkdir(root);
+          await input.authorize();
+        }
         if (mode === "maintenance_failure")
           throw new Error("injected unproven owner");
         return { ...input, settledFingerprint: "verified-fixture-fingerprint" };
@@ -2332,11 +2561,29 @@ describe("retained native cleanup activation", () => {
         releaseCommit();
       }
       const outcome = await pendingOutcome;
-      const succeeds = ["settled", "activation_commit_stalled"].includes(mode);
+      const ineligible = [
+        "live_owner",
+        "foreign_event",
+        "nonempty_root",
+        "wrong_result_digest",
+        "wrong_semantic_input",
+        "wrong_contract",
+        "wrong_turn",
+        "missing_result_command",
+        "bad_identity_hash",
+        "foreign_semantic_scope",
+        "wrong_provider_account",
+      ].includes(mode);
+      const succeeds = [
+        "settled",
+        "activation_commit_stalled",
+        "empty_root",
+        "distinct_provider_account",
+      ].includes(mode);
       expect(outcome.status).toBe(
         succeeds
           ? "settled"
-          : ["live_owner", "foreign_event"].includes(mode)
+          : ineligible
             ? "not_eligible"
             : "operator_required",
       );
@@ -2345,12 +2592,31 @@ describe("retained native cleanup activation", () => {
           source.map(([file]) => readFile(join(quarantine, file), "utf8")),
         ),
       ).toEqual(original);
-      expect(state.cleanup).toHaveBeenCalledTimes(
-        ["live_owner", "foreign_event"].includes(mode) ? 0 : 1,
-      );
+      expect(state.cleanup).toHaveBeenCalledTimes(ineligible ? 0 : 1);
       expect(state.retireCleanup).toHaveBeenCalledTimes(succeeds ? 1 : 0);
       expect(coordinator.phase).toBe("committed");
       expect(coordinator.resultId).toBe("result");
+      if (mode === "empty_root") {
+        const prepared = (
+          coordinator.recoveryHistory as Array<Record<string, unknown>>
+        ).find((entry) => entry.phase === "activation_prepared")!;
+        expect(typeof prepared.emptyRootArchive).toBe("string");
+        expect(
+          await readdir(join(directory, String(prepared.emptyRootArchive))),
+        ).toEqual([]);
+      }
+      if (mode === "nonempty_root")
+        expect(await readFile(join(root, "existing-owner"), "utf8")).toBe(
+          "preserved",
+        );
+      if (mode === "changed_empty_root")
+        expect(await readFile(join(root, "late-owner"), "utf8")).toBe(
+          "preserved",
+        );
+      if (mode === "replaced_empty_root") {
+        expect(await readdir(root)).toEqual([]);
+        expect(await readdir(`${root}.original-empty`)).toEqual([]);
+      }
       if (succeeds) {
         await access(root);
         expect(

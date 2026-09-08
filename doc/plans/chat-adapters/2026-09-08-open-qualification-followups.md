@@ -7,7 +7,8 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
-Latest checkpoint: `b4b6f5777` is pushed and deployed on live server 59.
+Latest checkpoint: `93d958946` is pushed. Live server 59 still runs `b4b6f5777`;
+the recovered-answer replacement and Telegram sizing fixes are not deployed yet.
 The previous qualification turn made progress: Telegram's original accepted
 photo answer was automatically presented, without another heartbeat or provider
 run. The next turn handled only the requested PR image removal; qualification
@@ -40,13 +41,16 @@ failed/observed at attempt zero, and no Retry has been submitted.
 The signed staged runner SHA-256 is
 `3cb217996132fa0cbbb3fa169dacd4250e3318840ed15f3fa3d2961536f34ce9`.
 
-Two live defects remain. Historical generic recovery left an empty canonical
-session directory, which the cleanup admission currently rejects. The retained
-wire identity also differs from the normalized driver event stored in the DB;
-fix the exact composed identity proof and isolate maintenance receipts from the
-driver sequence namespace. James owns that repair; Epicurus independently
-reviews its proof and live-shaped tests. Do not erase the directory/quarantine,
-rewrite historical events, or rerun the already-accepted photo request.
+Physical cleanup is ready for a controlled deployment, not yet proved live.
+Historical generic recovery left an empty canonical session directory; the
+repair preserves that exact inode in an archive during authenticated activation.
+The raw runner journal is now bound to the normalized driver identity and the
+server-accepted result, with a separate namespace for content-free maintenance
+receipts. Executor tests passed **200/200**, resume tests **36/36**, and server
+typecheck and independent review passed. A shortened live diagnostic initially
+omitted two control-plane evidence rows; the actual three-row production query
+passes the predicate. No safety predicate was relaxed. Do not erase the
+directory/quarantine, rewrite historical events, or rerun the accepted request.
 
 The recovered answer arrived as two new messages while old failure 150 remained.
 Boole owns a narrowly authorized same-run committed-answer replacement of the
@@ -79,17 +83,33 @@ suite passed **536/536** (129.18s), and server typecheck passed. The first
 deterministic browser run reached **16 passes / one failure / four not run**:
 Slack's catalog navigation remained blank before setup, timing out while waiting
 for the Connectors heading. Its saved screenshot is completely blank; the
-first run did not retain a trace. A fresh run with tracing enabled is running;
-do not describe this unexplained navigation failure as fixed or all browser
-checks as passed yet. These chat UX changes are checkpointed separately from
-the physical-cleanup work.
+first run did not retain a trace. The fresh diagnostic run with tracing enabled
+passed **21/21** (3.6 minutes), with no retries or skips and no assertion/timeout
+changes. The earlier blank page was not reproduced and remains unexplained;
+do not describe it as fixed. These chat UX changes were pushed in `93d958946`,
+separately from the physical-cleanup work.
 
 Boole's next bounded investigation is verified Slack deletion while reach is
 disabled: current filtering may fail to preserve an invalidation tombstone,
 allowing reuse after access is re-enabled. The proposed regression must prove
 that exact sequence before implementation; any fix must remain content-free,
 current-runtime and exact-source bound, with no comment or wake on disabled
-reach. This is separate, uncommitted work until verified.
+reach. Two real-service regressions (PNG and text) reproduced unauthorized reuse
+after re-enable. The content-free deletion-only fix and stale-event negatives
+passed **13/13**. The combined fresh suite then passed **541/542**: three new
+fixtures left eligible conversations behind, so a later global milestone scan
+counted four instead of one. Their exact rows were identified in the failed
+test database. Retiring only those fixture conversations after assertions
+reproduced red-to-green in the joint **7/7** cohort without weakening the
+one-message expectation. The final fresh complete suite passed **542/542**;
+server typecheck passed again. The verified slice is ready to deploy.
+
+Read-only follow-ups found two additional gaps: disabled-channel edits can
+lose source invalidation, and Slack's pinned adapter drops a file-only change
+when both text and edit timestamp are unchanged. Its lifecycle revision also
+needs to distinguish attachment changes. Separately, exact native retry must
+keep the provider thread and account/session identities distinct. These are
+next bounded repairs, not completed behavior or live qualification claims.
 
 Base `63c8b5d8d` is pushed. All 24 CI jobs, quality, and Greptile's explicit
 500-file review passed; PR #13038 still requires CODEOWNER approval and is not

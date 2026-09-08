@@ -15409,26 +15409,49 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             : nonDirectDestinationAllowed(currentEndpoint, currentResource));
         if (!destinationAllowed) {
           const filteredAt = new Date();
+          // A verified deletion of an exactly linked message still revokes its
+          // source lineage while reach is disabled. Otherwise re-enabling the
+          // channel would silently make a known-deleted file reusable again.
+          // Keep only the tombstone; no task comment, content or wake is allowed.
+          const retainDeletion =
+            currentConversation !== null &&
+            activeDelivery.eventKind === "message_deleted";
           await tx
             .update(chatDeliveries)
             .set({
-              state: "filtered",
+              state: retainDeletion ? "processed" : "filtered",
+              ...(retainDeletion
+                ? { conversationId: currentConversation.id }
+                : {}),
               normalizedEvent: {
                 providerEventId:
                   activeDelivery.normalizedEvent.providerEventId ??
                   activeDelivery.providerEventId,
                 kind: activeDelivery.eventKind,
+                ...(retainDeletion
+                  ? {
+                      runtimeContext: {
+                        generation: admittedRuntimeContext.generation,
+                        credentialFingerprint:
+                          admittedRuntimeContext.credentialFingerprint,
+                      },
+                    }
+                  : {}),
                 conversation: { externalThreadId: lifecycle.threadId },
                 message: {
                   providerMessageId: lifecycle.messageId,
                   targetProviderEventId: lifecycle.targetProviderEventId,
+                  ...(retainDeletion
+                    ? { providerSentAt: lifecycle.providerSentAt }
+                    : {}),
                 },
                 filtering: { contentRetained: false },
               },
               nextAttemptAt: null,
               processedAt: filteredAt,
-              redactedError:
-                "Destination is no longer enabled for message lifecycle events",
+              redactedError: retainDeletion
+                ? "Provider deletion retained without task content while destination access is disabled"
+                : "Destination is no longer enabled for message lifecycle events",
               updatedAt: filteredAt,
             })
             .where(

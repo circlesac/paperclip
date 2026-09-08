@@ -51,6 +51,8 @@ import {
   parsePaperclipQuestionSet,
   resolveSourceCodexHome,
   settleRetainedRunnerdSession,
+  validatePrpEvent,
+  validatePrpStructuredRunResult,
   type RunnerProcessHandle,
   type RunnerProcessLaunchSpec,
 } from "../../vendor/paperclip-runner/index.js";
@@ -75,6 +77,8 @@ import {
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { nativeSha256 } from "./canonical.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { NativeChatAttachmentReadScope } from "./chat-attachment-read.js";
 import {
@@ -1589,6 +1593,309 @@ function cleanupProcessAbsent(pid: unknown): pid is number {
   });
 }
 
+function cleanupCanonicalVacancy(root: string) {
+  const stat = lstatSync(root, { throwIfNoEntry: false });
+  if (!stat) return null;
+  if (!isSafeNativeStateDirectory(root) || readdirSync(root).length !== 0) {
+    throw new Error("native_cleanup_maintenance_unproven");
+  }
+  return {
+    device: stat.dev,
+    inode: stat.ino,
+    mode: stat.mode,
+    modifiedAt: stat.mtimeMs,
+  };
+}
+
+/** Raw runner events and normalized driver events are distinct streams. Bind
+ * the retained raw journal to the server-accepted result, not a guessed shared
+ * event identifier. This is read-only and never interprets a tool as a request. */
+export function retainedNativeCleanupJournalMatches(input: {
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    | "id"
+    | "companyId"
+    | "agentId"
+    | "nativeIssueId"
+    | "nativeSessionId"
+    | "runnerInstanceId"
+    | "completionContractId"
+    | "completionContractSha256"
+  >;
+  execution: NativeExecutionInput;
+  accepted: Pick<
+    typeof nativeRunResults.$inferSelect,
+    | "schemaStatus"
+    | "resultJson"
+    | "turnId"
+    | "canonicalSha256"
+    | "serverFingerprint"
+  >;
+  control: Record<string, unknown>;
+  providerSessionId: string;
+  providerAccountSessionId?: string | null;
+  persistedEvents: Array<
+    Pick<
+      typeof heartbeatRunEvents.$inferSelect,
+      | "eventType"
+      | "payload"
+      | "sourceInstanceId"
+      | "sourceEventId"
+      | "sourceSeq"
+      | "sourcePayloadSha256"
+    >
+  >;
+}): boolean {
+  const { run, accepted, control } = input;
+  const envelope = record(accepted.resultJson);
+  const terminal = record(envelope.terminal);
+  if (
+    accepted.schemaStatus !== "accepted" ||
+    !accepted.turnId ||
+    terminal.turnTerminalState !== "completed" ||
+    terminal.runTerminalState !== "succeeded" ||
+    !Array.isArray(control.committedEvents) ||
+    !Array.isArray(control.commands)
+  )
+    return false;
+  const canonical = {
+    result: envelope.result,
+    terminal: envelope.terminal,
+    turnId: accepted.turnId,
+  };
+  const fingerprint = nativeSha256({
+    runId: run.id,
+    completionContractSha256: run.completionContractSha256,
+    canonicalSha256: accepted.canonicalSha256,
+  });
+  const validPersisted = input.persistedEvents.filter((row) => {
+    const parsed = validatePrpEvent(record(row.payload).prpEvent);
+    return (
+      parsed.ok &&
+      parsed.event.runId === run.id &&
+      parsed.event.normalizedSessionId === run.nativeSessionId &&
+      parsed.event.sourceInstanceId === row.sourceInstanceId &&
+      parsed.event.sourceEventId === row.sourceEventId &&
+      parsed.event.sourceSeq === row.sourceSeq &&
+      row.sourcePayloadSha256 === nativeSha256(parsed.event)
+    );
+  });
+  const identities = validPersisted.filter(
+    (row) =>
+      ["session.started", "session.resumed"].includes(row.eventType) &&
+      row.sourceInstanceId === run.runnerInstanceId,
+  );
+  if (identities.length !== 1) return false;
+  const identityEvent = record(record(identities[0]!.payload).prpEvent);
+  const identityPayload = record(identityEvent.payload);
+  if (
+    identityPayload.providerSessionId !==
+      (input.providerAccountSessionId ?? input.providerSessionId) ||
+    identityPayload.driverSessionId !== input.providerSessionId ||
+    identityEvent.sourceKind !== "runner" ||
+    identityEvent.eventType !== identities[0]!.eventType ||
+    identityEvent.sourceEventId !==
+      `${run.runnerInstanceId}:${run.id}:${identityEvent.sourceSeq}`
+  )
+    return false;
+  const boundDigest = validPersisted.some((row) => {
+    const event = record(record(row.payload).prpEvent);
+    return (
+      event.sourceKind === "control_plane" &&
+      nativeSha256({
+        binding: {
+          companyId: run.companyId,
+          issueId: run.nativeIssueId,
+          agentId: run.agentId,
+          runId: run.id,
+          sessionId: run.nativeSessionId,
+          sourceInstanceId: run.runnerInstanceId,
+          controlPlaneSourceInstanceId: row.sourceInstanceId,
+          completionContractId: run.completionContractId,
+          completionContractSha256: run.completionContractSha256,
+        },
+        ...canonical,
+      }) === accepted.canonicalSha256
+    );
+  });
+  if (!(
+    (accepted.canonicalSha256 === `sha256:${nativeSha256(canonical)}` &&
+      accepted.serverFingerprint === `sha256:${fingerprint}`) ||
+    (accepted.serverFingerprint === fingerprint && boundDigest)
+  ))
+    return false;
+  const events = control.committedEvents.map((entry) =>
+    record(record(record(entry).envelope).payload),
+  );
+  const durableIdentity = record(control.identity);
+  const boundRaw = (event: Record<string, unknown>) =>
+    validatePrpEvent(event).ok &&
+    event.runId === run.id &&
+    event.sourceInstanceId === run.runnerInstanceId &&
+    event.sourceKind === "runner" &&
+    event.normalizedSessionId === run.nativeSessionId &&
+    event.turnId === durableIdentity.turnId &&
+    event.itemId === durableIdentity.itemId;
+  const commands = control.commands.map(record);
+  const contract = input.execution.completionContract.contract;
+  if (
+    !commands.some(
+      (command) =>
+        ["run.prepare", "run.attach"].includes(String(command.type)) &&
+        command.status === "completed" &&
+        canonicalJson(record(command.payload).completionContract) ===
+          canonicalJson({
+            revision: contract.revision,
+            criterionIds: contract.criteria.map((criterion) => criterion.id),
+          }),
+    )
+  )
+    return false;
+  if (
+    !commands.some(
+      (command) =>
+        command.type === "turn.start" &&
+        command.status === "completed" &&
+        record(record(command.result).result).providerTurnId ===
+          accepted.turnId,
+    )
+  )
+    return false;
+  if (
+    !events.some(
+      (event) =>
+        event.eventType === "turn.accepted" &&
+        boundRaw(event) &&
+        record(event.payload).providerTurnId === accepted.turnId &&
+        record(event.payload).providerSessionId === input.providerSessionId,
+    )
+  )
+    return false;
+  const submissions = events.filter(
+    (event) =>
+      event.eventType === "semantic_tool.input" &&
+      record(event.payload).semantic_tool &&
+      record(record(event.payload).semantic_tool).operationId ===
+        "paperclip_finish",
+  );
+  if (submissions.length !== 1) return false;
+  const event = submissions[0]!;
+  const semantic = record(record(event.payload).semantic_tool);
+  const correlation = record(semantic.correlation);
+  const result = validatePrpStructuredRunResult(semantic.input);
+  if (
+    !boundRaw(event) ||
+    !result.ok ||
+    canonicalJson(result.result) !== canonicalJson(envelope.result) ||
+    semantic.schema !== "paperclip.prp.semantic_tool.v1" ||
+    semantic.schemaVersion !== 1 ||
+    semantic.phase !== "input" ||
+    typeof semantic.callId !== "string" ||
+    !semantic.callId ||
+    record(semantic.content).digest !==
+      `sha256:${nativeSha256(semantic.input)}` ||
+    event.runId !== run.id ||
+    event.sourceInstanceId !== run.runnerInstanceId ||
+    event.normalizedSessionId !== run.nativeSessionId ||
+    correlation.runId !== run.id ||
+    correlation.normalizedSessionId !== run.nativeSessionId ||
+    correlation.turnId !== event.turnId ||
+    correlation.itemId !== event.itemId
+  )
+    return false;
+  return (
+    events.some((candidate) => {
+      const outcome = record(record(candidate.payload).semantic_tool);
+      return (
+        candidate.eventType === "semantic_tool.result" &&
+        boundRaw(candidate) &&
+        candidate.runId === run.id &&
+        candidate.sourceInstanceId === run.runnerInstanceId &&
+        candidate.normalizedSessionId === run.nativeSessionId &&
+        outcome.schema === semantic.schema &&
+        outcome.schemaVersion === 1 &&
+        outcome.phase === "result" &&
+        outcome.operationId === semantic.operationId &&
+        outcome.callId === semantic.callId &&
+        outcome.outcome === "succeeded" &&
+        outcome.code === "semantic_tool_succeeded" &&
+        outcome.operationReceiptId === `operation_${semantic.callId}` &&
+        canonicalJson(outcome.correlation) ===
+          canonicalJson(semantic.correlation)
+      );
+    }) &&
+    commands.some((command) => {
+      const payload = record(command.payload);
+      return (
+        command.type === "semantic_tool.result" &&
+        command.status === "completed" &&
+        payload.callId === semantic.callId &&
+        payload.operationId === semantic.operationId &&
+        payload.isError === false &&
+        payload.sourceEventId === event.sourceEventId &&
+        payload.sourceEventType === event.eventType &&
+        canonicalJson(payload.input) === canonicalJson(semantic.input) &&
+        canonicalJson(payload.correlation) ===
+          canonicalJson(semantic.correlation) &&
+        record(record(command.result).result).callId === semantic.callId
+      );
+    })
+  );
+}
+
+/** Durable, content-free evidence for an authenticated maintenance event.
+ * Never feed raw cleanup output into the normal driver/progress namespace. */
+export async function appendRetainedNativeCleanupEvent(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    nativeSessionId: string;
+    runnerInstanceId: string;
+    requestId: string;
+    event: PrpEvent;
+  },
+): Promise<void> {
+  const parsed = validatePrpEvent(input.event);
+  if (
+    !parsed.ok ||
+    parsed.event.runId !== input.runId ||
+    parsed.event.normalizedSessionId !== input.nativeSessionId ||
+    parsed.event.sourceInstanceId !== input.runnerInstanceId ||
+    parsed.event.sourceKind !== "runner" ||
+    !input.requestId
+  ) {
+    throw new Error("native_cleanup_maintenance_unproven");
+  }
+  const event = parsed.event;
+  const receipt = {
+    schema: "paperclip.native_cleanup_event.v1",
+    requestId: input.requestId,
+    rawSourceInstanceId: event.sourceInstanceId,
+    rawSourceEventId: event.sourceEventId,
+    rawSourceSeq: event.sourceSeq,
+    rawEventType: event.eventType,
+    rawCanonicalSha256: nativeSha256(event),
+  };
+  await appendHeartbeatRunEvent(db, {
+    companyId: input.companyId,
+    agentId: input.agentId,
+    runId: input.runId,
+    eventType: "native.cleanup.event",
+    stream: "system",
+    level: "info",
+    payload: { nativeCleanupEvent: receipt },
+    nativeSource: {
+      sourceInstanceId: `${input.runnerInstanceId}:cleanup:${input.requestId}`,
+      sourceEventId: `cleanup:${input.requestId}:${event.sourceEventId}`,
+      sourceSeq: event.sourceSeq,
+      protocolSchemaVersion: 1,
+      canonicalPayload: receipt,
+    },
+  });
+}
+
 /** Exact local cleanup only: the accepted result and original quarantine are
  * never rewritten. A failed/interrupted maintenance attempt is retained for
  * inspection, not retried from an older snapshot with unknown process owners. */
@@ -1618,6 +1925,7 @@ export async function reconcileRetainedNativeSessionCleanup(
     run: typeof heartbeatRuns.$inferSelect;
     quarantine: string;
     root: string;
+    emptyRoot: ReturnType<typeof cleanupCanonicalVacancy>;
     source: ReturnType<typeof cleanupStateSnapshot>;
     providerPid: number;
     providerSessionId: string;
@@ -1744,7 +2052,9 @@ export async function reconcileRetainedNativeSessionCleanup(
         .limit(1);
       if (environment.length) return null;
       const root = scopedRunnerdStateRoot(execution);
-      if (lstatSync(root, { throwIfNoEntry: false })) return null;
+      // A refused successor may create only the directory before admission
+      // fails. Inventory that exact empty inode, never an existing checkpoint.
+      const emptyRoot = cleanupCanonicalVacancy(root);
       const parent = resolve(runnerdStateBase(), "quarantine");
       if (!isSafeNativeStateDirectory(parent)) return null;
       const entries = readdirSync(parent);
@@ -1791,6 +2101,10 @@ export async function reconcileRetainedNativeSessionCleanup(
       const provider = record(providerEvent?.payload);
       if (
         !providerEvent ||
+        !validatePrpEvent(providerEvent).ok ||
+        providerEvent.sourceKind !== "runner" ||
+        providerEvent.turnId !== identity.turnId ||
+        providerEvent.itemId !== identity.itemId ||
         !cleanupProcessAbsent(provider.processId) ||
         typeof provider.providerSessionId !== "string" ||
         source.provider.threadId !== provider.providerSessionId ||
@@ -1801,22 +2115,35 @@ export async function reconcileRetainedNativeSessionCleanup(
       )
         return null;
       const persisted = await tx
-        .select({ payload: heartbeatRunEvents.payload })
+        .select()
         .from(heartbeatRunEvents)
         .where(
           and(
             eq(heartbeatRunEvents.runId, run.id),
             eq(heartbeatRunEvents.companyId, run.companyId),
-            eq(heartbeatRunEvents.sourceInstanceId, run.runnerInstanceId),
-            eq(heartbeatRunEvents.sourceEventId, providerEvent.sourceEventId),
+            or(
+              and(
+                eq(heartbeatRunEvents.sourceInstanceId, run.runnerInstanceId),
+                inArray(heartbeatRunEvents.eventType, ["session.started", "session.resumed"]),
+              ),
+              sql`${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind' = 'control_plane'`,
+            ),
           ),
         )
-        .limit(1)
-        .then((rows) => rows[0]);
+        .limit(20);
       if (
-        !persisted ||
-        canonicalJson(record(persisted.payload).prpEvent) !==
-          canonicalJson(providerEvent)
+        persisted.length >= 20 ||
+        !retainedNativeCleanupJournalMatches({
+          run,
+          execution,
+          accepted: result,
+          control: source.control,
+          providerSessionId: provider.providerSessionId,
+          providerAccountSessionId: typeof provider.providerAccountSessionId === "string"
+            ? provider.providerAccountSessionId
+            : null,
+          persistedEvents: persisted,
+        })
       )
         return null;
       const history = [
@@ -1844,6 +2171,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         run,
         quarantine,
         root,
+        emptyRoot,
         source,
         providerPid: provider.processId,
         providerSessionId: provider.providerSessionId,
@@ -1888,7 +2216,8 @@ export async function reconcileRetainedNativeSessionCleanup(
       executingRunnerdSessionScopes.get(reservedScope) !== leaseOwner ||
       cleanupStateSnapshot(owned.quarantine).fingerprint !==
         owned.source.fingerprint ||
-      lstatSync(owned.root, { throwIfNoEntry: false }) ||
+      canonicalJson(cleanupCanonicalVacancy(owned.root)) !==
+        canonicalJson(owned.emptyRoot) ||
       !cleanupProcessAbsent(owned.run.processPid) ||
       !cleanupProcessAbsent(owned.providerPid)
     )
@@ -1911,17 +2240,6 @@ export async function reconcileRetainedNativeSessionCleanup(
       );
       chmodSync(resolve(copy, file), 0o600);
     }
-    const port = new PaperclipControlPlanePort(db, {
-      companyId: owned.run.companyId,
-      issueId: owned.run.nativeIssueId!,
-      agentId: owned.run.agentId,
-      runId: owned.run.id,
-      sessionId: owned.run.nativeSessionId!,
-      sourceInstanceId: owned.run.runnerInstanceId!,
-      controlPlaneSourceInstanceId: `cleanup:${owned.run.id}`,
-      completionContractId: owned.run.completionContractId!,
-      completionContractSha256: owned.run.completionContractSha256!,
-    });
     const proof = await settleRetainedRunnerdSession({
       binding: {
         companyId: owned.run.companyId,
@@ -1940,11 +2258,22 @@ export async function reconcileRetainedNativeSessionCleanup(
       originalProviderPid: owned.providerPid,
       authorize,
       appendEvent: async (event) => {
-        await port.appendEvent(event);
+        await appendRetainedNativeCleanupEvent(db, {
+          companyId: owned.run.companyId,
+          agentId: owned.run.agentId,
+          runId: owned.run.id,
+          nativeSessionId: owned.run.nativeSessionId!,
+          runnerInstanceId: owned.run.runnerInstanceId!,
+          requestId: leaseOwner,
+          event,
+        });
       },
     });
     // Commit intent before the filesystem handoff. A crash can then be
     // distinguished from an unattempted quarantine; never replay its source.
+    const emptyRootArchive = owned.emptyRoot
+      ? `${basename(owned.root)}.empty-before-cleanup.${leaseOwner}`
+      : null;
     const preparedHistory = [
       ...owned.history,
       {
@@ -1955,6 +2284,9 @@ export async function reconcileRetainedNativeSessionCleanup(
         sourceFingerprint: proof.sourceFingerprint,
         settledFingerprint: proof.settledFingerprint,
         stagingName: basename(copy),
+        ...(emptyRootArchive
+          ? { emptyRootArchive, emptyRoot: owned.emptyRoot }
+          : {}),
         nativeSessionId: owned.run.nativeSessionId,
         runnerInstanceId: owned.run.runnerInstanceId,
         providerSessionId: owned.providerSessionId,
@@ -2002,6 +2334,13 @@ export async function reconcileRetainedNativeSessionCleanup(
         .then((rows) => rows[0]);
       if (!current || current.phase !== "committed") throw denied();
       await authorize();
+      if (emptyRootArchive) {
+        const archive = resolve(runnerdStateBase(), emptyRootArchive);
+        if (lstatSync(archive, { throwIfNoEntry: false })) throw denied();
+        // Preserve even an empty predecessor directory as evidence. The
+        // scope reservation and durable prepared intent cover this handoff.
+        renameSync(owned.root, archive);
+      }
       renameSync(copy, owned.root);
       await tx
         .update(nativeRunFinalizations)
