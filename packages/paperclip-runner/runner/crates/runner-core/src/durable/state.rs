@@ -1277,12 +1277,29 @@ fn redact_sensitive_text_values(input: &str) -> String {
     let is_value_end = |value: u8| {
         value.is_ascii_whitespace() || matches!(value, b',' | b';' | b'&' | b')' | b']' | b'}')
     };
+    // Preserve one sentence-final period, never an embedded/repeated dot or
+    // quoted value content. Even a credential ending here remains fully masked
+    // apart from this punctuation character. JWT validation uses this same
+    // boundary so a sentence period cannot hide an otherwise valid JWT.
+    let without_sentence_period = |start: usize, end: usize| {
+        if end > start + 1
+            && bytes[end - 1] == b'.'
+            && bytes[end - 2] != b'.'
+            && bytes
+                .get(end)
+                .is_none_or(|value| value.is_ascii_whitespace())
+        {
+            end - 1
+        } else {
+            end
+        }
+    };
     let value_end = |start: usize| {
         let mut end = start;
         while end < bytes.len() && !is_value_end(bytes[end]) {
             end += 1;
         }
-        end
+        without_sentence_period(start, end)
     };
     let quoted_value_start = |start: usize| {
         let mut quote_index = start;
@@ -1450,8 +1467,9 @@ fn redact_sensitive_text_values(input: &str) -> String {
         while jwt_end < bytes.len() && is_jwt_byte(bytes[jwt_end]) {
             jwt_end += 1;
         }
-        if jwt_end > jwt_start {
-            let candidate = &normalized[jwt_start..jwt_end];
+        let candidate_end = without_sentence_period(jwt_start, jwt_end);
+        if candidate_end > jwt_start {
+            let candidate = &normalized[jwt_start..candidate_end];
             let segments = candidate.split('.').collect::<Vec<_>>();
             if matches!(segments.len(), 3 | 4)
                 && segments.iter().all(|segment| {
@@ -1461,7 +1479,7 @@ fn redact_sensitive_text_values(input: &str) -> String {
                         })
                 })
             {
-                ranges.push((jwt_start, jwt_end));
+                ranges.push((jwt_start, candidate_end));
             }
         }
         jwt_start = jwt_end.saturating_add(1);
@@ -1626,6 +1644,8 @@ fn redact_sensitive_text_values(input: &str) -> String {
                     "the simple ",
                     "a balanced ",
                     "the balanced ",
+                    "a transparent ",
+                    "the transparent ",
                 ]
                 .iter()
                 .any(|lead| token_phrase_has_lead(lead)))
@@ -1698,7 +1718,7 @@ fn redact_sensitive_text_values(input: &str) -> String {
             while end < bytes.len() && !matches!(bytes[end], b'\n' | b'\r' | b',' | b';' | b'&') {
                 end += 1;
             }
-            end
+            without_sentence_period(value_start, end)
         } else {
             value_end(value_start)
         };
@@ -2224,6 +2244,8 @@ mod tests {
             "The simple token system is fair.",
             "Use a simple TOKEN SYSTEM",
             "Use a balanced token system.",
+            "Use a transparent token system to keep exchanges fair.",
+            "Describe the transparent token system clearly.",
             "One token can equal one standard game.",
             "Award one token per accepted game.",
         ] {
@@ -2334,6 +2356,117 @@ mod tests {
             assert_eq!(redacted, expected, "{input}");
             assert_eq!(redact_text(&redacted), redacted);
         }
+    }
+
+    #[test]
+    fn transparent_token_system_requires_exact_prose_boundaries() {
+        for lead in ["a transparent ", "the transparent "] {
+            for (tail, redacted_tail) in [
+                ("token=system", "token=[REDACTED]"),
+                ("token:system", "token:[REDACTED]"),
+                ("token \"system\"", "token \"[REDACTED]\""),
+                ("token 'system'", "token '[REDACTED]'"),
+                ("\"token\" system", "\"token\" [REDACTED]"),
+                ("access_token system", "access_token [REDACTED]"),
+                ("--token system", "--token [REDACTED]"),
+                ("token\nsystem", "token\n[REDACTED]"),
+                ("token system-secret", "token [REDACTED]"),
+                ("token system.signed-value", "token [REDACTED]"),
+                ("token system=secret", "token [REDACTED]"),
+                ("token system:secret", "token [REDACTED]"),
+                ("token system,secret", "token [REDACTED],secret"),
+                ("token system;secret", "token [REDACTED];secret"),
+                ("token system)secret", "token [REDACTED])secret"),
+                ("token arbitrary", "token [REDACTED]"),
+                ("token ghp_abcdefghijklmnopqrstuvwxyz", "token [REDACTED]"),
+                ("token sk-abcdefghijklmnop", "token [REDACTED]"),
+            ] {
+                let input = format!("{lead}{tail}");
+                assert_eq!(redact_text(&input), format!("{lead}{redacted_tail}"));
+            }
+        }
+        for input in [
+            "meta-transparent token system",
+            "a very transparent token system",
+            "a transparent token economy",
+            "one token clerk, one demonstration host",
+        ] {
+            assert!(redact_text(input).contains("[REDACTED]"), "{input}");
+        }
+        assert_eq!(
+            sanitize_value(&json!({
+                "summary": "Use a transparent token system; Bearer fixture-secret.",
+                "token": "system.",
+            })),
+            json!({
+                "summary": "Use a transparent token system; Bearer [REDACTED].",
+                "token": "[REDACTED]",
+            })
+        );
+    }
+
+    #[test]
+    fn sentence_period_redaction_keeps_credentials_and_embedded_dots_private() {
+        for (input, expected) in [
+            ("token=fixture-secret. Next.", "token=[REDACTED]. Next."),
+            ("token fixture-secret.", "token [REDACTED]."),
+            (
+                "token fixture.secret.suffix. Next.",
+                "token [REDACTED]. Next.",
+            ),
+            ("token fixture.secret.suffix", "token [REDACTED]"),
+            ("token fixture-secret..", "token [REDACTED]"),
+            ("token .", "token [REDACTED]"),
+            ("token=fixture-secret.\nRetry.", "token=[REDACTED].\nRetry."),
+            ("token=fixture-secret., Next.", "token=[REDACTED], Next."),
+            (
+                "token \"fixture-secret.\" Next.",
+                "token \"[REDACTED]\" Next.",
+            ),
+            ("token 'fixture-secret.' Next.", "token '[REDACTED]' Next."),
+            ("Bearer fixture-secret. Next.", "Bearer [REDACTED]. Next."),
+            (
+                "Authorization: Bearer fixture-secret. Next.",
+                "Authorization: Bearer [REDACTED]. Next.",
+            ),
+            (
+                "eyJabcdefghi.abcdefghijk.lmnopqrstuv. Next.",
+                "[REDACTED]. Next.",
+            ),
+            (
+                "eyJabcdefghi.abcdefghijk.lmnopqrstuv.wxyzabcdefg.",
+                "[REDACTED].",
+            ),
+            (
+                "token=eyJabcdefghi.abcdefghijk.lmnopqrstuv.",
+                "token=[REDACTED].",
+            ),
+            (
+                "Review token rules. Send a thank-you.",
+                "Review token [REDACTED]. Send a thank-you.",
+            ),
+        ] {
+            let redacted = redact_text(input);
+            assert_eq!(redacted, expected, "{input}");
+            assert_eq!(redact_text(&redacted), expected, "{input}");
+        }
+        let config = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&config);
+        let command = command("command_token_sentence_prose", 1);
+        state.begin_command(&command).unwrap();
+        state.complete_command(&command, json!({
+            "result": {
+                "schema": "paperclip.prp.run_result.v1",
+                "summary": "Use a transparent token system. Remove token=fixture-secret. Next.",
+            },
+            "nested": {"token": "fixture-secret."},
+        })).unwrap();
+        let completed = state.processed_commands.get(&command.command_id).unwrap();
+        assert_eq!(
+            completed.result["result"]["summary"],
+            json!("Use a transparent token system. Remove token=[REDACTED]. Next.")
+        );
+        assert_eq!(completed.result["nested"]["token"], json!("[REDACTED]"));
     }
 
     #[test]
