@@ -99,6 +99,25 @@ export class NativeSessionCloseUnrecoverableError extends Error {
   }
 }
 
+/** An authenticated, exactly bound runner event failed permanent integrity checks. */
+export class NativeSessionProtocolIntegrityError extends Error {
+  readonly code = "native_event_replay_conflict";
+  readonly recovery = "operator_required";
+
+  constructor(
+    readonly reason:
+      | "semantic_input_digest_mismatch"
+      | "source_event_replay_conflict",
+  ) {
+    super(
+      reason === "semantic_input_digest_mismatch"
+        ? "native_event_replay_conflict: authenticated runner semantic input failed integrity validation; automatic recovery is stopped."
+        : "native_event_replay_conflict: authenticated runner event conflicts with committed history; automatic recovery is stopped.",
+    );
+    this.name = "NativeSessionProtocolIntegrityError";
+  }
+}
+
 /** Admission is blocked by a retained owner that has no safe automatic close retry. */
 export class NativeSessionCleanupQuarantinedError extends Error {
   readonly code = "native_session_cleanup_quarantined";

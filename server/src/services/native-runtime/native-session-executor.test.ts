@@ -24,7 +24,10 @@ import {
   type PrpEvent,
 } from "@paperclipai/paperclip-runner";
 import { createHash } from "node:crypto";
-import { NativeSessionCleanupQuarantinedError } from "../../vendor/paperclip-runner/index.js";
+import {
+  NativeSessionCleanupQuarantinedError,
+  NativeSessionProtocolIntegrityError,
+} from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
 import {
   createNativeHarnessBackupStamp,
@@ -2362,6 +2365,7 @@ function leaseDb(
   coordinatorOverrides: Partial<LeaseCoordinator> = {},
   runResultJson: Record<string, unknown> = {},
   updates: Array<{ table: unknown; values: Record<string, unknown> }> = [],
+  runnerProfileJson: Record<string, unknown> = {},
 ): Db {
   const coordinator: LeaseCoordinator = {
     runId: boundExecution.binding.runId,
@@ -2399,6 +2403,7 @@ function leaseDb(
                   companyId: boundExecution.binding.companyId,
                   nativeIssueId: boundExecution.binding.issueId,
                   resultJson: runResultJson,
+                  runnerProfileJson,
                   runtimeMode: "native",
                 },
               ]
@@ -3875,6 +3880,154 @@ describe("native warm session supervision", () => {
 });
 
 describe("native session bounded recovery", () => {
+  it("keeps typed integrity failure permanent even if a wrapper changes its message", () => {
+    const failure = new NativeSessionProtocolIntegrityError(
+      "semantic_input_digest_mismatch",
+    );
+    failure.message = "provider_transport_failed: later cleanup failed";
+    const code = nativeSessionFailureSourceCode(failure);
+    expect(code).toBe("native_event_replay_conflict");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+      phase: "terminal_failure",
+      failureCode: code,
+      nextAttemptAt: null,
+    });
+    expect(
+      nativeSessionFailureSourceCode(
+        Object.assign(new Error("ordinary disconnect"), {
+          code: failure.code,
+          recovery: failure.recovery,
+        }),
+      ),
+    ).toBe("native_session_interrupted");
+  });
+
+  it.each([
+    { checkpointExists: false, ancillaryFailure: null },
+    { checkpointExists: true, ancillaryFailure: null },
+    { checkpointExists: false, ancillaryFailure: "log" },
+    { checkpointExists: true, ancillaryFailure: "log" },
+    { checkpointExists: false, ancillaryFailure: "recovery_write" },
+    { checkpointExists: true, ancillaryFailure: "recovery_write" },
+  ] as const)(
+    "preserves integrity failure without retrying the provider (%j)",
+    async ({ checkpointExists, ancillaryFailure }) => {
+      const updates: Array<{
+        table: unknown;
+        values: Record<string, unknown>;
+      }> = [];
+      const failure = new NativeSessionProtocolIntegrityError(
+        "semantic_input_digest_mismatch",
+      );
+      state.execute.mockReset().mockRejectedValueOnce(failure);
+      state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+      const secondaryFailure = new Error("temporary diagnostic storage failure");
+      const onLog = vi.fn(async (_stream: string, chunk: string) => {
+        if (
+          ancillaryFailure === "log" &&
+          chunk.includes("native session execution failed:")
+        ) {
+          throw secondaryFailure;
+        }
+      });
+      const db = leaseDb(
+        execution,
+        {},
+        {},
+        updates,
+        checkpointExists
+          ? {
+              sessionCheckpoint: {
+                providerSessionId: "provider-existing",
+              },
+            }
+          : {},
+      );
+      const transact = db.transaction.bind(db);
+      const recoveryWriteAttempt = vi.fn();
+      db.transaction = (async (operation) => {
+        if (state.execute.mock.calls.length > 0) {
+          recoveryWriteAttempt();
+          if (ancillaryFailure === "recovery_write") throw secondaryFailure;
+        }
+        return transact(operation);
+      }) as typeof db.transaction;
+      const updateIssue = vi.fn(async () => null);
+      const service = vi
+        .spyOn(issueServiceModule, "issueService")
+        .mockReturnValue({ update: updateIssue } as unknown as ReturnType<
+          typeof issueServiceModule.issueService
+        >);
+      try {
+        await expect(
+          executePaperclipNativeSession({
+            db,
+            execution,
+            runnerInstanceId: "runner",
+            onLog,
+          }),
+        ).rejects.toBe(failure);
+        expect(recoveryWriteAttempt).toHaveBeenCalledOnce();
+        expect(state.execute).toHaveBeenCalledOnce();
+        if (ancillaryFailure === "recovery_write") {
+          // The failed transaction cannot manufacture a persisted recovery or
+          // change task state, but its error must not permit a provider retry.
+          expect(
+            updates.some((entry) => entry.values.phase === "terminal_failure"),
+          ).toBe(false);
+          expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
+          expect(updateIssue).not.toHaveBeenCalled();
+          expect(
+            nativeSessionFailureDisposition(
+              1,
+              new Date(),
+              nativeSessionFailureSourceCode(failure),
+            ),
+          ).toMatchObject({
+            phase: "terminal_failure",
+            nextAttemptAt: null,
+          });
+          return;
+        }
+        expect(
+          updates.find(
+            (entry) =>
+              entry.table === nativeRunFinalizations &&
+              entry.values.phase === "terminal_failure",
+          )?.values,
+        ).toMatchObject({
+          failureCode: "native_event_replay_conflict",
+          nextAttemptAt: null,
+          failureDetail: {
+            originalFailureCode: "native_event_replay_conflict",
+            recoveryMode: checkpointExists
+              ? "exact_checkpoint_resume"
+              : "ambiguous_state",
+            nextAction: expect.stringContaining(
+              checkpointExists
+                ? "automatic recovery is stopped"
+                : "replacement provider session is forbidden",
+            ),
+          },
+        });
+        expect(state.upsertRecoveryAction).toHaveBeenCalledWith(
+          expect.objectContaining({
+            cause: "native_event_replay_conflict",
+            ownerType: "board",
+            wakePolicy: null,
+          }),
+        );
+        expect(updateIssue).toHaveBeenCalledWith(
+          execution.binding.issueId,
+          { status: "in_review" },
+          expect.anything(),
+        );
+      } finally {
+        service.mockRestore();
+      }
+    },
+  );
+
   it("makes only typed operator-required cleanup quarantine terminal on the first attempt", () => {
     const code = nativeSessionFailureSourceCode(
       new NativeSessionCleanupQuarantinedError(),

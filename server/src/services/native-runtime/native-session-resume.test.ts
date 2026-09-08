@@ -1,20 +1,47 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import {
   agents,
   companies,
+  completionContracts,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
+  nativeRunResults,
 } from "@paperclipai/db";
 import { describe, expect, it } from "vitest";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../../__tests__/helpers/embedded-postgres.js";
-import { canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
+import {
+  canonicalNativeRuntimeContextDigest,
+  defaultCapabilityRunnerdBinary,
+  executeNativeSession,
+  parseNativeExecutionInput,
+  type NativeExecutionInput,
+  type NativeSession,
+} from "../../vendor/paperclip-runner/index.js";
+import {
+  runnerPrpWebSocketInternals,
+  setupRunnerPrpWebSocketServer,
+} from "../../realtime/runner-prp-ws.js";
+import { createRunnerdBackend } from "./native-session-executor.js";
+import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import {
   LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION,
   REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION,
@@ -391,6 +418,443 @@ it("wires exact-session recovery and guarded selected identity into heartbeat pe
 });
 
 const embeddedSupport = await getEmbeddedPostgresTestSupport();
+const recoveryFakeCodex = resolve(
+  import.meta.dirname,
+  "../../../../packages/paperclip-runner/test/fixtures/fake-final-burst-codex-app-server.mjs",
+);
+
+(embeddedSupport.supported &&
+  existsSync(defaultCapabilityRunnerdBinary()) &&
+  existsSync(recoveryFakeCodex)
+  ? it
+  : it.skip)(
+  "archives a damaged prior epoch before completing guarded same-task replacement with real runnerd",
+  async () => {
+    const database = await startEmbeddedPostgresTestDatabase(
+      "native-damaged-resume-",
+    );
+    const db = createDb(database.connectionString);
+    const scratch = await mkdtemp(join(tmpdir(), "native-damaged-resume-"));
+    const stateBase = join(scratch, "sessions");
+    const bin = join(scratch, "bin");
+    const workspace = join(scratch, "workspace");
+    const sourceHome = join(scratch, "source-home");
+    const previousStateBase = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    const server = createServer();
+    let firstSession: NativeSession | undefined;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
+    try {
+      await Promise.all(
+        [bin, workspace, sourceHome].map((path) =>
+          mkdir(path, { recursive: true }),
+        ),
+      );
+      // Only the provider boundary is synthetic; driver, runnerd, authority
+      // rotation, prior-owner DB checks and archive/replacement are real.
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      const command = join(bin, "codex");
+      await writeFile(
+        command,
+        `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(recoveryFakeCodex)} "$CODEX_HOME/fake-state.json" 16\n`,
+      );
+      await chmod(command, 0o700);
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      const address = server.address();
+      if (!address || typeof address === "string")
+        throw new Error("Missing test listener");
+      setupRunnerPrpWebSocketServer(server, {
+        apiUrl: `http://127.0.0.1:${address.port}`,
+      });
+      const makeExecution = (runId: string): NativeExecutionInput => {
+        const { runtimeContext: _runtimeContext, ...value } = execution(
+          runId,
+          workspace,
+        );
+        return {
+          ...value,
+          schema: "paperclip.native-execution-input.v2",
+          provider: { kind: "codex", model: "gpt-5.6-luna" },
+          completionContract: {
+            ...value.completionContract,
+            contract: {
+              revision: "burst-v1",
+              objective: "Complete a fresh response after guarded recovery",
+              criteria: [
+                { id: "burst", requirement: "Complete the new response" },
+              ],
+            },
+          },
+        };
+      };
+      const firstExecution = makeExecution(previousRunId);
+      const currentExecution = makeExecution(currentRunId);
+      expect(() => parseNativeExecutionInput(firstExecution)).not.toThrow();
+      const runnerInstanceId = randomUUID();
+      const environment = {
+        PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+        HOME: sourceHome,
+        CODEX_HOME: sourceHome,
+      };
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Damaged recovery",
+        issuePrefix: "DNR",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Recovery runner",
+        status: "active",
+        adapterType: "paperclip_runner",
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Preserve the same task",
+        assigneeAgentId: agentId,
+        status: "in_progress",
+      });
+      await db.insert(completionContracts).values({
+        id: currentExecution.completionContract.id,
+        companyId,
+        issueId,
+        revision: 1,
+        schemaVersion: "paperclip.completion-contract.v1",
+        policyVersion: "damaged-recovery-v1",
+        risk: "standard",
+        completionAuthority: "server_arbiter",
+        incompleteCriteriaPolicy: "preserve_non_terminal",
+        contractJson: { ...currentExecution.completionContract.contract },
+        canonicalSha256: currentExecution.completionContract.sha256,
+        createdByActorType: "system",
+        createdByActorId: "test",
+      });
+      await db.insert(heartbeatRuns).values([
+        {
+          id: previousRunId,
+          companyId,
+          agentId,
+          status: "running",
+          runtimeMode: "native",
+          nativeIssueId: issueId,
+          nativeSessionId: normalizedSessionId,
+          runnerInstanceId,
+          completionContractId: firstExecution.completionContract.id,
+          completionContractSha256: firstExecution.completionContract.sha256,
+          runnerProfileJson: { nativeExecutionInput: firstExecution },
+        },
+        {
+          id: currentRunId,
+          companyId,
+          agentId,
+          status: "running",
+          runtimeMode: "native",
+          nativeIssueId: issueId,
+          nativeSessionId: normalizedSessionId,
+          runnerInstanceId,
+          completionContractId: currentExecution.completionContract.id,
+          completionContractSha256: currentExecution.completionContract.sha256,
+          runnerProfileJson: { nativeExecutionInput: currentExecution },
+        },
+      ]);
+      const firstBackend = await createRunnerdBackend({
+        db,
+        execution: firstExecution,
+        runnerInstanceId,
+        runnerEnvironment: environment,
+      });
+      firstSession = await firstBackend.openSession({
+        identity: {
+          companyId,
+          issueId,
+          agentId,
+          runId: previousRunId,
+          sessionId: normalizedSessionId,
+        },
+        workingDirectory: workspace,
+      });
+      const checkpoint = await firstSession.snapshot();
+      expect(checkpoint.identity).toEqual({
+        companyId,
+        issueId,
+        agentId,
+        runId: previousRunId,
+        sessionId: normalizedSessionId,
+      });
+      await firstSession.close({
+        reason: "Establish a suspended test-only historical root",
+      });
+      firstSession = undefined;
+      const [stateKey] = (await readdir(stateBase)).filter((name) =>
+        /^[a-f0-9]{64}$/.test(name),
+      );
+      expect(stateKey).toBeDefined();
+      const root = join(stateBase, stateKey!);
+      const runnerPath = join(root, "runner", "runner-state.json");
+      const providerPath = join(root, "runner", "codex-provider-state.json");
+      const runner = JSON.parse(await readFile(runnerPath, "utf8"));
+      const provider = JSON.parse(await readFile(providerPath, "utf8"));
+      expect(runner.lifecycle).toBe("suspended");
+
+      // Reproduce only in a generated disposable root the historical failure:
+      // an unacknowledged input whose digest predates bounded sanitization.
+      const badPayload = {
+        semantic_tool: {
+          schema: "paperclip.prp.semantic_tool.v1",
+          schemaVersion: 1,
+          phase: "input",
+          input: { summary: "bounded historical answer" },
+          content: { digest: `sha256:${"0".repeat(64)}` },
+        },
+      };
+      const envelope = {
+        protocol: "paperclip.runner",
+        version: 1,
+        kind: "event",
+        runnerInstanceId: runner.runnerInstanceId,
+        environmentLeaseId: runner.environmentLeaseId,
+        runId: previousRunId,
+        normalizedSessionId,
+        turnId: runner.turnId,
+        itemId: runner.itemId,
+        payload: {
+          schema: "paperclip.prp.event.v1",
+          sourceEventId: "historical-bad-input-44",
+          sourceSeq: 44,
+          sourceInstanceId: runner.runnerInstanceId,
+          sourceKind: "runner",
+          runId: previousRunId,
+          normalizedSessionId,
+          turnId: runner.turnId,
+          itemId: runner.itemId,
+          eventType: "semantic_tool.input",
+          schemaVersion: 1,
+          priority: 0,
+          emittedAt: "2026-09-08T00:00:00.000Z",
+          payload: badPayload,
+        },
+      };
+      runner.ackedSourceSeq = 43;
+      runner.nextSourceSeq = 45;
+      runner.outbox = [
+        {
+          sourceSeq: 44,
+          priority: 0,
+          eventType: "semantic_tool.input",
+          envelope,
+          byteSize: Buffer.byteLength(JSON.stringify(envelope)),
+        },
+      ];
+      provider.pendingEvents = [
+        {
+          executorEventId: "codex_provider_0000000000000044",
+          eventType: "semantic_tool.input",
+          priority: "p0",
+          payload: badPayload,
+        },
+      ];
+      provider.nextProviderEventSeq = 45;
+      await writeFile(runnerPath, JSON.stringify(runner));
+      await writeFile(providerPath, JSON.stringify(provider));
+      const damagedRunnerBytes = await readFile(runnerPath);
+      const damagedProviderBytes = await readFile(providerPath);
+      await expect(
+        createRunnerdBackend({
+          db,
+          execution: currentExecution,
+          runnerInstanceId,
+          runnerEnvironment: environment,
+        }),
+      ).rejects.toThrow("runner_state_identity_mismatch");
+      expect(await readFile(runnerPath, "utf8")).toBe(
+        damagedRunnerBytes.toString(),
+      );
+      expect(await readdir(root)).not.toContain("authority-epochs");
+      const source = previousRun({
+        nativeExecutionInput: firstExecution,
+        sessionCheckpoint: checkpoint,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed", runnerProfileJson: source.runnerProfileJson })
+        .where(eq(heartbeatRuns.id, previousRunId));
+      const selected = await findNativeSessionResumeRun(db, {
+        companyId,
+        agentId,
+        issueId,
+        normalizedSessionId,
+        currentRunId,
+        beforeCreatedAt: new Date(),
+      });
+      expect(selected?.id).toBe(previousRunId);
+      const rebound = rebindNativeSessionCheckpoint({
+        previousRun: selected!,
+        currentExecution,
+      });
+      expect(rebound).toMatchObject({
+        cursor: null,
+        semanticResult: null,
+        activeTurnId: null,
+        providerRecoveryPolicy: "allow_replacement_after_resume_failure",
+      });
+      expect(rebound?.identity).toEqual({
+        companyId,
+        issueId,
+        agentId,
+        runId: currentRunId,
+        sessionId: normalizedSessionId,
+      });
+
+      const backend = await createRunnerdBackend({
+        db,
+        execution: currentExecution,
+        runnerInstanceId,
+        runnerEnvironment: environment,
+      });
+      let continuity: Record<string, unknown> | undefined;
+      const controlPlaneInstanceId = randomUUID();
+      const port = new PaperclipControlPlanePort(db, {
+        companyId,
+        issueId,
+        runId: currentRunId,
+        agentId,
+        sessionId: normalizedSessionId,
+        completionContractId: currentExecution.completionContract.id,
+        completionContractSha256: currentExecution.completionContract.sha256,
+        sourceInstanceId: runnerInstanceId,
+        controlPlaneSourceInstanceId: controlPlaneInstanceId,
+      });
+      await expect(
+        executeNativeSession({
+          input: currentExecution,
+          backend,
+          persistedSession: rebound!,
+          runnerInstanceId,
+          controlPlaneInstanceId,
+          timeoutMs: 20_000,
+          controlPlane: port,
+          async onContinuityBreak(value) {
+            continuity = value;
+          },
+        }),
+      ).resolves.toMatchObject({
+        result: {
+          summary: "Fixture complete.",
+          reportedWorkDisposition: "done",
+        },
+        terminal: { runTerminalState: "succeeded" },
+        normalizedSessionId,
+      });
+      expect(continuity).toMatchObject({
+        reason: expect.stringContaining(
+          "run.attach requires a settled Codex provider session",
+        ),
+        previousDriverSessionId: checkpoint.sessionId,
+      });
+      const [epoch] = await readdir(join(root, "authority-epochs"));
+      const digest = (value: Buffer) =>
+        createHash("sha256").update(value).digest("hex");
+      expect(
+        digest(
+          await readFile(
+            join(root, "authority-epochs", epoch!, "runner-state.json"),
+          ),
+        ),
+      ).toBe(digest(damagedRunnerBytes));
+      const [continuityArchive] = await readdir(
+        join(root, "continuity-breaks"),
+      );
+      const archivedProvider = JSON.parse(
+        await readFile(
+          join(
+            root,
+            "continuity-breaks",
+            continuityArchive!,
+            "runner",
+            "codex-provider-state.json",
+          ),
+          "utf8",
+        ),
+      );
+      // Restoration may append a lifecycle notice, but must neither consume
+      // nor rewrite the old semantic input to make attachment succeed.
+      expect(
+        archivedProvider.pendingEvents.filter(
+          (event: { eventType: string }) =>
+            event.eventType === "semantic_tool.input",
+        ),
+      ).toEqual(JSON.parse(damagedProviderBytes.toString()).pendingEvents);
+      const completedProvider = JSON.parse(
+        await readFile(join(root, "codex-home", "fake-state.json"), "utf8"),
+      );
+      expect(completedProvider.nextTurn).toBe(1);
+      expect(completedProvider.turns["final-burst-turn-1"]).toMatchObject({
+        status: "completed",
+        deltaCount: 16,
+      });
+      const priorProvider = JSON.parse(
+        await readFile(
+          join(
+            root,
+            "continuity-breaks",
+            continuityArchive!,
+            "codex-home",
+            "fake-state.json",
+          ),
+          "utf8",
+        ),
+      );
+      expect(priorProvider.nextTurn).toBe(0);
+      const results = await db
+        .select()
+        .from(nativeRunResults)
+        .where(eq(nativeRunResults.runId, currentRunId));
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({
+        companyId,
+        issueId,
+        runId: currentRunId,
+        schemaStatus: "accepted",
+        resultJson: {
+          result: { summary: "Fixture complete." },
+          terminal: { runTerminalState: "succeeded" },
+        },
+      });
+      const sourceResults = await db
+        .select({ id: nativeRunResults.id })
+        .from(nativeRunResults)
+        .where(eq(nativeRunResults.runId, previousRunId));
+      expect(sourceResults).toHaveLength(0);
+      const persistedEvents = await db
+        .select({ sourceEventId: heartbeatRunEvents.sourceEventId })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, currentRunId));
+      expect(persistedEvents.length).toBeGreaterThan(0);
+      expect(persistedEvents.map((event) => event.sourceEventId)).not.toContain(
+        "historical-bad-input-44",
+      );
+      const [task] = await db
+        .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(task).toEqual({ id: issueId, assigneeAgentId: agentId });
+    } finally {
+      await firstSession
+        ?.close({ reason: "Recovery fixture cleanup" })
+        .catch(() => undefined);
+      runnerPrpWebSocketInternals.resetForTests();
+      server.closeAllConnections();
+      await new Promise<void>((done) => server.close(() => done()));
+      if (previousStateBase === undefined)
+        delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateBase;
+      await database.cleanup();
+      await rm(scratch, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
 (embeddedSupport.supported ? describe : describe.skip)(
   "native session recovery database orchestration",
   () => {

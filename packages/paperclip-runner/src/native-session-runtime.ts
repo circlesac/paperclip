@@ -20,6 +20,7 @@ import type { PersistedNativeSession } from "./contracts/native-session-backend.
 import {
   NativeSessionCloseUnrecoverableError,
   NativeSessionCleanupQuarantinedError,
+  NativeSessionProtocolIntegrityError,
 } from "./contracts/native-session-backend.js";
 import {
   validatePrpStructuredRunResult,
@@ -1771,6 +1772,7 @@ export async function executeNativeSession(
     return activeClose;
   };
   let executionSucceeded = false;
+  let protocolIntegrityFailure: NativeSessionProtocolIntegrityError | null = null;
   try {
     // Ownership publication is part of the execution-owned lifetime. If the
     // callback fails, the finally block below still quarantines and closes the
@@ -1992,8 +1994,16 @@ export async function executeNativeSession(
         // before joining cleanup so the failed turn cannot commit late or
         // strand execution on a never-settling durability call.
         consumptionAbort.abort(error);
-        await consuming.catch(() => undefined);
-        throw error;
+        let startupFailure = error;
+        await consuming.catch((consumptionError) => {
+          // A failed iterator may have already initiated close while start or
+          // checkpoint was pending. Retain the authenticated integrity fault,
+          // not the resulting transport/cleanup error from that race.
+          if (consumptionError instanceof NativeSessionProtocolIntegrityError) {
+            startupFailure = consumptionError;
+          }
+        });
+        throw startupFailure;
       }
       const terminalEvent = await consuming;
       consumed = terminalEvent;
@@ -2111,6 +2121,7 @@ export async function executeNativeSession(
     const baselineControlEventSequences = new Set<number>();
     const accountedControlEventSequences = new Set<number>();
     let baselineControlReplayCaptured = false;
+    let completionAdmissionStarted = false;
     const durableExecutionResult = await finalizeIdempotentControlPlaneWithin({
       timeoutMs: finalizationTimeoutMs,
       operation: async (signal) => {
@@ -2177,6 +2188,23 @@ export async function executeNativeSession(
             consumed.highestContiguousSourceSeq,
             receipt.highestContiguousSourceSeq,
           );
+        }
+        if (!completionAdmissionStarted) {
+          // Replay/appends can yield after the prepared result's last snapshot.
+          // Observe the driver's latched integrity fault once more before
+          // admitting completion; Codex snapshots inspect local state only.
+          try {
+            await session.snapshot({ signal });
+          } catch (error) {
+            if (error instanceof NativeSessionProtocolIntegrityError) throw error;
+            // Generic snapshot failures remain checkpoint enrichment failures,
+            // not evidence that the already validated result is invalid.
+          }
+          signal.throwIfAborted();
+          // Invocation is the local admission boundary, not an atomic fence
+          // with the remote commit. A lost acknowledgement can mean committed
+          // success, so later faults must not veto its idempotent confirmation.
+          completionAdmissionStarted = true;
         }
         await options.controlPlane.completeRun(
           {
@@ -2269,6 +2297,11 @@ export async function executeNativeSession(
     };
     executionSucceeded = true;
     return { ...durableExecutionResult, ...enrichment };
+  } catch (error) {
+    if (error instanceof NativeSessionProtocolIntegrityError) {
+      protocolIntegrityFailure = error;
+    }
+    throw error;
   } finally {
     const shouldClose =
       !options.keepSessionOpen || !executionSucceeded || sessionQuarantined;
@@ -2286,7 +2319,14 @@ export async function executeNativeSession(
         // Unlike ordinary provider cleanup, this close owns required remote
         // checkpoint persistence. Exhausting its bounded recovery must fail
         // the execution instead of converting the rejection into success.
-        await requiredClose;
+        try {
+          await requiredClose;
+        } catch (closeError) {
+          // The exact cleanup owner remains retained/quarantined above. Its
+          // rejection must not turn permanent integrity failure into a
+          // generic retryable transport failure at the control-plane boundary.
+          throw protocolIntegrityFailure ?? closeError;
+        }
       }
     } else if (shouldClose && !failedCleanupDeferred) {
       // A provider that ignores close must not keep execution pending forever.

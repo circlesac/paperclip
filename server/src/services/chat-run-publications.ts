@@ -162,7 +162,9 @@ export function safeMilestoneText(input: {
         ? `${input.agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.`
         : input.errorCode === "native_provider_usage_limit"
           ? `${input.agentName} couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying.`
-          : `${input.agentName} stopped before completing this turn.`;
+          : input.errorCode === "native_event_replay_conflict"
+            ? `${input.agentName} couldn't safely continue this turn. A Paperclip admin needs to review the run before it can be retried.`
+            : `${input.agentName} stopped before completing this turn.`;
   return `${recovery}${
     taskUrl
       ? ` Open the task in Paperclip: ${taskUrl}`

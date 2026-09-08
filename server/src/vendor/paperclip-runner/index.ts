@@ -69,6 +69,8 @@ const runner = (await import(sourceUrl.href)) as RunnerModule;
 export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
 export const NativeSessionCleanupQuarantinedError =
   runner.NativeSessionCleanupQuarantinedError;
+export const NativeSessionProtocolIntegrityError =
+  runner.NativeSessionProtocolIntegrityError;
 export const PaperclipSemanticDispatcher = runner.PaperclipSemanticDispatcher;
 export const CAPABILITY_SEMANTIC_TOOL_CATALOG =
   runner.CAPABILITY_SEMANTIC_TOOL_CATALOG;

@@ -78,6 +78,7 @@ export class CodexHarnessSession
   }
 
   async attachRun(input: { runId: string }): Promise<void> {
+    this.assertProtocolIntegrity();
     const transportOwnsQuiescence = this.transport.attachRun !== undefined;
     if (
       this.turnStartPending ||
@@ -92,6 +93,7 @@ export class CodexHarnessSession
       turnId: `turn_attachment_${randomUUID().replaceAll("-", "")}`,
       itemId: `item_attachment_${randomUUID().replaceAll("-", "")}`,
     });
+    this.assertProtocolIntegrity();
     if (transportOwnsQuiescence) {
       // Runnerd's attachment contract performs two durable readiness probes,
       // drains the settled provider tail, and rotates authority atomically.
@@ -133,6 +135,7 @@ export class CodexHarnessSession
     turnId: string;
     effectiveCollaborationMode: "default" | "plan";
   }> {
+    this.assertProtocolIntegrity();
     if (
       this.terminal ||
       this.protocolFailed ||
@@ -237,6 +240,7 @@ export class CodexHarnessSession
       // never observes the terminal turn ahead of turn.accepted.
       releaseTurnStartSettled();
     }
+    this.assertProtocolIntegrity();
     const turn = record(response.turn);
     const turnId = text(turn.id);
     if (turnId.length === 0)
@@ -268,6 +272,7 @@ export class CodexHarnessSession
     message: NativeUserMessage;
     correlationId?: string;
   }): Promise<void> {
+    this.assertProtocolIntegrity();
     this.requireCapability("steering");
     this.requireActiveTurn(input.turnId, "steering");
     if (input.correlationId) {
@@ -312,6 +317,7 @@ export class CodexHarnessSession
       );
     } catch (error) {
       if (error instanceof HarnessOperationAlreadyTerminalError) throw error;
+      this.rethrowProtocolIntegrity(error);
       const detail = redactCodexDiagnostic(String(error));
       if (/unsupported|unavailable|capability|method not found/i.test(detail)) {
         throw this.unsupported("steering", detail);
@@ -385,6 +391,7 @@ export class CodexHarnessSession
     turnId: string;
     resolution: HarnessRuntimeRequestResolution;
   }): Promise<void> {
+    this.assertProtocolIntegrity();
     this.requireCapability("runtimeRequestResolution");
     const pending = this.pendingRuntimeRequestMap.get(input.requestId);
     if (pending === undefined) {
@@ -551,6 +558,7 @@ export class CodexHarnessSession
   }
 
   async read(): Promise<Record<string, unknown>> {
+    this.assertProtocolIntegrity();
     this.requireCapability("read");
     try {
       return await this.transport.request("thread/read", {
@@ -660,6 +668,7 @@ export class CodexHarnessSession
   }
 
   async snapshot(): Promise<PersistedHarnessSession> {
+    this.assertProtocolIntegrity();
     return {
       driverKind: this.driverKind,
       driverSessionId: this.opened.threadId,

@@ -814,3 +814,158 @@ Independent ordering review found no regression. Log:
 The live server still runs the earlier skill-cache merge (`6f90d368a`);
 this last pool/shutdown merge has automated checks, not a new live restart
 qualification. CI and final-head Greptile confirmation remain outstanding.
+
+## Permanent protocol-failure propagation
+
+The historical Telegram checksum incident exposed an additional feedback
+problem: the controller rejected an authenticated bad semantic digest by
+closing its socket, while higher layers kept reconnecting until the turn's
+900-second deadline. The current fix distinguishes a proven permanent fault
+from an ordinary dropped connection or failed persistence attempt.
+
+`NativeSessionProtocolIntegrityError` carries an allowlisted reason and the
+existing `native_event_replay_conflict` disposition. The controller validates
+authentication, complete run/turn/item/source identity and source sequence
+before latching it. Bad semantic bytes and conflicting committed replay bytes
+cannot be committed, ACKed or dispatched. A successful commit already in
+flight also cannot reopen dispatch after the latch. Lifecycle command results
+remain available for exact-owner suspension; the fix does not discard durable
+history or manufacture cleanup success.
+
+The same class instance passes through transport requests and notifications,
+the Codex event queue, the harness backend and runtime cleanup. It takes
+precedence over buffered success or synthetic governed-wait output. Ordinary
+errors and objects that merely resemble its code stay on their existing
+paths. A database-confirmed replay conflict now uses the typed class after
+the existing authorization and exact-run lock. The server's recovery decision
+is permanent/operator-owned, and external chat receives only a safe request
+to have a Paperclip admin review the run.
+
+Initial verification passed **130/130** controller/staged-transport tests,
+**238/238** Codex-driver/backend tests, **78/78** runtime tests, and **183/183**
+executor/coordinator/external-copy tests. The controller cases use genuine
+encrypted authentication and cover wrong identity, out-of-sequence input,
+repeat faults, transient persistence, in-flight commit and suspension. One
+initial transport cohort hit an existing intermittent backlog/turn-ID failure;
+the isolated repeat and two later complete transport cohorts passed. Its
+original failed log is retained, not rewritten as a pass.
+
+Independent review then found that ancillary executor logging or a failed
+recovery-state write could replace the primary fault. Four red regressions
+established that gap. The final executor **166/166** pass covers preservation
+of the exact original error, continued recovery projection after logging
+failure, and no fabricated task/run updates after a failed transaction.
+The finalization admission boundary and composed negative-path test are being
+qualified separately before deployment; these initial counts are not a
+claim that all subsequent edits have completed verification.
+
+## Composed damaged-session replacement proof
+
+A new **35/35** resume cohort includes a real PostgreSQL, runnerd, driver,
+native runtime and Paperclip control-plane path. Only the Codex provider
+process and a generated historical corruption seed are synthetic. A normally
+suspended disposable root receives an invalid pending semantic event. A
+nonterminal prior database owner prevents rotation without changing its bytes.
+After normal terminal-owner eligibility, the real selector/rebind path tries
+warm attachment, which rejects the actual pending-event guard. The governed
+continuity-break path then creates one replacement provider turn and persists
+exactly one accepted result on the same task and agent.
+
+The archived prior runner-state bytes are SHA-256 identical; the invalid
+pending provider event is retained, never repaired or leaked into the new
+run. The old provider starts zero turns and the replacement starts one.
+This fixture uses persisted execution v2; existing context-guard cases cover
+other versions. It is stronger than a mocked selection/rebind or a test that
+stops at the replacement callback, but it is not live Telegram `CHA-24`
+recovery or proof of external publication. That original live root remains
+untouched. Independent server typecheck and formatting/diff checks passed.
+
+## Landing and latest sandbox-recovery master merge
+
+At pushed head `2ded499ed`, Greptile returned **5/5**, with the provenance P2
+resolved, and CI run `34248557216` passed every lane. This applies to that
+published head, not the later uncommitted integrity work.
+
+Master then advanced to `5752d6bd9`, adding stuck sandbox-plugin setup
+classification and bundled-plugin boot recovery. Clean merge `48767c1c0`
+retains the native held-owner guard, nonretryable preflight classification,
+chat idle handling and unadmitted-wake exclusions. Its internal plugin failure
+details are not included in external milestone messages. A six-file
+compatibility cohort passed **246/246**, including bundled/loader behavior,
+heartbeat recovery, operator notices, chat publication and the composed
+damaged-session proof. No migration or runnerd contract changed upstream.
+
+The fresh full chat integration passed **390/390** in 75.93 seconds using
+`chat_adapters_test_20260908_integrity_root01`, after all **255 journal
+entries through migration 0256**. This run preceded the final sandbox master
+merge; the 246-test cohort covers that merge's relevant paths. Full workspace
+typecheck and build subsequently passed, along with the final **10/10**
+deterministic browser retest. Broader tests are still running.
+
+### Completion admission and primary-error follow-through
+
+The finalization regression is now fixed. Between preparing a semantic result
+and invoking `completeRun`, control-plane replay/appends can yield. A final
+local snapshot observation rejects a typed fault latched in that interval;
+ordinary snapshot/enrichment failures retain their previous behavior. Once
+`completeRun` has been invoked, a timeout may mean that its transaction
+committed and the acknowledgement was lost. Its deterministic retry therefore
+cannot veto that potentially committed result based on a later observation.
+This is a local completion-admission boundary, **not an atomic fence with the
+remote database commit**. The tests explicitly cover a pending completion
+call and both final-event and completion acknowledgement loss.
+
+The two initial pre-admission cases went red-to-green; seven new boundary
+cases bring the runtime cohort to **85/85**. The final combined runtime plus
+Codex-driver/backend cohort passed **323/323**, with direct TypeScript and
+diff checks clean. Required cleanup, quarantine and original startup-race
+error preservation remain intact. A composed authenticated negative-path
+test subsequently passed as described below.
+
+### Authenticated negative-path composition and live restart
+
+The final negative-path fixture uses a genuine encrypted socket through the
+actual durable controller, runner transport, Codex driver, harness backend
+and `executeNativeSession`. It injects the invalid frame only after run
+admission and a real mapped `turn.started` event. The pending transport read
+and runtime reject the same typed object after required cleanup. The fault
+fails within five seconds despite a 900-second reconnect setting; source
+ACK stays at two, no bad payload is dispatched, no result is accepted and no
+replacement process is started. The repeated controller/runtime/driver cohort
+passed **132/132**. The synthetic process launcher and in-memory persistence
+port mean this is not a Rust-emission, live-provider or server-database test.
+Those boundaries have the separate staged transport, scoped coordinator,
+executor and composed recovery evidence above. Final runner primary/surface
+TypeScript checks passed after adding this test.
+
+Root restarted only the isolated live instance at **16:26:24 UTC**, from
+merge `48767c1c0` plus the verified uncommitted integrity patch, using
+`server-experimental-landing-46.log`. There were zero active/queued runs;
+the prior server gracefully drained zero interrupted runs and shut down its
+chat gateways. Pending provenance migration 0256 applied normally. The signed
+runner digest remains
+`e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
+All four configured endpoints are active; the Discord gateway connected.
+
+Fresh ordinary continuation `INTEGRITY-LANDING-0908` requested exactly
+`NATIVE-LUNA-READY` on existing tasks. Root submitted through the signed-in
+provider browsers and saw each final reply with its working state cleared:
+
+| Provider | Run | Native Luna duration | Submit to publication |
+| --- | --- | --- | --- |
+| Slack | `a0f1d707-c6e3-4fd5-90b0-f5d4ba05c48c` | 11.237 s | 13.146 s |
+| GitHub | `73ce21b7-9cd8-4380-9bd7-69c9f6992dfb` | 12.686 s | 17.148 s |
+| Telegram | `823d811f-daad-4bd3-91c0-c1dbdf587e3f` | 14.046 s | 16.602 s |
+
+Persisted execution profiles confirm `gpt-5.6-luna` for all three. Each
+working/final operation used one attempt and the same provider message:
+Slack `1788884841.421029`, GitHub `5588442165`, Telegram `417200359:132`.
+No duplicate final reply was observed. Slack's browser initially retained an
+older scrolled thread and needed a reload to restore its composer; the new
+message then sent normally. This is provider-browser navigation friction,
+not evidence of a failed Paperclip delivery.
+
+Discord's Eigenjoy browser login had expired, so no new Discord live send is
+claimed. Its login tab was left open and the user notified; the bot connection
+itself is active. Teams still lacks a qualified tenant. No corruption was
+introduced into live state and the old damaged Telegram task was not reset.

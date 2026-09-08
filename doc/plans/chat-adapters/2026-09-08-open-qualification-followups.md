@@ -10,13 +10,18 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
-  merged. Keep one PR: the current local diff is **483 files**, below 500.
+  merged. Keep one PR: published head `2ded499ed` is **483 files**, below 500.
+  The next integrity patch adds several shared runtime files; recount before
+  pushing (currently 493 including the new driver test).
 - The default-off **Experimental > Chat connectors** setting is implemented.
   Production GitHub tools remain visible and open directly without the
   chat/tool choice when disabled. Default-off and enabled browser flows passed.
   This is a UI visibility gate: active connections continue delivering until
   explicitly paused.
-- Master is incorporated through `023e640a7` in merge `21061f4de`. Full
+- Master is incorporated through `5752d6bd9` in merge `48767c1c0`. The newest
+  sandbox startup/recovery compatibility cohort passed **246/246**. Full
+  workspace typecheck/build also passed with the integrity production changes.
+  Previously, master through `023e640a7` was merged in `21061f4de`. Full
   workspace typecheck/build passed after this latest database-pool/shutdown
   merge. Chat reconciliation and runtime shutdown remain awaited before pool
   closure. The merged database/shutdown compatibility cohort passed **71/71**.
@@ -41,14 +46,20 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   generated audit text, never replaying retirement or rekeying. Two tests went
   red-to-green; the final reconciliation cohort is **5/5**, root's migration/
   client/snapshot/safety cohort **48/48**, and DB build/typecheck passed.
-  Independent code review found no issue. Request final-head review. Do not
-  mark review accepted, CI green or the PR ready to merge without evidence.
+  Independent code review found no issue. Greptile subsequently reviewed
+  `2ded499ed` at **5/5**, with the P2 resolved. CI run `34248557216` passed
+  **all lanes** at that exact head. These results do not cover the new,
+  currently uncommitted integrity patch; obtain review and CI again after push.
 
 ## Current deployed state and evidence
 
-The live server was restarted after the master merge at **15:04 UTC**, log
-`.paperclip-runtime/chat-adapters-live/server-experimental-landing-45.log`.
-It runs through `6f90d368a`; later fixture/documentation-only changes need no restart.
+The live server was restarted at **16:26:24 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-46.log`.
+It runs merge `48767c1c0` plus the verified integrity production patch. The
+restart had zero active/queued runs, and migration 0256 applied normally.
+Slack/GitHub/Telegram continuation smoke checks returned exact answers in
+**13.146 / 17.148 / 16.602 seconds**, on the same tasks using native Luna.
+Each working/final operation used one attempt and updated one provider message.
 Its private Board is at `http://127.0.0.1:3103`. Keep the public verified
 webhook proxy separate from the private Board.
 
@@ -101,15 +112,27 @@ switch to Terra. The signed/staged runner SHA-256 is
    description, then obtain green CI and Greptile review. The final fresh chat
    rerun is **390/390**; fix any new CI findings without weakening assertions.
    Leave checklist items unchecked while their evidence is missing.
-2. **Prompt permanent protocol-fault feedback.** An authenticated semantic
-   digest mismatch currently closes the socket and can leave “using tools”
-   visible until the 900-second deadline. Independent design review calls for
-   a typed, latched integrity callback after exact correlation validation,
-   wired through transport, notification/backend and runtime boundaries.
-   Preserve the primary fault through cleanup failure; use the permanent
-   integrity disposition. Do not ACK/dispatch the bad event or replace its
-   provider. Add unauthenticated/wrong-identity, repeated replay, transient
-   commit and failed-suspension negatives before claiming a prompt failure path.
+2. **Finish and deploy permanent protocol-fault feedback.** The original
+   authenticated digest mismatch can leave “using tools” visible until the
+   900-second deadline. Current uncommitted code adds the typed, latched fault
+   after exact authentication/correlation/sequence checks; bad events cannot
+   ACK or dispatch, and ordinary persistence failures remain retryable.
+   Controller/staged transport **130/130**, middle-layer **238/238**, runtime
+   **78/78**, and root executor/coordinator/safe-copy **183/183** passed.
+   Independent review then found executor diagnostic/cleanup writes could
+   still replace the primary fault, and a pre-completion runtime observation
+   gap. Both now have red-to-green fixes: executor **166/166**, runtime
+   **85/85**, and combined runtime/middle-layer **323/323**. The final local
+   integrity check precedes the first `completeRun` invocation; once admitted,
+   acknowledgement-loss retries preserve potentially committed success. This
+   is not an atomic fence with a remote database commit. The final encrypted
+   controller-to-driver/runtime negative-path composition passed; its combined
+   cohort is **132/132**, using a synthetic process launcher and persistence
+   port. Full workspace typecheck/build and **10/10** deterministic browser
+   tests pass. The production patch is deployed; broad local tests and final
+   PR review/CI remain pending.
+   Safe external copy directs users to an admin without exposing protocol
+   details. No fabricated corruption may be injected into a live provider root.
 3. **Damaged-session recovery.** Telegram `CHA-24` run
    `a4938fcc-dc2c-4146-a776-12512cf4b613` failed at 14:17:07 with a suspended
    runner but unacknowledged historical semantic event 44. Preserve that
@@ -120,6 +143,13 @@ switch to Terra. The signed/staged runner SHA-256 is
    Never hand-repair the digest or clear safety state to force success.
    The earlier first replacement request sacrificed to safe quarantine is
    also an unresolved operator-UX gap.
+   New deterministic composed evidence: **35/35** resume tests, including a
+   real runnerd + PostgreSQL + driver/runtime/control-plane path from a
+   generated damaged historical root to exactly one persisted accepted result
+   on the same task/agent. Active old ownership blocks rotation; archived
+   runner bytes and the invalid pending event are preserved. Only the provider
+   and historical corruption seed are synthetic. This uses persisted execution
+   v2 and is not actual live `CHA-24` recovery or external publication proof.
 4. **Conservative prose redaction.** All observed game-token phrases now pass
    live, but unfamiliar token-noun phrases can still be over-redacted. Preserve
    low-entropy credential coverage; no arbitrary-word/entropy heuristic.
@@ -135,6 +165,11 @@ switch to Terra. The signed/staged runner SHA-256 is
 7. **Teams external gate.** There is no qualified Microsoft 365 tenant/admin
    setup. Deterministic tests are not live Teams qualification. Continue other
    providers while this real external gate remains.
+8. **Discord browser login renewed.** The current Eigenjoy browser session
+   expired when reopening the conversation. Its login page is open and the
+   user was notified. The bot endpoint remains active; Slack/GitHub/Telegram
+   browsers are signed in. Do not claim a new Discord live retest until login
+   and a visible conversation result are verified.
 
 ## Working guardrails
 

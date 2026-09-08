@@ -50,6 +50,19 @@ describe("chat run milestone projection", () => {
     );
   });
 
+  it("gives permanent integrity failures a safe operator recovery path", () => {
+    const text = safeMilestoneText({
+      agentName: "Maya",
+      errorCode: "native_event_replay_conflict",
+      milestone: "failed",
+      issueId: "issue-1",
+    });
+    expect(text).toBe(
+      "Maya couldn't safely continue this turn. A Paperclip admin needs to review the run before it can be retried. Open the task in Paperclip for details.",
+    );
+    expect(text).not.toMatch(/digest|source.seq|semantic|replay.conflict/i);
+  });
+
   it("keeps every other run failure generic outside Paperclip", () => {
     expect(
       safeMilestoneText({

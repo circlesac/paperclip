@@ -42,8 +42,67 @@ import {
   type PrpEvent,
   type PrpStructuredRunResult,
 } from "./codex-app-server-driver.test-support.js";
+import { NativeSessionProtocolIntegrityError } from "../../contracts/native-session-backend.js";
 
 describe("Codex app-server Codex driver", () => {
+  it.each([
+    "initial-read",
+    "reconcile-read",
+    "goal-probe",
+    "plan-probe",
+  ] as const)(
+    "rethrows exact recovery integrity failure after cleanup at %s",
+    async (stage) => {
+      const originalTransport = new FakeCodexTransport();
+      const recoveryTransport = new FakeCodexTransport();
+      const fault = new NativeSessionProtocolIntegrityError(
+        "semantic_input_digest_mismatch",
+      );
+      const request = recoveryTransport.request.bind(recoveryTransport);
+      let reads = 0;
+      vi.spyOn(recoveryTransport, "request").mockImplementation(
+        async (method, params) => {
+          if (method === "thread/read") reads += 1;
+          if (
+            (stage === "initial-read" && method === "thread/read") ||
+            (stage === "reconcile-read" &&
+              method === "thread/read" &&
+              reads === 2) ||
+            (stage === "goal-probe" && method === "thread/goal/get") ||
+            (stage === "plan-probe" && method === "collaborationMode/list")
+          )
+            throw fault;
+          return request(method, params);
+        },
+      );
+      const close = vi.spyOn(recoveryTransport, "close");
+      // The integrity error remains primary even when required cleanup rejects.
+      close.mockRejectedValue(new Error("secondary cleanup failure"));
+      const driver = makeDriver(
+        [originalTransport, recoveryTransport],
+        stage === "plan-probe" ? { requestedCollaborationMode: "plan" } : {},
+      );
+      const original = await driver.openSession({
+        runId: "run-recovery-integrity",
+        normalizedSessionId: "session-recovery-integrity",
+        workingDirectory: WORKSPACE,
+      });
+      await original.startTurn({ message: { role: "user", text: "Work." } });
+      const checkpoint = await original.snapshot();
+      await original.close({ reason: "fixture disconnect" });
+      await expect(
+        driver.recoverSession!({
+          ...checkpoint,
+          providerRecoveryPolicy: "allow_replacement_after_resume_failure",
+        }),
+      ).rejects.toBe(fault);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(
+        recoveryTransport.calls.some((call) => call.method === "thread/start"),
+      ).toBe(false);
+    },
+  );
+
   it.each(["completed", "interrupted", "failed", "cancelled"])(
     "adopts a checkpointed active turn that became %s while disconnected",
     async (status) => {

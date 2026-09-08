@@ -2985,6 +2985,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       identity,
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
+      onProtocolIntegrityError: (error) => this.#failTransport(error),
       onSemanticToolInput: async (call) =>
         unwrapToolResponse(
           await this.#handler({
@@ -3636,6 +3637,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       identity,
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
+      onProtocolIntegrityError: (error) => this.#failTransport(error),
       onSemanticToolInput: async (call) =>
         unwrapToolResponse(
           await this.#handler({
@@ -4637,7 +4639,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         const detail = result.stderr.trim() || result.stdout.trim();
         if (detail) this.#diagnostic(detail.slice(-4_096));
         this.#publish();
-        if (this.#closed || this.#handle !== handle) return;
+        if (this.#closed || this.#failure !== null || this.#handle !== handle)
+          return;
         // A per-turn runner exits after its terminal suffix is durably ACKed.
         // Drain that suffix into the provider-facing queue before classifying
         // process completion; clean terminal exit is the expected lifecycle.
@@ -4676,7 +4679,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         );
       },
       (error) => {
-        if (this.#closed || this.#handle !== handle) return;
+        if (this.#closed || this.#failure !== null || this.#handle !== handle)
+          return;
         if (
           this.#startupComplete &&
           this.options.runnerReconnectGraceMs !== undefined &&
@@ -4704,6 +4708,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (
       this.#runnerRecoveryInProgress ||
       this.#closed ||
+      this.#failure !== null ||
       this.#handle !== failedHandle ||
       this.#core === null ||
       !failedHandle.restart
@@ -4720,7 +4725,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       `runner process disconnected; recovery is allowed for ${graceMs}ms`,
     );
     try {
-      while (!this.#closed && Date.now() < deadline) {
+      while (!this.#closed && this.#failure === null && Date.now() < deadline) {
         if (attempt > 0) {
           const base = delays[Math.min(attempt - 1, delays.length - 1)]!;
           const jittered = Math.max(
@@ -4729,7 +4734,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           );
           await new Promise((resolveWait) => setTimeout(resolveWait, jittered));
         }
-        if (this.#closed) return;
+        if (this.#closed || this.#failure !== null) return;
         if (Date.now() >= deadline) break;
         const priorConnectionCount = this.#core.store.state.connectionCount;
         let recoveredHandle: RunnerProcessHandle;
@@ -4766,7 +4771,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           },
         );
         const authenticated = (async () => {
-          while (!processSettled && !this.#closed && Date.now() < deadline) {
+          while (
+            !processSettled &&
+            !this.#closed &&
+            this.#failure === null &&
+            Date.now() < deadline
+          ) {
             if (
               this.#core !== null &&
               this.#core.store.state.connectionCount > priorConnectionCount &&
@@ -4802,8 +4812,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#rejectFailureSignal(error);
     if (this.#pump !== null) clearInterval(this.#pump);
     this.#pump = null;
-    this.#diagnostic(error.message);
-    this.#queue.close(error);
+    try {
+      this.#diagnostic(error.message);
+    } finally {
+      // An observer is not allowed to leave notification consumers waiting
+      // after the request path has already received this terminal failure.
+      this.#queue.close(error);
+    }
   }
 
   #throwIfFailed(): void {

@@ -38,6 +38,7 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   NativeSessionCleanupQuarantinedError,
+  NativeSessionProtocolIntegrityError,
   acpxRuntimeSessionDirectoryName,
   createNativeSessionBackend,
   createRunnerdCodexTransport,
@@ -2687,6 +2688,9 @@ export function nativeSessionFailureSourceCode(
   | "native_current_wake_comments_unread"
   | "native_current_wake_comments_changed_after_read"
   | "native_session_interrupted" {
+  if (error instanceof NativeSessionProtocolIntegrityError) {
+    return "native_event_replay_conflict";
+  }
   if (error instanceof NativeSessionCleanupQuarantinedError) {
     return "native_session_cleanup_quarantined";
   }
@@ -4760,30 +4764,48 @@ async function executePaperclipNativeSessionWithinScope(
     clearSteeringDeliveries(input.execution.binding.runId);
     clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
   } catch (error) {
+    const protocolIntegrityFailure =
+      error instanceof NativeSessionProtocolIntegrityError ? error : null;
     const ownershipUnverified =
       nativeSessionFailureSourceCode(error) ===
       NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT;
+    const attemptFailureStep = async (operation: () => unknown) => {
+      try {
+        await operation();
+      } catch (secondaryError) {
+        // A proven permanent fault must still attempt its durable recovery
+        // projection if ancillary logging, tracing, or warm cleanup fails.
+        // Other failures retain their existing propagation behavior.
+        if (protocolIntegrityFailure === null) throw secondaryError;
+      }
+    };
     try {
       await leaseRenewal.stop().catch(() => undefined);
       const failedAtMs = Date.now();
       const executionFailureMessage = redactSensitiveText(
         error instanceof Error ? error.message : String(error),
       ).slice(-4_096);
-      await input.onLog?.(
-        "stderr",
-        `[paperclip-runner] native session execution failed: ${executionFailureMessage}\n`,
+      await attemptFailureStep(() =>
+        input.onLog?.(
+          "stderr",
+          `[paperclip-runner] native session execution failed: ${executionFailureMessage}\n`,
+        ),
       );
       if (runnerSessionStartupScope) {
-        await trace.end(runnerSessionStartupScope, {
-          endedAtMs: failedAtMs,
-          outcome: "failed",
-        });
+        await attemptFailureStep(() =>
+          trace.end(runnerSessionStartupScope!, {
+            endedAtMs: failedAtMs,
+            outcome: "failed",
+          }),
+        );
       }
       if (agentTurnScope) {
-        await trace.end(agentTurnScope, {
-          endedAtMs: failedAtMs,
-          outcome: "failed",
-        });
+        await attemptFailureStep(() =>
+          trace.end(agentTurnScope!, {
+            endedAtMs: failedAtMs,
+            outcome: "failed",
+          }),
+        );
       }
       if (!taskSettleScope) {
         taskSettleScope = trace.start("task.settle", {
@@ -4800,11 +4822,13 @@ async function executePaperclipNativeSessionWithinScope(
         warmSessionId !== null &&
         lifecyclePolicy.mode === "warm"
       ) {
-        await releaseWarmNativeSession(
-          warmSessionId,
-          warmSessionOwnerToken,
-          lifecyclePolicy.idleTimeoutMs,
-          true,
+        await attemptFailureStep(() =>
+          releaseWarmNativeSession(
+            warmSessionId!,
+            warmSessionOwnerToken,
+            lifecyclePolicy.idleTimeoutMs,
+            true,
+          ),
         );
       }
       if (
@@ -4822,9 +4846,12 @@ async function executePaperclipNativeSessionWithinScope(
         throw error;
       }
       const now = new Date();
-      const sourceFailureCode = providerUsageLimitObserved
-        ? ("native_provider_usage_limit" as const)
-        : nativeSessionFailureSourceCode(error);
+      const sourceFailureCode =
+        error instanceof NativeSessionProtocolIntegrityError
+          ? ("native_event_replay_conflict" as const)
+          : providerUsageLimitObserved
+            ? ("native_provider_usage_limit" as const)
+            : nativeSessionFailureSourceCode(error);
       const recoveryEvidence = await nativeProviderRecoveryEvidence({
         db: input.db,
         runId: input.execution.binding.runId,
@@ -4890,7 +4917,7 @@ async function executePaperclipNativeSessionWithinScope(
                     : recoveryEvidence.recoveryMode === "ambiguous_state"
                       ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
                       : integrityFailure
-                        ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
+                        ? "Inspect the persisted runner events and checkpoint for an event integrity conflict; automatic recovery is stopped."
                         : sourceFailureCode === "native_provider_usage_limit"
                           ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
                           : sourceFailureCode ===
@@ -5057,6 +5084,9 @@ async function executePaperclipNativeSessionWithinScope(
       // None of those failures prove the retained runner stopped or authorize
       // heartbeat to release its environment and task execution ownership.
       if (ownershipUnverified) throw new NativeRunnerOwnershipUnverifiedError();
+      // A failed recovery-state write likewise cannot turn authenticated
+      // corruption into a generic error that heartbeat would retry.
+      if (protocolIntegrityFailure !== null) throw protocolIntegrityFailure;
     }
   }
   if (
