@@ -1903,3 +1903,153 @@ All five lockfile-policy/workflow tests pass, and the actual staged 500-file
 diff passes the repository's lockfile check. Re-running the installed Discord
 cohort after restoring the baseline lockfile still passes **88/88**, with no
 skips. No install or package rewrite occurred during this correction.
+
+## Source-file lifecycle and queued-media qualification
+
+These live journeys used server 58, started at **20:27:40.584 UTC** and ready
+at **20:27:45.773** on September 8. Its server baseline is `63c8b5d8d`; the
+subsequent wireframe-only commit changes no runtime bytes. The runner SHA-256
+remains `e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
+Both journeys used Maya E2E, native Paperclip Runner, Codex app-server and
+`gpt-5.6-luna`. They do not qualify the uncommitted exact-retry implementation.
+
+### Slack: edited-source reuse is refused without leaking a file
+
+Root uploaded non-sensitive `native-inbound-0907.txt` into the QA thread
+`1788898430.940089` as a new disposable reply `1788900766.028899`. Its 103 bytes
+have SHA-256 `6dc048b0f5c2f60a9a34eee0fc91ac52e1e4aefcdb1d47c74ffda2ec672a6fea`.
+The request asked the agent to record the exact source/attachment pair
+privately, without copying or returning the file. Delivery
+`733050c6-da38-402e-87e0-1c4a4b2da136` produced one native run
+`c0931b16-b66c-42ba-bcf9-349119dd4e22`, which succeeded from **20:52:47.674**
+to **20:53:05.219**. The rendered final was **File reference recorded**.
+
+Root edited that source through Slack's own message menu to withdraw reuse.
+The exact-target `message_updated` receipt
+`846eff86-d39e-4fef-a872-cf098f565bb5` processed at **20:58:25.474**. A new
+browser reply `1788901129.212169` requested the exact earlier pair without
+substitution, copying, or bypassing denial. Delivery
+`3db2dff4-03ca-4f4a-bb11-e2005251cfc7` and wake
+`4179949c-5048-4bee-9ccf-416ef4e89664` admitted native run
+`16743a8a-a6f4-4cae-bee2-1aaca008fadf`, **20:58:50.632–20:59:08.807**.
+Its only current input was comment `af4df257-af6c-4361-9abc-4badc39a71b8`.
+
+The actual `reuse_chat_attachment` call at sequence 34 used original comment
+`54a3c07b-2f34-4a8c-8c0e-432b4d1fa751` and attachment
+`5040777e-5fa6-424c-9c50-8eb3e8cc1021`. Sequence 35 returned
+`paperclip_runner_chat_attachment_source_denied`, `is_error: true`, at
+**20:58:58.873**. There was one reuse attempt and zero new attachments, work
+products or file publications. The original stored asset remained unchanged.
+Working and final each used one attempt on Slack message `1788901131.307639`.
+Root inspected the rendered final and usable composer: **The old attachment
+is no longer available to reuse.** No internal IDs, error code, download URL
+or substitute file appeared in the answer.
+
+Receipt-to-final was **19.421 seconds**, including **18.175 seconds** of native
+execution and **0.415 seconds** from run finish to publication. Functional
+outcome and the observed refusal experience both passed this edited-source
+journey. Source deletion remains separate and untested; editing is not deletion.
+
+### Telegram: genuine queued-media admission, then native shutdown failure
+
+Root sent a cat image through Telegram's **Photo** upload control, requesting
+a description of only that current image in approximately 400 words. While A
+was active, root sent `native-file-roundtrip-landing-0908.txt` through
+**Document**, requesting its object/color/count and the exact original file.
+No API or database write manufactured either input or result. Both belong to
+CHA-26, conversation `e3ee142e-4f21-41a9-9636-7fb5770094d5`, generation 10.
+
+| Evidence | Image A | Document B |
+| --- | --- | --- |
+| Delivery | `78763969-0116-4f4b-9f0b-977824b1244e` | `f8ef6070-61de-4eae-bd86-2cfe7717dcf5` |
+| Source comment | `0e780b80-b455-435b-af37-00a1ddeab6a1` | `17909654-58f9-4348-a5eb-ca8848b33a71` |
+| Wake | `61580c49-cadd-44ef-891d-e6cd3796e8e4` | `e8b2b68a-93d7-45ec-aea3-12731c91d58a` |
+| Run | `fd7011b6-323b-461a-bc43-a81835bece5f` | `fcf7adc4-39a5-4c42-8cbb-a9723ad22302` |
+| Started → finished UTC | 21:04:24.679 → 21:05:15.515 | 21:05:15.547 → 21:05:15.854 |
+
+Each run has exactly its own current comment. B's durable wake was created at
+**21:04:59.772**, **15.743 seconds before A finished**, and B started **32ms**
+after A finished: genuine queued admission with no execution overlap. The
+visible **Your follow-up is queued** notice was published at **21:05:00.646**,
+**2.177 seconds** after receipt. A's first working feedback took **3.605 seconds**.
+
+A imported as Telegram's JPEG, attachment `1dd21c0d-f389-4226-b660-efe24cd9d71c`,
+**221,327 bytes**. B imported as `f666b8ec-bd8d-4e8a-a672-b75f53153cb1`,
+**152 bytes**, with the exact expected SHA-256
+`e5ea1c89ad69c0ae9dffea0599c730e5d284816dbcd9dae44746c7a29f790293`.
+Import and admission passed; useful completion did not.
+
+A proposed a semantic result at **21:05:00.164**, accepted it at
+**21:05:05.377**, and recorded `run.terminal` succeeded/completed at
+**21:05:05.392**. About ten seconds later cleanup failed:
+`provider_transport_failed: runner did not durably suspend before checkpoint`.
+B then failed immediately with `runner_state_identity_mismatch`. Automatic
+`issue.continuation_recovery` run `3fa4a4e7-9137-45cd-b191-c90e7c5dd057` failed
+at **21:05:16.358** with `native_session_cleanup_quarantined`. All three refer
+to native session `ce94db0c-3aec-40be-8caa-c80d008fcbbb`.
+
+Five publication records, each with one attempt, updated two Telegram messages
+(`417200359:150` and `417200359:152`). Both ended with **Maya E2E stopped before
+completing this turn. Open the task in Paperclip:** and the correct task URL.
+There were zero generated attachments, work products or file publications;
+B never executed a file reuse/register action. Its actual file consumption,
+returned bytes and output isolation therefore remain unqualified. This is a
+**failed live journey**, not a successful media round trip or model timeout.
+
+Root revisited the messages and inspected the linked task. Clicking Telegram's
+`target=_blank` link did not expose an observable new in-app tab; explicitly
+opening that exact displayed URL loaded the correct Board task. Its screenshot
+showed B's queued/delivered timestamps, two failed-run notices and **Try again**
+for the failed automatic recovery run. Expanding that notice exposed
+`native_session_cleanup_quarantined`, without an actionable session-repair
+explanation. Root did not press Try again or change recovery state. The
+destination works, but the complete click transition was not verified and the
+recovery experience needs improvement.
+
+Preserve the accepted result and quarantined session evidence. A repair must
+not rerun accepted A, clear quarantine optimistically, or silently start a new
+conversation to turn this failure into a passing test. Shutdown ordering,
+exact accepted-result recovery and the queued document still require fixes
+and another real browser/native journey.
+
+Subsequent read-only inspection found the background finalizer had committed A
+at **21:06:16.107**, without provider replay. Accepted result
+`48917917-bd47-4cdf-837d-3d7dd4b80f57` contains the full cat description and an
+ordinary `yielded` / `response_wake` continuation. The first status decision
+preserved the failed-finalization claim; the later decision
+`49347a3d-a7f7-4617-ad58-e937f8dcce4d` preserves the task's newer `in_review`
+state. The run became `succeeded`/`committed`, but retained stale
+`adapter_failed` metadata. It still had zero authored comments and no final
+publication, so the provider continued to show failure. Durable semantic-result
+recovery is therefore present; useful response recovery and saved-session
+recovery are separate defects, not proof that the journey succeeded.
+
+### Control-first runner repair; recovery still in progress
+
+Read-only inspection retained the exact A authority in quarantine: control
+ACK 250, 90 unacknowledged runner deltas (251–340), 128 pending provider
+events, and pending `turn.stop` / `runner.suspend` commands. The run loop
+started another individually fsynced provider batch before reading those
+already queued commands. A deterministic regression reproduced the ordering:
+source sequence advanced from 1 to 129 before suspend could be processed.
+
+The runner now reads authenticated control traffic before beginning another
+provider batch. Ordinary output is polled only on an idle control read;
+autonomous receipt-limit maintenance, event persistence, cumulative ACK debt,
+command identity checks and the existing suspension deadline remain intact.
+The regression now leaves the retained tail untouched and durably suspends.
+This prevents a new output batch from overtaking a queued close; it does not
+pretend that the previously quarantined state was safely closed.
+
+Rust library verification passed **234/234**. Normal release build/staging and
+strict signature verification passed, producing runner SHA-256
+`4d06a271a91eedd4a317a59f097e39c6de5fc924296aafebf9b0d8031b6cc9aa`.
+Root's first full transport run was **87/88**: an exact-resume test read its
+asynchronous event journal immediately after an authenticated snapshot command.
+The production contract already permits that event to follow the snapshot.
+The test now waits conditionally, with a three-second bound, for exactly one
+durable resume event; all provider identity and command assertions remain.
+The final full transport run passed **88/88** in 64.01 seconds, including
+48/1,024-delta backlog suspension and active-checkpoint rejection. Workspace
+typecheck passed. This is staged-binary/fixture evidence, not a successful
+retest of the damaged live Telegram conversation.

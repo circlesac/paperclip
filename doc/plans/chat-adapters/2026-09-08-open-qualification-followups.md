@@ -5,7 +5,78 @@ are fixed or moved into permanent verification documentation.** It is not a
 release-completion claim. Completed work and historical failures are recorded
 in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md).
 
-## Current work: Discord restart repair and final landing gates
+## Current work: exact failed-chat retry and source-file lifecycle
+
+Base `63c8b5d8d` is pushed. All 24 CI jobs, quality, and Greptile's explicit
+500-file review passed; PR #13038 still requires CODEOWNER approval and is not
+merged. Do not spend the next qualification turn polling those unchanged gates.
+Keep the checked-in lockfile identical to origin/master; CI owns regeneration.
+
+User-requested wireframe cleanup is now pushed separately as `5ed80f70a`:
+all 67 remaining generated images and the gallery are excluded from the PR,
+which now has **432 files**. Written plans and production icons remain; archive
+links preserve the exact historical images. The focused UI contract suite
+passed. The retry changes below remain uncommitted and are not in that cleanup.
+
+The next implementation is a positive, server-authorized retry of an ordinary
+failed chat run. Board entry points must send the selected failed run ID, not
+copy mutable task/comment context. Persist a distinct idempotent retry intent,
+prove the complete original admitted comment batch and actor, recheck current
+source/access at enqueue, deferred promotion, execution and publication, and
+disable coalescing for that exact retry. Recovery-card resolution and retry
+intent creation must commit atomically. Never re-arm an original delivery or
+clear native integrity/quarantine evidence. Accepted/uncertain results, old
+conversation generations and unsupported interaction lineage remain refused.
+James owns chat service/admission/integration; Epicurus owns scheduler fences;
+Boole owns route regressions; root owns contracts/UI and live qualification.
+This is work in progress, not a verified retry feature yet.
+
+Slack source-edit invalidation passed live on server 58: the disposable file
+reply `1788900766.028899` was edited through Slack, then native Luna was asked
+to reuse its exact earlier source/attachment pair. The actual reuse call was
+denied with `paperclip_runner_chat_attachment_source_denied`; exactly one
+plain final said “The old attachment is no longer available to reuse.” No file
+or substitute was published. Receipt-to-final was 19.421 seconds. This proves
+edited-source invalidation, **not deletion**. The permanent log has exact IDs.
+
+The subsequent Telegram queued-media journey **failed** on CHA-26, generation
+10. Image run `fd7011b6-323b-461a-bc43-a81835bece5f` accepted its semantic result
+at 21:05:05.377 UTC, but failed ten seconds later because the runner did not
+durably suspend before checkpoint. Document B was genuinely queued 15.743
+seconds before A finished, started 32ms after A finished, then failed with
+`runner_state_identity_mismatch`. Automatic recovery run
+`3fa4a4e7-9137-45cd-b191-c90e7c5dd057` also failed with
+`native_session_cleanup_quarantined`. No final answer or returned file arrived.
+The original inputs and accepted-result/quarantine evidence must be preserved;
+do not rerun accepted A, clear quarantine, or mint a new session to hide this.
+
+Epicurus is reproducing control-command starvation behind a durable provider
+event batch and repairing shutdown ordering without weakening checkpoint
+proof. James is finishing exact retry eligibility, including read-only physical
+owner validation. Boole is adding actual rendered retry regressions to the
+existing deterministic browser suite. Root is checking the real recovery UX
+and maintaining evidence. Server 58 remains running on the earlier production
+server/native bytes; UI HMR includes current UI edits. Do not restart until
+native forensics are captured and the source/binary repair is verified.
+
+Fresh read-only inspection found A automatically became `succeeded`/`committed`
+at 21:06:16.107 without another provider attempt, but its accepted summary was
+never made into a comment or provider publication. The old adapter error also
+remained on the successful run. Epicurus is now adding independently authorized
+committed-response presentation, keeping later task status/governance intact.
+The Rust control-first fix passed 234 library tests and was staged with hash
+`4d06a271a91eedd4a317a59f097e39c6de5fc924296aafebf9b0d8031b6cc9aa`;
+strict signature verification passes. Root's first transport cohort was 87/88:
+an exact-resume test assumed its asynchronous resume event preceded the
+authenticated snapshot. A bounded event wait keeps the exact count/identity
+assertions; the final full transport cohort passed **88/88**. Workspace
+typecheck passed. The full fresh PostgreSQL chat suite was **474/475**: the
+existing joined-recovery drain test counted seven global wakes instead of
+three. Boole is diagnosing fixture spillover versus a real lifecycle race;
+do not call the complete integration suite passed. The retry/finalizer slice
+remains uncommitted while the independently verified native fix is checkpointed.
+
+## Earlier work: Discord restart repair and final landing gates
 
 The merged head `c52e98c9b` passed every CI job in run `34270590335`, but
 Greptile's automatic review stopped at its 100-file soft limit. Request an

@@ -3627,11 +3627,20 @@ it("probes an exact-authority resume and confirms its live provider identity", a
         (command) => command.type === "session.snapshot",
       ),
     ).toHaveLength(priorSnapshots + 2);
-    expect(
-      afterResume.committedEvents.filter(
-        (event) => event.eventType === "session.resumed",
-      ),
-    ).toHaveLength(priorResumeEvents + 1);
+    // The authenticated snapshot above proves the live provider identity.
+    // Control-first dispatch may deliver that command before the independent
+    // session event is ingested. Still require exactly one durable event;
+    // don't mistake an immediate file read for an event-delivery barrier.
+    await vi.waitFor(async () => {
+      const delivered = JSON.parse(await readFile(statePath, "utf8")) as {
+        committedEvents: Array<{ eventType: string }>;
+      };
+      expect(
+        delivered.committedEvents.filter(
+          (event) => event.eventType === "session.resumed",
+        ),
+      ).toHaveLength(priorResumeEvents + 1);
+    }, { timeout: 3_000, interval: 25 });
   } finally {
     await resumed.transport.close();
     await rm(stateDirectory, { recursive: true, force: true });

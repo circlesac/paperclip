@@ -536,13 +536,6 @@ pub fn run_durable_runner<E: CommandExecutor>(
             if started.elapsed() >= config.max_runtime {
                 break;
             }
-            poll_executor_events_after_controller_ack(
-                &mut state,
-                &store,
-                &config,
-                &mut executor,
-                sent_source_seq,
-            )?;
             if let Err(error) = send_outbox(&mut transport, &state, &mut sent_source_seq) {
                 disconnected_since.get_or_insert_with(Instant::now);
                 state.record_diagnostic(error.to_string());
@@ -560,7 +553,19 @@ pub fn run_durable_runner<E: CommandExecutor>(
                     "active connection lease expired; durable state is preserved",
                 ));
             }
-            let message = match transport.receive_json() {
+            // Read control before starting another fsynced provider batch.
+            // Consuming the last cumulative ACK must not let a new output
+            // suffix overtake the stop/suspend already queued behind it.
+            let control_message = transport.receive_json();
+            poll_executor_events_when_control_idle(
+                &mut state,
+                &store,
+                &config,
+                &mut executor,
+                sent_source_seq,
+                &control_message,
+            )?;
+            let message = match control_message {
                 Ok(Some(message)) => message,
                 Ok(None) => continue,
                 Err(error) => {
@@ -945,6 +950,32 @@ fn poll_executor_events_after_controller_ack<E: CommandExecutor>(
         return executor.maintain_backpressured_provider();
     }
     poll_executor_events(state, store, config, executor)
+}
+
+fn poll_executor_events_when_control_idle<E: CommandExecutor>(
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    executor: &mut E,
+    sent_source_seq: u64,
+    control_message: &Result<Option<Value>, DurableRunnerError>,
+) -> Result<(), DurableRunnerError> {
+    match control_message {
+        Ok(None) => poll_executor_events_after_controller_ack(
+            state,
+            store,
+            config,
+            executor,
+            sent_source_seq,
+        ),
+        // Autonomous receipt-limit cleanup must remain live under control/ACK
+        // traffic, but it cannot ingest ordinary provider output. Auth and
+        // command identity validation still precede every command effect.
+        Ok(Some(_)) => executor.maintain_backpressured_provider(),
+        // Keep the original transport failure and its existing reconnect path;
+        // don't admit another provider batch while disconnected.
+        Err(_) => Ok(()),
+    }
 }
 
 fn poll_executor_events<E: CommandExecutor>(
@@ -1739,6 +1770,227 @@ mod tests {
         assert_eq!(reloaded.outbox.len(), 1);
         assert_eq!(executor.events.len(), 1);
         assert!(executor.acknowledgements.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn queued_suspend_precedes_provider_tail_after_last_controller_ack() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-control-before-provider-tail-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = config(directory.clone());
+        config.max_outbox_bytes = 1024 * 1024;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        state
+            .enqueue_event(
+                &config,
+                "item.delta",
+                EventPriority::P1,
+                json!({"index": 0}),
+            )
+            .unwrap();
+        state.apply_ack(1).unwrap();
+        store.save(&state).unwrap();
+        let mut executor = RetainingEventExecutor {
+            events: (1..=128)
+                .map(|index| PolledEvent {
+                    executor_event_id: format!("tail-{index}"),
+                    event_type: "item.delta".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"index": index}),
+                })
+                .collect(),
+            fail_acknowledgement: false,
+            acknowledgements: Vec::new(),
+        };
+        let suspend = command("runner.suspend");
+        let pending_control = Ok(Some(json!({"kind": "command", "payload": suspend})));
+        poll_executor_events_when_control_idle(
+            &mut state,
+            &store,
+            &config,
+            &mut executor,
+            1,
+            &pending_control,
+        )
+        .unwrap();
+        assert_eq!(
+            state.highest_source_seq(),
+            1,
+            "a queued close command must not wait behind a fresh fsynced provider batch"
+        );
+        assert_eq!(executor.events.len(), 128);
+        assert!(executor.acknowledgements.is_empty());
+        let (result, lifecycle) =
+            process_command(&mut state, &store, &config, &mut executor, &suspend).unwrap();
+        persist_lifecycle_before_command_delivery(
+            &mut state,
+            &store,
+            lifecycle.durable_state().unwrap(),
+            &result,
+        )
+        .unwrap();
+        let (reloaded, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(result.status, "completed");
+        assert_eq!(reloaded.lifecycle, "suspended");
+        assert!(reloaded.pending_terminal_delivery.is_some());
+        assert_eq!(reloaded.acked_source_seq, 1);
+        assert!(reloaded.outbox.is_empty());
+        assert_eq!(
+            executor.events.len(),
+            128,
+            "unadmitted provider tail remains with its durable owner"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn control_first_poll_keeps_cleanup_live_and_preserves_transport_failure() {
+        struct ControlOnlyExecutor {
+            maintenance_calls: usize,
+        }
+        impl CommandExecutor for ControlOnlyExecutor {
+            fn execute(
+                &mut self,
+                _command: &Command,
+            ) -> Result<CommandExecution, DurableRunnerError> {
+                panic!("the poll gate cannot execute a control command")
+            }
+            fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                panic!("control traffic cannot admit an ordinary provider tail")
+            }
+            fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+                self.maintenance_calls += 1;
+                Ok(())
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-control-first-maintenance-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        store.save(&state).unwrap();
+        let original = serde_json::to_value(&state).unwrap();
+        let mut executor = ControlOnlyExecutor {
+            maintenance_calls: 0,
+        };
+        for kind in ["ack", "ping", "command"] {
+            let incoming = Ok(Some(json!({"kind":kind,"runId":"foreign-run"})));
+            poll_executor_events_when_control_idle(
+                &mut state,
+                &store,
+                &config,
+                &mut executor,
+                0,
+                &incoming,
+            )
+            .unwrap();
+            assert!(validate_control_identity(
+                incoming.as_ref().unwrap().as_ref().unwrap(),
+                &state,
+                None
+            )
+            .is_err());
+        }
+        assert_eq!(executor.maintenance_calls, 3);
+        let failed_read = Err(DurableRunnerError::invalid("original transport failure"));
+        poll_executor_events_when_control_idle(
+            &mut state,
+            &store,
+            &config,
+            &mut executor,
+            0,
+            &failed_read,
+        )
+        .unwrap();
+        assert!(failed_read
+            .unwrap_err()
+            .to_string()
+            .contains("original transport failure"));
+        assert_eq!(executor.maintenance_calls, 3);
+        assert_eq!(serde_json::to_value(&state).unwrap(), original);
+        let (reloaded, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(serde_json::to_value(reloaded).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn idle_control_poll_admits_only_durable_provider_events_and_keeps_ack_debt_gate() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-control-idle-events-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let event = PolledEvent {
+            executor_event_id: "retained-event".to_owned(),
+            event_type: "item.delta".to_owned(),
+            priority: EventPriority::P1,
+            payload: json!({"index":1}),
+        };
+        let mut executor = RetainingEventExecutor {
+            events: VecDeque::from([event.clone()]),
+            fail_acknowledgement: true,
+            acknowledgements: Vec::new(),
+        };
+        let idle = Ok(None);
+        let failure = poll_executor_events_when_control_idle(
+            &mut state,
+            &store,
+            &config,
+            &mut executor,
+            0,
+            &idle,
+        )
+        .unwrap_err();
+        assert!(failure
+            .to_string()
+            .contains("simulated crash before provider acknowledgement"));
+        let (mut recovered, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(recovered.outbox.len(), 1);
+        assert_eq!(recovered.acked_source_seq, 0);
+        assert_eq!(executor.events, VecDeque::from([event]));
+        executor.fail_acknowledgement = false;
+        poll_executor_events_when_control_idle(
+            &mut recovered,
+            &store,
+            &config,
+            &mut executor,
+            1,
+            &idle,
+        )
+        .unwrap();
+        assert_eq!(
+            executor.acknowledgements,
+            vec![1],
+            "controller ACK debt still defers provider replay"
+        );
+        recovered.apply_ack(1).unwrap();
+        store.save(&recovered).unwrap();
+        poll_executor_events_when_control_idle(
+            &mut recovered,
+            &store,
+            &config,
+            &mut executor,
+            1,
+            &idle,
+        )
+        .unwrap();
+        assert_eq!(executor.acknowledgements, vec![1, 1]);
+        assert_eq!(
+            recovered.highest_source_seq(),
+            1,
+            "replayed receipt must not allocate a duplicate source event"
+        );
+        assert!(executor.events.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
