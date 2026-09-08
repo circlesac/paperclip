@@ -886,3 +886,123 @@ message-to-final **15.004s**. `SLACK-LUNA-QUICK` published once on existing work
 message `1788852848.668699`, with one delivery/wake/eyes action. The in-app browser
 confirmed the exact final reply. Request-start/duration and retry metadata are
 still needed to attribute a future pre-receipt outlier reliably.
+
+### Timed ingress and transport revocation checkpoint (September 8, 07:48 UTC)
+
+Committed/pushed `eb0cb2841` (file-answer guidance), `2924ec872` (local webhook
+timing), and `fa3a0b63f` (real-database transport and admission regressions).
+The clean `fa3a0b63f` process started at 07:48:25.276 UTC and recovery was ready
+at 07:48:27.230. All seven historical recovery holds remained intact and no
+Maya run was active at restart. The webhook-only public proxy remained running.
+
+- Root's full chat integration passed **299/299** in 58.37s against fresh
+  embedded PostgreSQL (`native-webhook-transport-full-root-01.log`). The three
+  new transport cases build a genuine committed native review response and
+  selected files, then revoke the original requester or change the exact gate
+  before draining publications. All three parts cancel without a provider post,
+  edit, upload or receipt lookup. A held policy row instead produces a definite
+  pre-provider retry, then exactly one text and two file sends after release.
+- Mounted timing/body-parser/route tests passed **10/10**; with the real Slack
+  adapter/PG admission-failure case, **11/11**. Forged signatures and failed
+  inserts never report a durable receipt. The accepted retry records its real
+  committed row before acknowledgment. Events contain only closed numeric,
+  timing, provider/row identity and bounded retry-hint fields; no body, URL,
+  arbitrary header, credential or raw error is logged. This is local logging,
+  not telemetry or externally exported tracing.
+- File/prompt tests passed **123/123**, adapter compilation passed, and emitted
+  server compilation passed (`native-webhook-presentation-emitted-tsc-root-01.log`).
+  These tests do not prove the model will follow the wording guidance.
+
+The first live Slack message after this restart, `SLACK-TIMING-0908`, gives an
+actual HTTP boundary. Its provider timestamp was 07:49:22.930; HTTP arrived at
+07:49:23.520. Cold runtime initialization took about **6ms**, the durable receipt
+was recorded at **21.856ms**, and the 200 acknowledgment finished at **24.047ms**.
+Run `2250a8ec-52d0-40c4-a65c-200e94010a79` took **11.861s**. The single final
+`SLACK-LUNA-TIMED` was visible and published at 07:49:37.302, **14.372s** after
+the provider message. The earlier 98-second outlier did not recur; its historical
+cause remains unknown rather than retroactively attributed by this new sample.
+
+GitHub's inline `GH-TIMING-0908` returned `GITHUB-LUNA-TIMED` visibly in the
+same fixture thread. Run `db757de7-0f20-456a-9aa4-6c0adf0babf1` took **14.932s**.
+The webhook durably staged ingress and returned 202 in **82.379ms**, then
+initialized the runtime and admitted the message asynchronously under the same
+diagnostic request identity. No repository operation was requested or performed.
+
+Both native file retests delivered once: Telegram run
+`bf0eb51f-bc9e-49c2-9827-212fa4a3bcbb` took **38.171s**, with text/image messages
+`417200359:82` and `417200359:83`; Discord run
+`afc3ad5d-6c63-468a-bd83-e90cb57c5490` took **63.188s**, with the original note
+and PNG at `1546789814529957918` and `1546789820725071932`. The in-app browser
+showed the images and Discord's note preview. The wording retest **did not fully
+pass**: Telegram retained prepared/waiting boilerplate and Discord still said
+provider delivery was unconfirmed. Scoped boolean checks confirm the updated
+guidance reached both actual Codex user-input messages, not just stored server
+context. This is an instruction-following/wording defect, not a failed file
+transport or missing-prompt claim.
+
+### Native answered-question continuation defect (September 8, 07:43 UTC)
+
+On the earlier deployed `3ab1384f9`, Discord and Telegram each received a natural
+request to choose Amber or Cobalt through a clickable prompt, then return only
+the chosen color. Actual `turn_context.model` records for all four source and
+continuation runs are `gpt-5.6-luna`.
+
+- Discord source run `f93e89a8-6e36-447f-b523-11d7853be886` produced interaction
+  `00de7efd-2876-45d1-91a4-0cf6e5a15722`. One Cobalt click settled the visible
+  card to **Answered: Cobalt** and queued exactly one response continuation,
+  `a54a834d-55b1-4f0c-8a9a-941de93a4471`.
+- Telegram source run `c8b117fc-caf8-41d6-810c-b1d70e32e501` produced interaction
+  `40e22877-3354-46b0-a033-48458ab28373`. One Amber click removed the keyboard,
+  showed **Answered: Amber**, and queued exactly one continuation,
+  `5628e9a3-e3c4-4fb2-8b46-1463a15f92e9`.
+
+The continuations succeeded in 14.952s and 15.619s, but both provider finals
+said **Maya E2E completed this turn** instead of the selected color. Their
+accepted semantic summaries contained workflow bookkeeping, and no authorized
+review-preserving presentation proof was minted. The exact source-comment
+lineage survives, but the `issue.interaction.respond` wake is not recognized as
+an authenticated external answer for prompting and presentation. Separate human
+completion reviews remained pending and must not be bypassed by the repair.
+This is a failed end-to-end answer scenario, despite successful cards and
+exactly-once response delivery. A narrow attested-continuation fix is in progress.
+
+### GitHub inline edit audit (September 8, 07:55 UTC)
+
+Edited only our existing comment `3955555016` through GitHub's **Edit comment**
+UI, appending harmless marker `GH-INLINE-EDIT-0908`. The update was saved at
+07:55:19.257 UTC. Paperclip received one `message_updated` event
+`f373ca14-06b8-4c86-971d-3d15e0538272` and processed it at 07:55:21.673.
+It appended correction comment `964922f1-c620-433f-ae40-d130d31a4f0b` to the
+existing `CHA-10` task and preserved the original comment. No new run was
+created. GitHub visibly retained the corrected text. In Paperclip's `CHA-10`
+activity, expanding **System update · An external message was edited** showed
+the same correction and marker. No PR code, review resolution, installation
+or repository settings were changed.
+
+### Native answer repair checkpoint (September 8, 08:05 UTC)
+
+`5d329ba4d` fixes Discord terminal-card edits to send explicit empty components,
+so Discord removes answered controls instead of retaining the previous buttons.
+The adapter patch passes **39/39** tests and applies cleanly to pristine 4.39.0;
+the patched scratch module matches the installed module. The combined root
+Discord/prompt/file cohort passed **167/167**.
+
+`fb905c844` adds a distinct server-attested native answered-question path. It
+binds the exact source run/comment, processed provider choice, canonical answer,
+durable response receipt, target wake/run, current linked actor and destination.
+The marker alone grants no authority. Finalization and transport revalidate it;
+lost authorization is revoked rather than an excuse to schedule generic work.
+The existing human completion review is preserved. A real PostgreSQL overlap
+test verifies advisory-before-identity locking during concurrent unlink.
+
+The focused native files passed **58/58**, server typecheck passed, and the
+independent guard review found no remaining blocker in this bounded repair.
+Root separately passed **299/299** chat integration tests, shared/UI typechecks,
+adapter compilation and emitted server compilation. These are installed-tree
+checks, not clean frozen-install qualification.
+
+This repair currently covers a single-choice provider answer sourced from one
+direct-chat comment. Questions created by an already resumed answer turn and
+multi-comment source batches are deliberately not covered; arbitrary sequential
+question chains remain a release gap. Live requalification of the repaired
+answer, Discord controls and wording is still required at this checkpoint.
