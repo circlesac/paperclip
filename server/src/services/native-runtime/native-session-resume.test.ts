@@ -1027,56 +1027,71 @@ describe("rebindNativeSessionCheckpoint", () => {
     expect(result.normalizedSessionId).not.toBe(normalizedSessionId);
   });
 
-  it("refreshes retained completion descriptions without changing the Paperclip task or prior history", () => {
-    // Deployed v8 / finish_response_wake_concrete_object.v2 local catalog.
-    const retainedFingerprint =
-      "sha256:5b7b302db36f7ed6686f9ea1ba70bbf79ebd7fabf86953b548d966a2bc38b648";
-    expect(NATIVE_TOOL_CONTRACT_FINGERPRINT).not.toBe(retainedFingerprint);
-    const prior = previousRun({
-      nativeToolContractFingerprint: retainedFingerprint,
-    });
-    const priorSnapshot = structuredClone(prior);
-    const modes: boolean[] = [];
-    const result = buildNativeExecutionWithCheckpoint({
-      previousRun: prior,
-      normalizedSessionId,
-      buildExecution: (options) => {
-        modes.push(options.resumedSession);
-        const current = execution(currentRunId);
-        return {
-          ...current,
-          session: {
-            ...current.session,
-            normalizedSessionId: options.normalizedSessionId,
-          },
-          task: {
-            ...current.task,
-            prompt: options.resumedSession
-              ? "Paperclip Resume Delta"
-              : "Full context for the same Paperclip task",
-          },
-        };
-      },
-    });
-    expect(modes).toEqual([true, false]);
-    expect(result.checkpoint).toBeNull();
-    expect(result.normalizedSessionId).not.toBe(normalizedSessionId);
-    expect(result.execution.binding).toMatchObject({
-      companyId,
-      issueId,
-      agentId,
-      runId: currentRunId,
-    });
-    expect(result.execution.workspace).toEqual(execution(currentRunId).workspace);
-    expect(result.execution.task.prompt).toBe(
-      "Full context for the same Paperclip task",
-    );
-    // No deletion/reset of the existing provider checkpoint or Paperclip history.
-    expect(prior).toEqual(priorSnapshot);
-    expect(prior.runnerProfileJson.sessionCheckpoint.sessionId).toBe(
-      "provider-thread-123",
-    );
-  });
+  it.each([
+    {
+      contract: "completion descriptions",
+      // Deployed v8 / finish_response_wake_concrete_object.v2 local catalog.
+      retainedFingerprint:
+        "sha256:5b7b302db36f7ed6686f9ea1ba70bbf79ebd7fabf86953b548d966a2bc38b648",
+    },
+    {
+      contract: "task-bound human-input description",
+      // Deployed v9 still advertises the generic mock-task question description.
+      retainedFingerprint:
+        "sha256:b64efcd063a575925aa95dbd2a20953386eaa760f05b0e0e73b4ae04a97679b0",
+    },
+  ])(
+    "refreshes retained $contract without changing the Paperclip task or prior history",
+    ({ retainedFingerprint }) => {
+      expect(NATIVE_TOOL_CONTRACT_FINGERPRINT).not.toBe(retainedFingerprint);
+      const prior = previousRun({
+        nativeToolContractFingerprint: retainedFingerprint,
+      });
+      const priorSnapshot = structuredClone(prior);
+      const modes: boolean[] = [];
+      const result = buildNativeExecutionWithCheckpoint({
+        previousRun: prior,
+        normalizedSessionId,
+        buildExecution: (options) => {
+          modes.push(options.resumedSession);
+          const current = execution(currentRunId);
+          return {
+            ...current,
+            session: {
+              ...current.session,
+              normalizedSessionId: options.normalizedSessionId,
+            },
+            task: {
+              ...current.task,
+              prompt: options.resumedSession
+                ? "Paperclip Resume Delta"
+                : "Full context for the same Paperclip task",
+            },
+          };
+        },
+      });
+      expect(modes).toEqual([true, false]);
+      expect(result.checkpoint).toBeNull();
+      expect(result.normalizedSessionId).not.toBe(normalizedSessionId);
+      expect(result.execution.binding).toMatchObject({
+        companyId,
+        issueId,
+        agentId,
+        runId: currentRunId,
+      });
+      expect(result.execution.workspace).toEqual(
+        execution(currentRunId).workspace,
+      );
+      expect(result.execution.task.prompt).toBe(
+        "Full context for the same Paperclip task",
+      );
+      // No deletion/reset of the existing provider checkpoint or Paperclip history.
+      expect(prior).toEqual(priorSnapshot);
+      expect(prior.runnerProfileJson.sessionCheckpoint.sessionId).toBe(
+        "provider-thread-123",
+      );
+    },
+  );
 
   it("rotates a provider thread created while the current-wake reader was conditionally advertised", () => {
     expect(CONDITIONAL_READER_TOOL_CONTRACT_FINGERPRINT).not.toBe(

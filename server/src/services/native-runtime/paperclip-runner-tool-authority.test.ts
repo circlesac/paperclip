@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import {
   activityLog,
@@ -19,6 +20,7 @@ import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { READ_CURRENT_WAKE_COMMENTS_TOOL_NAME } from "./current-wake-comments.js";
+import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../vendor/paperclip-runner/index.js";
 
 describe("PaperclipRunnerToolAuthority", () => {
   let temporary: Awaited<
@@ -222,6 +224,160 @@ describe("PaperclipRunnerToolAuthority", () => {
     expect(authority.definitions().map((tool) => tool.name)).not.toContain(
       "set_dependencies",
     );
+  });
+
+  it.each(["standard", "ask"] as const)(
+    "advertises real task-bound questions and provider-dependent controls in %s mode",
+    (workMode) => {
+      const original = CAPABILITY_SEMANTIC_TOOL_CATALOG.find(
+        (tool) => tool.operationId === "request_human_input",
+      )!;
+      const originalSnapshot = structuredClone(original);
+      const authority = new PaperclipRunnerToolAuthority(db, {
+        companyId,
+        agentId,
+        issueId,
+        runId,
+        workMode,
+      });
+      const advertised = JSON.parse(
+        JSON.stringify(authority.definitions()),
+      ).find((tool: { name: string }) => tool.name === "request_human_input");
+      expect(advertised.description).toContain(
+        "current Paperclip task bound to this run",
+      );
+      expect(advertised.description).toContain(
+        "interactionKind 'questions' with payload.questions",
+      );
+      expect(advertised.description).toContain(
+        "supported provider question controls or a safe fallback",
+      );
+      expect(advertised.description).toContain(
+        "Normal task permissions and review gates still apply",
+      );
+      expect(advertised.description).not.toContain("mock");
+      expect(advertised.description).not.toContain("questionSpec");
+      expect(advertised.inputSchema).toEqual(original.inputSchema);
+      expect(advertised.inputSchema.properties).toHaveProperty("payload");
+      expect(advertised.inputSchema.properties).not.toHaveProperty(
+        "questionSpec",
+      );
+      expect(original).toEqual(originalSnapshot);
+    },
+  );
+
+  it("executes the advertised payload.questions shape once on the bound reviewed task", async () => {
+    const binding = {
+      companyId: randomUUID(),
+      agentId: randomUUID(),
+      issueId: randomUUID(),
+      runId: randomUUID(),
+    };
+    await db.insert(companies).values({
+      id: binding.companyId,
+      name: "Question invocation",
+      issuePrefix: "RQA",
+    });
+    await db.insert(agents).values({
+      id: binding.agentId,
+      companyId: binding.companyId,
+      name: "Question agent",
+      adapterType: "paperclip_runner",
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: binding.issueId,
+      companyId: binding.companyId,
+      title: "Question on reviewed task",
+      status: "in_review",
+      workMode: "standard",
+      reviewPolicy: "human_only",
+      assigneeAgentId: binding.agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: binding.runId,
+      companyId: binding.companyId,
+      agentId: binding.agentId,
+      status: "running",
+      runtimeMode: "native",
+      nativeIssueId: binding.issueId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      contextSnapshot: { issueId: binding.issueId },
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: binding.runId })
+      .where(eq(issues.id, binding.issueId));
+    const authority = new PaperclipRunnerToolAuthority(db, binding);
+    const advertised = authority
+      .definitions()
+      .find((tool) => tool.name === "request_human_input")!;
+    expect(advertised.description).toContain("payload.questions");
+    const questions = [
+      {
+        id: "color",
+        prompt: "Choose one color",
+        selectionMode: "single",
+        required: true,
+        options: [
+          { id: "amber", label: "Amber" },
+          { id: "cobalt", label: "Cobalt" },
+        ],
+      },
+    ];
+    const call = {
+      tool: "request_human_input",
+      callId: "advertised-question",
+      arguments: {
+        idempotencyKey: "advertised-question",
+        interactionKind: "questions",
+        title: "Choose one color",
+        prompt: "Choose one color",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, questions },
+      },
+    };
+    const first = await authority.execute(call);
+    expect(first).toMatchObject({
+      disposition: "applied",
+      interaction: {
+        companyId: binding.companyId,
+        issueId: binding.issueId,
+        sourceRunId: binding.runId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, questions },
+      },
+    });
+    await expect(
+      authority.execute({ ...call, callId: "advertised-question-replay" }),
+    ).resolves.toEqual(first);
+    const rows = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, binding.issueId));
+    expect(rows).toHaveLength(1);
+    const [task] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, binding.issueId));
+    expect(task).toMatchObject({
+      status: "in_review",
+      reviewPolicy: "human_only",
+      assigneeAgentId: binding.agentId,
+      executionRunId: binding.runId,
+    });
+    const entries = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, binding.issueId));
+    expect(
+      entries.filter(
+        (entry) => entry.action === "issue.thread_interaction_created",
+      ),
+    ).toHaveLength(1);
   });
 
   it("does not project a foreign-company task through approval context", async () => {

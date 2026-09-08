@@ -106,6 +106,10 @@ describe("native execution input external-chat framing", () => {
       expect(input.task.prompt).not.toContain(
         "including marking the task done",
       );
+      expect(input.task.prompt).toContain("request_human_input");
+      expect(input.task.prompt).toContain('interactionKind="questions"');
+      expect(input.task.prompt).toContain("one question at a time");
+      expect(input.task.prompt).toContain("Never fabricate answer URLs");
       expect(wakePayload).not.toHaveProperty("questionResponse");
       const unbound = buildNativeExecutionInput({
         ...args,
@@ -117,6 +121,9 @@ describe("native execution input external-chat framing", () => {
         ],
       });
       expect(unbound.task.title).toBe("Old exact-output request");
+      expect(unbound.task.prompt).not.toContain(
+        "Native external-chat questions",
+      );
       const earlierInteractionId = "10000000-0000-4000-8000-000000000020";
       const sequential = buildNativeExecutionInput({
         ...args,
@@ -139,6 +146,7 @@ describe("native execution input external-chat framing", () => {
       expect(sequential.task.title).toBe("External chat follow-up");
       expect(sequential.task.prompt).toContain("Circle");
       expect(sequential.task.prompt).toContain("Amber");
+      expect(sequential.task.prompt).toContain("next unanswered question");
       expect(
         sequential.task.prompt.indexOf("Choose a shape: Circle"),
       ).toBeLessThan(sequential.task.prompt.indexOf("Choose a color: Amber"));
@@ -150,83 +158,91 @@ describe("native execution input external-chat framing", () => {
       expect(wakePayload).not.toHaveProperty("questionResponse");
     },
   );
-  it("uses neutral framing and the closed reader for an authenticated overflow chat turn", () => {
-    const staleRootTitle = "Reply with exactly STALE-OVERFLOW-MARKER";
-    const input = buildNativeExecutionInput({
-      companyId: "10000000-0000-4000-8000-000000000001",
-      runId: "50000000-0000-4000-8000-000000000005",
-      issue: {
-        id: "20000000-0000-4000-8000-000000000002",
-        identifier: "CHAT-5",
-        title: staleRootTitle,
-        description: "Started from Discord.",
-        workMode: "standard",
-      },
-      taskPrompt: `Paperclip task context:\n- Title: ${JSON.stringify(staleRootTitle)}`,
-      wakePayload: {
-        reason: "External chat message received",
-        externalChatProvider: "discord",
-        checkedOutByHarness: true,
+  it.each([false, true])(
+    "uses neutral framing and real question tools for authenticated overflow chat (resumed: %s)",
+    (resumedSession) => {
+      const staleRootTitle = "Reply with exactly STALE-OVERFLOW-MARKER";
+      const input = buildNativeExecutionInput({
+        companyId: "10000000-0000-4000-8000-000000000001",
+        runId: "50000000-0000-4000-8000-000000000005",
         issue: {
           id: "20000000-0000-4000-8000-000000000002",
           identifier: "CHAT-5",
           title: staleRootTitle,
           description: "Started from Discord.",
-          descriptionTruncated: false,
-          status: "in_progress",
           workMode: "standard",
         },
-        commentWindow: {
-          requestedCount: 2,
-          includedCount: 1,
-          missingCount: 1,
-        },
-        commentIds: ["comment-overflow-1", "comment-overflow-2"],
-        latestCommentId: "comment-overflow-2",
-        comments: [
-          {
-            id: "comment-overflow-2",
-            issueId: "20000000-0000-4000-8000-000000000002",
-            body: "Answer both queued messages.",
-            bodyTruncated: false,
-            authorType: "user",
+        taskPrompt: `Paperclip task context:\n- Title: ${JSON.stringify(staleRootTitle)}`,
+        resumedSession,
+        wakePayload: {
+          reason: "External chat message received",
+          externalChatProvider: "discord",
+          checkedOutByHarness: true,
+          issue: {
+            id: "20000000-0000-4000-8000-000000000002",
+            identifier: "CHAT-5",
+            title: staleRootTitle,
+            description: "Started from Discord.",
+            descriptionTruncated: false,
+            status: "in_progress",
+            workMode: "standard",
           },
-        ],
-        fallbackFetchNeeded: true,
-      },
-      agentId: "30000000-0000-4000-8000-000000000003",
-      workspace: {
-        id: "50000000-0000-4000-8000-000000000005",
-        cwd: "/workspace",
-        repoUrl: null,
-        repoRef: null,
-        branchName: null,
-      },
-      normalizedSessionId: "60000000-0000-4000-8000-000000000006",
-      provider: "codex",
-      completionContract: {
-        id: "70000000-0000-4000-8000-000000000007",
-        sha256: `sha256:${"a".repeat(64)}`,
-        schemaVersion: "paperclip.run-result.v1",
-        contract: {
-          revision: "1",
-          objective: "Respond to all pending comments in order",
-          criteria: [
+          commentWindow: {
+            requestedCount: 2,
+            includedCount: 1,
+            missingCount: 1,
+          },
+          commentIds: ["comment-overflow-1", "comment-overflow-2"],
+          latestCommentId: "comment-overflow-2",
+          comments: [
             {
-              id: "objective",
-              requirement: "Read every current wake comment.",
+              id: "comment-overflow-2",
+              issueId: "20000000-0000-4000-8000-000000000002",
+              body: "Answer both queued messages.",
+              bodyTruncated: false,
+              authorType: "user",
             },
           ],
+          fallbackFetchNeeded: true,
         },
-      },
-      runtimeContext: nativeRuntimeContextFixture(),
-    });
+        agentId: "30000000-0000-4000-8000-000000000003",
+        workspace: {
+          id: "50000000-0000-4000-8000-000000000005",
+          cwd: "/workspace",
+          repoUrl: null,
+          repoRef: null,
+          branchName: null,
+        },
+        normalizedSessionId: "60000000-0000-4000-8000-000000000006",
+        provider: "codex",
+        completionContract: {
+          id: "70000000-0000-4000-8000-000000000007",
+          sha256: `sha256:${"a".repeat(64)}`,
+          schemaVersion: "paperclip.run-result.v1",
+          contract: {
+            revision: "1",
+            objective: "Respond to all pending comments in order",
+            criteria: [
+              {
+                id: "objective",
+                requirement: "Read every current wake comment.",
+              },
+            ],
+          },
+        },
+        runtimeContext: nativeRuntimeContextFixture(),
+      });
 
-    expect(input.task.title).toBe("External chat follow-up");
-    expect(input.task.description).toBeNull();
-    expect(input.task.prompt).toContain("read_current_wake_comments");
-    expect(input.task.prompt).toContain(staleRootTitle);
-  });
+      expect(input.task.title).toBe("External chat follow-up");
+      expect(input.task.description).toBeNull();
+      expect(input.task.prompt).toContain("read_current_wake_comments");
+      expect(input.task.prompt).toContain(staleRootTitle);
+      expect(input.task.prompt).toContain("request_human_input");
+      expect(input.task.prompt).toContain("Never fabricate answer URLs");
+      expect(input.task.prompt).toContain("not a self-contained text answer");
+      expect(input.task.prompt).toContain('continuationPolicy="wake_assignee"');
+    },
+  );
 
   it.each([false, true])(
     "keeps GitHub's task-only file guidance in the closed native input (resumed: %s)",

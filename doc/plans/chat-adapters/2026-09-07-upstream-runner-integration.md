@@ -1056,3 +1056,67 @@ includes the deliberate five-second semantic-result grace before controlled
 provider cancellation; reducing it requires a separate correctness proof for
 durable suffixes and session suspension. These overlapping runs are one workload
 sample, not a controlled model benchmark or proof about the earlier 98s outlier.
+
+### Atomic chains and completion-field contract (September 8, 08:24 UTC)
+
+Committed/pushed `67bdc52f4` for bounded sequential questions and `161212685`
+for completion-field descriptions. Root passed **1,322/1,322** native runtime
+tests, **299/299** chat integration tests, **89/89** runner completion/actual
+Codex transport tests, **33/33** checkpoint tests, emitted server compilation,
+and runner TypeScript build. The deterministic chat browser suite also passed
+**9/9** (all five setup flows and four Board file-batch recovery states).
+No Rust binary, generated protocol artifact or lockfile edit was needed.
+
+Chains now support at most eight linked single-choice answers from one original
+direct-chat comment. Every ancestor is reconstructed from durable answer/action/
+delivery/wake records and current identity/reach; cycles, duplicates, altered
+ancestors and a ninth hop fail closed. Authorization and response materialization
+share a short nonblocking-lock transaction. A real PostgreSQL barrier test
+blocks a coherent answer/action/receipt rewrite until the authorized input is
+captured, then rejects the changed chain on the next read. No provider I/O holds
+those locks. Answers enter the existing immutable native execution input used
+for replay; this is not a zero-persistence claim and creates no extra durable
+wake/chat/task answer copies.
+
+The clean `161212685` live process reports the correct loaded health version.
+All four real provider-session declarations contain the updated completion
+schema and description. The existing fingerprint mechanism correctly starts a
+new Codex session with full task context while retaining each Paperclip
+conversation, task, attachments and audit history. Actual `turn_context.model`
+events confirm `gpt-5.6-luna` in all four initial runs and the Discord correction.
+
+- Slack `3b9b46c4-e636-4a2f-8240-3cc126fc329c`: 14.864s run; exact visible
+  `SLACK-LUNA-CONTRACT-READY`, one publication at 08:24:38.554.
+- GitHub `2ac53402-2024-4203-b4d9-fea5fa21cdf0`: 13.299s run; exact visible
+  `GITHUB-LUNA-CONTRACT-READY` in the same inline fixture thread, comment
+  `3955842490` at 08:25:03.120. No repository operation.
+- Telegram `3e644cd2-b25a-4c5d-affc-22ff161b9ea1`: 41.235s run; original photo
+  visibly delivered once at `417200359:92`. Waiting/unconfirmed-delivery wording
+  disappeared, but an unnecessary prepared-attachment sentence remains.
+- Discord's initial sequential request `b747a717-e0ff-4a84-88c6-91f9ec6a7bfc`
+  did **not** create a native question: its canonical summary fabricated relative
+  choice links, which the safe renderer reduced to a text list. A natural
+  correction `37800c84-281e-486f-9e63-15241221f6c4` then used `paperclip_block`
+  and falsely claimed the choice interaction was unavailable. Neither run
+  invoked `request_human_input`; no question interaction was created.
+
+The actual Discord session's 23-tool declaration does contain
+`request_human_input`, including its required fields and question interaction
+kind. This is not a missing-tool or provider-outage finding. Its current live
+description says **active mock task**, and the native chat prompt gives no
+structured-question exception to the zero-API text shortcut. Production
+descriptor/guidance correction and another live test are required; these failed
+requests do not qualify sequential interaction behavior.
+
+The next correction keeps the generic mock catalog unchanged and overrides only
+the real authority's advertised description. Native external-chat guidance now
+explicitly selects the real structured-question tool, forbids fabricated answer
+links, and explains one-at-a-time continuation. Its documented argument shape is
+`payload.questions`, matching the production authority and declared schema;
+there is no `questionSpec` argument. The retained-tool fingerprint advances to
+v10 so already-open Codex sessions receive the corrected declaration without
+resetting Paperclip task history. Root's combined prompt/authority/checkpoint
+suite passes **56/56**, with server typecheck passing. The real authority test
+creates the documented question on an in-review, human-review-required task,
+replays it idempotently, and verifies the original task/review state and one
+audit event. Live requalification is still required.
