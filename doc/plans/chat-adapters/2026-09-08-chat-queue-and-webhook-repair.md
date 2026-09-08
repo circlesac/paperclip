@@ -1527,5 +1527,62 @@ additional lost guard.
 The combined review is **500 files**. Only the superseded v3/v4 design notes
 were removed from the working tree; their exact contents are linked from
 `wireframes-archive.md` at checkpoint `9668530e1`. Current designs, generator
-inputs and all live qualification evidence remain present. Server 50 still
-runs the earlier production code until a deliberate post-merge restart.
+inputs and all live qualification evidence remain present.
+
+### Merged deployment and real in-flight queue
+
+Code head `ea8e45e17` received exact-head Greptile **5/5**, explicitly
+**500 files reviewed / zero comments**, with no unresolved thread. Full
+workspace typecheck and build passed. Normal build staging changed the runner
+inode but preserved its signed bytes and SHA-256. CI `34262337249` was still
+running without failures when this record was written; inspect the PR for its
+final result rather than inferring success from these local checks.
+
+Root verified zero active/queued runs, stopped server 50 normally, and started
+server 51 from the clean merged head at **18:20:56.016 UTC**. The five-second
+HTTP drain expired on remaining connections; provider shutdown completed and
+the old listener closed before restart. The Board remains private and the
+verified webhook proxy is unchanged. A Board reload showed the expected active
+catalog, without an error banner or sign-in redirect.
+
+One `DISPATCH-MERGE-0908` continuation was sent through each signed-in provider
+UI. Slack, GitHub and Telegram returned exactly `DISPATCH-MERGE-READY` in
+**16.188 / 17.441 / 14.776 seconds**; native Luna execution used
+**13.622 / 12.898 / 11.510 seconds**. All used Paperclip Runner with Codex
+app-server, one current wake comment, one succeeded run and one accepted
+native result. Each retained its existing task/current conversation generation
+and used one provider message for working→final, with one attempt per update.
+There were no new attachments or work products. Scoped delivery, action, wake,
+run, result, publication and 156-event checks found no matched credential or
+signed-URL leakage; this is not a full independent shell-command audit.
+Root inspected the rendered Slack/GitHub result and Board, and verified the
+Telegram reply through its visible accessibility text. No fresh broad Telegram
+screenshot was taken because its unrelated chat list was outside this check.
+Only sampled transitions were inspected; this is not an exhaustive flicker test.
+
+The first Slack follow-up pair, `QUEUE-MERGE-0908`, produced correct ordered
+replies but did **not** exercise queuing: B's webhook reached Paperclip
+**1.073 seconds after A finished**. It remains sequential-continuation proof.
+The next pair, `QUEUE-INFLIGHT-0908`, submitted B immediately after the current
+working indicator appeared: A at **18:26:29.050**, B at **18:26:31.781 UTC**.
+B ingress preceded A completion by **9.159 seconds**. Its immutable receipt
+recorded `deferred_issue_execution` with no run ID; its durable wake waited
+**8.424 seconds**, then was claimed **39 milliseconds after A finished**.
+
+A's run `4bf615a1-7977-4792-8491-681e874c6d4e` completed with exactly
+`QUEUE-INFLIGHT-FIRST`; B's run `a6b2b7fe-a0a7-458c-a39f-1eea93a1f7c4`
+completed with exactly `QUEUE-INFLIGHT-SECOND`. Both current-wake arrays
+contained only their own source comment; accepted results and final replies
+were ordered, with zero same-task run overlap. A finished delivery in
+**12.763 seconds**. B received `Your follow-up is queued.` in **2.642 seconds**
+and its final in **24.259 seconds**, including queue time. B's queued, working
+and final publications all updated provider message `1788891994.388049`;
+A used `1788891991.492959`. All five updates used one attempt: two bot reply
+identities, not five posts. No files or work products were created.
+
+Root saw the working and ordered final states, with the working indicator
+cleared and no duplicate result or error. The brief queue notice was verified
+in delivery records, not caught in the sampled screenshots. The final flow was
+clear and usable: each request had its own answer and no recovery intervention
+was needed. This proves the particular same-thread in-flight sequence, not
+every provider, ownership-takeover or permission-revocation permutation.

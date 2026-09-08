@@ -7,6 +7,20 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Landing status
 
+- Code head `ea8e45e17` is pushed and mergeable in PR #13038, **500 files**.
+  Greptile reviewed that exact head at **5/5**, explicitly all 500 files,
+  with zero new comments or unresolved findings. Full merged workspace
+  `pnpm -r typecheck` and `pnpm build` passed. Normal build staging replaced
+  the runner inode but preserved its exact signed bytes and hash. Consult
+  the PR for current CI status; run `34262337249` was still running without
+  failures when this evidence was recorded. Do not treat earlier green lanes
+  as proof that its remaining lanes passed. The latest documentation checkpoint
+  must also receive its normal final-head gates.
+  Server 51 now runs that merged code. New native Luna continuations passed
+  in Slack/GitHub/Telegram in **16.188 / 17.441 / 14.776 seconds**. A separate
+  Slack in-flight pair proved durable deferral, exact per-comment isolation,
+  no overlapping runs and one queued→working→final provider message. The
+  permanent log below records the timing and visual-proof boundaries.
 - Fixture follow-up `9668530e1` passed the exact CI Rust release-workspace
   command: **480 passed / zero failed / one ignored**. Debug Codex and native
   backend targets also passed **66 + 10**, with the existing Codex subprocess
@@ -26,8 +40,7 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   actual module-boundary check pass. The combined PR is **500 files** after
   archiving only the superseded v3/v4 design notes in Git history. Current
   designs, generators and qualification evidence remain available. Final
-  merged-head CI/review and deployment are still required; the running server
-  is still server 50 below.
+  merged-head CI/review remain required; the later deployment is recorded below.
 - Preceding pushed head `a756325e0` received Greptile **5/5**, with all 497
   files reviewed and no unresolved finding. Its CI `34260240654` exposed a
   Rust import-order mismatch in the fake provider: standalone formatting had
@@ -141,15 +154,16 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current deployed state and evidence
 
-The live server was restarted at **17:39:47.681 UTC**, log
-`.paperclip-runtime/chat-adapters-live/server-experimental-landing-50.log`.
-It started from clean head `179fb5a53`; its native production code remains
-`aaa74597f`, including the final malformed-response guard and turn-admission
-patch. The restart followed the controlled GitHub source-change test below,
-with zero active/queued runs before shutdown. UI files use Vite development
-middleware; root reloaded and checked the experimental/tool entry points after
-the later GitHub repository-controls merge without changing the backend process.
-Only runner TypeScript was rebuilt; the signed runner binary is unchanged.
+The live server was restarted at **18:20:56.016 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-51.log`.
+It started from clean head `ea8e45e17`, including the merged run-dispatch
+module, source-only status bridge, final malformed-response guard and
+turn-admission patch. There were zero active/queued runs before shutdown.
+The normal five-second HTTP drain expired on remaining browser connections;
+provider cleanup completed and the old process exited before restart.
+UI files use Vite development middleware; root reloaded the Board and saw its
+active connector catalog without an error banner. Full workspace build passed
+after restart; normal staging preserved the exact signed runner bytes.
 The same native production code on server 47 passed Slack/GitHub/Telegram
 continuation smoke checks, returning exact answers in **14.741 / 18.018 /
 15.940 seconds**, on the
