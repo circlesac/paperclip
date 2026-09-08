@@ -1828,3 +1828,13 @@ the pending private-image delivery is not declared qualified. Teams Developer
 Portal still shows its Microsoft sign-in gate. These provider gates and the
 separately documented latency benchmark remain explicit; this is not a
 blanket production-ready sign-off for all five providers.
+
+The final Discord file answer was independently distinguished from memory-only
+recall: its run-scoped provider record contains exactly one successful
+`read_chat_attachment` operation (527.616ms), with matching durable
+`tool.execution.started` / `tool.execution.completed` events at sequences
+29/33. Its returned metadata identifies attachment
+`2fa67267-dab6-477d-a1e0-00e75d2d39cd`, 128-byte `text/plain`, SHA-256
+`fd40030afb62b83181a2a46dde8220e8defecfa0b4328e380c30b1899ccdce24`.
+No raw tool arguments, contents, reasoning, or credentials were copied into
+this evidence record or external progress messages.
