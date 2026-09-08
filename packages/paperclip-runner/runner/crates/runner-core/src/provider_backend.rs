@@ -20,7 +20,7 @@ use crate::durable::{
     create_private_temporary_file, current_unix_ms, open_private_regular_file,
     sanitize_semantic_tool_input, sanitize_value, verify_private_directory, Command,
     CommandExecution, CommandExecutor, DurableRunnerConfig, DurableRunnerError, EventPriority,
-    OpenCodeLaunchProfile, PolledEvent,
+    OpenCodeLaunchProfile, PolledEvent, TerminalDeliveryReconciliation,
 };
 use crate::provider_bridge::{
     authorized_tool_catalog_digest, semantic_value_digest, AuthorizedToolSet, DurableReplayFilter,
@@ -1175,6 +1175,11 @@ impl CodexCommandExecutor {
     }
 
     fn restore_once(&mut self) -> Result<(), DurableRunnerError> {
+        self.load_state_without_provider()?;
+        self.restore_provider_if_needed()
+    }
+
+    fn load_state_without_provider(&mut self) -> Result<(), DurableRunnerError> {
         let path = self.state_path();
         let mut file = match open_private_regular_file(&path) {
             Ok(file) => file,
@@ -1213,7 +1218,7 @@ impl CodexCommandExecutor {
             ));
         }
         self.state = Some(state);
-        self.restore_provider_if_needed()
+        Ok(())
     }
 
     fn restore_provider_if_needed(&mut self) -> Result<(), DurableRunnerError> {
@@ -3402,6 +3407,36 @@ impl CommandExecutor for CodexCommandExecutor {
         }
         self.provider = None;
         Ok(())
+    }
+
+    fn reconcile_terminal_delivery(
+        &mut self,
+    ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        // A fresh terminal-delivery process has no provider handle. Validate
+        // its retained state without starting a provider merely to stop it.
+        // If this process already owns a handle, stop only that exact handle.
+        if let Some(provider) = self.provider.as_mut() {
+            provider.shutdown().map_err(|error| {
+                DurableRunnerError::invalid(format!("failed to stop Codex provider: {error}"))
+            })?;
+            self.provider = None;
+        }
+        if self.state.is_none() {
+            self.load_state_without_provider()?;
+        }
+        let state = self.state.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid(
+                "terminal delivery reconciliation requires retained provider state",
+            )
+        })?;
+        state.validate()?;
+        Ok(
+            if state.lifecycle == "prepared" && state.active_provider_turn_id.is_none() {
+                TerminalDeliveryReconciliation::CleanupCompleted
+            } else {
+                TerminalDeliveryReconciliation::ProviderCleanupPending
+            },
+        )
     }
 }
 

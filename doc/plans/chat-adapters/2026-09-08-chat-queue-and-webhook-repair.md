@@ -2503,3 +2503,43 @@ currently tries to restore a provider merely to shut it down; correcting that
 producer behavior and recording future per-epoch owner retirement are separate
 work. The original failed copy remains `operator_required`; neither its history
 nor its commands are reset, and no repeat live attempt has been submitted.
+
+### Cold terminal delivery is distinct from physical provider cleanup
+
+The real composed runner test exposed an unintended cold launch: reconciling a
+failed terminal receipt called shutdown, which restored Codex merely to stop
+it. The producer now validates retained provider state without launching, and
+both native selection wrappers forward that operation. A separate persistent
+cleanup marker survives acknowledged terminal delivery. Ordinary attach/start
+and provider polling remain blocked; only a new exact stop with confirmed exit
+clears the marker. Replaying the original failed terminal command retains its
+receipt and does not rewind the newer command cursor.
+
+Two additional regressions were reproduced and repaired: repeated failed stops
+could compact the marker's original command, and a pre-authentication timeout
+could overwrite the terminal lifecycle and make its journal unreloadable.
+Admission now refuses before that bounded journal eviction; transport failure
+records preserve the exact terminal lifecycle and receipt. Verification passed
+239/239 Rust unit tests, 70 Codex provider tests, and 10 native-selector tests.
+The provider target's existing ignored subprocess helper also ran separately
+and passed. Formatting and diff checks passed. The normal optimized runner
+build succeeded; staging and live deployment are still pending controller-side
+ownership-barrier verification.
+
+### Original GitHub B retry: live result, 23:53 UTC
+
+From the live Board dashboard, root opened original failed run
+`38dfc3ec-4fa7-4ed4-8563-7650dfce3d47` and used its Retry control once. New run
+`7c4827a6-705a-4295-8196-f51a821a4af3` retained the exact latest wake comment and
+source-run link. The Board showed Paperclip Runner / Codex / `gpt-5.6-luna`,
+then success in 15 seconds. In the private disposable GitHub QA repository,
+comment `5593571969` changed from working feedback to exactly
+`CONTROL-FIRST-B-READY`. Refresh and screenshot inspection confirmed persistence
+in PR-level conversation 3, not its line-review thread.
+
+This verifies the original request's retry end to end on server 60, not all
+GitHub features. The old failed-attempt notice remains immediately above the
+successful retry; the new answer is clear but the historical presentation is
+not yet a polished recovery experience. Telegram's retained cleanup and file B
+request remain unresolved. The browser became available again after host sleep;
+no provider credential or permission change was needed for this retry.

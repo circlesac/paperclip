@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::acpx_provider_backend::{AcpxCommandExecutor, ACPX_PROVIDER_STATE_FILE};
 use crate::durable::{
     Command, CommandExecution, CommandExecutor, DurableRunnerConfig, DurableRunnerError,
-    PolledEvent,
+    PolledEvent, TerminalDeliveryReconciliation,
 };
 use crate::managed_provider_backend::{
     ManagedProviderCommandExecutor, MANAGED_PROVIDER_STATE_FILE,
@@ -56,6 +56,16 @@ impl CommandExecutor for SelectedExecutor {
             Self::LocalFacade(executor) => executor.acknowledge_events(count),
             Self::Acpx(executor) => executor.acknowledge_events(count),
             Self::Managed(executor) => executor.acknowledge_events(count),
+        }
+    }
+
+    fn reconcile_terminal_delivery(
+        &mut self,
+    ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        match self {
+            Self::LocalFacade(executor) => executor.reconcile_terminal_delivery(),
+            Self::Acpx(executor) => executor.reconcile_terminal_delivery(),
+            Self::Managed(executor) => executor.reconcile_terminal_delivery(),
         }
     }
 
@@ -205,6 +215,18 @@ impl CommandExecutor for NativeProviderCommandExecutor {
                 "cannot acknowledge provider events before provider selection",
             ))
         }
+    }
+
+    fn reconcile_terminal_delivery(
+        &mut self,
+    ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        // Selection only loads the provider authority. The selected executor
+        // decides whether terminal delivery can settle without a cold launch.
+        self.select_recovery()?;
+        self.selected.as_mut().map_or_else(
+            || Ok(TerminalDeliveryReconciliation::CleanupCompleted),
+            CommandExecutor::reconcile_terminal_delivery,
+        )
     }
 
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {

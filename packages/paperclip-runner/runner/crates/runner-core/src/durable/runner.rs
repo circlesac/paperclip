@@ -224,6 +224,12 @@ fn apply_authority_rotation(
     store.save(state)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalDeliveryReconciliation {
+    CleanupCompleted,
+    ProviderCleanupPending,
+}
+
 pub trait CommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError>;
 
@@ -253,6 +259,38 @@ pub trait CommandExecutor {
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
         Ok(())
     }
+
+    /// Reconcile an already-durable terminal delivery without implicitly
+    /// restoring a provider. A delivery-only result retains a separate fence
+    /// until a new explicit stop proves physical provider cleanup.
+    fn reconcile_terminal_delivery(
+        &mut self,
+    ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        self.shutdown()?;
+        Ok(TerminalDeliveryReconciliation::CleanupCompleted)
+    }
+}
+
+fn shutdown_preserving_cleanup<E: CommandExecutor>(
+    state: &DurableState,
+    executor: &mut E,
+) -> Result<(), DurableRunnerError> {
+    if state.pending_terminal_delivery.is_some() || state.pending_provider_cleanup.is_some() {
+        executor.reconcile_terminal_delivery().map(|_| ())
+    } else {
+        executor.shutdown()
+    }
+}
+
+fn record_recoverable_transport_failure(state: &mut DurableState, reason: &str) {
+    // A pending terminal receipt must retain its exact suspended/stopped
+    // lifecycle so a new authenticated process can reconcile that receipt.
+    // Record the transport failure separately instead of invalidating the
+    // durable fence merely because this attempt could not authenticate.
+    if state.pending_terminal_delivery.is_none() {
+        state.lifecycle = "recoverable_failure".to_owned();
+    }
+    state.recoverable_failure = Some(reason.to_owned());
 }
 
 #[derive(Default)]
@@ -297,7 +335,9 @@ pub fn run_durable_runner<E: CommandExecutor>(
     let store = DurableStateStore::new(&config.state_dir)?;
     let (mut state, recovered) = store.load_or_create(&config)?;
     if state.lifecycle == "revoked"
-        || (state.lifecycle == "stopped" && state.pending_terminal_delivery.is_none())
+        || (state.lifecycle == "stopped"
+            && state.pending_terminal_delivery.is_none()
+            && state.pending_provider_cleanup.is_none())
     {
         return Ok(());
     }
@@ -330,9 +370,11 @@ pub fn run_durable_runner<E: CommandExecutor>(
                 .reconnect_grace
                 .is_some_and(|grace| disconnected_at.elapsed() >= grace)
             {
-                let _ = executor.shutdown();
-                state.lifecycle = "recoverable_failure".to_owned();
-                state.recoverable_failure = Some("transport_reconnect_grace_exceeded".to_owned());
+                let _ = shutdown_preserving_cleanup(&state, &mut executor);
+                record_recoverable_transport_failure(
+                    &mut state,
+                    "transport_reconnect_grace_exceeded",
+                );
                 state.record_diagnostic(
                     "transport reconnect grace exceeded; durable state is preserved",
                 );
@@ -343,9 +385,11 @@ pub fn run_durable_runner<E: CommandExecutor>(
             }
         }
         if started.elapsed() >= config.max_runtime {
-            let _ = executor.shutdown();
-            state.lifecycle = "recoverable_failure".to_owned();
-            state.recoverable_failure = Some("transport_reconnect_deadline_exceeded".to_owned());
+            let _ = shutdown_preserving_cleanup(&state, &mut executor);
+            record_recoverable_transport_failure(
+                &mut state,
+                "transport_reconnect_deadline_exceeded",
+            );
             state.record_diagnostic(
                 "transport reconnect deadline elapsed; durable state is preserved",
             );
@@ -357,9 +401,8 @@ pub fn run_durable_runner<E: CommandExecutor>(
         if lease.as_ref().is_some_and(|credential| {
             current_unix_ms().is_ok_and(|now| now >= credential.expires_at_unix_ms)
         }) {
-            let _ = executor.shutdown();
-            state.lifecycle = "recoverable_failure".to_owned();
-            state.recoverable_failure = Some("lease_expired_requires_bootstrap".to_owned());
+            let _ = shutdown_preserving_cleanup(&state, &mut executor);
+            record_recoverable_transport_failure(&mut state, "lease_expired_requires_bootstrap");
             state.record_diagnostic("connection lease expired; a fresh bootstrap is required");
             store.save(&state)?;
             return Err(DurableRunnerError::invalid(
@@ -510,7 +553,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                     // this process and overwrite its durable terminal state as
                     // ready merely to retry a later outbox frame.
                     store.save(&state)?;
-                    let _ = executor.shutdown();
+                    let _ = shutdown_preserving_cleanup(&state, &mut executor);
                     return Err(error);
                 }
                 disconnected = true;
@@ -544,9 +587,11 @@ pub fn run_durable_runner<E: CommandExecutor>(
                 break;
             }
             if current_unix_ms()? >= connection.expires_at_unix_ms {
-                let _ = executor.shutdown();
-                state.lifecycle = "recoverable_failure".to_owned();
-                state.recoverable_failure = Some("lease_expired_requires_bootstrap".to_owned());
+                let _ = shutdown_preserving_cleanup(&state, &mut executor);
+                record_recoverable_transport_failure(
+                    &mut state,
+                    "lease_expired_requires_bootstrap",
+                );
                 state.record_diagnostic("active connection lease expired");
                 store.save(&state)?;
                 return Err(DurableRunnerError::invalid(
@@ -666,7 +711,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                             // The controller has accepted this terminal result.
                             // Stop even though a later outbox frame failed so a
                             // reconnect cannot restore the runner to ready.
-                            let _ = executor.shutdown();
+                            let _ = shutdown_preserving_cleanup(&state, &mut executor);
                             return Err(error);
                         }
                         disconnected_since.get_or_insert_with(Instant::now);
@@ -740,7 +785,7 @@ fn persist_lifecycle_before_shutdown<E: CommandExecutor>(
 ) -> Result<(), DurableRunnerError> {
     state.lifecycle = lifecycle.to_owned();
     store.save(state)?;
-    executor.shutdown()
+    shutdown_preserving_cleanup(state, executor)
 }
 
 fn persist_lifecycle_before_command_delivery(
@@ -788,7 +833,31 @@ fn finish_terminal_transition_after_ack<E: CommandExecutor>(
     // Keep the durable fence through provider cleanup. If cleanup fails, a
     // replacement may authenticate only to retry terminal reconciliation and
     // cannot restore the suspended runner to ready.
+    if state.pending_provider_cleanup.is_some() {
+        return finish_terminal_reconciliation(state, store, executor);
+    }
     executor.shutdown()?;
+    complete_terminal_delivery_after_cleanup(state, store)
+}
+
+fn finish_terminal_reconciliation<E: CommandExecutor>(
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    executor: &mut E,
+) -> Result<(), DurableRunnerError> {
+    let outcome = executor.reconcile_terminal_delivery()?;
+    if outcome == TerminalDeliveryReconciliation::ProviderCleanupPending
+        && state.pending_provider_cleanup.is_none()
+    {
+        state.pending_provider_cleanup =
+            Some(state.pending_terminal_delivery.clone().ok_or_else(|| {
+                DurableRunnerError::invalid(
+                    "delivery-only reconciliation requires an exact terminal fence",
+                )
+            })?);
+    }
+    // Clearing delivery never clears a pre-existing physical cleanup fence.
+    // Only a new successful turn.stop may do that.
     complete_terminal_delivery_after_cleanup(state, store)
 }
 
@@ -910,10 +979,10 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
     if let Err(error) = send_outbox(transport, state, &mut sent_source_seq) {
         state.record_diagnostic("outbox delivery failed after terminal result reconciliation");
         store.save(state)?;
-        let _ = executor.shutdown();
+        let _ = shutdown_preserving_cleanup(state, executor);
         return Err(error);
     }
-    finish_terminal_transition_after_ack(state, store, executor)
+    finish_terminal_reconciliation(state, store, executor)
 }
 
 fn stop_after_terminal_result_delivery_failure<E: CommandExecutor>(
@@ -929,7 +998,7 @@ fn stop_after_terminal_result_delivery_failure<E: CommandExecutor>(
     // a future authorized process instead.
     state.record_diagnostic(error.to_string());
     store.save(state)?;
-    let _ = executor.shutdown();
+    let _ = shutdown_preserving_cleanup(state, executor);
     Err(error)
 }
 
@@ -940,6 +1009,9 @@ fn poll_executor_events_after_controller_ack<E: CommandExecutor>(
     executor: &mut E,
     sent_source_seq: u64,
 ) -> Result<(), DurableRunnerError> {
+    if state.pending_provider_cleanup.is_some() {
+        return Ok(());
+    }
     // The controller emits one cumulative ACK per durably committed event.
     // Polling another provider batch before consuming that already-sent prefix
     // makes the ACK/stop queue grow faster than this loop can read it. Keep
@@ -960,6 +1032,9 @@ fn poll_executor_events_when_control_idle<E: CommandExecutor>(
     sent_source_seq: u64,
     control_message: &Result<Option<Value>, DurableRunnerError>,
 ) -> Result<(), DurableRunnerError> {
+    if state.pending_provider_cleanup.is_some() {
+        return Ok(());
+    }
     match control_message {
         Ok(None) => poll_executor_events_after_controller_ack(
             state,
@@ -984,6 +1059,9 @@ fn poll_executor_events<E: CommandExecutor>(
     config: &DurableRunnerConfig,
     executor: &mut E,
 ) -> Result<(), DurableRunnerError> {
+    if state.pending_provider_cleanup.is_some() {
+        return Ok(());
+    }
     let mut events = executor.poll_events()?.into_iter().peekable();
     while events.peek().is_some() {
         let mut durable_prefix = 0;
@@ -1032,13 +1110,29 @@ fn process_command<E: CommandExecutor>(
     executor: &mut E,
     command: &Command,
 ) -> Result<(StoredCommandResult, CommandLifecycle), DurableRunnerError> {
+    if let Some(pending) = state.pending_provider_cleanup.as_ref() {
+        let fresh_stop =
+            command.command_type == "turn.stop" && command.controller_seq > pending.controller_seq;
+        let terminal_replay = command.command_id == pending.command_id
+            && command.controller_seq == pending.controller_seq
+            && command.command_type == pending.command_type;
+        if !fresh_stop && !terminal_replay {
+            return Err(DurableRunnerError::invalid(
+                "provider cleanup requires a new exact turn.stop before other work",
+            ));
+        }
+    }
     match state.begin_command(command)? {
         CommandDisposition::Replay(result) => {
-            let lifecycle = if result.status == "pending" {
-                CommandLifecycle::Continue
-            } else {
-                CommandLifecycle::for_terminal(command)
-            };
+            let lifecycle =
+                if result.status == "pending" || state.pending_provider_cleanup.is_some() {
+                    // Its terminal delivery was already reconciled. Replaying
+                    // the old receipt must not replace the newer command cursor
+                    // with another terminal-delivery fence at an older sequence.
+                    CommandLifecycle::Continue
+                } else {
+                    CommandLifecycle::for_terminal(command)
+                };
             return Ok((result, lifecycle));
         }
         CommandDisposition::Reject(result) => {
@@ -1077,7 +1171,18 @@ fn process_command<E: CommandExecutor>(
     for (event_type, priority, payload) in execution.events {
         state.enqueue_event(config, event_type, priority, payload)?;
     }
+    let cleanup_proven = state
+        .pending_provider_cleanup
+        .as_ref()
+        .is_some_and(|pending| {
+            command.command_type == "turn.stop"
+                && command.controller_seq > pending.controller_seq
+                && execution.result.get("providerExitConfirmed") == Some(&Value::Bool(true))
+        });
     let result = state.complete_command(command, execution.result)?;
+    if cleanup_proven {
+        state.pending_provider_cleanup = None;
+    }
     store.save(state)?;
     Ok((result, CommandLifecycle::for_terminal(command)))
 }
@@ -1263,6 +1368,324 @@ mod tests {
             precondition: None,
             payload: json!({}),
         }
+    }
+
+    #[test]
+    fn pre_auth_deadline_preserves_pending_terminal_delivery_without_launching() {
+        struct ColdOnlyExecutor;
+        impl CommandExecutor for ColdOnlyExecutor {
+            fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                panic!("pre-auth expiry cannot execute a command");
+            }
+            fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+                panic!("pre-auth terminal expiry cannot restore a provider");
+            }
+            fn reconcile_terminal_delivery(
+                &mut self,
+            ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+                Ok(TerminalDeliveryReconciliation::ProviderCleanupPending)
+            }
+        }
+        for (kind, lifecycle) in [
+            ("runner.suspend", "suspended"),
+            ("runner.shutdown", "stopped"),
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-runner-terminal-deadline-{}-{lifecycle}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            let mut config = config(directory.clone());
+            config.max_runtime = Duration::from_nanos(1);
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let terminal = command(kind);
+            state.begin_command(&terminal).unwrap();
+            let failed = state
+                .fail_command(&terminal, json!({"code": "original_failure"}))
+                .unwrap();
+            persist_lifecycle_before_command_delivery(&mut state, &store, lifecycle, &failed)
+                .unwrap();
+            let error = run_durable_runner(
+                config.clone(),
+                BootstrapTicket::new("unused-test-ticket".to_owned()).unwrap(),
+                ColdOnlyExecutor,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("transport reconnect deadline elapsed"));
+            let (restored, _) = store
+                .load_or_create(&config)
+                .expect("timeout cannot invalidate the retained terminal fence");
+            assert_eq!(restored.lifecycle, lifecycle);
+            assert_eq!(
+                restored.pending_terminal_delivery,
+                state.pending_terminal_delivery
+            );
+            assert_eq!(
+                restored.processed_commands.get(&terminal.command_id),
+                Some(&failed)
+            );
+            assert_eq!(
+                restored.recoverable_failure.as_deref(),
+                Some("transport_reconnect_deadline_exceeded")
+            );
+            for reason in [
+                "transport_reconnect_grace_exceeded",
+                "lease_expired_requires_bootstrap",
+            ] {
+                let mut expired = restored.clone();
+                record_recoverable_transport_failure(&mut expired, reason);
+                store.save(&expired).unwrap();
+                let (expired, _) = store.load_or_create(&config).unwrap();
+                assert_eq!(expired.lifecycle, lifecycle);
+                assert_eq!(
+                    expired.pending_terminal_delivery,
+                    state.pending_terminal_delivery
+                );
+                assert_eq!(
+                    expired.processed_commands.get(&terminal.command_id),
+                    Some(&failed)
+                );
+                assert_eq!(expired.recoverable_failure.as_deref(), Some(reason));
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+        let mut ordinary = DurableState::new(&config(PathBuf::from("unused")));
+        record_recoverable_transport_failure(&mut ordinary, "lease_expired_requires_bootstrap");
+        assert_eq!(ordinary.lifecycle, "recoverable_failure");
+    }
+
+    #[test]
+    fn pending_provider_cleanup_blocks_new_work_and_preserves_failed_terminal() {
+        for kind in ["run.attach", "turn.start", "runner.drain", "runner.suspend"] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-runner-cleanup-gate-{}-{kind}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            let config = config(directory.clone());
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let terminal = command("runner.suspend");
+            state.begin_command(&terminal).unwrap();
+            let failed = state
+                .fail_command(&terminal, json!({"code": "retained_failure"}))
+                .unwrap();
+            state.lifecycle = "suspended".to_owned();
+            let mut persisted = serde_json::to_value(&state).unwrap();
+            persisted["pendingProviderCleanup"] = json!({
+                "commandId": terminal.command_id,
+                "controllerSeq": terminal.controller_seq,
+                "commandType": terminal.command_type,
+                "lifecycle": "suspended",
+            });
+            state = serde_json::from_value(persisted).unwrap();
+            store.save(&state).unwrap();
+            let mut next = command(kind);
+            next.command_id = "new-command".to_owned();
+            next.controller_seq = 2;
+            let mut executor = CountingExecutor { calls: 0 };
+            process_command(&mut state, &store, &config, &mut executor, &next)
+                .expect_err("unproved provider cleanup must fence new work");
+            assert_eq!(executor.calls, 0);
+            assert_eq!(
+                state.processed_commands.get(&terminal.command_id),
+                Some(&failed)
+            );
+            assert_eq!(state.last_controller_command_seq, 1);
+            let (restored, _) = store.load_or_create(&config).unwrap();
+            assert!(!serde_json::to_value(restored).unwrap()["pendingProviderCleanup"].is_null());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn delivery_only_reconciliation_keeps_cleanup_fenced_until_a_new_proven_stop() {
+        struct ColdExecutor {
+            polls: usize,
+            maintenance: usize,
+            shutdowns: usize,
+            reconciliations: usize,
+            calls: usize,
+            stop_proof: Value,
+        }
+        impl CommandExecutor for ColdExecutor {
+            fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                self.calls += 1;
+                if self.stop_proof == json!({"fail": true}) {
+                    return Err(DurableRunnerError::invalid("new stop failed"));
+                }
+                Ok(CommandExecution::result(
+                    json!({"providerExitConfirmed": self.stop_proof}),
+                ))
+            }
+            fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                self.polls += 1;
+                Ok(Vec::new())
+            }
+            fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+                self.maintenance += 1;
+                Ok(())
+            }
+            fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+                self.shutdowns += 1;
+                Ok(())
+            }
+            fn reconcile_terminal_delivery(
+                &mut self,
+            ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+                self.reconciliations += 1;
+                Ok(TerminalDeliveryReconciliation::ProviderCleanupPending)
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-delivery-only-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let terminal = command("runner.suspend");
+        state.begin_command(&terminal).unwrap();
+        let failed = state
+            .fail_command(&terminal, json!({"code": "original_failure"}))
+            .unwrap();
+        persist_lifecycle_before_command_delivery(&mut state, &store, "suspended", &failed)
+            .unwrap();
+        let mut executor = ColdExecutor {
+            polls: 0,
+            maintenance: 0,
+            shutdowns: 0,
+            reconciliations: 0,
+            calls: 0,
+            stop_proof: Value::Null,
+        };
+        // Failed/expired terminal delivery cleanup must also remain cold.
+        shutdown_preserving_cleanup(&state, &mut executor).unwrap();
+        assert!(state.pending_terminal_delivery.is_some());
+        finish_terminal_reconciliation(&mut state, &store, &mut executor).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        assert!(state.pending_terminal_delivery.is_none());
+        assert_eq!(
+            state.pending_provider_cleanup.as_ref().unwrap().command_id,
+            terminal.command_id
+        );
+        assert_eq!(state.lifecycle, "suspended");
+        assert_eq!(
+            state.processed_commands.get(&terminal.command_id),
+            Some(&failed)
+        );
+        shutdown_preserving_cleanup(&state, &mut executor).unwrap();
+        poll_executor_events(&mut state, &store, &config, &mut executor).unwrap();
+        poll_executor_events_after_controller_ack(&mut state, &store, &config, &mut executor, 1)
+            .unwrap();
+        poll_executor_events_when_control_idle(
+            &mut state,
+            &store,
+            &config,
+            &mut executor,
+            0,
+            &Ok(Some(json!({"kind": "ping"}))),
+        )
+        .unwrap();
+        assert_eq!(
+            (executor.polls, executor.maintenance, executor.shutdowns),
+            (0, 0, 0)
+        );
+        assert_eq!(executor.reconciliations, 3);
+        let (replayed, _) =
+            process_command(&mut state, &store, &config, &mut executor, &terminal).unwrap();
+        assert_eq!(replayed, failed);
+        assert_eq!(executor.calls, 0);
+        for (index, proof) in [
+            json!({"fail": true}),
+            json!(false),
+            json!("true"),
+            json!(true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            executor.stop_proof = proof;
+            let mut stop = command("turn.stop");
+            stop.command_id = format!("new-stop-{index}");
+            stop.controller_seq = index as u64 + 2;
+            process_command(&mut state, &store, &config, &mut executor, &stop).unwrap();
+            assert_eq!(state.pending_provider_cleanup.is_none(), index == 3);
+            let (restored, _) = store.load_or_create(&config).unwrap();
+            assert_eq!(
+                restored.pending_provider_cleanup,
+                state.pending_provider_cleanup
+            );
+            assert_eq!(
+                restored.processed_commands.get(&terminal.command_id),
+                Some(&failed)
+            );
+            if index == 0 {
+                assert_eq!(
+                    restored
+                        .processed_commands
+                        .get(&stop.command_id)
+                        .unwrap()
+                        .status,
+                    "failed"
+                );
+                let (old_result, lifecycle) =
+                    process_command(&mut state, &store, &config, &mut executor, &terminal).unwrap();
+                assert_eq!(old_result, failed);
+                assert_eq!(lifecycle, CommandLifecycle::Continue);
+                assert!(state.pending_terminal_delivery.is_none());
+                assert_eq!(state.last_controller_command_seq, 2);
+                store
+                    .load_or_create(&config)
+                    .expect("old terminal replay cannot invalidate the new cursor");
+            }
+        }
+        let mut start = command("turn.start");
+        start.command_id = "after-cleanup".to_owned();
+        start.controller_seq = 6;
+        process_command(&mut state, &store, &config, &mut executor, &start).unwrap();
+        assert_eq!(executor.calls, 5);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_provider_cleanup_rejects_forged_terminal_identity_on_reload() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-cleanup-marker-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let terminal = command("runner.suspend");
+        state.begin_command(&terminal).unwrap();
+        state
+            .fail_command(&terminal, json!({"code": "original_failure"}))
+            .unwrap();
+        state.lifecycle = "suspended".to_owned();
+        for (field, value) in [
+            ("commandId", json!("foreign")),
+            ("controllerSeq", json!(2)),
+            ("commandType", json!("turn.start")),
+            ("lifecycle", json!("ready")),
+        ] {
+            let mut encoded = serde_json::to_value(&state).unwrap();
+            encoded["pendingProviderCleanup"] = json!({"commandId": terminal.command_id, "controllerSeq": 1, "commandType": "runner.suspend", "lifecycle": "suspended"});
+            encoded["pendingProviderCleanup"][field] = value;
+            store
+                .save(&serde_json::from_value(encoded).unwrap())
+                .unwrap();
+            assert!(
+                store.load_or_create(&config).is_err(),
+                "must reject forged {field}"
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

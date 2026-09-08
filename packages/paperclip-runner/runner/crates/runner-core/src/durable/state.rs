@@ -201,6 +201,8 @@ pub struct DurableState {
     pub processed_command_fingerprints: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) pending_terminal_delivery: Option<PendingTerminalDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_provider_cleanup: Option<PendingTerminalDelivery>,
     #[serde(default)]
     executor_event_receipts: BTreeMap<String, ExecutorEventReceipt>,
     pub diagnostics: Vec<String>,
@@ -231,6 +233,7 @@ impl DurableState {
             processed_commands: BTreeMap::new(),
             processed_command_fingerprints: BTreeMap::new(),
             pending_terminal_delivery: None,
+            pending_provider_cleanup: None,
             executor_event_receipts: BTreeMap::new(),
             diagnostics: Vec::new(),
             backpressure: false,
@@ -530,6 +533,25 @@ impl DurableState {
                 "controller sequence must be contiguous: expected {expected}, received {}",
                 command.controller_seq
             )));
+        }
+
+        if self.processed_commands.len() >= MAX_RECENT_COMMANDS
+            && self
+                .pending_provider_cleanup
+                .as_ref()
+                .is_some_and(|pending| {
+                    self.processed_commands
+                        .values()
+                        .min_by_key(|result| result.controller_seq)
+                        .is_some_and(|oldest| oldest.command_id == pending.command_id)
+                })
+        {
+            // The marker's exact failed terminal receipt is still authority.
+            // Refuse before journaling/effects instead of evicting that receipt
+            // or allowing an unbounded sequence of unsuccessful cleanup stops.
+            return Err(DurableRunnerError::invalid(
+                "provider cleanup exhausted its bounded command journal; operator recovery is required",
+            ));
         }
 
         self.last_controller_command_seq = command.controller_seq;
@@ -1006,6 +1028,28 @@ fn validate_binding(
                                 && result.status != "pending"
                         })
             });
+    let pending_provider_cleanup_is_valid =
+        state
+            .pending_provider_cleanup
+            .as_ref()
+            .is_none_or(|pending| {
+                let lifecycle = match pending.command_type.as_str() {
+                    "runner.suspend" => "suspended",
+                    "runner.shutdown" => "stopped",
+                    _ => return false,
+                };
+                pending.lifecycle == lifecycle
+                    && pending.controller_seq <= state.last_controller_command_seq
+                    && state
+                        .processed_commands
+                        .get(&pending.command_id)
+                        .is_some_and(|result| {
+                            result.command_id == pending.command_id
+                                && result.controller_seq == pending.controller_seq
+                                && result.command_type == pending.command_type
+                                && result.status != "pending"
+                        })
+            });
     command_sequences.sort_unstable();
     let command_cursors_are_valid = match (command_sequences.first(), command_sequences.last()) {
         (None, None) => state.compacted_through_controller_seq == state.last_controller_command_seq,
@@ -1033,6 +1077,7 @@ fn validate_binding(
         || !command_fingerprints_are_valid
         || !executor_event_receipts_are_valid
         || !pending_terminal_delivery_is_valid
+        || !pending_provider_cleanup_is_valid
     {
         return Err(DurableRunnerError::invalid(
             "durable state cursors, bounds, or journals are inconsistent",
@@ -2012,6 +2057,65 @@ mod tests {
             state.begin_command(&command).unwrap(),
             CommandDisposition::Replay(result) if result.result == json!({"ok": true})
         ));
+    }
+
+    #[test]
+    fn cleanup_marker_prevents_compacting_its_original_terminal_receipt() {
+        let directory = temporary_directory("cleanup-command-capacity");
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut terminal = command("original-terminal", 1);
+        terminal.command_type = "runner.suspend".to_owned();
+        state.begin_command(&terminal).unwrap();
+        let failed = state
+            .fail_command(&terminal, json!({"code": "original_failure"}))
+            .unwrap();
+        state.lifecycle = "suspended".to_owned();
+        state.pending_provider_cleanup = Some(PendingTerminalDelivery {
+            command_id: terminal.command_id.clone(),
+            controller_seq: terminal.controller_seq,
+            command_type: terminal.command_type.clone(),
+            lifecycle: "suspended".to_owned(),
+        });
+        for sequence in 2..=MAX_RECENT_COMMANDS as u64 {
+            let mut stop = command(&format!("failed-stop-{sequence}"), sequence);
+            stop.command_type = "turn.stop".to_owned();
+            assert_eq!(
+                state.begin_command(&stop).unwrap(),
+                CommandDisposition::Execute
+            );
+            state
+                .fail_command(&stop, json!({"code": "stop_failed"}))
+                .unwrap();
+        }
+        let unchanged = serde_json::to_value(&state).unwrap();
+        let mut overflow = command("one-stop-too-many", MAX_RECENT_COMMANDS as u64 + 1);
+        overflow.command_type = "turn.stop".to_owned();
+        state
+            .begin_command(&overflow)
+            .expect_err("a new command cannot compact the active cleanup authority");
+        assert_eq!(serde_json::to_value(&state).unwrap(), unchanged);
+        assert_eq!(state.processed_commands.len(), MAX_RECENT_COMMANDS);
+        assert_eq!(
+            state.processed_commands.get(&terminal.command_id),
+            Some(&failed)
+        );
+        assert!(
+            matches!(state.begin_command(&terminal).unwrap(), CommandDisposition::Replay(result) if result == failed)
+        );
+        store.save(&state).unwrap();
+        let (restored, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(
+            restored.pending_provider_cleanup,
+            state.pending_provider_cleanup
+        );
+        assert_eq!(
+            restored.processed_commands.get(&terminal.command_id),
+            Some(&failed)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

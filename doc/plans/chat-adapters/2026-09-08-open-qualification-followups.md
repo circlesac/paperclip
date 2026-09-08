@@ -7,6 +7,41 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+Newest evidence (23:55 UTC): the browser is available again. Root retried the
+original GitHub B run `38dfc3ec-4fa7-4ed4-8563-7650dfce3d47` through its Board
+Retry control, producing run `7c4827a6-705a-4295-8196-f51a821a4af3`. It ran on
+Paperclip Runner / Codex / `gpt-5.6-luna`, succeeded in 15 seconds, and updated
+GitHub comment `5593571969` to exactly `CONTROL-FIRST-B-READY`. Refresh and visual
+inspection confirmed the result in QA PR 3. The old failed-attempt notice is
+still visible above it: functional retry succeeded, but historical-failure
+presentation still needs judgment. No new source request was substituted.
+
+The strict copy-only legacy proof now accepts the actual 91 receipts with both
+retained snapshots unchanged. It matches Rust's explicit nullable command
+fingerprint fields, validates complete envelopes/wrappers, exact diagnostic
+suffix and expired capability pointers. Pure-proof/discovery tests pass 60/60
+and server typechecking passes. This is **not** a runner-exit or live-cleanup
+claim. The new controller still needs a pre-authentication barrier that prevents
+command delivery until its spawned-process receipt commits. Do not deploy or
+invoke maintenance until that moving slice passes composed tests and review.
+
+Cold terminal reconciliation is repaired in the producer and both native
+wrappers. Its separate physical-cleanup marker blocks ordinary work until a new
+exact stop proves exit. Journal-capacity and pre-authentication timeout tests
+preserve the old terminal receipt instead of making its state unreloadable.
+Rust verification: 239 unit tests, 70 Codex provider tests, and 10 native-selector
+tests passed; the existing ignored subprocess helper executed separately and
+passed. The normal release build succeeded, but has not been staged or deployed.
+
+Source-revocation full-suite verification is pending a fresh repeat. Full01 was
+558/560: one broad fixture queue sweep admitted unrelated earlier Slack work,
+and one old expectation still required filtering rather than content-free
+invalidation. Both were corrected without weakening no-wake/no-content checks.
+Full02 was 557/560 with three timeouts aligning with recorded Mac sleep periods
+(including 453-second and 186-second sleeps). Do not increase test deadlines or
+claim either full run passed; the next repeat uses command-scoped idle-sleep
+prevention, never a thermal-safety override.
+
 Latest checkpoint: `9ef354692` is pushed and deployed as server 60 (PID 11488,
 port 3103; log `server-experimental-landing-60.log`). The earlier recovered-answer
 replacement and Telegram sizing fixes are also deployed, but their changed

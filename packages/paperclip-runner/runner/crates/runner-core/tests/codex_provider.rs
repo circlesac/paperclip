@@ -8,7 +8,9 @@ use paperclip_runner_core::codex_provider::{
 };
 use paperclip_runner_core::durable::{
     Command, CommandExecutor, DurableRunnerConfig, DurableRunnerError, PolledEvent,
+    TerminalDeliveryReconciliation,
 };
+use paperclip_runner_core::native_provider_backend::NativeProviderCommandExecutor;
 use paperclip_runner_core::provider_backend::CodexCommandExecutor;
 use paperclip_runner_core::provider_bridge::{
     authorized_tool_catalog_digest, AuthorizedTool, AuthorizedToolSet, ProviderToolBridge,
@@ -3527,6 +3529,99 @@ fn durable_backend_settles_tools_before_a_natural_terminal_event() {
         .is_err());
 
     executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn durable_terminal_delivery_reconciliation_does_not_launch_a_cold_provider() {
+    let directory = temporary_directory("cold-terminal-delivery");
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": provider_config(&directory, &["--hold-turn"])}),
+        ))
+        .unwrap();
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    first
+        .execute(&command(
+            "start",
+            3,
+            "turn.start",
+            json!({"text": "Keep only this original turn."}),
+        ))
+        .unwrap();
+    first.shutdown().unwrap();
+    drop(first);
+    let state_path = directory.join("codex-provider-state.json");
+    let original = fs::read(&state_path).unwrap();
+    let original_json: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(original_json["lifecycle"], "turn_active");
+    let mut cold = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    assert_eq!(
+        cold.reconcile_terminal_delivery().unwrap(),
+        TerminalDeliveryReconciliation::ProviderCleanupPending
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), original);
+    assert_eq!(call_count(&directory, "thread/start"), 1);
+    assert_eq!(call_count(&directory, "thread/resume"), 0);
+    assert_eq!(call_count(&directory, "turn/start"), 1);
+    assert_eq!(
+        cold.reconcile_terminal_delivery().unwrap(),
+        TerminalDeliveryReconciliation::ProviderCleanupPending
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), original);
+    drop(cold);
+
+    // Exercise both native selection wrappers used by the runner binary, not
+    // just the provider implementation's direct hook.
+    let mut native_cold =
+        NativeProviderCommandExecutor::with_runner_config(&directory, &runner_config);
+    assert_eq!(
+        native_cold.reconcile_terminal_delivery().unwrap(),
+        TerminalDeliveryReconciliation::ProviderCleanupPending
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), original);
+    assert_eq!(call_count(&directory, "thread/resume"), 0);
+    assert_eq!(call_count(&directory, "turn/start"), 1);
+    drop(native_cold);
+
+    let mut stopping = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let stopped = stopping
+        .execute(&command("new-stop", 4, "turn.stop", json!({})))
+        .unwrap();
+    assert_eq!(stopped.result["providerExitConfirmed"], true);
+    let prepared = fs::read(&state_path).unwrap();
+    let prepared_json: Value = serde_json::from_slice(&prepared).unwrap();
+    assert_eq!(prepared_json["lifecycle"], "prepared");
+    assert_eq!(prepared_json["threadId"], original_json["threadId"]);
+    assert_eq!(
+        prepared_json["providerProcessGeneration"].as_u64().unwrap(),
+        original_json["providerProcessGeneration"].as_u64().unwrap() + 1
+    );
+    drop(stopping);
+    let mut prepared_executor =
+        CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    assert_eq!(
+        prepared_executor.reconcile_terminal_delivery().unwrap(),
+        TerminalDeliveryReconciliation::CleanupCompleted
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), prepared);
+    let mut native_prepared =
+        NativeProviderCommandExecutor::with_runner_config(&directory, &runner_config);
+    assert_eq!(
+        native_prepared.reconcile_terminal_delivery().unwrap(),
+        TerminalDeliveryReconciliation::CleanupCompleted
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), prepared);
+    assert_eq!(call_count(&directory, "thread/start"), 1);
+    assert_eq!(call_count(&directory, "thread/resume"), 1);
+    assert_eq!(call_count(&directory, "turn/start"), 1);
     fs::remove_dir_all(directory).unwrap();
 }
 
