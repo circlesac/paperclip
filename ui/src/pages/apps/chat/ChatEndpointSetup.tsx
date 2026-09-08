@@ -26,6 +26,7 @@ import {
 } from "@/api/chatEndpoints";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import { isAgentStatusInvokable } from "@paperclipai/shared";
 import { sanitizedSetupErrorMessage } from "./chat-setup-error";
 import {
@@ -525,6 +526,13 @@ function ProviderConnectStep({
     values?: Record<string, string>,
   ) => void;
 }) {
+  const { pushToast } = useToast();
+  const reportCopyFailure = () =>
+    pushToast({
+      title: "Couldn't copy to clipboard",
+      body: "Select and copy the value manually.",
+      tone: "error",
+    });
   const field = (key: string, label: string, type = "password") => (
     <label className="grid gap-2 text-sm font-medium">
       {label}
@@ -1016,9 +1024,10 @@ settings:
             variant="outline"
             disabled={!credentials.clientId?.trim()}
             onClick={() => {
-              void navigator.clipboard
-                .writeText(teamsManifestSettings)
-                .then(() => setManifestCopied(true));
+              void copyTextToClipboard(teamsManifestSettings).then(
+                () => setManifestCopied(true),
+                reportCopyFailure,
+              );
             }}
           >
             {manifestCopied
@@ -1242,9 +1251,11 @@ settings:
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={() =>
-                    navigator.clipboard.writeText(generatedWebhookSecret)
-                  }
+                  onClick={() => {
+                    void copyTextToClipboard(generatedWebhookSecret).catch(
+                      reportCopyFailure,
+                    );
+                  }}
                 >
                   Copy webhook secret
                 </Button>
@@ -1411,9 +1422,10 @@ settings:
         <Button
           variant="outline"
           onClick={() => {
-            void navigator.clipboard
-              .writeText(slackManifest)
-              .then(() => setManifestCopied(true));
+            void copyTextToClipboard(slackManifest).then(
+              () => setManifestCopied(true),
+              reportCopyFailure,
+            );
           }}
         >
           {manifestCopied ? "Manifest copied" : "Copy manifest"}

@@ -245,8 +245,18 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     const token = typeof req.query.token === "string" ? req.query.token : "";
     if (token.length < 32 || token.length > 4096)
       throw badRequest("A valid identity-link token is required");
-    const preview = await service.previewIdentityLink(token);
-    assertCompanyAccess(req, preview.companyId);
+    const preview = await getAccessibleResource(
+      req,
+      res,
+      service.previewIdentityLink(token).catch((error) => {
+        // Do not distinguish a valid foreign-company token from an invalid or
+        // expired token. Confirmation keeps its own validation contract.
+        if (error instanceof HttpError && error.status === 422) return null;
+        throw error;
+      }),
+      "Identity-link request not found",
+    );
+    if (!preview) return;
     res.json(preview);
   });
 

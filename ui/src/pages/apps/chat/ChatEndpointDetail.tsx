@@ -36,6 +36,7 @@ import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useToast } from "@/context/ToastContext";
 import { formatDateTime } from "@/lib/utils";
 import { queryKeys } from "@/lib/queryKeys";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import { Link, Navigate, useNavigate, useParams } from "@/lib/router";
 
 const tabs = ["settings", "access", "conversations", "activity"] as const;
@@ -530,7 +531,7 @@ function Access({
             size="sm"
             variant="outline"
             onClick={() => {
-              void navigator.clipboard.writeText(confirmationUrl).then(
+              void copyTextToClipboard(confirmationUrl).then(
                 () =>
                   pushToast({
                     title: "Confirmation link copied",
