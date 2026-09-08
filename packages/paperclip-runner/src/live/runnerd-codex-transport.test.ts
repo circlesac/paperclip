@@ -2078,18 +2078,60 @@ it("rejects active work and buffered tools from a resumed stopped checkpoint", a
       activeProviderTurnId: null,
     });
     await writeFile(join(stateDirectory, "resume-unowned-turn"), "armed");
+    const secondIdentity = {
+      ...identity,
+      runId: "run-stopped-second",
+      turnId: "turn-stopped-second",
+      itemId: "item-stopped-second",
+    };
     second = createCapabilityRunnerdCodexTransport({
       ...options,
-      prpIdentity: {
-        ...identity,
-        runId: "run-stopped-second",
-        turnId: "turn-stopped-second",
-        itemId: "item-stopped-second",
-      },
+      prpIdentity: secondIdentity,
     });
     second.transport.setServerRequestHandler(semanticHandler);
     await expect(second.transport.request("thread/read", {})).rejects.toThrow(
       "prepared provider checkpoint resumed unexpected active work",
+    );
+    // Exercise the normal durable transfer before inspecting the rejection:
+    // provider pendingEvents is an acknowledged queue, not an event journal.
+    await vi.waitFor(
+      async () => {
+        const provider = JSON.parse(await readFile(providerPath, "utf8"));
+        expect(provider.pendingEvents).toEqual([]);
+        const control = JSON.parse(
+          await readFile(
+            join(stateDirectory, "control-plane", "control-plane-state.json"),
+            "utf8",
+          ),
+        ) as {
+          committedEvents: Array<{
+            eventType: string;
+            envelope: { payload: { payload: { code?: string } } };
+          }>;
+        };
+        const rejections = control.committedEvents.filter(
+          (event) =>
+            event.eventType === "harness.diagnostic" &&
+            event.envelope.payload.payload.code ===
+              "prepared_provider_checkpoint_has_active_work",
+        );
+        expect(rejections).toEqual([
+          expect.objectContaining({
+            logicalEffectCount: 1,
+            envelope: expect.objectContaining({
+              ...secondIdentity,
+              payload: expect.objectContaining({
+                payload: expect.objectContaining({
+                  code: "prepared_provider_checkpoint_has_active_work",
+                  paperclipAccepted: false,
+                  providerReportedActive: true,
+                }),
+              }),
+            }),
+          }),
+        ]);
+      },
+      { timeout: 5_000 },
     );
     const closed = JSON.parse(await readFile(providerPath, "utf8"));
     expect(closed).toMatchObject({
@@ -2098,15 +2140,7 @@ it("rejects active work and buffered tools from a resumed stopped checkpoint", a
       activeProviderTurnId: null,
     });
     expect(semanticHandler).not.toHaveBeenCalled();
-    expect(closed.pendingEvents).toContainEqual(
-      expect.objectContaining({
-        eventType: "harness.diagnostic",
-        payload: expect.objectContaining({
-          code: "prepared_provider_checkpoint_has_active_work",
-          paperclipAccepted: false,
-        }),
-      }),
-    );
+    expect(closed.pendingEvents).toEqual([]);
   } finally {
     await Promise.allSettled([
       first.transport.close(),
