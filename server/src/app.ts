@@ -138,6 +138,11 @@ import { toolAccessService } from "./services/tool-access.js";
 import { chatChannelService } from "./services/chat-channels.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { enqueueChatRunMilestones } from "./services/chat-run-publications.js";
+import {
+  createCoalescedAsyncTrigger,
+  isChatPublicationCommitSignal,
+} from "./services/chat-publication-reconciliation.js";
+import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { heartbeatService } from "./services/heartbeat.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
@@ -276,12 +281,17 @@ export function createChatReconciliationCoordinator(input: {
   processPendingSlackSessionSyncs: () => Promise<unknown>;
   onError: (lane: ChatReconciliationLane, error: unknown) => void;
 }) {
+  let stopped = false;
   const inFlight = new Map<ChatReconciliationLane, Promise<void>>();
+  const publicationReconciliation = createCoalescedAsyncTrigger({
+    run: input.flushPublications,
+    onError: (error) => input.onError("publications", error),
+  });
   const start = (
     lane: ChatReconciliationLane,
     task: () => Promise<unknown>,
   ) => {
-    if (inFlight.has(lane)) return;
+    if (stopped || inFlight.has(lane)) return;
     const pending = Promise.resolve()
       .then(task)
       .then(() => undefined)
@@ -293,14 +303,25 @@ export function createChatReconciliationCoordinator(input: {
   };
   return {
     reconcile() {
+      if (stopped) return;
       start("provider runtimes", input.reconcileProviderRuntimes);
       start("deliveries", input.processPendingDeliveries);
-      start("publications", input.flushPublications);
+      publicationReconciliation.poll();
       start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
       start("Slack session status", input.processPendingSlackSessionSyncs);
     },
+    notifyPublications() {
+      publicationReconciliation.notify();
+    },
+    stop() {
+      stopped = true;
+      publicationReconciliation.stop();
+    },
     async drain() {
-      await Promise.allSettled([...inFlight.values()]);
+      await Promise.allSettled([
+        ...inFlight.values(),
+        publicationReconciliation.drain(),
+      ]);
     },
   };
 }
@@ -1080,6 +1101,12 @@ export async function createApp(
       logger.error({ err, lane }, `Failed to reconcile chat ${lane}`);
     },
   });
+  const unsubscribeChatPublicationSignals = subscribeAllCompanyLiveEvents(
+    (event) => {
+      if (isChatPublicationCommitSignal(event))
+        chatReconciliation.notifyPublications();
+    },
+  );
   let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
     () => {
       chatReconciliation.reconcile();
@@ -1205,6 +1232,8 @@ export async function createApp(
       scheduler.stop();
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
+      unsubscribeChatPublicationSignals();
+      chatReconciliation.stop();
       if (chatPublicationTimer) {
         clearInterval(chatPublicationTimer);
         chatPublicationTimer = null;
