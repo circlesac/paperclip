@@ -21,13 +21,25 @@ continues. This supersedes the earlier instruction not to tend pull requests.
 4. Fill the repository PR template, report verification limits honestly, and
    obtain reviews before claiming the work ready to merge.
 
+PR [#13038](https://github.com/paperclipai/paperclip/pull/13038) is open as
+one 468-file review against master. It is mergeable; CI and review must still
+pass before landing. Master is incorporated through `b97101893` by
+`1a442f5a0`, including the new project repository selection flow. Independent
+compatibility checks passed 138 UI and 19 server tests. Full workspace
+typecheck and build passed again after that second merge.
+
 The visibility flag is committed as `56c096e5e`; the pasted-URL shortcut
 correction and exact recovery-test settlement wait are in `2feb8375f`.
 The real default-off GitHub tool flow and enabled chat catalog both passed
 browser inspection. Chat connectors are enabled on the existing live test
 instance so qualification can continue. Full workspace typecheck/build and
 the final 390-test chat integration rerun passed. The broad suite is still
-running and has reported a CLI guidance allowlist failure under investigation.
+running. Its CLI guidance failure was caused by ignored historical runtime
+recordings, not current source guidance. Commit `9beee1d14` excludes only the
+root recordings directory; all 38 focused guard tests pass without changing
+the command allowlist. Do not upload the earlier failure log, which quotes
+captured prompts. The final ten-test browser suite is running from root's
+unrestricted environment on isolated port 3199; subagent execution hit EPERM.
 
 ## Current tested/deployed state
 

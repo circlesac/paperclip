@@ -304,6 +304,7 @@ function endpointFixture(provider: ProviderCase, seed: Seed) {
 }
 
 type ChatMock = {
+  chatEndpointListReads: number;
   createdWithAgentId: string | null;
   configuredCredentialKeys: string[];
   githubPrivateKeyMatchedFile: boolean | null;
@@ -330,6 +331,7 @@ async function installChatControlPlaneMock(
   page: Page,
   provider: ProviderCase,
   seed: Seed,
+  { enableChatConnectors }: { enableChatConnectors: boolean },
 ): Promise<ChatMock> {
   const endpoint = endpointFixture(provider, seed);
   const state: ChatMock & {
@@ -338,6 +340,7 @@ async function installChatControlPlaneMock(
   } = {
     created: false,
     failNextGitHubEndpointRead: false,
+    chatEndpointListReads: 0,
     createdWithAgentId: null,
     configuredCredentialKeys: [],
     githubPrivateKeyMatchedFile: null,
@@ -395,6 +398,7 @@ async function installChatControlPlaneMock(
 
     if (pathname === `/api/companies/${seed.companyId}/chat-endpoints`) {
       if (method === "GET") {
+        state.chatEndpointListReads += 1;
         await fulfill(route, { endpoints: state.created ? [endpoint] : [] });
         return;
       }
@@ -444,7 +448,10 @@ async function installChatControlPlaneMock(
       pathname === "/api/instance/settings/experimental" &&
       method === "GET"
     ) {
-      await fulfill(route, { enableIsolatedWorkspaces: false });
+      await fulfill(route, {
+        enableChatConnectors,
+        enableIsolatedWorkspaces: false,
+      });
       return;
     }
 
@@ -1164,11 +1171,58 @@ test.describe.serial("native chat adapter UI", () => {
     seed = await seedCompanyAndAgent(request);
   });
 
+  test("GitHub: the default-off gate keeps direct tool setup and fences chat routes", async ({
+    page,
+  }) => {
+    const github = PROVIDERS.find(
+      (provider) => provider.provider === "github",
+    )!;
+    const mock = await installChatControlPlaneMock(page, github, seed, {
+      enableChatConnectors: false,
+    });
+
+    await page.goto(`/${seed.prefix}/apps`);
+    await expect(
+      page.getByRole("heading", { name: "Connectors" }),
+    ).toBeVisible({ timeout: 30_000 });
+    const connector = page.locator(
+      `[role="listitem"][data-app-slug="${github.slug}"]`,
+    );
+    await expect(connector).toBeVisible();
+    await connector
+      .getByRole("button", { name: "Connect GitHub" })
+      .click();
+
+    await expect(page).toHaveURL(/\/apps\/connect\?/);
+    expect(new URL(page.url()).searchParams.get("source")).toBe("github");
+    await expect(
+      page.getByRole("heading", { name: "Connect GitHub as" }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Choose how to connect" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText("Chat with an agent", { exact: true }),
+    ).toHaveCount(0);
+
+    await page.goto(`/${seed.prefix}/apps/chat/connect?provider=github`);
+    await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/apps$`));
+    await expect(
+      page.getByRole("heading", { name: "Connectors" }),
+    ).toBeVisible();
+    await page.goto(`/${seed.prefix}/apps/chat/endpoint-github/settings`);
+    await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/apps$`));
+    await expect.poll(() => mock.chatEndpointListReads).toBe(0);
+    expect(mock.createdWithAgentId).toBeNull();
+  });
+
   for (const provider of PROVIDERS) {
     test(`${provider.name}: catalog, setup, and connection management tabs`, async ({
       page,
     }) => {
-      const mock = await installChatControlPlaneMock(page, provider, seed);
+      const mock = await installChatControlPlaneMock(page, provider, seed, {
+        enableChatConnectors: true,
+      });
 
       await page.goto(`/${seed.prefix}/apps`);
       await expect(
