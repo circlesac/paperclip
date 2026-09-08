@@ -344,7 +344,8 @@ fn codex_transport_buffers_notifications_while_waiting_for_responses() {
         .start_turn("Complete the fake task.", &config.cwd)
         .expect("start provider turn");
     let mut event_types = Vec::new();
-    for _ in 0..16 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
         if let Some(CodexProviderEvent::Notification { method, params }) =
             provider.poll().expect("poll provider event")
         {
@@ -357,6 +358,7 @@ fn codex_transport_buffers_notifications_while_waiting_for_responses() {
         if event_types.iter().any(|event| event == "turn.completed") {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(event_types.iter().any(|event| event == "turn.started"));
     assert!(event_types.iter().any(|event| event == "item.completed"));
@@ -507,14 +509,11 @@ fn codex_completion_cancels_pending_tool_request_before_releasing_capacity() {
             },
         )
         .expect("observe the first semantic tool call");
-    let completed = (0..32).any(|_| {
-        matches!(
-            provider.poll().expect("poll first completion"),
-            Some(CodexProviderEvent::Notification { method, .. })
-                if method == "turn/completed"
-        )
-    });
-    assert!(completed, "Codex completed with a tool call still pending");
+    let completed = wait_for_notification(&mut provider, "turn/completed");
+    assert_eq!(
+        completed["turn"]["id"], "provider-turn-1",
+        "Codex completed with a tool call still pending"
+    );
     for _ in 0..100 {
         if call_count(&directory, "tool-response:failure") == 1 {
             break;
@@ -1178,15 +1177,9 @@ fn rejected_replacement_turn_start_preserves_result_and_exit_authority() {
     provider
         .start_turn("Complete the first turn.", &config.cwd)
         .expect("start first provider turn");
-    let first_completed = (0..32).any(|_| {
-        matches!(
-            provider.poll().expect("poll first turn"),
-            Some(CodexProviderEvent::Notification { method, .. })
-                if method == "turn/completed"
-        )
-    });
-    assert!(
-        first_completed,
+    let first_completed = wait_for_notification(&mut provider, "turn/completed");
+    assert_eq!(
+        first_completed["turn"]["id"], "provider-turn-1",
         "observe the authoritative first completion"
     );
 
@@ -1246,15 +1239,9 @@ fn rejected_replacement_turn_start_does_not_hide_contradictory_turn_evidence() {
     provider
         .start_turn("Complete the first turn.", &config.cwd)
         .expect("start first provider turn");
-    let first_completed = (0..32).any(|_| {
-        matches!(
-            provider.poll().expect("poll first turn"),
-            Some(CodexProviderEvent::Notification { method, .. })
-                if method == "turn/completed"
-        )
-    });
-    assert!(
-        first_completed,
+    let first_completed = wait_for_notification(&mut provider, "turn/completed");
+    assert_eq!(
+        first_completed["turn"]["id"], "provider-turn-1",
         "observe the authoritative first completion"
     );
 
@@ -1334,15 +1321,9 @@ fn ambiguous_or_dead_replacement_start_preserves_result_not_exit_authority() {
         provider
             .start_turn("Complete the first turn.", &config.cwd)
             .expect("start first provider turn");
-        let first_completed = (0..32).any(|_| {
-            matches!(
-                provider.poll().expect("poll first turn"),
-                Some(CodexProviderEvent::Notification { method, .. })
-                    if method == "turn/completed"
-            )
-        });
-        assert!(
-            first_completed,
+        let first_completed = wait_for_notification(&mut provider, "turn/completed");
+        assert_eq!(
+            first_completed["turn"]["id"], "provider-turn-1",
             "observe the authoritative first completion for {label}"
         );
 
@@ -1464,21 +1445,19 @@ fn ambiguous_replacement_turn_adopts_one_later_completion_identity() {
         let mut switches = vec![switch, "--complete-ambiguous-second-turn"];
         if omit_started {
             switches.push("--omit-ambiguous-turn-started");
+            // A successful reply without a turn ID immediately terminates the
+            // provider. Queue the exact completion before that invalid reply
+            // so this case tests retained evidence, not a race against teardown.
+            switches.push("--complete-ambiguous-second-turn-before-response");
         }
         let config = provider_config(&directory, &switches);
         let mut provider = CodexProvider::start(&config, None).expect("start Codex provider");
         provider
             .start_turn("Complete the first turn.", &config.cwd)
             .expect("start first provider turn");
-        let first_completed = (0..32).any(|_| {
-            matches!(
-                provider.poll().expect("poll first turn"),
-                Some(CodexProviderEvent::Notification { method, .. })
-                    if method == "turn/completed"
-            )
-        });
-        assert!(
-            first_completed,
+        let first_completed = wait_for_notification(&mut provider, "turn/completed");
+        assert_eq!(
+            first_completed["turn"]["id"], "provider-turn-1",
             "observe the authoritative first completion for {label}"
         );
 
@@ -2059,15 +2038,9 @@ fn accepted_replacement_turn_revokes_prior_authority_before_idle_crash() {
     provider
         .start_turn("Complete the first turn.", &config.cwd)
         .expect("start first provider turn");
-    let first_completed = (0..32).any(|_| {
-        matches!(
-            provider.poll().expect("poll first turn"),
-            Some(CodexProviderEvent::Notification { method, .. })
-                if method == "turn/completed"
-        )
-    });
-    assert!(
-        first_completed,
+    let first_completed = wait_for_notification(&mut provider, "turn/completed");
+    assert_eq!(
+        first_completed["turn"]["id"], "provider-turn-1",
         "observe the authoritative first completion"
     );
 
@@ -3559,7 +3532,11 @@ fn durable_backend_settles_tools_before_a_natural_terminal_event() {
 #[test]
 fn durable_backend_resumes_the_active_thread_without_restarting_the_turn() {
     let directory = temporary_directory("resume");
-    let config = provider_config(&directory, &["--hold-turn"]);
+    // Interrupt acceptance and the durably settled terminal are separate frames.
+    let config = provider_config(
+        &directory,
+        &["--hold-turn", "--interrupt-terminal-delay-ms", "50"],
+    );
     let mut first = CodexCommandExecutor::new(&directory);
     first
         .execute(&command(
@@ -3604,17 +3581,8 @@ fn durable_backend_resumes_the_active_thread_without_restarting_the_turn() {
     recovered
         .execute(&command("interrupt", 5, "turn.interrupt", json!({})))
         .expect("interrupt recovered provider turn");
-    let mut terminal_seen = false;
-    for _ in 0..16 {
-        let events = poll_and_ack(&mut recovered).expect("poll interrupted turn");
-        terminal_seen |= events
-            .iter()
-            .any(|event| event.event_type == "turn.interrupted");
-        if terminal_seen {
-            break;
-        }
-    }
-    assert!(terminal_seen);
+    let terminal = wait_for_executor_event(&mut recovered, "turn.interrupted");
+    assert_eq!(terminal.payload["providerTurnId"], "provider-turn-1");
     recovered
         .shutdown()
         .expect("stop recovered provider process");

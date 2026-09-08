@@ -7,6 +7,27 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Landing status
 
+- Latest pushed head `a756325e0` received Greptile **5/5**, with all 497
+  files reviewed and no unresolved finding. Its CI `34260240654` exposed a
+  Rust import-order mismatch in the fake provider: standalone formatting had
+  used a different convention from the workspace's edition-2021 check. Both
+  Build and Typecheck stopped at `cargo fmt --check`; their downstream build
+  and release-registry steps did not run. The preceding runner Vitest suite
+  passed **1,703 tests / three skipped**, including the 1,024-event suffix
+  case in **7.823 seconds**. That observation does not establish the cause of
+  the older first-close failure. Fix the formatting with the exact workspace
+  command, not standalone defaults.
+  Additional local compatibility passed **88/88** staged transport tests,
+  then exposed seven positive-completion wait failures in the Rust provider
+  tests (**59 passed / seven failed / one ignored**). Empty polls wait up to
+  one millisecond; 16/32 iterations are not a reliable subprocess completion
+  deadline. Condition-based waits preserve exact identity and authority checks.
+  The missing-ID fixture also must buffer its completion before the malformed
+  reply intentionally triggers process termination. A further interrupt wait
+  went red to green with a controlled asynchronous terminal. The final debug
+  Codex target passed **66 tests / one ignored**, with eight positive waits
+  corrected and all safety assertions retained. The adjacent native backend
+  and full release-workspace gates are still in progress.
 - Current continuation: documentation head `179fb5a53` received Greptile
   **5/5**, with no open finding. Its CI `34257833081` failed the runner Build
   lane: the real-transport 1,024-event suffix test rejected its first close
@@ -25,7 +46,8 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   writes, persists before terminal output and rejects malformed existing state.
   Three deterministic cases went red to green; all **seven fake-provider unit
   tests**, a concurrent **2/2** stress repeat and final **3/3** staged transport
-  cases pass. Runner TypeScript/Rust formatting and merged UI TypeScript pass.
+  cases pass. Runner TypeScript and merged UI TypeScript pass. The standalone
+  Rust-format check missed the workspace convention, corrected above.
   Closed failure diagnostics
   retain the original and successor epochs without raw payloads. No production
   runner guard or deadline changes. This does not explain the original CI

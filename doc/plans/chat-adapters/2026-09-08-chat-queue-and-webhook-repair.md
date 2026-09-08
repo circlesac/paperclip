@@ -1425,9 +1425,59 @@ checks remain unchanged, as do their deadlines. Production runner source and
 the staged/signed binary are unchanged; only the fake provider was rebuilt.
 Final staged verification passed **3/3** (48- and 1,024-suffix shutdown/rebind,
 plus unexpected-active resume), with the default binary resolver restored.
-Final fake-provider units passed **7/7**; runner TypeScript, Rust formatting and
-diff checks passed. Independent review's malformed-diagnostic concern was
+Final fake-provider units passed **7/7**; runner TypeScript, standalone Rust
+formatting and diff checks passed. The standalone formatting result did not
+match the workspace convention, as corrected below. Independent review's
+malformed-diagnostic concern was
 addressed: non-record command entries are excluded, emitted values are closed,
 and diagnostic failures cannot replace the original exception. The merged UI
 also passed its incremental TypeScript check.
 The original CI failure remains unproven and requires renewed exact-head gates.
+
+### Workspace formatting and fake-provider consumer synchronization
+
+Greptile reviewed `a756325e0` at **5/5**, covering all 497 files with no open
+finding. CI `34260240654` then failed Build and Typecheck on the same import
+ordering in the fake provider. Both use
+`cargo fmt --manifest-path runner/Cargo.toml --all -- --check`, with the
+workspace edition-2021 convention. The earlier standalone formatter check was
+not equivalent. Actual Build and release-registry steps were skipped. The
+preceding runner Vitest suite passed **1,703 tests / three skipped**, including
+the original 1,024-suffix case in **7.823 seconds**; that is a passing repeat,
+not causal proof for the earlier CI first-close failure.
+
+Separately, local full staged transport passed **88/88**. The Rust
+`codex_provider` target then reported **59 passed / seven failed / one ignored**.
+All seven failures exhausted fixed-count positive-completion polls. An empty
+poll waits up to one millisecond, so 16/32 iterations assumed a small scheduling
+and I/O window rather than waiting for the expected subprocess event. A
+diagnostic-only continuation retained the original failing assertions: four
+replacement cases observed the exact expected first-turn terminal after a
+further **5, 7, 22 and 28 milliseconds**. Durable fake-state persistence exposed
+these assumptions. This explains those observed consumer-wait failures, not
+the older CI first-close failure.
+
+The narrowly scoped follow-up uses bounded condition waits, preserving or
+strengthening exact turn identity assertions. It does not change production
+timeouts. A later missing-ID case exposed another fixture scheduling assumption:
+production intentionally terminates the provider immediately after a successful
+start response omits its identity. Completion emitted after that response can
+legitimately be interrupted. That tuple now uses the existing pre-response
+completion switch and keeps the omitted-start signal and every synthesized
+start, exact turn-2 completion and exit-authority assertion. This proves retained
+buffered evidence, not execution after termination. Separate fail-closed
+missing-ID tests remain unchanged.
+
+The next debug target had **65 passed / one failed / one ignored**. Its sole
+failure was a recovered active turn's interrupt: another 16-poll positive
+terminal wait. The existing 50-millisecond interrupt-delay switch reproduced
+that assertion failure deterministically; a diagnostic continuation observed
+the exact interrupted turn **65 milliseconds later**, with valid settled state.
+The final fixture retains that asynchronous delay and uses the existing bounded
+poll-and-ack helper, additionally asserting the exact interrupted turn identity.
+The focused case passed. This brings the repair to eight positive waits; no
+negative absence, receipt-limit, replay-retention or production deadline is
+relaxed. The final full debug Codex target passed **66 tests / one ignored**
+in **88.40 seconds**. The ignored test is its existing subprocess helper, not
+a skipped qualification case. Workspace formatting now passes the exact CI
+command. Adjacent native-backend and full release-workspace checks are pending.
