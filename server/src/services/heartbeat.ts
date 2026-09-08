@@ -226,6 +226,7 @@ import {
   EXTERNAL_CHAT_QUESTION_RESPONSE_KEY,
   resolveExternalChatQuestionResponse,
 } from "./native-runtime/external-chat-question-response.js";
+import { materializeExternalChatQuestionResponseInput } from "./native-runtime/external-chat-question-response-input.js";
 import {
   NativeRunnerOwnershipUnverifiedError,
   isNativeRunnerOwnershipHeld,
@@ -21722,15 +21723,27 @@ export function heartbeatService(
             }
           } else {
             const interactionId = readNonEmptyString(context.interactionId);
-            const interactionResponses =
-              await materializeNativeInteractionResponses({
-                db,
-                companyId: agent.companyId,
-                issueId: issueRef.id,
-                runId: run.id,
-                agentId: agent.id,
-                interactionIds: interactionId ? [interactionId] : [],
-              });
+            const interactionResponses = context[
+              EXTERNAL_CHAT_QUESTION_RESPONSE_KEY
+            ]
+              ? await materializeExternalChatQuestionResponseInput({
+                  db,
+                  binding: {
+                    companyId: agent.companyId,
+                    issueId: issueRef.id,
+                    runId: run.id,
+                    agentId: agent.id,
+                  },
+                  contextSnapshot: context,
+                })
+              : await materializeNativeInteractionResponses({
+                  db,
+                  companyId: agent.companyId,
+                  issueId: issueRef.id,
+                  runId: run.id,
+                  agentId: agent.id,
+                  interactionIds: interactionId ? [interactionId] : [],
+                });
             const runnerAdapterConfig = parseObject(agent.adapterConfig);
             const managedProfile =
               nativeRuntimeResolution.profile.backend ===

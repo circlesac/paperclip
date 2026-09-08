@@ -117,6 +117,37 @@ describe("native execution input external-chat framing", () => {
         ],
       });
       expect(unbound.task.title).toBe("Old exact-output request");
+      const earlierInteractionId = "10000000-0000-4000-8000-000000000020";
+      const sequential = buildNativeExecutionInput({
+        ...args,
+        interactionResponses: [
+          {
+            interactionId: earlierInteractionId,
+            kind: "ask_user_questions",
+            response: {
+              status: "answered",
+              result: {
+                version: 1,
+                answers: [{ questionId: "shape", optionIds: ["circle"] }],
+                summaryMarkdown: "Choose a shape: Circle",
+              },
+            },
+          },
+          ...args.interactionResponses!,
+        ],
+      });
+      expect(sequential.task.title).toBe("External chat follow-up");
+      expect(sequential.task.prompt).toContain("Circle");
+      expect(sequential.task.prompt).toContain("Amber");
+      expect(
+        sequential.task.prompt.indexOf("Choose a shape: Circle"),
+      ).toBeLessThan(sequential.task.prompt.indexOf("Choose a color: Amber"));
+      expect(
+        sequential.interactionResponses.map(
+          (response) => response.interactionId,
+        ),
+      ).toEqual([earlierInteractionId, interactionId]);
+      expect(wakePayload).not.toHaveProperty("questionResponse");
     },
   );
   it("uses neutral framing and the closed reader for an authenticated overflow chat turn", () => {

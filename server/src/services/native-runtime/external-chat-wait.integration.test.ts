@@ -51,6 +51,9 @@ import { reconcileNativeFinalizations } from "./native-finalization-reconciler.j
 import { authorizeChatConversationForBoundRun, isExternalChatWaitAuthorizationContention } from "./chat-attachment-reuse.js";
 import { attestReviewedExternalChatRun, buildPaperclipWakePayload } from "../heartbeat.js";
 import { questionResponseDeliveryValues } from "../question-response-delivery.js";
+import { resolveExternalChatQuestionResponse } from "./external-chat-question-response.js";
+import { materializeExternalChatQuestionResponseInput } from "./external-chat-question-response-input.js";
+import * as nativeInteractionBridge from "./native-interaction-bridge.js";
 import type { AskUserQuestionsInteraction } from "@paperclipai/shared";
 
 describe("native external-chat response wait", () => {
@@ -365,9 +368,10 @@ describe("native external-chat response wait", () => {
 
   async function seedAnsweredChatTurn(
     provider: "telegram" | "discord" = "telegram",
+    target?: { fixture: Awaited<ReturnType<typeof seedWaitTurn>>; gate: Awaited<ReturnType<typeof seedPriorCompletionReview>> },
   ) {
-    const fixture = await seedWaitTurn(provider);
-    const gate = await seedPriorCompletionReview(fixture);
+    const fixture = target?.fixture ?? await seedWaitTurn(provider);
+    const gate = target?.gate ?? await seedPriorCompletionReview(fixture);
     const [current] = await db
       .select()
       .from(heartbeatRuns)
@@ -501,7 +505,7 @@ describe("native external-chat response wait", () => {
     };
     await db
       .update(heartbeatRuns)
-      .set({ wakeupRequestId: wakeId, contextSnapshot: context })
+      .set({ wakeupRequestId: wakeId, contextSnapshot: context, status: "running" })
       .where(eq(heartbeatRuns.id, fixture.runId));
     return {
       ...fixture,
@@ -547,6 +551,386 @@ describe("native external-chat response wait", () => {
       .set({ contextSnapshot: fixture.context })
       .where(eq(heartbeatRuns.id, fixture.runId));
   }
+
+  async function seedSequentialQuestionChain(depth = 2) {
+    const fixture = await seedAnsweredChatTurn();
+    const parents: Array<Awaited<ReturnType<typeof seedAnsweredChatTurn>>> = [];
+    let cursor = fixture;
+    for (let index = 1; index < depth; index += 1) {
+      cursor = await seedAnsweredChatTurn("telegram", {
+        fixture: { ...fixture, runId: cursor.sourceRunId },
+        gate: fixture.gate,
+      });
+      parents.unshift(cursor);
+    }
+    for (const parent of parents) {
+      await db
+        .update(issues)
+        .set({ executionRunId: parent.runId })
+        .where(eq(issues.id, fixture.issueId));
+      await attestAnswer(parent);
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded" })
+        .where(eq(heartbeatRuns.id, parent.runId));
+    }
+    await db
+      .update(issues)
+      .set({ executionRunId: fixture.runId })
+      .where(eq(issues.id, fixture.issueId));
+    return { fixture, parents };
+  }
+
+  it("authorizes sequential chat questions through exact durable parents and preserves the original request", async () => {
+    const { fixture, parents } = await seedSequentialQuestionChain(3);
+    await attestAnswer(fixture);
+    const resolved = await resolveExternalChatQuestionResponse(
+      db,
+      fixture,
+      fixture.context,
+      "read",
+    );
+    expect(resolved?.interactionIds).toEqual([
+      ...parents.map((parent) => parent.interactionId),
+      fixture.interactionId,
+    ]);
+    expect(resolved?.marker.sourceCommentId).toBe(fixture.commentId);
+    expect(fixture.context.source).toBe("issue.interaction.respond");
+    expect(fixture.context.wakeCommentIds).toEqual([fixture.commentId]);
+    const responses = await materializeExternalChatQuestionResponseInput({
+      db, binding: fixture, contextSnapshot: fixture.context,
+    });
+    expect(responses.map((response) => response.interactionId)).toEqual(resolved!.interactionIds);
+    const resultJson = await finishReviewResponse(fixture);
+    expect(
+      await authorizeNativeChatReviewPresentation(db, {
+        ...fixture,
+        resultJson,
+      }),
+    ).toBe(true);
+    expect(
+      await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, fixture.gate.id)),
+    ).toEqual([expect.objectContaining({ status: "pending" })]);
+  });
+
+  it.each(["execution_owner", "agent_paused", "membership_revoked"] as const)(
+    "rechecks current sequential answer input authority after attestation: %s",
+    async (kind) => {
+      const { fixture } = await seedSequentialQuestionChain();
+      await attestAnswer(fixture);
+      if (kind === "execution_owner")
+        await db
+          .update(issues)
+          .set({ executionRunId: fixture.sourceRunId })
+          .where(eq(issues.id, fixture.issueId));
+      if (kind === "agent_paused")
+        await db
+          .update(agents)
+          .set({ status: "paused" })
+          .where(eq(agents.id, fixture.agentId));
+      if (kind === "membership_revoked")
+        await db
+          .update(companyMemberships)
+          .set({ status: "suspended" })
+          .where(
+            and(
+              eq(companyMemberships.companyId, fixture.companyId),
+              eq(companyMemberships.principalId, fixture.userId),
+            ),
+          );
+      await expect(
+        materializeExternalChatQuestionResponseInput({
+          db,
+          binding: fixture,
+          contextSnapshot: fixture.context,
+        }),
+      ).rejects.toThrow(
+        kind === "membership_revoked"
+          ? "paperclip_runner_chat_attachment_principal_denied"
+          : "reviewed_chat_execution_binding_not_authorized",
+      );
+    },
+  );
+
+  it("materializes a sequential answer chain atomically with authorization before a coherent ancestor rewrite", async () => {
+    const { fixture, parents } = await seedSequentialQuestionChain();
+    await attestAnswer(fixture);
+    const parent = parents[0]!;
+    let reached!: () => void;
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original =
+      nativeInteractionBridge.materializeNativeInteractionResponses;
+    const spy = vi
+      .spyOn(nativeInteractionBridge, "materializeNativeInteractionResponses")
+      .mockImplementationOnce(async (input) => {
+        reached();
+        await released;
+        return original(input);
+      });
+    const prompt = materializeExternalChatQuestionResponseInput({
+      db,
+      binding: fixture,
+      contextSnapshot: fixture.context,
+    });
+    let mutation: Promise<void> | null = null;
+    let mutationPid = 0;
+    try {
+      await Promise.race([
+        ready,
+        prompt.then(() => {
+          throw new Error("materialization_barrier_not_reached");
+        }),
+      ]);
+      mutation = db.transaction(async (tx) => {
+        const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+        mutationPid = Number(backend!.pid);
+        const [interaction] = await tx
+          .update(issueThreadInteractions)
+          .set({
+            result: {
+              version: 1,
+              answers: [{ questionId: "color", optionIds: ["amber"] }],
+            },
+          })
+          .where(eq(issueThreadInteractions.id, parent.interactionId))
+          .returning();
+        const [action] = await tx
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, parent.actionId));
+        await tx
+          .update(chatActions)
+          .set({ payload: { ...action!.payload, optionId: "amber" } })
+          .where(eq(chatActions.id, parent.actionId));
+        await tx
+          .update(issueQuestionResponseDeliveries)
+          .set({
+            payloadSha256: questionResponseDeliveryValues(
+              interaction! as unknown as AskUserQuestionsInteraction,
+            ).payloadSha256,
+          })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, parent.responseDeliveryId),
+          );
+      });
+      await vi.waitFor(async () => {
+        expect(mutationPid).toBeGreaterThan(0);
+        const [waiting] = await db.execute(
+          sql`select exists(select 1 from pg_locks where pid = ${mutationPid} and not granted) as waiting`,
+        );
+        expect(waiting!.waiting).toBe(true);
+      });
+      release();
+      const captured = await prompt;
+      await mutation;
+      expect(captured.map((response) => response.interactionId)).toEqual([
+        parent.interactionId,
+        fixture.interactionId,
+      ]);
+      expect(JSON.stringify(captured)).toContain("Cobalt");
+      expect(JSON.stringify(captured)).not.toContain("Amber");
+      await expect(
+        materializeExternalChatQuestionResponseInput({
+          db,
+          binding: fixture,
+          contextSnapshot: fixture.context,
+        }),
+      ).rejects.toThrow("reviewed_chat_execution_binding_not_authorized");
+    } finally {
+      release();
+      await Promise.allSettled([prompt, ...(mutation ? [mutation] : [])]);
+      spy.mockRestore();
+    }
+  });
+
+  it.each([
+    "missing_parent_marker",
+    "missing_parent_delivery",
+    "tampered_parent_answer",
+    "rewritten_parent_answer_and_receipt",
+    "duplicate_parent_action",
+    "revoked_parent_principal",
+    "wrong_parent_actor",
+    "source_cycle",
+    "different_parent_issue",
+  ] as const)(
+    "rejects an unauthenticated sequential chat question chain: %s",
+    async (kind) => {
+      const { fixture, parents } = await seedSequentialQuestionChain();
+      const parent = parents[0]!;
+      if (kind === "missing_parent_marker") {
+        const context = { ...parent.context };
+        delete context.paperclipExternalChatQuestionResponse;
+        await db
+          .update(heartbeatRuns)
+          .set({ contextSnapshot: context })
+          .where(eq(heartbeatRuns.id, parent.runId));
+      }
+      if (kind === "missing_parent_delivery")
+        await db
+          .delete(issueQuestionResponseDeliveries)
+          .where(
+            eq(issueQuestionResponseDeliveries.id, parent.responseDeliveryId),
+          );
+      if (kind === "tampered_parent_answer")
+        await db
+          .update(issueThreadInteractions)
+          .set({
+            result: {
+              version: 1,
+              answers: [{ questionId: "color", optionIds: ["amber"] }],
+            },
+          })
+          .where(eq(issueThreadInteractions.id, parent.interactionId));
+      if (kind === "rewritten_parent_answer_and_receipt") {
+        const [interaction] = await db
+          .update(issueThreadInteractions)
+          .set({
+            result: {
+              version: 1,
+              answers: [{ questionId: "color", optionIds: ["amber"] }],
+            },
+          })
+          .where(eq(issueThreadInteractions.id, parent.interactionId))
+          .returning();
+        const [action] = await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, parent.actionId));
+        await db
+          .update(chatActions)
+          .set({ payload: { ...action!.payload, optionId: "amber" } })
+          .where(eq(chatActions.id, parent.actionId));
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({
+            payloadSha256: questionResponseDeliveryValues(
+              interaction! as unknown as AskUserQuestionsInteraction,
+            ).payloadSha256,
+          })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, parent.responseDeliveryId),
+          );
+      }
+      if (kind === "duplicate_parent_action") {
+        const [action] = await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, parent.actionId));
+        await db
+          .insert(chatActions)
+          .values({
+            ...action!,
+            id: randomUUID(),
+            providerActionId: "duplicate-parent-response",
+          });
+      }
+      if (kind === "revoked_parent_principal")
+        await db
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.principalId, fixture.principalId));
+      if (kind === "wrong_parent_actor")
+        await db
+          .update(agentWakeupRequests)
+          .set({ requestedByActorId: "another-user" })
+          .where(eq(agentWakeupRequests.id, parent.wakeId));
+      if (kind === "different_parent_issue")
+        await db
+          .update(heartbeatRuns)
+          .set({ nativeIssueId: fixture.sourceRunId })
+          .where(eq(heartbeatRuns.id, parent.runId));
+      if (kind === "source_cycle") {
+        const [wake] = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, parent.wakeId));
+        await db
+          .update(agentWakeupRequests)
+          .set({ payload: { ...wake!.payload, sourceRunId: fixture.runId } })
+          .where(eq(agentWakeupRequests.id, parent.wakeId));
+        await db
+          .update(issueThreadInteractions)
+          .set({ sourceRunId: fixture.runId })
+          .where(eq(issueThreadInteractions.id, parent.interactionId));
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({ sourceRunId: fixture.runId })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, parent.responseDeliveryId),
+          );
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: { ...parent.context, sourceRunId: fixture.runId },
+          })
+          .where(eq(heartbeatRuns.id, parent.runId));
+      }
+      expect(
+        await attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: fixture.context,
+        }),
+      ).toBe(false);
+      expect(
+        fixture.context.paperclipExternalChatQuestionResponse,
+      ).toBeUndefined();
+    },
+  );
+
+  it("bounds sequential question ancestry without silently dropping earlier answers", async () => {
+    const { fixture, parents } = await seedSequentialQuestionChain(9);
+    const deepestAllowed = parents.at(-1)!;
+    expect(
+      (
+        await resolveExternalChatQuestionResponse(
+          db,
+          deepestAllowed,
+          deepestAllowed.context,
+          "read",
+        )
+      )?.interactionIds,
+    ).toHaveLength(8);
+    expect(
+      await attestReviewedExternalChatRun({
+        db,
+        ...fixture,
+        contextSnapshot: fixture.context,
+      }),
+    ).toBe(false);
+  });
+
+  it("revalidates sequential question ancestors before publishing the later answer", async () => {
+    const { fixture, parents } = await seedSequentialQuestionChain();
+    await attestAnswer(fixture);
+    const resultJson = await finishReviewResponse(fixture);
+    expect(
+      await authorizeNativeChatReviewPresentation(db, {
+        ...fixture,
+        resultJson,
+      }),
+    ).toBe(true);
+    await db
+      .update(agentWakeupRequests)
+      .set({ requestedByActorId: "another-user" })
+      .where(eq(agentWakeupRequests.id, parents[0]!.wakeId));
+    expect(
+      await authorizeNativeChatReviewPresentation(db, {
+        ...fixture,
+        resultJson,
+      }),
+    ).toBe(false);
+  });
 
   it.each(["telegram", "discord"] as const)(
     "retains authenticated %s answer continuation presentation without resolving prior review",

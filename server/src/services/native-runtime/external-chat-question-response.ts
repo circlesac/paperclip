@@ -37,6 +37,22 @@ type Marker = {
   conversationId: string;
   bindingSha256: string;
 };
+type ResolvedQuestionResponse = {
+  marker: Marker;
+  provider: typeof chatEndpoints.$inferSelect.provider;
+  authorizationContext: Record<string, unknown>;
+  /** Authoritative answered interactions, oldest first; not persisted answer text. */
+  interactionIds: string[];
+};
+// Keep authorization work/lock duration bounded. A ninth linked answer is
+// denied, never admitted with a silently truncated ancestor history.
+const MAX_QUESTION_RESPONSE_CHAIN_DEPTH = 8;
+type Chain = {
+  runIds: Set<string>;
+  interactionIds: Set<string>;
+  deliveryIds: Set<string>;
+  actionIds: Set<string>;
+};
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -57,11 +73,36 @@ export async function resolveExternalChatQuestionResponse(
   contextSnapshot: unknown,
   lockMode: LockMode = "blocking",
   mint = false,
-): Promise<{
-  marker: Marker;
-  provider: typeof chatEndpoints.$inferSelect.provider;
-  authorizationContext: Record<string, unknown>;
-} | null> {
+): Promise<ResolvedQuestionResponse | null> {
+  return resolveQuestionResponseChain(
+    tx,
+    binding,
+    contextSnapshot,
+    lockMode,
+    mint,
+    {
+      runIds: new Set(),
+      interactionIds: new Set(),
+      deliveryIds: new Set(),
+      actionIds: new Set(),
+    },
+  );
+}
+
+async function resolveQuestionResponseChain(
+  tx: Db,
+  binding: Binding,
+  contextSnapshot: unknown,
+  lockMode: LockMode,
+  mint: boolean,
+  chain: Chain,
+): Promise<ResolvedQuestionResponse | null> {
+  if (
+    chain.runIds.has(binding.runId) ||
+    chain.runIds.size >= MAX_QUESTION_RESPONSE_CHAIN_DEPTH
+  )
+    return null;
+  chain.runIds.add(binding.runId);
   const context = record(contextSnapshot);
   if (
     context.source !== "issue.interaction.respond" ||
@@ -174,15 +215,45 @@ export async function resolveExternalChatQuestionResponse(
       : query.for("update"));
   if (rows.length !== 1) return null;
   const { interaction, delivery, source, wake } = rows[0]!;
+  if (
+    chain.interactionIds.has(interaction.id) ||
+    chain.deliveryIds.has(delivery.id) ||
+    chain.runIds.has(source.id)
+  )
+    return null;
+  chain.interactionIds.add(interaction.id);
+  chain.deliveryIds.add(delivery.id);
   const sourceContext = record(source.contextSnapshot);
   const sourceWake = record(sourceContext.paperclipWake);
-  const provider = (
-    ["slack", "github", "discord", "microsoft-teams", "telegram"] as const
-  ).find(
-    (candidate) =>
-      sourceContext.source === `chat:${candidate}` ||
-      sourceContext.source === `chat:${candidate}:recovery`,
-  );
+  // A follow-up question inherits no authority from its marker alone. Rebuild
+  // every parent proof from current durable state until the direct-chat root.
+  const parent =
+    sourceContext.source === "issue.interaction.respond"
+      ? await resolveQuestionResponseChain(
+          tx,
+          {
+            companyId: binding.companyId,
+            agentId: binding.agentId,
+            issueId: binding.issueId,
+            runId: source.id,
+          },
+          sourceContext,
+          lockMode,
+          false,
+          chain,
+        )
+      : null;
+  if (sourceContext.source === "issue.interaction.respond" && !parent)
+    return null;
+  const provider =
+    parent?.provider ??
+    (
+      ["slack", "github", "discord", "microsoft-teams", "telegram"] as const
+    ).find(
+      (candidate) =>
+        sourceContext.source === `chat:${candidate}` ||
+        sourceContext.source === `chat:${candidate}:recovery`,
+    );
   const sourceIds = ids(sourceContext.wakeCommentIds);
   const wakePayload = record(wake.payload);
   if (
@@ -205,6 +276,8 @@ export async function resolveExternalChatQuestionResponse(
     ) ||
     sourceIds.length !== 1 ||
     sourceIds[0] !== context.sourceCommentId ||
+    (parent !== null &&
+      parent.marker.sourceCommentId !== context.sourceCommentId) ||
     interaction.kind !== "ask_user_questions" ||
     interaction.status !== "answered" ||
     interaction.createdByAgentId !== binding.agentId ||
@@ -376,6 +449,14 @@ export async function resolveExternalChatQuestionResponse(
     endpoint,
     identity,
   } = actions[0]!;
+  if (chain.actionIds.has(action.id)) return null;
+  chain.actionIds.add(action.id);
+  if (
+    parent &&
+    (parent.marker.endpointId !== endpoint.id ||
+      parent.marker.conversationId !== conversation.id)
+  )
+    return null;
   const answers = record(interaction.result).answers;
   const selectedAnswer = Array.isArray(answers)
     ? answers
@@ -437,6 +518,11 @@ export async function resolveExternalChatQuestionResponse(
       sourceRunId: source.id,
       sourceIds,
       sourceOrigin: sourceContext.source,
+      // Omit this field for a direct-chat parent so deployed v1 proofs remain
+      // byte-compatible. A chained proof commits to every validated ancestor.
+      ...(parent
+        ? { sourceQuestionResponseSha256: parent.marker.bindingSha256 }
+        : {}),
       interaction: {
         id: interaction.id,
         payload: interaction.payload,
@@ -480,6 +566,7 @@ export async function resolveExternalChatQuestionResponse(
   return {
     marker,
     provider,
+    interactionIds: [...(parent?.interactionIds ?? []), interaction.id],
     authorizationContext: {
       ...context,
       source: `chat:${provider}`,

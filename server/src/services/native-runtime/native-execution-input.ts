@@ -109,13 +109,32 @@ export function buildNativeExecutionInput(input: {
     : null;
   const answerResult = question?.response.result as
     Record<string, unknown> | undefined;
+  // The server supplies only the revalidated answer chain, in source order.
+  // Keep prior choices available even when this continuation starts a fresh
+  // provider session; never recover them from model prose or a transcript.
+  const answerChain = question
+    ? input.interactionResponses?.filter((response) =>
+        response.kind === "ask_user_questions" &&
+        response.response.status === "answered" &&
+        typeof (response.response.result as Record<string, unknown> | undefined)
+          ?.summaryMarkdown === "string")
+    : null;
+  const answerSummary =
+    answerChain && answerChain.length > 1 &&
+    answerChain.at(-1)?.interactionId === question?.interactionId
+      ? answerChain.map((response, index) => {
+          const label = index === answerChain.length - 1
+            ? "Latest answered question" : `Earlier answer ${index + 1}`;
+          return `${label}:\n${(response.response.result as Record<string, unknown>).summaryMarkdown}`;
+        }).join("\n\n")
+      : answerResult?.summaryMarkdown;
   const wakePayload =
-    question && typeof answerResult?.summaryMarkdown === "string"
+    question && typeof answerSummary === "string"
       ? {
           ...wake,
           questionResponse: {
             interactionId: question.interactionId,
-            summaryMarkdown: answerResult.summaryMarkdown,
+            summaryMarkdown: answerSummary,
           },
         }
       : input.wakePayload;
