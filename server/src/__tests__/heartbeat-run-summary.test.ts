@@ -725,6 +725,70 @@ describe("resolveHeartbeatRunResponse", () => {
     });
   });
 
+  it("requires separate server review-presentation authorization for a governed response wait", () => {
+    const resultJson = {
+      finalizationPhase: "committed",
+      finalizationReasonCode: "governed_response_waiting",
+      externalChatReviewPresentation: {
+        schema: "paperclip.chat_review_response_presentation.v1",
+      },
+      nativeResult: {
+        schema: "paperclip.run_result.v1",
+        reportedWorkDisposition: "yielded",
+        summary:
+          "The original image is prepared for delivery; the completion review is still pending.",
+        continuation: {
+          kind: "response_wake",
+          summary: "Wait for the next authorized message",
+          idempotencyKey: "review-wait",
+        },
+      },
+    };
+    const resolve = (
+      reviewAuthorized: boolean,
+      bound = true,
+      result = resultJson,
+    ) =>
+      resolveHeartbeatRunResponse({
+        resultJson: result,
+        preferFinalResponseOverExistingComment: true,
+        externalChatResponseWakeSummaryAuthorized: bound,
+        externalChatReviewResponseSummaryAuthorized: reviewAuthorized,
+        finalAgentMessage: {
+          text: "Never publish this raw narration or review payload",
+          channel: "final",
+          sourceEventId: "raw",
+        },
+      });
+    expect(resolve(true)).toMatchObject({
+      text: resultJson.nativeResult.summary,
+      decision: {
+        chosenSource: "semantic_result_summary",
+        commentAction: "create",
+      },
+    });
+    expect(resolve(false).text).toBeNull();
+    expect(resolve(true, false).text).toBeNull();
+    expect(
+      resolve(true, true, {
+        ...resultJson,
+        finalizationPhase: "retryable_failure",
+      }).text,
+    ).toBeNull();
+    expect(
+      resolve(true, true, {
+        ...resultJson,
+        nativeResult: {
+          ...resultJson.nativeResult,
+          continuation: {
+            ...resultJson.nativeResult.continuation,
+            kind: "same_agent",
+          },
+        },
+      }).text,
+    ).toBeNull();
+  });
+
   it("recognizes root and continuation external-chat presentation contexts", () => {
     expect(
       isExternalChatPresentationContext({

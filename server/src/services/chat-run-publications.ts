@@ -26,6 +26,7 @@ import { safeChatTaskUrl } from "./chat-task-url.js";
 import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitration.js";
 import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } from "./heartbeat-run-summary.js";
 import { resolveChatOriginPublicationBindings } from "./issues.js";
+import { authorizeNativeChatReviewPresentation } from "./native-runtime/native-chat-review-presentation.js";
 
 type SafeRunMilestone =
   "queued" | "working" | "waiting_for_input" | "completed" | "failed";
@@ -49,6 +50,25 @@ export async function resolveChatRunPresentationAuthorizationReason(
 ): Promise<
   typeof CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON | "internal_agent_write"
 > {
+  const [run] = await db
+    .select({ resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+      ),
+    )
+    .limit(1);
+  if (
+    run?.resultJson?.finalizationReasonCode === "governed_response_waiting" &&
+    !(await authorizeNativeChatReviewPresentation(db, {
+      ...input,
+      resultJson: run.resultJson,
+    }))
+  ) {
+    return "internal_agent_write";
+  }
   const bindings = await resolveChatOriginPublicationBindings(
     db,
     input.companyId,

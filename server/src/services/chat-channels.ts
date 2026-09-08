@@ -126,6 +126,11 @@ import {
   type IssueAssignmentWakeupDeps,
 } from "./issue-assignment-wakeup.js";
 import { issueService } from "./issues.js";
+import {
+  authorizeNativeChatReviewPresentation,
+  NativeChatReviewPresentationContentionError,
+} from "./native-runtime/native-chat-review-presentation.js";
+import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { safeChatTaskUrl } from "./chat-task-url.js";
 import { getExternalChannelBindingSummary } from "./chat-channel-binding.js";
@@ -10269,7 +10274,35 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // the retry resume here without duplicating the task or comment.
         if (addressed && !thread.isDM) await thread.subscribe();
         await acceptInboundWakeup(activeDelivery.id, attachmentResult);
-        await processInboundWakeup(activeDelivery.id);
+        if (!(await processInboundWakeup(activeDelivery.id))) return;
+        const acceptedWake = await db
+          .select({ status: chatActions.status })
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.deliveryId, activeDelivery.id),
+              eq(chatActions.kind, "inbound_wakeup"),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (acceptedWake?.status !== "processed") return;
+        // Recover the visible receipt as well as the durable wake. The
+        // receipt action is idempotent and resolves the current runtime fence.
+        await Promise.allSettled([
+          receiptReactionSupported
+            ? addReceiptReaction({
+                deliveryId: activeDelivery.id,
+                endpoint,
+                message,
+                runtimeContext,
+                thread,
+              })
+            : Promise.resolve(),
+          endpoint.provider === "slack"
+            ? Promise.resolve()
+            : thread.startTyping("Working…"),
+        ]);
         return;
       }
 
@@ -23485,6 +23518,60 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return null;
       }
       let authorizationActionId: string | null = null;
+      // A native response alongside an older completion review has its own
+      // narrow authorization. Recheck that exact proof, review and original
+      // requester at the transport claim, including file publications whose
+      // comment is the run's earlier internal attachment-selection comment.
+      if (
+        input.publication.commentId &&
+        !isExplicitOperatorPublication(input.publication)
+      ) {
+        const [origin] = await tx
+          .select({ runId: heartbeatRuns.id, resultJson: heartbeatRuns.resultJson })
+          .from(issueComments)
+          .innerJoin(
+            heartbeatRuns,
+            and(
+              eq(heartbeatRuns.id, issueComments.createdByRunId),
+              eq(heartbeatRuns.companyId, issueComments.companyId),
+            ),
+          )
+          .where(
+            and(
+              eq(issueComments.id, input.publication.commentId),
+              eq(issueComments.companyId, endpoint.companyId),
+              eq(issueComments.issueId, input.publication.issueId),
+            ),
+          )
+          .limit(1);
+        if (
+          origin?.resultJson?.finalizationReasonCode === "governed_response_waiting"
+        ) {
+          try {
+            if (
+              !(await authorizeNativeChatReviewPresentation(
+                tx as unknown as Db,
+                {
+                  companyId: endpoint.companyId,
+                  issueId: input.publication.issueId,
+                  runId: origin.runId,
+                  resultJson: origin.resultJson,
+                  destination: {
+                    endpointId: endpoint.id,
+                    conversationId: conversation.id,
+                  },
+                },
+                "nonblocking",
+              ))
+            )
+              return null;
+          } catch (error) {
+            if (isExternalChatWaitAuthorizationContention(error))
+              throw new NativeChatReviewPresentationContentionError();
+            throw error;
+          }
+        }
+      }
       if (authorizationAction?.principalId) {
         const authorization = await lockCurrentPrincipalAuthorization(
           tx,
@@ -24151,21 +24238,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           reason:
             "Provider accepted the publication, but Paperclip could not confirm its durable result",
         }
-      : isOutboundAttachmentValidationError(error)
-        ? {
-            kind: "failed" as const,
-            reason: error.message,
-          }
-        : isOutboundAttachmentHydrationError(error)
+      : error instanceof NativeChatReviewPresentationContentionError
+        ? { kind: "retry" as const, retryAfterMs: 250, reason: error.message }
+        : isOutboundAttachmentValidationError(error)
           ? {
-              kind: "retry" as const,
-              retryAfterMs: Math.min(
-                60_000,
-                2 ** Math.max(0, attempts) * 1_000,
-              ),
+              kind: "failed" as const,
               reason: error.message,
             }
-          : classifyChatPublicationError(error, attempts);
+          : isOutboundAttachmentHydrationError(error)
+            ? {
+                kind: "retry" as const,
+                retryAfterMs: Math.min(60_000, 2 ** Math.max(0, attempts) * 1_000),
+                reason: error.message,
+              }
+            : classifyChatPublicationError(error, attempts);
     const failure = redactSensitiveText(disposition.reason).slice(
       0,
       MAX_ERROR_TEXT,

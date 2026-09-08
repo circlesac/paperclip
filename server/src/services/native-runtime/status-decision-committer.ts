@@ -25,6 +25,10 @@ import {
 } from "./status-arbiter.js";
 import { nativeSha256 } from "./canonical.js";
 import {
+  prepareNativeChatReviewPresentationInTransaction,
+  restoreNativeChatReviewPresentationInTransaction,
+} from "./native-chat-review-presentation.js";
+import {
   isExternalChatWaitAuthorizationContention,
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
@@ -1037,6 +1041,7 @@ export async function commitNativeStatusDecision(input: {
   preMaterializedEffects?: NativeMaterializedStatusEffect[];
   supersedesCommittedDecisionId?: string;
   requireExternalChatResponseWaitAuthorization?: { agentId: string };
+  reviewResponsePresentation?: { agentId: string; resultId: string; gateId: string };
 }) {
   if (input.decision.reasonCode === null) {
     throw new Error("native_status_reason_code_required");
@@ -1106,12 +1111,40 @@ export async function commitNativeStatusDecision(input: {
         throw new NativeStatusRaceError();
       }
     }
+    let externalChatReviewPresentation = null;
+    if (
+      reasonCode === "governed_response_waiting" &&
+      input.reviewResponsePresentation &&
+      input.decision.effects.length === 1 &&
+      input.decision.effects[0]?.kind === "create_interaction" &&
+      input.decision.effects[0].gate?.kind === "interaction" &&
+      input.decision.effects[0].gate.id === input.reviewResponsePresentation.gateId
+    ) {
+      try {
+        externalChatReviewPresentation =
+          await prepareNativeChatReviewPresentationInTransaction(
+            tx as unknown as Db,
+            {
+              companyId: input.companyId,
+              issueId: input.issueId,
+              runId: input.runId,
+              assessmentId: input.assessmentId,
+              ...input.reviewResponsePresentation,
+            },
+          );
+      } catch (error) {
+        if (isExternalChatWaitAuthorizationContention(error))
+          throw new NativeStatusRaceError();
+        throw error;
+      }
+    }
     const decisionJson = {
       statusAction: input.decision.statusAction,
       toStatus: input.decision.toStatus,
       reasonCode,
       unblockDescriptor: input.decision.unblockDescriptor,
       effects: input.decision.effects,
+      ...(externalChatReviewPresentation ? { externalChatReviewPresentation } : {}),
       priorStatusVersion: input.priorStatusVersion,
       projectedStatusVersion: input.decision.statusAction === "preserve"
         ? input.priorStatusVersion
@@ -1342,6 +1375,16 @@ export async function commitNativeStatusDecision(input: {
       nextAttemptAt: finalizationError ? new Date(Date.now() + 30_000) : null,
       updatedAt: new Date(),
     }).where(eq(nativeRunFinalizations.runId, input.runId));
+    if (externalChatReviewPresentation && input.reviewResponsePresentation) {
+      await restoreNativeChatReviewPresentationInTransaction(tx as unknown as Db, {
+        companyId: input.companyId,
+        issueId: input.issueId,
+        runId: input.runId,
+        decisionId: decisionRow.id,
+        resultId: input.reviewResponsePresentation.resultId,
+        assessmentId: input.assessmentId,
+      });
+    }
     const { publication } = await persistActivity(tx as unknown as Db, {
       companyId: input.companyId,
       actorType: "system",

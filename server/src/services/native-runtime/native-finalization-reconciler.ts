@@ -14,7 +14,11 @@ import {
   workAssessments,
   workspaceOperations,
 } from "@paperclipai/db";
-import { finalizeNativeRun, recordNativeFinalizationFailure } from "./native-run-finalizer.js";
+import {
+  finalizeNativeRun,
+  recordNativeFinalizationFailure,
+  repairCommittedNativeReviewResponse,
+} from "./native-run-finalizer.js";
 import {
   commitNativeStatusDecision,
   dispatchPendingNativeStatusEffects,
@@ -418,6 +422,7 @@ export async function reconcileNativeFinalizations(
       issueStatusVersion: issues.statusVersion,
       issueDecisionId: issues.lastStatusDecisionId,
       coordinatorPhase: nativeRunFinalizations.phase,
+      resultId: nativeRunFinalizations.resultId,
       assessmentId: nativeRunFinalizations.assessmentId,
       decisionId: nativeRunFinalizations.decisionId,
       runnerProfileJson: heartbeatRuns.runnerProfileJson,
@@ -512,6 +517,25 @@ export async function reconcileNativeFinalizations(
           )).limit(1).then((entries) => entries[0] ?? null)
         : null;
       const currentDecisionJson = record(currentDecision?.decisionJson);
+      if (
+        row.coordinatorPhase === "committed" &&
+        row.decisionId &&
+        row.resultId &&
+        row.assessmentId &&
+        currentDecisionJson.externalChatReviewPresentation
+      ) {
+        // A later chat turn may retain the same pending review. Recover the
+        // earlier response independently before status reconciliation skips
+        // its superseded decision; this cannot change issue disposition.
+        await repairCommittedNativeReviewResponse(db, {
+          companyId: row.companyId,
+          issueId: row.issueId,
+          runId: row.runId,
+          decisionId: row.decisionId,
+          resultId: row.resultId,
+          assessmentId: row.assessmentId,
+        });
+      }
       if (row.coordinatorPhase === "committed" && row.decisionId && !currentDecision) {
         throw new Error("native_committed_decision_missing");
       }

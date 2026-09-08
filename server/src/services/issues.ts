@@ -114,6 +114,10 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitration.js";
 import {
+  authorizeNativeChatReviewPresentation,
+  retryNativeChatReviewPresentation,
+} from "./native-runtime/native-chat-review-presentation.js";
+import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
@@ -11661,18 +11665,23 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
     ): Promise<IssueComment> {
       if (dbOrTx === db && actor.runId) {
-        return db.transaction(async (tx) => {
-          // Serialize run-authored comments on the issue so a provider retry
-          // cannot publish the same visible result twice. This needs no schema
-          // change: the issue row is the transaction fence, and the recursive
-          // call below performs the lookup and insert while holding it.
-          await tx
-            .select({ id: issues.id })
-            .from(issues)
-            .where(eq(issues.id, issueId))
-            .for("update");
-          return addComment(issueId, body, actor, options, tx);
-        });
+        const append = () =>
+          db.transaction(async (tx) => {
+            // Serialize run-authored comments on the issue so a provider retry
+            // cannot publish the same visible result twice. This needs no schema
+            // change: the issue row is the transaction fence, and the recursive
+            // call below performs the lookup and insert while holding it.
+            await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(eq(issues.id, issueId))
+              .for("update");
+            return addComment(issueId, body, actor, options, tx);
+          });
+        return options?.authorizationReason ===
+          CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
+          ? retryNativeChatReviewPresentation(append)
+          : append();
       }
       const issue = await dbOrTx
         .select({ companyId: issues.companyId })
@@ -11709,6 +11718,41 @@ export function issueService(db: Db) {
         actor.runId,
       );
       const createdByRunId = createdByRun?.id ?? null;
+      if (
+        createdByRunId &&
+        options?.authorizationReason === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON
+      ) {
+        const [presentationRun] = await dbOrTx
+          .select({ resultJson: heartbeatRuns.resultJson })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, createdByRunId),
+              eq(heartbeatRuns.companyId, issue.companyId),
+            ),
+          )
+          .limit(1);
+        if (
+          presentationRun?.resultJson?.finalizationReasonCode ===
+            "governed_response_waiting" &&
+          (parseObject(presentationRun.resultJson.nativeResult).summary !== body ||
+            !(await authorizeNativeChatReviewPresentation(
+              dbOrTx,
+              {
+                companyId: issue.companyId,
+                issueId,
+                runId: createdByRunId,
+                resultJson: presentationRun.resultJson,
+              },
+              "nonblocking",
+            )))
+        ) {
+          throw conflict(
+            "This chat response is no longer authorized for external presentation",
+            { code: "chat_review_response_presentation_denied" },
+          );
+        }
+      }
       if (actor.runId && !createdByRunId) {
         logger.warn(
           { issueId, companyId: issue.companyId, runId: actor.runId },

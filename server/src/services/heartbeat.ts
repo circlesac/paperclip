@@ -23163,6 +23163,11 @@ export function heartbeatService(
               finalAgentMessage,
               preferFinalResponseOverExistingComment:
                 externalChatPresentationContext,
+              externalChatReviewResponseSummaryAuthorized:
+                persistedResultJson?.finalizationReasonCode ===
+                  "governed_response_waiting" &&
+                externalChatPresentationAuthorization ===
+                  CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
               externalChatResponseWakeSummaryAuthorized:
                 Boolean(adapterResult.nativeFinalization) &&
                 externalChatPresentationAuthorization ===

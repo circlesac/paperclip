@@ -785,3 +785,50 @@ UI typecheck and token gates pass. All **8/8** inspector tests pass after
 explicitly selecting Overview before asserting its label
 (`native-inspector-status-root-03.log`). No raw capture or credential exposure
 was enabled.
+
+### Review-preserving chat presentation and receipt recovery (September 8)
+
+The follow-up separates a current authorized chat answer from resolution of a
+pre-existing native completion review. A server-minted proof binds the committed
+decision, accepted canonical result and assessment, exact review policy, causal
+requester and destination. It permits only the canonical final summary and
+selected files; generic governed waits, new questions/approvals, raw provider
+output and forged markers remain private. Current permission, task status,
+review policy and destination are rechecked at comment creation and transport.
+A later valid chat wait under the same unchanged review does not invalidate
+files already queued by an earlier turn.
+
+Independent reviews also closed crash and contention edges: proof/result
+projection is recoverable from the committed tuple, reconciliation materializes
+the reply/files exactly once without resolving the review, and an atomic
+ownership guard preserves a concurrently installed recovery hold. Completed
+presentations take a cheap existence fast path, including operator-deleted
+comments, so recovery neither recreates them nor repeatedly performs expensive
+authorization transactions. Comment retries release all transaction locks;
+pre-provider authorization contention is retryable, not ambiguous delivery.
+
+The duplicate-ingress stress test initially exposed an omitted receipt on the
+existing-message retry path. That path now recovers its idempotent reaction
+only after a durable wake receipt. A deterministic endpoint-lock test proves
+one comment, one wake and one visible receipt after the retry. The broader
+duplicate storm test now permits only the specific transient lock error from
+direct synchronous SDK callbacks and verifies the durable queue drains.
+
+- Focused native review/recovery tests: **76/76**
+  (`native-review-presentation-08.log`), including concurrent ownership holds,
+  repeated crash replay, later same-review decisions and operator deletion.
+- Full chat integration plus reviewed binding/interaction compatibility:
+  **313/313**, including **296/296** chat integration tests
+  (`native-review-chat-compat-root-02.log`). The earlier 311/312 result exposed
+  the receipt-recovery defect and is not recorded as a pass.
+- Both independent code reviews passed. The full native-runtime cohort passed
+  **1,277/1,277** across 33 files in 81.62s
+  (`native-review-full-root-01.log`), and emitted server compilation passed
+  (`native-review-emitted-tsc-root-01.log`). These precede two narrow follow-ups:
+  skipping redundant metadata restoration for the latest already-materialized
+  decision and excluding only adapter-managed `paperclipRuntimeServices` and
+  `paperclipRuntimePrimaryUrl` display fields from the otherwise unchanged
+  context hash. Those final differences passed **78/78** focused tests
+  (`native-review-presentation-09.log`) and server typechecking; changed causal
+  wake data still denies publication.
+  Live media qualification remains pending until the new server is restarted.

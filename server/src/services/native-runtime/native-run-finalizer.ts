@@ -32,6 +32,16 @@ import { issueService } from "../issues.js";
 import { nativeSha256 } from "./canonical.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
+import {
+  authorizeNativeChatReviewPresentation,
+  hasMaterializedNativeReviewResponse,
+  restoreNativeChatReviewPresentationInTransaction,
+} from "./native-chat-review-presentation.js";
+import { logger } from "../../middleware/logger.js";
+import {
+  isNativeRunnerOwnershipHeld,
+  nativeRunnerOwnershipNotHeldCondition,
+} from "./native-runner-ownership.js";
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -451,6 +461,7 @@ async function projectCommittedRun(input: {
     eq(heartbeatRuns.id, input.run.id),
     eq(heartbeatRuns.runtimeMode, "native"),
     inArray(heartbeatRuns.status, ["queued", "running", "failed"]),
+    nativeRunnerOwnershipNotHeldCondition(),
   )).returning();
   // The WHERE clause above allows "failed" as a source status, so a run that
   // failed before its coordinator committed can still pick up the committed
@@ -464,6 +475,81 @@ async function projectCommittedRun(input: {
   }
 }
 
+async function materializeCommittedReviewResponse(db: Db, runId: string) {
+  try {
+    const [run] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    if (!run?.nativeIssueId || !run.resultJson?.externalChatReviewPresentation)
+      return;
+    const decisionId = record(
+      run.resultJson.externalChatReviewPresentation,
+    ).decisionId;
+    if (
+      typeof decisionId !== "string" ||
+      (await hasMaterializedNativeReviewResponse(db, {
+        companyId: run.companyId,
+        issueId: run.nativeIssueId,
+        runId,
+        decisionId,
+      }))
+    )
+      return;
+    const summary = record(run.resultJson.nativeResult).summary;
+    if (
+      typeof summary !== "string" ||
+      !(await authorizeNativeChatReviewPresentation(db, {
+        companyId: run.companyId,
+        issueId: run.nativeIssueId,
+        runId,
+        resultJson: run.resultJson,
+      }))
+    )
+      return;
+    // The coordinator transaction is already committed. addComment owns a
+    // fresh issue transaction, rechecks the proof and carries selected files;
+    // its same-run/text and publication keys make recovery replay idempotent.
+    await issueService(db).addComment(
+      run.nativeIssueId,
+      summary,
+      { agentId: run.agentId, runId },
+      {
+        authorizationReason: "allow_chat_run_presentation",
+      },
+    );
+  } catch (error) {
+    // The durable committed proof remains retryable by the next reconciler
+    // sweep. Presentation failure must not reclassify a successful native run.
+    logger.warn(
+      { runId, error },
+      "Committed chat review response is awaiting presentation retry",
+    );
+  }
+}
+
+/** Presentation recovery is independent from re-arbitrating issue status. */
+export async function repairCommittedNativeReviewResponse(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+    decisionId: string;
+    resultId: string;
+    assessmentId: string;
+  },
+) {
+  if (await hasMaterializedNativeReviewResponse(db, input)) return;
+  const restored = await db.transaction((tx) =>
+    restoreNativeChatReviewPresentationInTransaction(
+      tx as unknown as Db,
+      input,
+    ),
+  );
+  if (restored) await materializeCommittedReviewResponse(db, input.runId);
+}
 export async function finalizeNativeRun(input: {
   db: Db;
   runId: string;
@@ -489,7 +575,36 @@ export async function finalizeNativeRun(input: {
   });
   const coordinator = claim.coordinator;
   if (!claim.leaseOwner && coordinator.phase === "committed") {
-    if (input.projectRunStatus) await projectCommittedRun({ db: input.db, run, coordinator });
+    if (isNativeRunnerOwnershipHeld(run)) return coordinator;
+    const presentationAlreadyMaterialized = coordinator.decisionId
+      ? await hasMaterializedNativeReviewResponse(input.db, {
+          companyId: run.companyId,
+          issueId: coordinator.issueId,
+          runId: run.id,
+          decisionId: coordinator.decisionId,
+        })
+      : false;
+    if (
+      !presentationAlreadyMaterialized &&
+      coordinator.decisionId &&
+      coordinator.resultId &&
+      coordinator.assessmentId
+    ) {
+      await input.db.transaction((tx) =>
+        restoreNativeChatReviewPresentationInTransaction(tx as unknown as Db, {
+          companyId: run.companyId,
+          issueId: coordinator.issueId,
+          runId: run.id,
+          decisionId: coordinator.decisionId!,
+          resultId: coordinator.resultId!,
+          assessmentId: coordinator.assessmentId!,
+        }),
+      );
+    }
+    if (input.projectRunStatus)
+      await projectCommittedRun({ db: input.db, run, coordinator });
+    if (input.projectRunStatus && !presentationAlreadyMaterialized)
+      await materializeCommittedReviewResponse(input.db, input.runId);
     return coordinator;
   }
   const [resultRow, contractRow] = await Promise.all([
@@ -629,6 +744,12 @@ export async function finalizeNativeRun(input: {
           decision.reasonCode === "external_chat_response_waiting"
             ? { agentId: run.agentId }
             : undefined,
+        reviewResponsePresentation:
+          decision.reasonCode === "governed_response_waiting" &&
+          governanceGate?.kind === "interaction" &&
+          externalChatResponseWaitAuthorization === "authorized"
+            ? { agentId: run.agentId, resultId: resultRow.id, gateId: governanceGate.id }
+            : undefined,
         failpoint: input.failpoint,
       });
       const now = new Date();
@@ -656,6 +777,12 @@ export async function finalizeNativeRun(input: {
           authoritativeDecision: decision.toStatus,
           finalizationPolicyVersion: decision.policyVersion,
           finalizationReasonCode: decision.reasonCode,
+          // Only the locked status transaction can mint this presentation
+          // proof. Never carry a runner-provided marker forward.
+          externalChatReviewPresentation: record(committed.decision.decisionJson).externalChatReviewPresentation
+            ? { ...record(record(committed.decision.decisionJson).externalChatReviewPresentation), decisionId: committed.decision.id }
+            : null,
+          ...(record(committed.decision.decisionJson).externalChatReviewPresentation ? { nativeResult: result } : {}),
           verificationCaveats: assessment.verificationCaveats,
           ignoredAttentionRequests: assessment.ignoredAttentionRequests,
           issueStatusBefore: authoritativeIssue.status,
@@ -669,6 +796,7 @@ export async function finalizeNativeRun(input: {
       if (input.projectRunStatus && !alreadyEmittedByCommittedDecision && updatedRun) {
         await emitAgentTaskRun(input.db, updatedRun);
       }
+      if (input.projectRunStatus) await materializeCommittedReviewResponse(input.db, input.runId);
       return { ...coordinator, phase: finalizationPhase, assessmentId: assessmentRow.id, decisionId: committed.decision.id };
     } catch (error) {
       if (error instanceof NativeStatusRaceError && attempt < 2) {

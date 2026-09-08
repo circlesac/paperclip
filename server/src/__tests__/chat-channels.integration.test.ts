@@ -15058,6 +15058,84 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  it("recovers the visible receipt exactly once after wake acceptance contention", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    const first = makeThread({
+      channelId: "C-RECEIPT-RETRY",
+      id: "slack:C-RECEIPT-RETRY:1000.1",
+      name: "receipt-retry",
+    });
+    const message = makeMessage({
+      id: "1000.1",
+      text: "@maya acknowledge this after retry",
+      mentioned: true,
+    });
+    let releaseLock!: () => void;
+    let lockEntered!: () => void;
+    const holdLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      lockEntered = resolve;
+    });
+    let lockTransaction: Promise<unknown> | undefined;
+    first.subscribe.mockImplementationOnce(async () => {
+      lockTransaction = db.transaction(async (tx) => {
+        await tx
+          .select({ id: chatEndpoints.id })
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, endpoint.id))
+          .for("update");
+        lockEntered();
+        await holdLock;
+      });
+      await entered;
+    });
+    try {
+      await expect(
+        deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          thread: first.thread,
+          message,
+          trigger: "mention",
+        }),
+      ).rejects.toMatchObject({ cause: { code: "55P03" } });
+      expect(wakeup).not.toHaveBeenCalled();
+      expect(runtime.endpoints.get(endpoint.id)?.reactions).toEqual([]);
+    } finally {
+      releaseLock();
+      await lockTransaction;
+    }
+    await vi.waitFor(
+      async () => {
+        await service.processPendingDeliveries();
+        expect(wakeup).toHaveBeenCalledTimes(1);
+        expect(runtime.endpoints.get(endpoint.id)?.reactions).toEqual([
+          { threadId: first.thread.id, messageId: message.id, emoji: "eyes" },
+        ]);
+      },
+      { timeout: 10_000 },
+    );
+    await service.processPendingDeliveries();
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(runtime.endpoints.get(endpoint.id)?.reactions).toHaveLength(1);
+    const [delivery] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.endpointId, endpoint.id));
+    expect(delivery).toMatchObject({ state: "processed" });
+    expect(
+      await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.companyId, fixture.companyId)),
+    ).toHaveLength(1);
+    await service.shutdown();
+  });
+
   it("deduplicates inbound events, keeps one task per thread, and requires enablement for newly discovered channels", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service, wakeup } =
@@ -15079,7 +15157,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       mentioned: true,
     });
 
-    await Promise.all(
+    const duplicateResults = await Promise.allSettled(
       Array.from({ length: 12 }, () =>
         deliverMessage({
           callbacks,
@@ -15090,6 +15168,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         }),
       ),
     );
+    // Concurrent duplicate receipts can briefly hold the endpoint while the
+    // issue-first wake acceptance checks it with NOWAIT. The direct SDK test
+    // callback surfaces that contention; its durable delivery must still drain
+    // to exactly one wake rather than requiring every synchronous call to win.
+    for (const result of duplicateResults) {
+      if (result.status === "rejected") {
+        expect(result.reason).toMatchObject({ cause: { code: "55P03" } });
+      }
+    }
     await deliverMessage({
       callbacks,
       endpointId: endpoint.id,
@@ -15097,6 +15184,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       message: firstMessage,
       trigger: "mention",
     });
+    await vi.waitFor(
+      async () => {
+        await service.processPendingDeliveries();
+        expect(wakeup).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 10_000 },
+    );
 
     let conversations = await db
       .select()
