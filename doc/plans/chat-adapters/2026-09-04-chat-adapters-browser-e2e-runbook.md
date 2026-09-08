@@ -519,7 +519,9 @@ Run C5 and C6 with GitHub-specific expectations:
 - long output is one GFM comment updated at a coarse cadence, not a stream of noisy comments;
 - provider edits preserve a stable message link and final content;
 - rich actions/forms fall back to explanatory text plus an authenticated Paperclip link;
-- the current GitHub adapter is text-only: provider attachments are not ingested, and URLs in Markdown remain ordinary text links rather than fetched or stored files;
+- public inbound GitHub uploads referenced in the exact admitted comment are ingested from canonical `github.com/user-attachments/assets/…` or `files/…` URLs. Test a PNG and text file in issue, PR, and inline-review comments, then verify exact bytes on the Paperclip task and native agent inspection. Arbitrary external links are not fetched;
+- attachment downloads use no App token, user token, or browser cookie. Private/access-gated attachments remain unavailable: verify a 403/404 or login/error response produces a current-input omission, no stored file, and no substitution of an older attachment;
+- restart before deferred attachment processing and verify the stable comment-bound descriptor recovers once. Signed CDN redirect URLs remain transient; ordinary delivery JSON contains only the original query-free locator. Downloads retain deployment MIME/byte limits, public-address/redirect allowlists, a 20-second per-file deadline and shared 60-second batch deadline. After batch expiry, remaining files produce explicit current-input omissions without further network requests. More than 20 file references produce an attachment-limit omission that survives restart rather than silently claiming all files were imported;
 - outbound files use safe links when native upload is unavailable;
 - there is no DM, ephemeral, modal, or native button claim in the UI;
 - asking Maya to inspect or change repository code does not grant access. Without a separate GitHub tool connection, Maya returns a safe limitation/link and no code operation occurs.
@@ -537,7 +539,9 @@ Run C5 and C6 with GitHub-specific expectations:
 
 ### G7 — GitHub evidence and cleanup
 
-Capture the App permission screen, selected repositories, issue/PR/review conversations, reaction/edit behavior, fallback link, Conversations rows, duplicate delivery, and unavailable/recovered state. Close test issues/PRs, delete the disposable GitHub App, revoke identity links, and remove the Paperclip connection. The current GitHub adapter does not upload fixture files; URLs used in text-only fallback checks require no provider-file cleanup. Never delete a repository unless the authorization envelope explicitly names it as disposable.
+Capture the App permission screen, selected repositories, issue/PR/review conversations, reaction/edit behavior, public inbound attachment hashes, private-file omission, fallback link, Conversations rows, duplicate delivery, and unavailable/recovered state. Close test issues/PRs, delete the disposable GitHub App, revoke identity links, and remove the Paperclip connection. The GitHub App does not upload output files; public inbound fixtures are user-uploaded and must be included in the authorized cleanup scope. Never delete a repository unless the authorization envelope explicitly names it as disposable.
+
+GitHub documents [anonymous access for public uploads and repository-gated private uploads](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/attaching-files). This public-only ingestion does not claim private App-token downloads. The [GitHub CLI upload implementation](https://github.com/cli/cli/blob/trunk/internal/attachments/client.go) permits OAuth/PAT/fine-grained PAT credentials, not App installation tokens; Paperclip therefore retains its truthful private-task outbound fallback without broadening repository permissions.
 
 ## 7. Microsoft Teams live browser runbook
 

@@ -137,6 +137,13 @@ import {
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { safeChatTaskUrl } from "./chat-task-url.js";
+import {
+  GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS,
+  GitHubAttachmentUnavailableError,
+  githubAttachmentLimitOmissions,
+  prepareGitHubPublicAttachment,
+  restoreGitHubAttachmentLimitOmissions,
+} from "./chat-github-attachments.js";
 import { getExternalChannelBindingSummary } from "./chat-channel-binding.js";
 import {
   discoverDedicatedGitHubAppInstallation,
@@ -8444,6 +8451,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     issueId: string;
     issueCommentId: string;
     attachments: Attachment[];
+    attachmentLimitOmissions?: number;
     actorUserId: string | null;
   }): Promise<{
     storedIds: string[];
@@ -8454,6 +8462,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       omissionReasons[reason] = (omissionReasons[reason] ?? 0) + count;
     };
     const boundedAttachments = input.attachments.slice(0, 20);
+    if (
+      input.endpoint.provider === "github" &&
+      input.attachmentLimitOmissions
+    ) {
+      omit("attachment_limit", input.attachmentLimitOmissions);
+    }
     if (input.attachments.length > boundedAttachments.length) {
       omit(
         "attachment_limit",
@@ -8501,8 +8515,23 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       existingByFingerprint.set(fingerprint, ids);
     }
     const storedIds: string[] = [];
-    for (const attachment of boundedAttachments) {
+    // One shared deadline bounds the sequential batch; an expired batch never
+    // starts another GitHub request. Other providers retain their own policy.
+    const githubBatchSignal =
+      input.endpoint.provider === "github"
+        ? AbortSignal.timeout(GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS)
+        : undefined;
+    for (let attachment of boundedAttachments) {
       try {
+        // GitHub's anonymized upload URLs carry no trustworthy MIME metadata.
+        // Resolve public bytes only here, after durable comment admission, and
+        // then apply the same storage/type policy as every native attachment.
+        if (input.endpoint.provider === "github") {
+          attachment = await prepareGitHubPublicAttachment(
+            attachment,
+            githubBatchSignal,
+          );
+        }
         if (
           attachment.size !== undefined &&
           attachment.size > MAX_ATTACHMENT_BYTES
@@ -8571,7 +8600,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         });
         storedIds.push(row.id);
       } catch (error) {
-        omit("processing_failed");
+        // Use the closed current-input omission vocabulary consumed by native
+        // prompts; provider-specific diagnostics remain redacted log codes.
+        omit(
+          error instanceof GitHubAttachmentUnavailableError
+            ? "download_unavailable"
+            : "processing_failed",
+        );
         // A malformed or unavailable provider attachment must not strand the
         // durable text delivery. The rejected file is intentionally omitted;
         // the delivery remains auditable through its normalized attachment
@@ -9673,6 +9708,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         text: message.text.slice(0, MAX_INBOUND_TEXT),
         mentionedBot: message.isMention === true,
         providerSentAt: providerSentAt?.toISOString() ?? null,
+        ...(endpoint.provider === "github" &&
+        githubAttachmentLimitOmissions(message)
+          ? {
+              attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
+            }
+          : {}),
         attachments: message.attachments.slice(0, 20).map((attachment) => ({
           name: sanitizeFilename(attachment.name),
           mimeType: normalizeContentType(attachment.mimeType),
@@ -10264,6 +10305,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           issueId: rebound.issueId,
           issueCommentId: inboundCommentId,
           attachments: nativeInboundAttachments,
+          attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
           actorUserId: rebound.authorUserId,
         });
         if (
@@ -11193,6 +11235,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         issueId: conversation.issueId,
         issueCommentId: comment.id,
         attachments: nativeInboundAttachments,
+        attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
         actorUserId,
       });
       if (
@@ -11773,6 +11816,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         text?: unknown;
         mentionedBot?: unknown;
         attachments?: Array<{ recovery?: unknown }>;
+        attachmentLimitOmissions?: unknown;
       };
       conversation?: { providerUrl?: unknown };
     };
@@ -11783,7 +11827,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const attachments = (normalized.message?.attachments ?? [])
       .map((attachment) =>
         attachment.recovery
-          ? endpointRuntime.rehydrateAttachment(attachment.recovery)
+          ? endpointRuntime.rehydrateAttachment(attachment.recovery, {
+              threadId: thread.id,
+              messageId: providerMessageId,
+            })
           : null,
       )
       .filter((attachment): attachment is Attachment => Boolean(attachment));
@@ -11815,6 +11862,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       links: [],
       isMention: normalized.message?.mentionedBot === true,
     } as unknown as Message;
+    if (endpointRuntime.provider === "github") {
+      restoreGitHubAttachmentLimitOmissions(
+        message,
+        normalized.message?.attachmentLimitOmissions,
+      );
+    }
     const normalizedTrigger = normalized.trigger;
     const trigger: ChatSdkMessageCallbackEvent["trigger"] =
       normalizedTrigger === "direct_message" ||

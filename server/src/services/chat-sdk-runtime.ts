@@ -49,6 +49,13 @@ import {
 } from "chat";
 import type { StateAdapter } from "chat";
 import {
+  githubAttachmentLocator,
+  githubPublicAttachmentsFromMessage,
+  rehydrateGitHubPublicAttachment,
+  validateGitHubAttachmentLocator,
+  type GitHubPublicAttachmentLocator,
+} from "./chat-github-attachments.js";
+import {
   createPaperclipChatSdkState,
   type ChatSdkStatePersistence,
 } from "./chat-sdk-state.js";
@@ -159,6 +166,7 @@ interface DurableAttachmentMetadata {
 }
 
 type ChatSdkAttachmentLocator =
+  | GitHubPublicAttachmentLocator
   | {
       enterpriseId?: string;
       isEnterpriseInstall?: true;
@@ -196,7 +204,7 @@ type ChatSdkAttachmentLocator =
 export interface ChatSdkAttachmentRecoveryDescriptor {
   attachment: DurableAttachmentMetadata;
   locator: ChatSdkAttachmentLocator;
-  provider: Exclude<ChatSdkProvider, "github">;
+  provider: ChatSdkProvider;
   version: 1;
 }
 
@@ -1069,6 +1077,13 @@ function createAttachmentRecoveryDescriptor(
   if (!metadata) return null;
   const fetchMetadata = attachment.fetchMetadata ?? {};
 
+  if (provider === "github") {
+    const locator = githubAttachmentLocator(attachment);
+    return locator
+      ? { version: 1, provider, attachment: metadata, locator }
+      : null;
+  }
+
   if (provider === "slack") {
     const url = sanitizedRecoveryUrl(fetchMetadata.url ?? attachment.url);
     if (!url) return null;
@@ -1171,6 +1186,13 @@ function validatedAttachmentRecoveryDescriptor(
   if (!isRecord(value.attachment) || !isRecord(value.locator)) return null;
   const metadata = value.attachment as unknown as Attachment;
   const kind = value.locator.kind;
+  if (provider === "github" && kind === "github_public_attachment") {
+    const locator = validateGitHubAttachmentLocator(value.locator);
+    const attachment = durableAttachmentMetadata(metadata);
+    return locator && attachment
+      ? { version: 1, provider, attachment, locator }
+      : null;
+  }
   if (provider === "slack" && kind === "slack_private_url") {
     return createAttachmentRecoveryDescriptor(provider, {
       ...metadata,
@@ -1339,6 +1361,11 @@ function registerCallbacks(
       context?: MessageContext,
     ): Promise<void> => {
       if (!acceptsProviderScope(message.raw)) return;
+      if (provider === "github" && message.attachments.length === 0) {
+        message.attachments.push(
+          ...githubPublicAttachmentsFromMessage(message),
+        );
+      }
       await trackCallback(
         async () =>
           await callbacks.onMessage({
@@ -1903,12 +1930,21 @@ export class ChatSdkEndpointRuntime {
    * Rebuild an adapter-authenticated download closure after process restart.
    * Invalid, cross-provider, or no-longer-safe descriptors fail closed.
    */
-  rehydrateAttachment(descriptor: unknown): Attachment | null {
+  rehydrateAttachment(
+    descriptor: unknown,
+    source?: { threadId: string; messageId: string },
+  ): Attachment | null {
     const validated = validatedAttachmentRecoveryDescriptor(
       this.provider,
       descriptor,
     );
-    if (!validated || !this.adapter.rehydrateAttachment) return null;
+    if (!validated) return null;
+    if (validated.locator.kind === "github_public_attachment") {
+      return source
+        ? rehydrateGitHubPublicAttachment(validated.locator, source)
+        : null;
+    }
+    if (!this.adapter.rehydrateAttachment) return null;
     let fetchMetadata: Record<string, string>;
     switch (validated.locator.kind) {
       case "slack_private_url":

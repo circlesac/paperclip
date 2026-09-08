@@ -1181,3 +1181,94 @@ and human-answer wait. The current run actually starts at 08:39:42.527 and
 finishes at 08:40:01.536 (19.009s). This is an ambiguous aggregate-span label,
 not evidence of a 69-second current model call. The latest run and its private
 Runner Inspector are open in the Board for inspection; raw capture stays off.
+
+### Current-answer timing and live media recheck — 2026-09-08
+
+Commit `8becccc10` corrects the question-continuation timing boundary. The
+server exposes the latest answer's timestamp only after its existing durable
+authorization transaction commits. That attempt-local value creates
+`question_response.to_run_created`; it is not persisted into wake authority,
+markers, or telemetry. Original comment provenance and ordinary/retry timing
+remain unchanged. Root independently passed **108/108** trace, question-wait
+authorization, and redaction tests (`question-timing-root-01.log`). The author
+also passed the two actual-executor timing cases and direct server TypeScript
+checking. Live verification of the new timing boundary is still pending.
+
+On deployed `7df7d4ca1`, the real Discord media run
+`ffb87912-bede-4465-b894-414fd47b38e6` returned the original 128-byte note and
+2,111,878-byte PNG with matching hashes, once each. Browser inspection shows
+the note's “cobalt otter 47” phrase and the actual orange-tabby image. The
+brief response describes pale green eyes and a pink-and-blue cushion without
+an unconfirmed-delivery disclaimer. Run time was **43.575s**, with the final
+image published **50.234s** after the request.
+
+Slack run `4347cb30-40d2-4ee3-b42e-ec50550d061e` likewise returned the original
+128-byte note and 2,088,249-byte PNG with matching hashes and single-attempt
+publications. Both the file preview and full-size image were inspected in the
+signed-in browser. The retained original filename contains “telegram”; the
+hash matches this Slack conversation's own upload, not another conversation's
+file. Run time was **68.388s**, request-to-image **78.952s**. The text still
+says “prepared below,” a minor wording weakness despite successful delivery.
+For these two runs, `heartbeat.queue` was 10ms each, runner startup was
+1.30–1.45s, and `agent.turn` was 41.553s / 66.697s. These file-work timings
+must not be represented as queue delay or compared directly to simple echoes.
+
+GitHub run `9fa4bd36-21f1-4cee-b63a-c1f6fa946314` produced
+`github-file-proof-0908.txt` on the same review-thread task. The visible Board
+file controls work, and a read-only local content-route check returned HTTP
+200 with exactly 18 bytes, no newline, and SHA256
+`ec122da672aaa0e82dff8877c0240be2c3d5eab7f4f9545dae73d4d513347703`.
+The provider's fallback comment `3956106559` settled once at 08:55:14.201Z,
+but had no useful Open task link because this instance advertised loopback.
+The private Board also shows repeated model workspace/filename typos during
+the 54.155s run; this is a model-quality cost, not transport queueing. A
+closed-metadata audit of all three actual Codex rollout windows confirms
+`gpt-5.6-luna`, not merely the configured model. GitHub made seven tool round
+trips: five commands, file registration, and completion. Two commands supplied
+the wrong workspace and one returned a missing-file error. The failures
+themselves returned in 29–64ms, while failure-to-next-call intervals summed
+to 19.148s. The applied file receipt correctly says `paperclip_task_only`.
+
+The local launcher's canonical Board URLs now use the existing private
+Tailscale HTTPS origin, while the public webhook-only Funnel remains on
+`:8443`. Before restart, read-only checks verified private Board task/health
+HTTP 200 and public Funnel task HTTP 404. No routing, audience, credential,
+or public Board access was added. A fresh provider fallback-link check remains
+required after restart.
+
+GitHub's official CLI upload implementation explicitly excludes App tokens;
+using a personal-token uploader is not an acceptable chat-identity workaround.
+Public inbound attachment ingestion is being implemented separately from the
+still-unsupported private inbound and native App upload cases. New work also
+adds closed, cadence-limited native progress without relaying event payloads.
+Neither in-flight change is counted as live-qualified here.
+
+`origin/master` was fetched to `297d8741f5f192c66abbec325b1e956cf0e5e667`.
+The two new code changes after the previously integrated `d8b958053` are
+awaiting reconciliation; the explicit no-lockfile-edit constraint remains.
+
+The isolated deterministic browser suite passed **9/9** in 2.2 minutes
+(`chat-ui-native-progress-root-01.log`): all five provider setup/management
+flows and four file-batch delivery/reload recovery scenarios. It used a fresh
+throwaway instance on port 3199, not the signed-in live accounts or port 3103.
+
+The frozen safe-progress/public-GitHub implementation then passed the full
+chat integration suite **309/309** on a fresh embedded PostgreSQL fixture
+(`chat-progress-github-full-root-01.log`), plus root direct server/shared/UI
+typechecks. Safe progress passed **34/34** unit cases and **6/6** focused
+database cases, including exact 19.999s/20s boundaries and same-phase
+suppression. Independent review found no additional privacy or ordering
+blocker. Provider prose comes only from exact event-type constants; selectors
+do not read native event messages or payloads. Existing final/question/current
+reach fences and the single working-message lane remain in place.
+
+GitHub's focused cohort passed **156/156**, including 50 new helper tests;
+four restarted-ingress database cases cover public bytes, private 404,
+21-reference omission accounting, and abort without subsequent fetches.
+Independent review caught the original silent overflow, which is now fixed.
+Downloads are credential-free with pinned public-network egress, bounded
+redirects/bytes, per-file timeout, and a shared 60-second download-batch
+budget. This is not a hard total admission deadline: storage and bounded DNS
+resolution have their own costs. Only canonical source-bound URLs and a
+bounded omission count survive restart; signed redirects remain ephemeral.
+This checkpoint still requires live deployment and provider qualification.

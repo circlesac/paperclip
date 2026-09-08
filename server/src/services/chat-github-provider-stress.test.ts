@@ -290,7 +290,27 @@ describe("GitHub published adapter stress contract", () => {
     ]);
     expect(deliveries[2]?.message.text).toContain(uploadedImageUrl);
     expect(deliveries[2]?.message.text).toContain(uploadedTextUrl);
-    expect(deliveries[2]?.message.attachments).toEqual([]);
+    expect(deliveries[2]?.message.attachments).toHaveLength(2);
+    for (const attachment of deliveries[2]!.message.attachments) {
+      expect(attachment.fetchData).toBeUndefined();
+      const descriptor = runtime.attachmentRecoveryDescriptor(attachment);
+      expect(descriptor).toMatchObject({
+        provider: "github",
+        locator: { kind: "github_public_attachment", sourceMessageId: "4401" },
+      });
+      expect(
+        runtime.rehydrateAttachment(descriptor, {
+          threadId: deliveries[2]!.message.threadId,
+          messageId: "4401",
+        }),
+      ).not.toBeNull();
+      expect(
+        runtime.rehydrateAttachment(descriptor, {
+          threadId: deliveries[2]!.message.threadId,
+          messageId: "4402",
+        }),
+      ).toBeNull();
+    }
     expect(providerRequests).toHaveLength(6);
     expect(providerRequests.every((url) => url.includes("/reactions"))).toBe(
       true,

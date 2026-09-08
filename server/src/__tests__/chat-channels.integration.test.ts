@@ -44,6 +44,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueAttachments,
@@ -101,6 +102,13 @@ import {
 } from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
+import {
+  GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS,
+  githubAttachmentLocator,
+  githubPublicAttachmentsFromMessage,
+  rehydrateGitHubPublicAttachment,
+} from "../services/chat-github-attachments.js";
+import * as attachmentEgress from "../services/remote-http-fetch.js";
 import type {
   PrpStructuredRunResult,
   PrpTerminalState,
@@ -198,6 +206,10 @@ class FakeEndpointRuntime {
     private readonly attachmentBodies: Map<string, Buffer>,
     private readonly initializeHook?: () => Promise<void>,
   ) {}
+
+  get provider() {
+    return this.options.providerConfig.provider;
+  }
 
   async handleWebhook(request: Request) {
     this.webhookRequest = request;
@@ -416,6 +428,17 @@ class FakeEndpointRuntime {
   }
 
   attachmentRecoveryDescriptor(attachment: Attachment) {
+    if (this.options.providerConfig.provider === "github") {
+      const locator = githubAttachmentLocator(attachment);
+      return locator
+        ? {
+            version: 1,
+            provider: "github",
+            attachment: { type: attachment.type, name: attachment.name },
+            locator,
+          }
+        : null;
+    }
     const recoveryKey = attachment.fetchMetadata?.testRecoveryKey;
     if (typeof recoveryKey !== "string") return null;
     return {
@@ -515,7 +538,10 @@ class FakeEndpointRuntime {
     } as Message;
   }
 
-  rehydrateAttachment(descriptor: unknown): Attachment | null {
+  rehydrateAttachment(
+    descriptor: unknown,
+    source?: { threadId: string; messageId: string },
+  ): Attachment | null {
     this.rehydratedAttachmentDescriptors.push(descriptor);
     if (!descriptor || typeof descriptor !== "object") return null;
     const value = descriptor as {
@@ -524,6 +550,14 @@ class FakeEndpointRuntime {
       attachment?: Attachment;
       locator?: { kind?: unknown; recoveryKey?: unknown };
     };
+    if (
+      this.options.providerConfig.provider === "github" &&
+      value.provider === "github" &&
+      value.version === 1 &&
+      source
+    ) {
+      return rehydrateGitHubPublicAttachment(value.locator, source);
+    }
     if (
       value.version !== 1 ||
       value.provider !== this.options.providerConfig.provider ||
@@ -1749,6 +1783,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       endpoint,
       callbacks,
       webhookSecret,
+      providerFetch,
       setInstallationId(value: number) {
         installationId = value;
       },
@@ -13820,6 +13855,248 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(wakeup).not.toHaveBeenCalled();
     await restarted.service.shutdown();
   });
+
+  it.each([
+    { status: 200, count: 1, expireBatch: false },
+    { status: 404, count: 1, expireBatch: false },
+    { status: 200, count: 21, expireBatch: false },
+    { status: 200, count: 3, expireBatch: true },
+  ])(
+    "ingests only admitted public GitHub attachments after restart (HTTP $status, $count files, expired batch $expireBatch)",
+    async ({ status, count, expireBatch }) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const deferred: Array<() => void> = [];
+      const context = await configuredGitHubEndpoint(fixture, {
+        storage: storage.storage,
+        deferWebhookProcessing: true,
+        scheduleDeferredWork: (work) => deferred.push(work),
+      });
+      const { service, endpoint, callbacks } = context;
+      const sourceThreadId = "github:paperclipai/paperclip:issue:93";
+      const sourceUrl =
+        "https://github.com/user-attachments/files/31917991/public-proof.txt";
+      const thread = makeThread({
+        id: sourceThreadId,
+        channelId: "github:paperclipai/paperclip",
+        name: "paperclipai/paperclip",
+      });
+      const publicBody = Buffer.from("exact current GitHub public file");
+      const batch = new AbortController();
+      const egress = vi
+        .spyOn(attachmentEgress, "guardedRemoteHttpFetch")
+        .mockImplementation(async () => {
+          if (expireBatch) batch.abort();
+          return new Response(
+            status === 200 ? publicBody : "private response never retained",
+            { status, headers: { "content-type": "text/plain" } },
+          );
+        });
+      let restarted: ReturnType<typeof createService> | undefined;
+      let timeoutSpy: { mockRestore(): void } | undefined;
+      try {
+        await db
+          .update(chatEndpoints)
+          .set({ status: "active" })
+          .where(eq(chatEndpoints.id, endpoint.id));
+        const [resource] = await service.listResources(endpoint.id);
+        await service.replaceResources(endpoint.id, [
+          { id: resource!.id, enabled: false },
+        ]);
+        const send = async (id: string) => {
+          const urls = Array.from({ length: count }, (_, index) =>
+            index === 0
+              ? sourceUrl
+              : `https://github.com/user-attachments/files/${31917991 + index}/proof-${index}.txt`,
+          );
+          const message = makeMessage({
+            id,
+            text: "@maya inspect the exact current files",
+            mentioned: true,
+            userId: "42",
+            raw: {
+              type: "issue_comment",
+              threadType: "issue",
+              prNumber: 93,
+              repository: { full_name: "paperclipai/paperclip" },
+              comment: {
+                id: Number(id),
+                body: urls.map((url) => `[file](${url})`).join("\n"),
+                user: { id: 42 },
+              },
+            },
+          });
+          message.threadId = sourceThreadId;
+          message.formatted = {
+            type: "root",
+            children: urls.map((url) => ({ type: "link", url, children: [] })),
+          };
+          message.attachments.push(
+            ...githubPublicAttachmentsFromMessage(message),
+          );
+          await deliverMessage({
+            callbacks,
+            endpointId: endpoint.id,
+            provider: "github",
+            thread: thread.thread,
+            trigger: "mention",
+            message,
+          });
+        };
+        await send("93001");
+        await db
+          .update(chatDeliveries)
+          .set({ nextAttemptAt: new Date(0) })
+          .where(eq(chatDeliveries.endpointId, endpoint.id));
+        await service.processPendingDeliveries();
+        expect(egress).not.toHaveBeenCalled();
+        expect(storage.putFile).not.toHaveBeenCalled();
+        await service.replaceResources(endpoint.id, [
+          { id: resource!.id, enabled: true },
+        ]);
+        await send("93002");
+        expect(egress).not.toHaveBeenCalled();
+        const [delivery] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              like(chatDeliveries.providerEventId, "%:93002"),
+            ),
+          );
+        expect({
+          state: delivery!.state,
+          error: delivery!.redactedError,
+        }).toEqual({ state: "received", error: null });
+        expect(
+          (delivery!.normalizedEvent as { message: { attachments: unknown[] } })
+            .message.attachments[0],
+        ).toMatchObject({
+          recovery: {
+            provider: "github",
+            locator: {
+              url: sourceUrl,
+              sourceMessageId: "93002",
+              sourceThreadId,
+            },
+          },
+        });
+        expect(
+          (
+            delivery!.normalizedEvent as {
+              message: {
+                attachments: unknown[];
+                attachmentLimitOmissions?: number;
+              };
+            }
+          ).message,
+        ).toMatchObject({
+          attachments: expect.any(Array),
+          ...(count > 20 ? { attachmentLimitOmissions: 1 } : {}),
+        });
+        expect(
+          (delivery!.normalizedEvent as { message: { attachments: unknown[] } })
+            .message.attachments,
+        ).toHaveLength(Math.min(20, count));
+        await service.shutdown();
+        await db
+          .update(chatDeliveries)
+          .set({ nextAttemptAt: new Date(0) })
+          .where(eq(chatDeliveries.id, delivery!.id));
+        restarted = createService(
+          new FakeChatSdkRuntime(),
+          context.providerFetch as typeof globalThis.fetch,
+          { storage: storage.storage },
+        );
+        if (expireBatch) {
+          const timeout = AbortSignal.timeout.bind(AbortSignal);
+          timeoutSpy = vi
+            .spyOn(AbortSignal, "timeout")
+            .mockImplementation((ms) =>
+              ms === GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS
+                ? batch.signal
+                : timeout(ms),
+            );
+        }
+        await restarted.service.processPendingDeliveries();
+        const [storedDelivery] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.id, delivery!.id));
+        expect({
+          state: storedDelivery!.state,
+          error: storedDelivery!.redactedError,
+          recovered: restarted.runtime.endpoints.get(endpoint.id)
+            ?.rehydratedAttachmentDescriptors.length,
+        }).toEqual({
+          state: "processed",
+          error:
+            status === 200 && count <= 20 && !expireBatch
+              ? null
+              : expect.any(String),
+          recovered: Math.min(20, count),
+        });
+        expect(egress).toHaveBeenCalledTimes(
+          expireBatch ? 1 : Math.min(20, count),
+        );
+        expect(restarted.wakeup).toHaveBeenCalledTimes(1);
+        expect(storedDelivery!.state).toBe("processed");
+        expect(JSON.stringify(storedDelivery)).not.toContain(
+          "private response",
+        );
+        if (status === 200 && !expireBatch) {
+          expect(storage.putFile).toHaveBeenCalledTimes(Math.min(20, count));
+          expect(storage.putFile).toHaveBeenCalledWith(
+            expect.objectContaining({
+              body: publicBody,
+              originalFilename: "public-proof.txt",
+              contentType: "text/plain",
+            }),
+          );
+          const storedAttachments = await db
+            .select({ sha256: assets.sha256 })
+            .from(issueAttachments)
+            .innerJoin(assets, eq(assets.id, issueAttachments.assetId))
+            .where(eq(issueAttachments.companyId, fixture.companyId));
+          expect(storedAttachments).toHaveLength(Math.min(20, count));
+          expect(
+            storedAttachments.every(
+              (row) =>
+                row.sha256 ===
+                createHash("sha256").update(publicBody).digest("hex"),
+            ),
+          ).toBe(true);
+          if (count > 20) {
+            const wakeJson = JSON.stringify(restarted.wakeup.mock.calls);
+            expect(wakeJson).toContain('"attachment_limit":1');
+            expect(wakeJson).toContain("externalAttachmentOmissions");
+          }
+        } else {
+          expect(storage.putFile).not.toHaveBeenCalled();
+          const wakeJson = JSON.stringify(restarted.wakeup.mock.calls);
+          expect(wakeJson).toContain(`"download_unavailable":${count}`);
+          expect(wakeJson).toContain("externalAttachmentOmissions");
+          expect(
+            await db
+              .select()
+              .from(issueAttachments)
+              .where(eq(issueAttachments.companyId, fixture.companyId)),
+          ).toHaveLength(0);
+        }
+        await restarted.service.processPendingDeliveries();
+        expect(egress).toHaveBeenCalledTimes(
+          expireBatch ? 1 : Math.min(20, count),
+        );
+        expect(restarted.wakeup).toHaveBeenCalledTimes(1);
+      } finally {
+        await service.shutdown();
+        await restarted?.service.shutdown();
+        egress.mockRestore();
+        timeoutSpy?.mockRestore();
+      }
+    },
+  );
 
   it("rehydrates a durable attachment descriptor after restart and stores the file on the issue", async () => {
     const fixture = await seedCompany();
@@ -37741,6 +38018,384 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ).resolves.toHaveLength(1);
     },
   );
+
+  async function safeNativeProgressFixture(
+    provider: "slack" | "github" | "discord" | "telegram",
+    suffix: string,
+  ) {
+    const fixture = await seedCompany();
+    const configured =
+      provider === "slack"
+        ? await configuredSlackEndpoint(fixture)
+        : provider === "github"
+          ? await configuredGitHubEndpoint(fixture)
+          : provider === "discord"
+            ? await configuredDiscordEndpoint(fixture)
+            : await configuredTelegramEndpoint(fixture);
+    const { callbacks, endpoint, runtime, service } = configured;
+    const telegramChatId = `77113${suffix.padStart(3, "0")}`;
+    const messageId =
+      provider === "slack"
+        ? `1789000${suffix}.100001`
+        : provider === "github"
+          ? `9900${suffix}`
+          : provider === "discord"
+            ? `55555555555556${suffix.padStart(3, "0")}`
+            : `${telegramChatId}:101`;
+    const thread =
+      provider === "slack"
+        ? makeThread({
+            channelId: `C-SAFE-PROGRESS-${suffix}`,
+            id: `slack:C-SAFE-PROGRESS-${suffix}:${messageId}`,
+            name: `safe-progress-${suffix}`,
+          })
+        : provider === "github"
+          ? makeThread({
+              channelId: "github:paperclipai/paperclip",
+              id: `github:paperclipai/paperclip:issue:${700 + Number(suffix)}`,
+              name: "paperclipai/paperclip",
+            })
+          : provider === "discord"
+            ? makeThread({
+                channelId: `33333333333334${suffix.padStart(3, "0")}`,
+                id: `discord:1457808928258658549:33333333333334${suffix.padStart(3, "0")}:${messageId}`,
+                name: `safe-progress-${suffix}`,
+              })
+            : makeThread({
+                channelId: telegramChatId,
+                id: `telegram:${telegramChatId}`,
+                isDM: true,
+                name: `safe-progress-${suffix}`,
+              });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider,
+      thread: thread.thread,
+      message: makeMessage({
+        id: messageId,
+        mentioned: provider !== "telegram",
+        text:
+          provider === "telegram"
+            ? "Show safe progress"
+            : "@maya show safe progress",
+        userId: provider === "telegram" ? telegramChatId : "U-SAFE-PROGRESS",
+      }),
+      trigger: provider === "telegram" ? "direct_message" : "mention",
+    });
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    if (!conversation) throw new Error("Expected safe-progress conversation");
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected safe-progress runtime");
+
+    const createRun = async (label: string) => {
+      const runId = randomUUID();
+      const baseCreatedAt = new Date(Date.now() - 60_000);
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: fixture.companyId,
+        agentId: fixture.assignedAgentId,
+        runtimeMode: "native",
+        status: "running",
+        contextSnapshot: await chatWakeContext({
+          endpointId: endpoint.id,
+          issueId: conversation.issueId,
+          provider,
+          providerMessageId: messageId,
+        }),
+      });
+      await db.insert(chatPublications).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        conversationId: conversation.id,
+        issueId: conversation.issueId,
+        idempotencyKey: `run:${runId}:working:${endpoint.id}`,
+        payload: { text: `Maya is working on ${label}…`, progressState: "working" },
+        state: "pending",
+        createdAt: baseCreatedAt,
+        updatedAt: baseCreatedAt,
+      });
+      await service.processPendingPublications(100);
+      return { baseCreatedAt, runId };
+    };
+    const addEvent = async (
+      run: Awaited<ReturnType<typeof createRun>>,
+      eventType = "item.completed",
+      seq = 1,
+      createdAt = new Date(run.baseCreatedAt.getTime() + 30_000 + seq),
+    ) => {
+      await db.insert(heartbeatRunEvents).values({
+        companyId: fixture.companyId,
+        runId: run.runId,
+        agentId: fixture.assignedAgentId,
+        seq,
+        eventType,
+        message: "PRIVATE native event prose must stay in Paperclip",
+        payload: {
+          toolName: "secret_internal_tool",
+          arguments: { token: "PRIVATE-NATIVE-TOKEN" },
+          result: "PRIVATE-NATIVE-RESULT",
+          target: "PRIVATE-NATIVE-TARGET",
+        },
+        createdAt,
+      });
+    };
+    return {
+      addEvent,
+      conversation,
+      createRun,
+      endpoint,
+      fixture,
+      providerRuntime,
+      service,
+      thread,
+    };
+  }
+
+  it.each(["slack", "github", "discord", "telegram"] as const)(
+    "coalesces closed native progress on %s without projecting event content",
+    async (provider, index) => {
+      const context = await safeNativeProgressFixture(
+        provider,
+        String(index + 1),
+      );
+      const run = await context.createRun(`${provider} work`);
+      await context.addEvent(run);
+      // A future event name that merely shares an allowlisted prefix must not
+      // become provider authority or replace the latest exact event.
+      await context.addEvent(run, "item.completed.private-extension", 2);
+
+      await expect(
+        enqueueChatRunMilestones(db, { since: new Date(0) }),
+      ).resolves.toBe(1);
+      await context.service.processPendingPublications(100);
+
+      expect(context.providerRuntime.posts).toEqual([
+        {
+          threadId: context.thread.thread.id,
+          text: `Maya is working on ${provider} work…`,
+        },
+      ]);
+      expect(context.providerRuntime.edits).toEqual([
+        {
+          threadId: context.thread.thread.id,
+          messageId: "outbound-1",
+          text: "Maya is making progress…",
+        },
+      ]);
+      expect(
+        JSON.stringify({
+          edits: context.providerRuntime.edits,
+          posts: context.providerRuntime.posts,
+        }),
+      ).not.toMatch(/PRIVATE|secret_internal_tool/);
+      const progressRows = await db
+        .select()
+        .from(chatPublications)
+        .where(
+          like(
+            chatPublications.idempotencyKey,
+            `run:${run.runId}:working:${context.endpoint.id}:native:%`,
+          ),
+        );
+      expect(progressRows).toEqual([
+        expect.objectContaining({
+          idempotencyKey: `run:${run.runId}:working:${context.endpoint.id}:native:making_progress:1`,
+          payload: {
+            text: "Maya is making progress…",
+            progressState: "working",
+          },
+          providerMessageId: "outbound-1",
+          state: "published",
+        }),
+      ]);
+      await expect(
+        enqueueChatRunMilestones(db, { since: new Date(0) }),
+      ).resolves.toBe(0);
+      await expect(
+        context.service.processPendingPublications(100),
+      ).resolves.toBe(0);
+      expect(context.providerRuntime.posts).toHaveLength(1);
+      expect(context.providerRuntime.edits).toHaveLength(1);
+      await context.service.shutdown();
+    },
+  );
+
+  it("enforces the native progress cadence boundary and one publication per phase", async () => {
+    const context = await safeNativeProgressFixture("telegram", "8");
+    const run = await context.createRun("cadence boundaries");
+    const at = (offsetMs: number) =>
+      new Date(run.baseCreatedAt.getTime() + offsetMs);
+
+    await context.addEvent(run, "research.progressed", 1, at(19_999));
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(0);
+
+    await context.addEvent(run, "research.completed", 2, at(20_000));
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(1);
+    const [researchPublication] = await db
+      .select({ id: chatPublications.id })
+      .from(chatPublications)
+      .where(
+        eq(
+          chatPublications.idempotencyKey,
+          `run:${run.runId}:working:${context.endpoint.id}:native:researching:2`,
+        ),
+      );
+    if (!researchPublication) {
+      throw new Error("Expected research progress publication");
+    }
+    // Model a prior sweep at the event boundary so the next phase can exercise
+    // the same exact cadence without waiting on wall-clock time.
+    await db
+      .update(chatPublications)
+      .set({ createdAt: at(20_000), updatedAt: at(20_000) })
+      .where(eq(chatPublications.id, researchPublication.id));
+
+    await context.addEvent(run, "tool.execution.started", 3, at(39_999));
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(0);
+    await context.addEvent(run, "tool.execution.completed", 4, at(40_000));
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(1);
+
+    await context.addEvent(run, "tool.execution.progressed", 5, at(60_000));
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(0);
+    await expect(
+      db
+        .select({ id: chatPublications.id })
+        .from(chatPublications)
+        .where(
+          like(
+            chatPublications.idempotencyKey,
+            `run:${run.runId}:working:${context.endpoint.id}:native:%`,
+          ),
+        ),
+    ).resolves.toHaveLength(2);
+    await context.service.shutdown();
+  });
+
+  it("keeps native progress behind question, final, and current reach authority", async () => {
+    const context = await safeNativeProgressFixture("telegram", "9");
+
+    const questionRun = await context.createRun("a question");
+    await context.addEvent(questionRun);
+    await db.insert(issueThreadInteractions).values({
+      companyId: context.fixture.companyId,
+      issueId: context.conversation.issueId,
+      kind: "ask_user_questions",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: context.fixture.assignedAgentId,
+      sourceRunId: questionRun.runId,
+      status: "pending",
+      payload: {
+        version: 1,
+        prompt: "Choose one",
+        questions: [
+          {
+            id: "choice",
+            prompt: "Choose one",
+            options: [
+              { id: "a", label: "A" },
+              { id: "b", label: "B" },
+            ],
+          },
+        ],
+      },
+    });
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(0);
+
+    const revokedRun = await context.createRun("revoked reach");
+    await context.addEvent(revokedRun);
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(1);
+    await db
+      .update(chatEndpoints)
+      .set({ allowDirectMessages: false, updatedAt: new Date() })
+      .where(eq(chatEndpoints.id, context.endpoint.id));
+    await context.service.processPendingPublications(100);
+    const [revokedProgress] = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        like(
+          chatPublications.idempotencyKey,
+          `run:${revokedRun.runId}:working:${context.endpoint.id}:native:%`,
+        ),
+      );
+    expect(revokedProgress).toMatchObject({ state: "cancelled", attempts: 1 });
+    await db
+      .update(chatEndpoints)
+      .set({ allowDirectMessages: true, updatedAt: new Date() })
+      .where(eq(chatEndpoints.id, context.endpoint.id));
+
+    const finalRun = await context.createRun("a final answer");
+    await context.addEvent(finalRun);
+    await expect(
+      enqueueChatRunMilestones(db, { since: new Date(0) }),
+    ).resolves.toBe(1);
+    await addSelectedChatFinal({
+      agentId: context.fixture.assignedAgentId,
+      body: "Authoritative final answer",
+      companyId: context.fixture.companyId,
+      issueId: context.conversation.issueId,
+      runId: finalRun.runId,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "succeeded",
+        resultJson: {
+          presentationDecision: {
+            chosenSource: "existing_issue_comment",
+            commentAction: "none",
+          },
+        },
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, finalRun.runId));
+    await context.service.processPendingPublications(100);
+
+    expect(context.providerRuntime.edits.at(-1)).toEqual({
+      threadId: context.thread.thread.id,
+      messageId: expect.any(String),
+      text: "Authoritative final answer",
+    });
+    expect(JSON.stringify(context.providerRuntime.edits)).not.toContain(
+      "PRIVATE native event prose",
+    );
+    const finalPublications = await db
+      .select({
+        idempotencyKey: chatPublications.idempotencyKey,
+        state: chatPublications.state,
+      })
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.endpointId, context.endpoint.id),
+          like(chatPublications.idempotencyKey, `run:${finalRun.runId}:%`),
+        ),
+      );
+    expect(
+      finalPublications.every(
+        (publication) => publication.state === "published",
+      ),
+    ).toBe(true);
+    await context.service.shutdown();
+  });
 
   it("coalesces one Telegram run into one provider message", async () => {
     const fixture = await seedCompany();
