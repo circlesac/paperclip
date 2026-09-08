@@ -19,6 +19,7 @@ import { and, desc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  chatEndpoints,
   documentRevisions,
   heartbeatRuns,
   issueApprovals,
@@ -45,6 +46,7 @@ import {
 } from "./current-wake-comments.js";
 import {
   authorizeChatAttachmentReuse,
+  authorizeChatConversationForBoundRun,
   LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION,
   LIST_CHAT_ATTACHMENTS_TOOL_NAME,
   listAuthorizedChatAttachments,
@@ -1003,21 +1005,52 @@ export class PaperclipRunnerToolAuthority {
         const context = await this.#lockAuthorizedMutationContext(
           tx as unknown as Db,
         );
+        const isFilePreparation =
+          operationId === "register_deliverable" ||
+          operationId === REUSE_CHAT_ATTACHMENT_TOOL_NAME;
+        const snapshot = record(context.run.contextSnapshot);
+        const wake = snapshot.paperclipWake;
+        const normalized = normalizePaperclipWakePayload(wake);
+        let provider =
+          normalized?.issue?.id === this.binding.issueId &&
+          isPaperclipExternalChatContractTurn(wake)
+            ? normalized.externalChatProvider
+            : null;
+        if (
+          isFilePreparation &&
+          snapshot.source === "issue.interaction.respond" &&
+          snapshot.paperclipExternalChatQuestionResponse
+        ) {
+          // Answer text is invocation-only, so the persisted wake cannot use
+          // the prompt-shape question predicate. Resolve the durable answer
+          // chain and current reach/principal before effects or receipt replay;
+          // a marker alone never supplies the provider or new authority.
+          const authorized = await authorizeChatConversationForBoundRun(
+            tx as unknown as Db,
+            this.binding,
+            context.run.contextSnapshot,
+            "nonblocking",
+          );
+          const [endpoint] = await tx
+            .select({ provider: chatEndpoints.provider })
+            .from(chatEndpoints)
+            .where(
+              and(
+                eq(chatEndpoints.id, authorized.endpointId),
+                eq(chatEndpoints.companyId, this.binding.companyId),
+                eq(chatEndpoints.assignedAgentId, this.binding.agentId),
+              ),
+            );
+          if (!endpoint) {
+            throw new Error("paperclip_runner_chat_attachment_binding_denied");
+          }
+          provider = endpoint.provider;
+        }
         // Describe file preparation from the locked, server-built wake, never
         // from file/tool arguments. Replays of older receipts gain the same
         // honest delivery guidance without repeating their committed effect.
         const describeResult = (result: unknown): unknown => {
-          if (
-            operationId !== "register_deliverable" &&
-            operationId !== REUSE_CHAT_ATTACHMENT_TOOL_NAME
-          ) return result;
-          const wake = record(context.run.contextSnapshot).paperclipWake;
-          const normalized = normalizePaperclipWakePayload(wake);
-          const provider =
-            normalized?.issue?.id === this.binding.issueId &&
-            isPaperclipExternalChatContractTurn(wake)
-              ? normalized.externalChatProvider
-              : null;
+          if (!isFilePreparation) return result;
           return {
             ...record(result),
             fileDelivery: paperclipChatFilePreparationDelivery(provider),

@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -21,6 +24,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueAttachments,
   issueApprovals,
   issueThreadInteractions,
   issueQuestionResponseDeliveries,
@@ -44,6 +48,7 @@ import {
   authorizeNativeChatReviewPresentation,
   hasMaterializedNativeReviewResponse,
 } from "./native-chat-review-presentation.js";
+import * as nativeChatReviewPresentation from "./native-chat-review-presentation.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import { issueService } from "../issues.js";
@@ -55,6 +60,9 @@ import { resolveExternalChatQuestionResponse } from "./external-chat-question-re
 import { materializeExternalChatQuestionResponseInput } from "./external-chat-question-response-input.js";
 import * as nativeInteractionBridge from "./native-interaction-bridge.js";
 import type { AskUserQuestionsInteraction } from "@paperclipai/shared";
+import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
+import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
+import { createStorageService } from "../../storage/service.js";
 
 describe("native external-chat response wait", () => {
   let temporary: Awaited<
@@ -551,6 +559,220 @@ describe("native external-chat response wait", () => {
       .set({ contextSnapshot: fixture.context })
       .where(eq(heartbeatRuns.id, fixture.runId));
   }
+
+  async function withAnsweredFileTool(
+    provider: "telegram" | "discord",
+    tool: "register_deliverable" | "reuse_chat_attachment",
+    check: (input: {
+      fixture: Awaited<ReturnType<typeof seedAnsweredChatTurn>>;
+      invoke: () => Promise<unknown>;
+    }) => Promise<void>,
+  ) {
+    const fixture = await seedAnsweredChatTurn(provider);
+    await attestAnswer(fixture);
+    const root = await mkdtemp(path.join(tmpdir(), "answered-chat-file-"));
+    try {
+      const workspaceRoot = path.join(root, "workspace");
+      await mkdir(workspaceRoot);
+      const storage = createStorageService(
+        createLocalDiskStorageProvider(path.join(root, "storage")),
+      );
+      const body = Buffer.from("Cobalt\n");
+      const filename = "answer.txt";
+      await writeFile(path.join(workspaceRoot, filename), body);
+      const runner = new PaperclipRunnerToolAuthority(db, {
+        ...fixture,
+        workspaceRoot,
+        storage,
+      });
+      let sourceAttachmentId: string | null = null;
+      if (tool === "reuse_chat_attachment") {
+        const stored = await storage.putFile({
+          companyId: fixture.companyId,
+          namespace: `issues/${fixture.issueId}`,
+          originalFilename: filename,
+          contentType: "text/plain",
+          body,
+        });
+        const attachment = await issueService(db).createAttachment({
+          issueId: fixture.issueId,
+          issueCommentId: fixture.commentId,
+          provider: stored.provider,
+          objectKey: stored.objectKey,
+          contentType: stored.contentType,
+          byteSize: stored.byteSize,
+          sha256: stored.sha256,
+          originalFilename: stored.originalFilename,
+          createdByUserId: fixture.userId,
+        });
+        sourceAttachmentId = attachment.id;
+      }
+      await check({
+        fixture,
+        invoke: () =>
+          runner.execute({
+            tool,
+            callId: randomUUID(),
+            arguments: {
+              idempotencyKey: "answer-file-v1",
+              title: "Chosen color",
+              ...(tool === "register_deliverable"
+                ? {
+                    filename,
+                    contentRef: filename,
+                    contentType: "text/plain",
+                    byteSize: body.length,
+                    sha256: createHash("sha256").update(body).digest("hex"),
+                  }
+                : {
+                    sourceCommentId: fixture.commentId,
+                    attachmentId: sourceAttachmentId,
+                  }),
+            },
+          }),
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it.each([
+    ["telegram", "register_deliverable"],
+    ["discord", "register_deliverable"],
+    ["telegram", "reuse_chat_attachment"],
+    ["discord", "reuse_chat_attachment"],
+  ] as const)(
+    "describes %s answered-question %s delivery from current authority without duplicate effects",
+    async (provider, tool) => {
+      await withAnsweredFileTool(
+        provider,
+        tool,
+        async ({ fixture, invoke }) => {
+          // Answer text is intentionally ephemeral. A prompt-shape predicate on
+          // the durable wake is not the authority for this file delivery mode.
+          expect(fixture.context.paperclipWake).not.toHaveProperty(
+            "questionResponse",
+          );
+          const first = await invoke();
+          expect(first).toMatchObject({
+            disposition: "applied",
+            fileDelivery: {
+              provider,
+              mode: "provider_attachment",
+              preparationState: "prepared",
+              providerDeliveryConfirmed: false,
+            },
+          });
+          const attachments = await db
+            .select()
+            .from(issueAttachments)
+            .where(eq(issueAttachments.issueId, fixture.issueId));
+          expect(attachments).toHaveLength(
+            tool === "register_deliverable" ? 1 : 2,
+          );
+          expect(await invoke()).toEqual(first);
+          expect(
+            await db
+              .select()
+              .from(issueAttachments)
+              .where(eq(issueAttachments.issueId, fixture.issueId)),
+          ).toEqual(attachments);
+          const [gate] = await db
+            .select()
+            .from(issueThreadInteractions)
+            .where(eq(issueThreadInteractions.id, fixture.gate.id));
+          expect(gate).toEqual(fixture.gate);
+
+          // Receipt replay still rechecks the real destination; a prior mode
+          // does not survive current reach revocation or repeat the file effect.
+          await db
+            .update(chatEndpoints)
+            .set({ allowDirectMessages: false })
+            .where(eq(chatEndpoints.id, fixture.endpointId));
+          await expect(invoke()).rejects.toThrow(
+            "paperclip_runner_chat_attachment_destination_denied",
+          );
+          expect(
+            await db
+              .select()
+              .from(issueAttachments)
+              .where(eq(issueAttachments.issueId, fixture.issueId)),
+          ).toEqual(attachments);
+        },
+      );
+    },
+  );
+
+  it.each([
+    ["register_deliverable", "forged_marker"],
+    ["reuse_chat_attachment", "forged_marker"],
+    ["register_deliverable", "changed_generation"],
+    ["reuse_chat_attachment", "changed_generation"],
+    ["register_deliverable", "membership_revoked"],
+    ["reuse_chat_attachment", "membership_revoked"],
+  ] as const)(
+    "denies answered-question %s file preparation before effects for %s",
+    async (tool, mutation) => {
+      await withAnsweredFileTool(
+        "telegram",
+        tool,
+        async ({ fixture, invoke }) => {
+          const attachments = await db
+            .select()
+            .from(issueAttachments)
+            .where(eq(issueAttachments.issueId, fixture.issueId));
+          const [before] = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, fixture.runId));
+          if (mutation === "forged_marker") {
+            const context = structuredClone(fixture.context);
+            const marker =
+              context.paperclipExternalChatQuestionResponse as Record<
+                string,
+                unknown
+              >;
+            marker.bindingSha256 = "0".repeat(64);
+            await db
+              .update(heartbeatRuns)
+              .set({ contextSnapshot: context })
+              .where(eq(heartbeatRuns.id, fixture.runId));
+          } else if (mutation === "changed_generation") {
+            await db
+              .update(chatConversations)
+              .set({ sessionGeneration: 2 })
+              .where(eq(chatConversations.id, fixture.conversationId));
+          } else {
+            await db
+              .update(companyMemberships)
+              .set({ status: "suspended" })
+              .where(
+                and(
+                  eq(companyMemberships.companyId, fixture.companyId),
+                  eq(companyMemberships.principalId, fixture.userId),
+                ),
+              );
+          }
+          await expect(invoke()).rejects.toThrow(
+            mutation === "membership_revoked"
+              ? "paperclip_runner_chat_attachment_principal_denied"
+              : "paperclip_runner_chat_attachment_binding_denied",
+          );
+          expect(
+            await db
+              .select()
+              .from(issueAttachments)
+              .where(eq(issueAttachments.issueId, fixture.issueId)),
+          ).toEqual(attachments);
+          const [after] = await db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, fixture.runId));
+          expect(after?.resultJson).toEqual(before?.resultJson);
+        },
+      );
+    },
+  );
 
   async function seedSequentialQuestionChain(depth = 2) {
     const fixture = await seedAnsweredChatTurn();
@@ -1911,6 +2133,33 @@ describe("native external-chat response wait", () => {
       await lockRelease;
     });
     await lockObserved;
+    let observeBackoff!: () => void;
+    let releaseBackoff!: () => void;
+    const backoffObserved = new Promise<void>((resolve) => {
+      observeBackoff = resolve;
+    });
+    const backoffRelease = new Promise<void>((resolve) => {
+      releaseBackoff = resolve;
+    });
+    const originalRetry =
+      nativeChatReviewPresentation.retryNativeChatReviewPresentation;
+    const retry = vi
+      .spyOn(nativeChatReviewPresentation, "retryNativeChatReviewPresentation")
+      .mockImplementation((attempt) =>
+        originalRetry(async () => {
+          try {
+            return await attempt();
+          } catch (error) {
+            if (isExternalChatWaitAuthorizationContention(error)) {
+              // Observe the actual rollback/backoff boundary, not a wall-clock
+              // instant that may land inside a subsequent short transaction.
+              observeBackoff();
+              await backoffRelease;
+            }
+            throw error;
+          }
+        }),
+      );
     let finished = false;
     const append = issueService(db)
       .addComment(
@@ -1922,8 +2171,12 @@ describe("native external-chat response wait", () => {
       .finally(() => {
         finished = true;
       });
+    const appendOutcome = append.then(
+      (comment) => ({ comment }),
+      (error: unknown) => ({ error }),
+    );
     try {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await backoffObserved;
       expect(finished).toBe(false);
       await db.transaction(async (tx) => {
         await tx
@@ -1931,12 +2184,26 @@ describe("native external-chat response wait", () => {
           .from(issues)
           .where(eq(issues.id, fixture.issueId))
           .for("update", { noWait: true });
+        await tx
+          .select()
+          .from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.runId, fixture.runId))
+          .for("update", { noWait: true });
+        await tx
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.issueId, fixture.issueId))
+          .for("update", { noWait: true });
       });
     } finally {
       release();
-      await holding;
+      releaseBackoff();
+      await Promise.allSettled([holding, appendOutcome]);
+      retry.mockRestore();
     }
-    const comment = await append;
+    const outcome = await appendOutcome;
+    if ("error" in outcome) throw outcome.error;
+    const { comment } = outcome;
     expect(
       await db
         .select()
