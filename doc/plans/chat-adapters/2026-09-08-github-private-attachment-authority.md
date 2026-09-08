@@ -30,10 +30,13 @@ explains why knowing the original private URL is insufficient.
    installation App, fixed `api.github.com`, no query, and no redirects. PAT,
    cookie, user-token, unbound-installation, and custom-host fallbacks are absent.
 3. The authenticated response must match comment ID, repository, issue/PR,
-   review-root when applicable, and the original body hash. A single anchor to
-   the original asset must contain exactly one image targeting the same asset
-   UUID on `private-user-images.githubusercontent.com`, with a sole JWT query.
-   Ambiguous or changed renderings fail closed. HTML parsing is inert and bounded.
+   review-root when applicable, and the original body hash. Exactly one anchor
+   must contain one image targeting the same asset UUID on
+   `private-user-images.githubusercontent.com`, with a sole JWT query absent
+   from the original body. Its link must be either the original asset URL or
+   exactly its image URL. Both forms share one candidate count; duplicate,
+   mixed, or conflicting same-asset renderings fail closed. HTML parsing is
+   inert and bounded.
 4. The signed image target is ephemeral. Download requests never receive App
    credentials or cookies. Existing HTTPS/public-address pinning, redirect
    allowlisting, byte/MIME validation, 20-second file and 60-second download-batch
@@ -86,13 +89,21 @@ delivery IDs in the existing rejection log. Codes distinguish App authority or
 request failure, exact source/body mismatch, missing rendering, unsupported
 generic files, ambiguous/denied mapping, and a valid same-UUID signed-image
 shape without the required original source anchor. In particular,
-`github_attachment_canonical_signed_anchor_only` detects an exact signed
-anchor/image pair but still denies it. It is diagnostic evidence, not new
-download authority.
+`github_attachment_canonical_signed_anchor_only` detected and denied an exact
+signed anchor/image pair in the diagnostic-only deployment.
 
 No response HTML, URL, JWT query, token, or provider error details enter these
 diagnostics. SDK-wrapped errors retain only exact whitelisted codes with bounded
 cause traversal; unknown errors collapse to a closed request-failed code.
 Durable current-input omissions and agent prompts still use only
-`download_unavailable`. The next live test must establish the actual App
-rendering shape before extending accepted mappings.
+`download_unavailable`.
+
+At 09:57:09 UTC on September 8, the actual App path emitted that signed-anchor
+diagnostic for the newly admitted private review-comment image. This proved the
+shape behind the unchanged source/body/repository/review-thread fences. The
+bounded follow-up accepts exactly one such pair, with identical link/image
+URLs and the same private-host/path/UUID/JWT checks. No additional host or
+credential authority was added. Contract and PostgreSQL restart tests cover
+both accepted forms, credential-free bytes, mixed/duplicate rejection, and
+unchanged current-access/revocation checks. Successful live byte intake and
+agent inspection must still be qualified after deployment.

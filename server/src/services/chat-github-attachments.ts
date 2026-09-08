@@ -595,14 +595,20 @@ function resolveCanonicalAttachmentTargetOrThrow(
       "github_attachment_canonical_file_unsupported",
     );
   const sourceBody = row.body;
-  const signedImage = (src: string): URL | null => {
+  const imagePath = new RegExp(
+    `^/[1-9][0-9]*/[1-9][0-9]*-${assetId}\\.(?:png|jpe?g|gif|webp)$`,
+    "i",
+  );
+  const sameAssetImage = (src: string): URL | null => {
     const target = allowedRedirect(src, locator.url);
+    return target?.hostname === "private-user-images.githubusercontent.com" &&
+      imagePath.test(target.pathname)
+      ? target
+      : null;
+  };
+  const signedImage = (src: string): URL | null => {
+    const target = sameAssetImage(src);
     return target &&
-      target.hostname === "private-user-images.githubusercontent.com" &&
-      new RegExp(
-        `^/[1-9][0-9]*/[1-9][0-9]*-${assetId}\\.(?:png|jpe?g|gif|webp)$`,
-        "i",
-      ).test(target.pathname) &&
       [...target.searchParams.keys()].join(",") === "jwt" &&
       /^[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+$/i.test(
         target.searchParams.get("jwt") ?? "",
@@ -614,35 +620,43 @@ function resolveCanonicalAttachmentTargetOrThrow(
   const fragment = JSDOM.fragment(row.body_html);
   const candidates: URL[] = [];
   for (const anchor of fragment.querySelectorAll("a[href]")) {
-    if (anchor.getAttribute("href") !== locator.url) continue;
+    const href = anchor.getAttribute("href")!;
     const images = anchor.querySelectorAll("img[src]");
+    if (
+      href !== locator.url &&
+      !sameAssetImage(href) &&
+      ![...images].some((image) => sameAssetImage(image.getAttribute("src")!))
+    )
+      continue;
     if (images.length !== 1)
       throw new GitHubAttachmentUnavailableError(
         "github_attachment_canonical_image_count_invalid",
       );
     const src = images[0]!.getAttribute("src")!;
     const target = signedImage(src);
-    if (!target)
+    // The second form was observed in the exact App-rendered live comment.
+    // Both the original-anchor and signed-anchor forms enter one candidate set
+    // so duplicated or mixed renderings cannot silently choose a target.
+    if (
+      !target ||
+      (href !== locator.url && (href !== src || !signedImage(href)))
+    )
       throw new GitHubAttachmentUnavailableError(
         "github_attachment_canonical_target_denied",
       );
     candidates.push(target);
   }
-  if (candidates.length === 1) return candidates[0]!;
-  if (candidates.length > 1)
+  const sameAssetImages = [...fragment.querySelectorAll("img[src]")].filter(
+    (image) =>
+      image.getAttribute("src") === locator.url ||
+      sameAssetImage(image.getAttribute("src")!),
+  );
+  if (candidates.length > 1 || sameAssetImages.length > 1)
     throw new GitHubAttachmentUnavailableError(
       "github_attachment_canonical_mapping_ambiguous",
     );
-  // Shape-only evidence for the next legitimate provider test. These forms
-  // remain denied; observing them does not widen the supported mapping.
-  for (const anchor of fragment.querySelectorAll("a[href]")) {
-    const images = anchor.querySelectorAll("img[src]");
-    const src = images.length === 1 ? images[0]!.getAttribute("src")! : "";
-    if (src && anchor.getAttribute("href") === src && signedImage(src))
-      throw new GitHubAttachmentUnavailableError(
-        "github_attachment_canonical_signed_anchor_only",
-      );
-  }
+  if (candidates.length === 1 && sameAssetImages.length === 1)
+    return candidates[0]!;
   if (
     [...fragment.querySelectorAll("img[src]")].some((image) =>
       signedImage(image.getAttribute("src")!),

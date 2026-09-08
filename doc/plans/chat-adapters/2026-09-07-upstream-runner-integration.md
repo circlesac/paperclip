@@ -1501,3 +1501,28 @@ a passing private-image qualification. The signed-in browser renders a
 signed image anchor, but that does not establish the installation App's
 canonical response format; follow-up diagnosis must use the genuine product
 path without copying browser credentials or signed links into the connector.
+
+### Current Luna timing breakdown
+
+Closed `run.performance.span` data for the eleven successful native runs
+created after 09:15Z shows queue times of **9–15ms**. Fresh-task preparation
+is **101–217ms**; answered-question preparation is **1.771–2.059s**.
+Representative spans below are internal boundaries, not provider delivery
+or end-to-end latency:
+
+| Live sample | Queue | Preparation | Agent turn | Measured run span |
+| --- | ---: | ---: | ---: | ---: |
+| Slack follow-up after Stop | 9ms | 139ms | 12.434s | 13.656s |
+| Discord DM answer | 11ms | 1.771s | 12.511s | 15.709s |
+| Telegram photo | 10ms | 137ms | 31.394s | 33.100s |
+| Telegram answered photo | 15ms | 1.850s | 30.676s | 33.871s |
+| Slack two-file response | 10ms | 102ms | 54.069s | 55.646s |
+
+The earlier click/send-to-provider timestamps remain the actual user-visible
+measurements. Do not label the difference between these internal spans as
+provider publication overhead: it also includes run finalization boundaries.
+The short GitHub unavailable-image reply is not a successful image-performance
+sample. These observations do not show queue starvation; most measured time
+is inside the native model/tool turn. They support keeping Luna for the
+current test pass, not a claim that every request meets a latency target or
+that Terra would necessarily be faster. No model/effort change was made.

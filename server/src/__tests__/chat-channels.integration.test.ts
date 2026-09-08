@@ -14118,6 +14118,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     "cancel_race",
     "delivery_race",
     "signed_anchor",
+    "ambiguous_anchor",
   ] as const)(
     "resolves an admitted GitHub private image after restart with current reach at %s",
     async (revokeAt) => {
@@ -14134,7 +14135,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555";
       const signedUrl =
         "https://private-user-images.githubusercontent.com/123/456-11111111-2222-3333-4444-555555555555.png?jwt=header.privatepayload.signature";
-      const body = `![exact current image](${sourceUrl})`;
+      const body =
+        revokeAt === "signed_anchor"
+          ? `<img width="512" alt="exact current image" src="${sourceUrl}" />`
+          : `![exact current image](${sourceUrl})`;
       const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
       const [resource] = await service.listResources(endpoint.id);
       await service.replaceResources(endpoint.id, [
@@ -14153,7 +14157,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           issue_url:
             "https://api.github.com/repos/paperclipai/paperclip/issues/93",
           body,
-          body_html: `<a href="${revokeAt === "signed_anchor" ? signedUrl : sourceUrl}"><img src="${signedUrl}"></a>`,
+          body_html: `<a href="${["signed_anchor", "ambiguous_anchor"].includes(revokeAt) ? signedUrl : sourceUrl}"><img src="${signedUrl}"></a>`.repeat(revokeAt === "ambiguous_anchor" ? 2 : 1),
         });
       const warning = vi.spyOn(chatAttachmentLogger, "warn");
       let receiptMutation: Promise<unknown> | undefined;
@@ -14303,17 +14307,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect.any(AbortSignal),
         );
         expect(egress).toHaveBeenCalledTimes(
-          revokeAt === "signed_anchor" ? 1 : 2,
+          revokeAt === "ambiguous_anchor" ? 1 : 2,
         );
         const stored = await db
           .select()
           .from(issueAttachments)
           .where(eq(issueAttachments.companyId, fixture.companyId));
-        expect(stored).toHaveLength(revokeAt === "none" ? 1 : 0);
+        const imported = revokeAt === "none" || revokeAt === "signed_anchor";
+        expect(stored).toHaveLength(imported ? 1 : 0);
         expect(restarted.wakeup).toHaveBeenCalledTimes(
-          revokeAt === "none" || revokeAt === "signed_anchor" ? 1 : 0,
+          imported || revokeAt === "ambiguous_anchor" ? 1 : 0,
         );
-        expect(storage.objects.size).toBe(revokeAt === "none" ? 1 : 0);
+        expect(storage.objects.size).toBe(imported ? 1 : 0);
         if (["download", "cancel_race", "delivery_race"].includes(revokeAt))
           expect(storage.putFile).not.toHaveBeenCalled();
         if (revokeAt === "storage")
@@ -14324,8 +14329,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(eq(chatDeliveries.endpointId, endpoint.id));
         expect(JSON.stringify(deliveries)).not.toContain("privatepayload");
         expect(JSON.stringify(deliveries)).not.toContain("body_html");
-        if (revokeAt === "signed_anchor") {
-          const code = "github_attachment_canonical_signed_anchor_only";
+        if (revokeAt === "ambiguous_anchor") {
+          const code = "github_attachment_canonical_mapping_ambiguous";
           const diagnostic = warning.mock.calls.find(
             ([fields]) =>
               typeof fields === "object" &&
@@ -14348,8 +14353,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect(storage.putFile).not.toHaveBeenCalled();
           expect(deliveries[0]!.state).toBe("processed");
         }
-        if (revokeAt === "none") {
+        if (imported) {
           expect([...storage.objects.values()][0]).toEqual(bytes);
+          expect(JSON.stringify(restarted.wakeup.mock.calls)).not.toMatch(
+            /privatepayload|jwt|body_html/,
+          );
           await restarted.service.processPendingDeliveries();
           expect(egress).toHaveBeenCalledTimes(2);
           expect(restarted.wakeup).toHaveBeenCalledTimes(1);

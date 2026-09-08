@@ -73,6 +73,118 @@ function canonicalComment(overrides: Record<string, unknown> = {}) {
 }
 
 describe("GitHub exact-comment private image resolution", () => {
+  it("imports the live-observed exact signed anchor and image after locator restart", async () => {
+    const value = message();
+    const raw = value.raw as { comment: { body: string } };
+    raw.comment.body = `<img width="512" alt="Image" src="${imageUrl}" />`;
+    const saved = JSON.parse(
+      JSON.stringify(
+        githubAttachmentLocator(githubPublicAttachmentsFromMessage(value)[0]!),
+      ),
+    );
+    const recovered = rehydrateGitHubPublicAttachment(saved, {
+      threadId,
+      messageId: "4242",
+    })!;
+    const canonical = canonicalComment({
+      body: raw.comment.body,
+      body_html: `<a href="${signedImageUrl}"><img src="${signedImageUrl}"></a>`,
+    });
+    request.mockResolvedValueOnce(new Response("private", { status: 404 }));
+    request.mockResolvedValueOnce(
+      new Response(png, { headers: { "content-type": "image/png" } }),
+    );
+    const prepared = await prepareGitHubPublicAttachment(
+      recovered,
+      undefined,
+      async () => canonical,
+    );
+    expect(await prepared.fetchData!()).toEqual(png);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(String(request.mock.calls[1]![0])).toBe(signedImageUrl);
+    for (const [, init] of request.mock.calls) {
+      expect(init.credentials).toBe("omit");
+      expect(new Headers(init.headers).has("authorization")).toBe(false);
+      expect(new Headers(init.headers).has("cookie")).toBe(false);
+    }
+    expect(JSON.stringify([saved, prepared])).not.toMatch(
+      /jwt|body_html|private-user-images/,
+    );
+    expect(githubAttachmentLocator(recovered)).toEqual(saved);
+  });
+  it.each([
+    [
+      "duplicate_signed",
+      `<a href="${signedImageUrl}"><img src="${signedImageUrl}"></a>`.repeat(2),
+    ],
+    [
+      "mixed_original_signed",
+      `<a href="${imageUrl}"><img src="${signedImageUrl}"></a><a href="${signedImageUrl}"><img src="${signedImageUrl}"></a>`,
+    ],
+    [
+      "conflicting_jwt",
+      `<a href="${signedImageUrl.replace("header", "other")}"><img src="${signedImageUrl}"></a>`,
+    ],
+    [
+      "different_uuid",
+      `<a href="${signedImageUrl}"><img src="${signedImageUrl.replace("11111111", "99999999")}"></a>`,
+    ],
+    [
+      "different_host",
+      `<a href="https://example.com/image"><img src="${signedImageUrl}"></a>`,
+    ],
+    [
+      "multiple_images",
+      `<a href="${signedImageUrl}"><img src="${signedImageUrl}"><img src="${signedImageUrl.replace("11111111", "99999999")}"></a>`,
+    ],
+    [
+      "mixed_malformed_signed",
+      `<a href="${imageUrl}"><img src="${signedImageUrl}"></a><a href="${signedImageUrl}"></a>`,
+    ],
+    [
+      "extra_unanchored_image",
+      `<a href="${signedImageUrl}"><img src="${signedImageUrl}"></a><img src="${signedImageUrl}">`,
+    ],
+    [
+      "extra_query",
+      `<a href="${signedImageUrl}&amp;token=extra"><img src="${signedImageUrl}&amp;token=extra"></a>`,
+    ],
+  ])(
+    "denies ambiguous or untrusted live signed mapping %s",
+    async (_name, body_html) => {
+      const canonical = canonicalComment({ body_html });
+      expect(
+        resolveGitHubCommentAttachmentTarget(attachment(), canonical),
+      ).toBeNull();
+      request.mockResolvedValueOnce(new Response("private", { status: 404 }));
+      await expect(
+        prepareGitHubPublicAttachment(
+          attachment(),
+          undefined,
+          async () => canonical,
+        ),
+      ).rejects.toMatchObject({ name: "GitHubAttachmentUnavailableError" });
+      expect(request).toHaveBeenCalledTimes(1);
+    },
+  );
+  it("rejects a user-embedded signed URL even when the exact source-body hash matches", async () => {
+    const value = message();
+    const raw = value.raw as { comment: { body: string } };
+    raw.comment.body += `\n<a href="${signedImageUrl}"><img src="${signedImageUrl}"></a>`;
+    const image = githubPublicAttachmentsFromMessage(value)[0]!;
+    const canonical = canonicalComment({
+      body: raw.comment.body,
+      body_html: `<a href="${signedImageUrl}"><img src="${signedImageUrl}"></a>`,
+    });
+    expect(resolveGitHubCommentAttachmentTarget(image, canonical)).toBeNull();
+    request.mockResolvedValueOnce(new Response("private", { status: 404 }));
+    await expect(
+      prepareGitHubPublicAttachment(image, undefined, async () => canonical),
+    ).rejects.toMatchObject({
+      code: "github_attachment_canonical_target_denied",
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
   it.each(
     [
       [null, "response_unavailable"],
@@ -95,12 +207,6 @@ describe("GitHub exact-comment private image resolution", () => {
           body_html: `<a href="${imageUrl}"><img src="${signedImageUrl}"></a><a href="${imageUrl}"><img src="${signedImageUrl}"></a>`,
         }),
         "mapping_ambiguous",
-      ],
-      [
-        canonicalComment({
-          body_html: `<a href="${signedImageUrl}"><img src="${signedImageUrl}"></a>`,
-        }),
-        "signed_anchor_only",
       ],
       [
         canonicalComment({ body_html: `<img src="${signedImageUrl}">` }),
@@ -371,93 +477,121 @@ describe("GitHub exact-comment private image resolution", () => {
       }),
     ).rejects.toMatchObject({ message: "github_attachment_download_failed" });
   });
-  it("actual SDK App auth sends installation credentials only to fixed canonical comment API", async () => {
-    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
-      .privateKey.export({ type: "pkcs8", format: "pem" })
-      .toString();
-    const providerFetch = vi.fn(
-      async (_input: string | URL | Request, _init?: RequestInit) =>
-        Response.json(
-          {
-            token: "ghs-test-only",
-            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
-            permissions: { issues: "read" },
-            repository_selection: "selected",
+  it.each(["original", "signed"] as const)(
+    "actual SDK App auth sends installation credentials only to fixed canonical comment API for %s anchor",
+    async (shape) => {
+      const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+        .privateKey.export({ type: "pkcs8", format: "pem" })
+        .toString();
+      const providerFetch = vi.fn(
+        async (_input: string | URL | Request, _init?: RequestInit) =>
+          Response.json(
+            {
+              token: "ghs-test-only",
+              expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+              permissions: { issues: "read" },
+              repository_selection: "selected",
+            },
+            { status: 201 },
+          ),
+      );
+      vi.stubGlobal("fetch", providerFetch);
+      const canonical = canonicalComment({
+        body_html: `<a href="${shape === "signed" ? signedImageUrl : imageUrl}"><img src="${signedImageUrl}"></a>`,
+      });
+      request.mockResolvedValue(Response.json(canonical));
+      const runtime = createChatSdkEndpointRuntime({
+        companyId: "company-test",
+        endpointId: "endpoint-test",
+        logger: "silent",
+        callbacks: { onMessage() {} },
+        persistence: {
+          async compareAndSet() {
+            return true;
           },
-          { status: 201 },
-        ),
-    );
-    vi.stubGlobal("fetch", providerFetch);
-    request.mockResolvedValue(Response.json(canonicalComment()));
-    const runtime = createChatSdkEndpointRuntime({
-      companyId: "company-test",
-      endpointId: "endpoint-test",
-      logger: "silent",
-      callbacks: { onMessage() {} },
-      persistence: {
-        async compareAndSet() {
-          return true;
+          async deleteIfVersion() {
+            return true;
+          },
+          async read() {
+            return null;
+          },
         },
-        async deleteIfVersion() {
-          return true;
+        providerConfig: {
+          provider: "github",
+          userName: "maya",
+          credentials: {
+            appId: "123",
+            installationId: 2468,
+            botUserId: 999,
+            privateKey,
+            webhookSecret: "test-only",
+          },
         },
-        async read() {
-          return null;
-        },
-      },
-      providerConfig: {
-        provider: "github",
-        userName: "maya",
-        credentials: {
-          appId: "123",
-          installationId: 2468,
-          botUserId: 999,
-          privateKey,
-          webhookSecret: "test-only",
-        },
-      },
-    });
-    try {
-      const result = await runtime.resolveGitHubAttachmentComment(
-        githubAttachmentCommentRequest(attachment())!,
-        new AbortController().signal,
-      );
-      expect(result).toEqual(canonicalComment());
-      expect(providerFetch).toHaveBeenCalledTimes(1);
-      expect(String(providerFetch.mock.calls[0]?.[0])).toBe(
-        "https://api.github.com/app/installations/2468/access_tokens",
-      );
-      expect(request).toHaveBeenCalledTimes(1);
-      expect(String(request.mock.calls[0]![0])).toBe(canonicalComment().url);
-      expect(
-        new Headers(request.mock.calls[0]![1].headers).get("authorization"),
-      ).toBe("token ghs-test-only");
-      request.mockResolvedValueOnce(
-        new Response("private response body", { status: 403 }),
-      );
-      await expect(
-        runtime.resolveGitHubAttachmentComment(
+      });
+      try {
+        const result = await runtime.resolveGitHubAttachmentComment(
           githubAttachmentCommentRequest(attachment())!,
           new AbortController().signal,
-        ),
-      ).rejects.toMatchObject({
-        message: "github_attachment_canonical_api_access_denied",
-      });
-      request.mockRejectedValueOnce(
-        new Error(`private provider detail ${signedImageUrl}`),
-      );
-      await expect(
-        runtime.resolveGitHubAttachmentComment(
-          githubAttachmentCommentRequest(attachment())!,
-          new AbortController().signal,
-        ),
-      ).rejects.toMatchObject({
-        message: "github_attachment_canonical_api_request_failed",
-      });
-    } finally {
-      await runtime.shutdown();
-    }
-  });
+        );
+        expect(result).toEqual(canonical);
+        expect(
+          resolveGitHubCommentAttachmentTarget(attachment(), result)?.href,
+        ).toBe(signedImageUrl);
+        expect(providerFetch).toHaveBeenCalledTimes(1);
+        expect(String(providerFetch.mock.calls[0]?.[0])).toBe(
+          "https://api.github.com/app/installations/2468/access_tokens",
+        );
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(String(request.mock.calls[0]![0])).toBe(canonicalComment().url);
+        expect(
+          new Headers(request.mock.calls[0]![1].headers).get("authorization"),
+        ).toBe("token ghs-test-only");
+        request.mockResolvedValueOnce(new Response("private", { status: 404 }));
+        request.mockResolvedValueOnce(Response.json(canonical));
+        request.mockResolvedValueOnce(
+          new Response(png, { headers: { "content-type": "image/png" } }),
+        );
+        const prepared = await prepareGitHubPublicAttachment(
+          attachment(),
+          undefined,
+          (descriptor, signal) =>
+            runtime.resolveGitHubAttachmentComment(descriptor, signal),
+        );
+        expect(await prepared.fetchData!()).toEqual(png);
+        expect(request.mock.calls.slice(1).map(([url]) => String(url))).toEqual(
+          [imageUrl, canonical.url, signedImageUrl],
+        );
+        for (const call of [request.mock.calls[1]!, request.mock.calls[3]!]) {
+          expect(new Headers(call[1].headers).has("authorization")).toBe(false);
+          expect(new Headers(call[1].headers).has("cookie")).toBe(false);
+        }
+        request.mockResolvedValueOnce(
+          new Response("private response body", { status: 403 }),
+        );
+        await expect(
+          runtime.resolveGitHubAttachmentComment(
+            githubAttachmentCommentRequest(attachment())!,
+            new AbortController().signal,
+          ),
+        ).rejects.toMatchObject({
+          message: "github_attachment_canonical_api_access_denied",
+        });
+        request.mockRejectedValueOnce(
+          new Error(`private provider detail ${signedImageUrl}`),
+        );
+        await expect(
+          runtime.resolveGitHubAttachmentComment(
+            githubAttachmentCommentRequest(attachment())!,
+            new AbortController().signal,
+          ),
+        ).rejects.toMatchObject({
+          message: "github_attachment_canonical_api_request_failed",
+        });
+      } finally {
+        await runtime.shutdown();
+      }
+    },
+  );
   it.each(["personal_token", "custom_host", "missing_installation"])(
     "does not resolve private attachments with %s authority",
     async (mode) => {
