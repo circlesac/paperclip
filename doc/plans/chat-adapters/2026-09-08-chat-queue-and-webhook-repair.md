@@ -1732,3 +1732,43 @@ did the final server typecheck/build. The deterministic five-provider UI and
 file-send browser suite passed **10/10**. Existing CI/Greptile green at
 `5988fb475` precedes this slice;
 new exact-head gates and required CODEOWNER approval remain necessary.
+
+## Agent-onboarding master compatibility
+
+After committing the recovery slice as `e72a50480`, origin/master advanced to
+`ebaeba40e` (PR #13011). The merge preserves both complete HTTP credential
+redaction tests. The new single AgentDetail flow and contextual sidebar retain
+the default-off chat flag, loaded-state redirect checks and channel filtering,
+alongside upstream label overrides. GitHub tools still bypass the chat/tool
+choice when the experiment is disabled. The onboarding wizard continues to
+create an agent; it does not retarget immutable chat endpoints.
+
+Merged verification passed **110/110** server/adapter compatibility cases,
+**421/421** chat integration cases on a new PostgreSQL database and **310/310**
+focused UI cases. Plain server/UI typechecks and all token gates passed.
+Workspace typecheck initially found a missing `channels` entry in the new
+Storybook prototype's exhaustive description record. Adding that entry fixes
+the consumer without weakening the production type. The superseded v2 design
+note is archived with an exact Git link, keeping this one PR at **500 files**;
+current design, production code and test coverage are retained.
+
+Full merged workspace typecheck and build passed. Root reloaded the live Board
+after a transient `useCompany` error during merge editing; the normal reload
+restored Activity, agent overview and Channels. The overview identifies
+Paperclip Runner and `gpt-5.6-luna`. The new upstream section heading duplicated
+the Channels panel's own heading. A browser regression reproduced **two**
+headings where one was expected. The parent now leaves this title to its
+existing panel. Root inspected before/after screenshots and verified one
+heading with all four active provider identities and their connection links.
+
+The original merged deterministic suite passed **10/10**. Two new agent-route
+checks cover the experiment off/on: disabled routes return to overview without
+loading endpoints or showing Channels navigation; enabled routes show exactly
+one title and the connect action. The first extra run failed during embedded
+PostgreSQL initialization, before tests, with the host at 32 shared-memory
+segments. Root used a new database on the already isolated test PostgreSQL,
+without altering other clusters or global settings. The enabled heading case
+then went red to green. Final full browser verification passed **12/12** in
+2.2 minutes on another fresh database. Final UI typecheck/build and token gates
+also passed. These browser fixtures mock provider HTTP; the live observations
+above use the existing signed-in Board and provider tabs.

@@ -247,7 +247,6 @@ export function Layout() {
     )
   ) : null;
   const secondarySidebar =
-    streamlinedUiEnabled &&
     shellRoute.builtInContextualSurface === "agent" &&
     agentId ? (
       <AgentContextualSidebar agentRef={agentId} />

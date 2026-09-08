@@ -1182,16 +1182,14 @@ test.describe.serial("native chat adapter UI", () => {
     });
 
     await page.goto(`/${seed.prefix}/apps`);
-    await expect(
-      page.getByRole("heading", { name: "Connectors" }),
-    ).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole("heading", { name: "Connectors" })).toBeVisible(
+      { timeout: 30_000 },
+    );
     const connector = page.locator(
       `[role="listitem"][data-app-slug="${github.slug}"]`,
     );
     await expect(connector).toBeVisible();
-    await connector
-      .getByRole("button", { name: "Connect GitHub" })
-      .click();
+    await connector.getByRole("button", { name: "Connect GitHub" }).click();
 
     await expect(page).toHaveURL(/\/apps\/connect\?/);
     expect(new URL(page.url()).searchParams.get("source")).toBe("github");
@@ -1215,6 +1213,41 @@ test.describe.serial("native chat adapter UI", () => {
     await expect.poll(() => mock.chatEndpointListReads).toBe(0);
     expect(mock.createdWithAgentId).toBeNull();
   });
+
+  for (const enabled of [false, true]) {
+    test(`Agent Channels: one heading and current experiment gate (${enabled})`, async ({
+      page,
+    }) => {
+      const github = PROVIDERS.find(
+        (provider) => provider.provider === "github",
+      )!;
+      const mock = await installChatControlPlaneMock(page, github, seed, {
+        enableChatConnectors: enabled,
+      });
+
+      await page.goto(`/${seed.prefix}/agents/${seed.agentId}/channels`);
+      const channelsHeading = page.getByRole("heading", {
+        name: "Channels",
+        exact: true,
+      });
+      if (enabled) {
+        await expect(page).toHaveURL(/\/channels$/);
+        await expect(channelsHeading).toHaveCount(1);
+        await expect(channelsHeading).toBeVisible();
+        await expect(
+          page.getByRole("link", { name: "Connect a channel" }),
+        ).toBeVisible();
+        await expect.poll(() => mock.chatEndpointListReads).toBeGreaterThan(0);
+      } else {
+        await expect(page).toHaveURL(/\/overview$/);
+        await expect(channelsHeading).toHaveCount(0);
+        await expect(
+          page.getByRole("link", { name: "Channels", exact: true }),
+        ).toHaveCount(0);
+        expect(mock.chatEndpointListReads).toBe(0);
+      }
+    });
+  }
 
   for (const provider of PROVIDERS) {
     test(`${provider.name}: catalog, setup, and connection management tabs`, async ({
@@ -1698,7 +1731,10 @@ test.describe.serial("native chat adapter UI", () => {
       expect(new URL(page.url()).searchParams.get("reconnect")).toBe("1");
       await expect(
         page.getByRole("heading", {
-          name: provider.provider === "github" ? "Reconnect GitHub App" : provider.setupHeading,
+          name:
+            provider.provider === "github"
+              ? "Reconnect GitHub App"
+              : provider.setupHeading,
         }),
       ).toBeVisible();
       await expect(

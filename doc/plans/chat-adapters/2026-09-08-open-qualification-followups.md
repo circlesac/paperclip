@@ -7,6 +7,28 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: missed GitHub callbacks and exact-request retry
 
+The recovery slice is committed as `e72a50480`. The next landing step merges
+master `ebaeba40e` (agent onboarding, PR #13011). Resolve both sides of the
+HTTP credential-redaction test and preserve chat experiment guards in the
+new always-on AgentDetail/sidebar. The merged server compatibility cohort
+passed **110/110** and fresh full chat integration passed **421/421**;
+the focused UI cohort passed **310/310**. A real merged typecheck failure
+identified a missing `channels` description in the upstream Storybook
+prototype. Its exhaustive record is fixed; plain UI/server typechecks and
+token gates pass. The superseded v2 note joins v3/v4 in the linked Git archive
+to retain **500 changed files**, without removing tests or production code.
+Final merged workspace typecheck and build passed. The expanded browser suite
+passed **12/12** on another fresh database, including agent Channels with the
+experiment off/on and all five provider journeys. Live inspection found a
+duplicate Channels heading after the upstream layout change. The new browser
+test reproduced two headings; the panel now owns its single title, verified
+again visually. The first additional browser attempt failed before any test
+because embedded PostgreSQL could not initialize while host shared memory was
+full. Using the existing isolated PostgreSQL with a new database avoided that
+host limit; no unrelated process or global setting was changed. Final UI
+typecheck/build and token gates passed after the heading fix. Fresh remote
+CI and Greptile still must validate the pushed merge head.
+
 This section supersedes the older in-flight CI snapshot below. Documentation
 head `5988fb475` passed CI `34263294210`, including both required aggregates,
 and Greptile reviewed all 500 files at **5/5** with no new finding. PR #13038
