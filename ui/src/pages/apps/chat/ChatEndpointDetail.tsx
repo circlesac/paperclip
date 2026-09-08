@@ -14,6 +14,7 @@ import {
 import {
   chatEndpointsApi,
   type ChatActivityItem,
+  type ChatEndpoint,
   type ChatEndpointResource,
   type ChatProvider,
 } from "@/api/chatEndpoints";
@@ -134,6 +135,30 @@ export function isIndividuallyToggleableResource(
 
 function activityDetailLabel(item: ChatActivityItem): string {
   return replayableFailureStates.has(item.status) ? "Reason" : "Details";
+}
+
+export function connectionHealthPresentation(
+  endpoint: Pick<ChatEndpoint, "status" | "healthMessage" | "lastError">,
+) {
+  // Health events outlive pause/removal. They are history, not lifecycle state.
+  const lifecycleMessages = {
+    draft: "Connection setup is incomplete.",
+    verifying: "Connection verification is in progress.",
+    paused: "Connection is paused. Resume it to receive new messages.",
+    attention: "Connection needs attention.",
+    revoked: "Connection access is revoked. Reconnect to verify access.",
+    archived: "Connection has been removed from Paperclip.",
+  };
+  const lifecycleMessage =
+    endpoint.status === "active" ? null : lifecycleMessages[endpoint.status];
+  return {
+    message: lifecycleMessage ?? endpoint.healthMessage ?? null,
+    previousHealth: lifecycleMessage ? endpoint.healthMessage ?? null : null,
+    error: endpoint.lastError ?? null,
+    errorLabel: ["active", "attention", "revoked"].includes(endpoint.status)
+      ? "Reason"
+      : "Last reported error",
+  };
 }
 
 export function ChatEndpointDetail() {
@@ -786,7 +811,8 @@ function Activity({
       }),
   });
   const rows = query.data ?? [];
-  const { status, healthMessage, lastError } = endpoint;
+  const { status } = endpoint;
+  const health = connectionHealthPresentation(endpoint);
   const lifecycleAction = lifecycle.variables;
   const callbackSurfaceRows = endpoint.setup?.callbackSurfaces
     ? ([
@@ -798,7 +824,7 @@ function Activity({
   return (
     <section className="space-y-5">
       <h2 className="text-lg font-semibold">Connection activity</h2>
-      {(healthMessage || lastError) && (
+      {(health.message || health.error) && (
         <div
           className={`flex items-start gap-2 rounded-lg border p-3 text-sm ${status === "attention" || status === "revoked" ? "border-destructive/40 bg-destructive/5 text-destructive" : "border-border bg-muted/30 text-foreground"}`}
         >
@@ -806,10 +832,17 @@ function Activity({
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           )}
           <div>
-            {healthMessage && <p>{healthMessage}</p>}
-            {lastError && (
+            {health.message && <p>{health.message}</p>}
+            {health.previousHealth && (
               <p className="mt-1 text-xs opacity-80">
-                <span className="font-medium">Reason:</span> {lastError}
+                <span className="font-medium">Last reported health:</span>{" "}
+                {health.previousHealth}
+              </p>
+            )}
+            {health.error && (
+              <p className="mt-1 text-xs opacity-80">
+                <span className="font-medium">{health.errorLabel}:</span>{" "}
+                {health.error}
               </p>
             )}
           </div>

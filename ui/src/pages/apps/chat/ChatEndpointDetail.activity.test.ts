@@ -1,10 +1,72 @@
 import { describe, expect, it } from "vitest";
-import type { ChatActivityItem } from "@/api/chatEndpoints";
+import type { ChatActivityItem, ChatEndpointStatus } from "@/api/chatEndpoints";
 import {
+  connectionHealthPresentation,
   isIndividuallyToggleableResource,
   isReplayEligible,
   isResolutionEligible,
 } from "./ChatEndpointDetail";
+
+describe("chat endpoint lifecycle health presentation", () => {
+  it.each<[ChatEndpointStatus, string]>([
+    ["paused", "Connection is paused. Resume it to receive new messages."],
+    ["draft", "Connection setup is incomplete."],
+    ["verifying", "Connection verification is in progress."],
+    ["attention", "Connection needs attention."],
+    ["revoked", "Connection access is revoked. Reconnect to verify access."],
+    ["archived", "Connection has been removed from Paperclip."],
+  ])("prioritizes %s over stale connected health", (status, message) => {
+    const presentation = connectionHealthPresentation({
+      status,
+      healthMessage: "Connected",
+      lastError: null,
+    });
+    expect(presentation.message).toBe(message);
+    expect(presentation.previousHealth).toBe("Connected");
+    expect(presentation.error).toBeNull();
+  });
+
+  it("shows the paused lifecycle even without a previous health event", () => {
+    expect(connectionHealthPresentation({ status: "paused" }).message).toBe(
+      "Connection is paused. Resume it to receive new messages.",
+    );
+  });
+
+  it.each(["paused", "draft", "verifying", "archived"] as const)(
+    "labels retained errors as historical while %s",
+    (status) => {
+      expect(
+        connectionHealthPresentation({ status, lastError: "Gateway timed out" }),
+      ).toMatchObject({
+        error: "Gateway timed out",
+        errorLabel: "Last reported error",
+      });
+    },
+  );
+
+  it.each(["active", "attention", "revoked"] as const)(
+    "preserves current error details while %s",
+    (status) => {
+      expect(
+        connectionHealthPresentation({ status, lastError: "Access denied" }),
+      ).toMatchObject({ error: "Access denied", errorLabel: "Reason" });
+    },
+  );
+
+  it("preserves active health and does not invent a connected state", () => {
+    expect(
+      connectionHealthPresentation({
+        status: "active",
+        healthMessage: "Reconnecting",
+      }),
+    ).toMatchObject({ message: "Reconnecting", previousHealth: null });
+    expect(connectionHealthPresentation({ status: "active" })).toMatchObject({
+      message: null,
+      previousHealth: null,
+      error: null,
+    });
+  });
+});
 
 function activity(overrides: Partial<ChatActivityItem> = {}): ChatActivityItem {
   return {

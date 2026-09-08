@@ -1772,3 +1772,111 @@ then went red to green. Final full browser verification passed **12/12** in
 2.2 minutes on another fresh database. Final UI typecheck/build and token gates
 also passed. These browser fixtures mock provider HTTP; the live observations
 above use the existing signed-in Board and provider tabs.
+
+## Discord connecting-socket retirement
+
+A clean restart at merged head `c52e98c9b` exposed a real process crash:
+`Opening handshake has timed out`, emitted without a WebSocket error handler.
+The pinned `@discordjs/ws` destroy path removed its error handler but only
+closed OPEN sockets. A CONNECTING socket could remain alive until its handshake
+timer fired. Adapter shutdown also raced asynchronous login and did not await
+client destruction. This is a production defect, not a test-harness failure.
+
+The pinned library patch now invalidates asynchronous connection work, closes
+or terminates its socket, and retains the error handler until close completes.
+The adapter waits for destruction and ignores late ready/failure notifications
+after retirement. Independent review reproduced two adjacent races: a packet
+resuming after asynchronous decode, and the real Discord client resuming its
+outer gateway lookup after destruction. Both have regression tests and are
+fenced by the repair. Genuine timeout recovery remains enabled; no global
+uncaught-exception handler or weakened delivery guard hides failures.
+
+The first four lifecycle cases reproduced the failure, including a child
+process using the actual pinned library and a real local TCP socket. The final
+agent cohort passed **84/84**. Root's independent Discord adapter, transport and
+publication-error cohort passed **88/88**, with no skips. These include positive
+Hello-timeout and handshake-error recovery controls, plus retirement during
+recovery. Independent review found no further blocker in this scoped repair.
+
+Frozen offline installation passed with zero downloads. Package/workspace patch
+configuration agrees. The generated lockfile now records previously missing
+chat SDK dependencies and patch hashes: all 1,435 existing package keys remain,
+99 are newly recorded, and no existing importer or transitive dependency version
+changed. Full workspace typecheck and build passed. The staged native runner
+still passes strict signature verification and has unchanged SHA-256
+`e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
+
+The superseded v5/v6 surface notes remain at immutable links in
+`wireframes-archive.md`; their setup audit and minimum-setup specification stay
+in the worktree. This reserves the new lockfile and WebSocket patch within one
+500-file PR without removing current implementation or tests.
+
+### Live post-onboarding compatibility
+
+Before installing the socket repair, server 55 served the clean merged head.
+GitHub comment `5590988738` produced exactly one native Codex app-server /
+`gpt-5.6-luna` run (`ec9060b7-0cd3-4faa-9823-49fa4851f3a4`) and one working-to-final
+bot message `5590989975`. The exact final `GH-ONBOARDING-MERGE-READY` arrived in
+**21.209 seconds**, including **15.963 seconds** of native execution. Root
+inspected the rendered reply. Telegram likewise returned the exact
+`TG-ONBOARDING-MERGE-READY` in **18.039 seconds**, including **15.629 seconds** of
+native execution, through one run and one updated provider message
+`417200359:148`. Root observed its final text in the provider's accessibility
+state. Both retained their current tasks, used one attempt per publication and
+required no input resend or recovery. These are compatibility passes, not proof
+that the separate Discord restart crash was fixed.
+
+The existing 115-reply Slack thread remained at **Loading replies…** without a
+reply composer after normal refresh/reopen attempts. No continuation was sent
+there; this is not a Paperclip ingress failure. A fresh root mention in the
+same authorized QA channel is the bounded post-patch alternate journey.
+
+Server 56 loaded the frozen patch at **20:13:21.244 UTC**, became ready at
+**20:13:26.601**, and connected its real Discord Gateway. Root submitted the
+fresh Slack root at **20:13:50.836**. Its exact input `1788898430.940089`
+created one task (CHA-28), one wake and one native Codex app-server/Luna run.
+Working appeared after **2.666 seconds**; the exact `SLACK-PATCH-READY` final
+published after **21.766 seconds**, including **19.926 seconds** of native
+execution. Working and final each used one attempt on the same provider message
+`1788898433.486579`. The task remained in progress without duplicate work.
+Root opened the actual thread and inspected the reply, eyes reaction and usable
+continuation composer. The initial mention autocomplete incorrectly labeled the
+existing bot as not in the channel; actual mention resolution, ingress and
+delivery succeeded without changing membership. The old long-thread stall and
+this provider autocomplete inconsistency are not claimed fixed by Paperclip.
+
+The final fresh PostgreSQL integration run passed **421/421**, with no skips,
+in **91.49 seconds**. Its database was absent before creation and held zero
+companies, endpoints or tasks before the single suite invocation. Two setup
+commands failed before any test: a cleanup helper lacked its URL argument, then
+an unnecessary ESM import attempt failed resolution. Neither is a product-test
+failure or a retry of a populated fixture. Source and dependency patch hashes
+were unchanged through the successful suite.
+
+Root also exercised the real Discord connection's Activity controls. **Pause**
+at **20:18:30.670 UTC** stopped its old listener, and **Resume** at
+**20:18:51.453** started and connected a new listener inside the same server.
+The endpoint returned to active without a crash or credential replacement.
+This is live bot lifecycle proof, not a new user-to-bot interaction: Discord's
+browser user session is logged out. The paused screenshot also exposed a
+separate stale **Connected** health label, despite the paused badge and Resume
+button. The Activity panel now prioritizes lifecycle state and labels retained
+health as **Last reported health**. Active health/errors remain intact; no
+controls, provider settings or permissions changed. Eleven new assertions
+failed against the old projection; the final focused suite passed **31/31**,
+including 15 new cases. UI typecheck and all token gates passed.
+
+Root repeated Pause at **20:21:49.501 UTC**, inspected the corrected rendered
+paused sentence and explicitly historical health, then resumed at
+**20:21:55.661**. The real listener again stopped and a new listener connected;
+the endpoint returned to active. This UI and lifecycle regression passed live.
+Root's adjacent Activity/API/contract cohort also passed **49/49**; the final
+UI production build passed after the presentation fix.
+
+The post-dependency-change deterministic browser suite passed **12/12**, with
+no skips or retries, in **2.3 minutes**. It used another verified-new database
+on the isolated PostgreSQL server. The test web server exited and retained no
+database session. Coverage includes all five providers, default-off GitHub
+tool routing, agent Channels off/on, and file batches across reload and
+ambiguous response loss. Provider HTTP is mocked; this does not replace the
+live proofs or clear the Discord-login and Teams-tenant gates.

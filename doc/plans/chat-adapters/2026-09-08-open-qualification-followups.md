@@ -5,11 +5,54 @@ are fixed or moved into permanent verification documentation.** It is not a
 release-completion claim. Completed work and historical failures are recorded
 in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md).
 
-## Current work: missed GitHub callbacks and exact-request retry
+## Current work: Discord restart repair and final landing gates
 
-The recovery slice is committed as `e72a50480`. The next landing step merges
-master `ebaeba40e` (agent onboarding, PR #13011). Resolve both sides of the
-HTTP credential-redaction test and preserve chat experiment guards in the
+The merged head `c52e98c9b` passed every CI job in run `34270590335`, but
+Greptile's automatic review stopped at its 100-file soft limit. Request an
+explicit complete review after pushing the final follow-up. The PR still needs
+CODEOWNER approval; it is not merged. Keep it at **500 files**.
+
+Server 54 exposed an unhandled Discord `Opening handshake has timed out` on a
+clean restart. A real local-socket regression reproduced it. The repair closes
+CONNECTING sockets before releasing their error handler, awaits adapter
+destruction, and fences late login/packet continuations. Independent review
+reproduced two adjacent late-retirement races; their tests now pass. Genuine
+timeout recovery remains available. The agent cohort passed **84/84**; root's
+independent Discord/transport/publication-error cohort passed **88/88**, with
+no skips. Frozen offline install, full workspace typecheck/build and strict
+runner signature verification pass; no existing dependency versions changed.
+Fresh full chat integration passed **421/421** and the deterministic browser
+suite passed **12/12** on separate new PostgreSQL databases, with no skips or
+retries. Browser fixtures cover all five providers, the experiment off/on and
+file-batch delivery states. They mock provider HTTP and are not live accounts.
+The superseded v5/v6 surface notes are recoverable through immutable Git links
+in `wireframes-archive.md`; current specs and tests remain in the worktree.
+
+Server 56 loaded the patched dependencies at **20:13:21.244 UTC**, became ready
+at **20:13:26.601**, and connected the real Discord Gateway. Its base is c52 plus
+the frozen uncommitted repair. A final clean-head restart is still required.
+The old Slack thread remained stuck loading in Slack, with no composer and no
+input sent. Root instead submitted one fresh root mention in the same QA
+channel and visually confirmed exactly `SLACK-PATCH-READY` plus a usable reply
+composer. Independent correlation confirmed one wake, one native Luna run and
+one working-to-final message: **2.666 seconds** to working, **21.766 seconds**
+to final. Both publication operations used one attempt; the task stays open.
+Before this patch, clean-merge native Luna continuations passed in GitHub and
+Telegram in **21.209 / 18.039 seconds**. Root owns provider UI; subagents
+independently correlate delivery/run/publication records. Discord browser login
+and a qualified Teams tenant still limit new provider-user interaction proof.
+
+Two real Discord Pause/Resume cycles stopped the old listener and connected a
+new one inside server 56. The first cycle exposed stale **Connected** copy
+while paused. The Activity panel now shows lifecycle-first wording and labels
+retained health as historical. Eleven assertions failed against the old
+projection; **31/31** focused cases and root's three-file **49/49** cohort pass,
+as do UI typecheck and token gates. Root visually rechecked the corrected paused
+state and resumed the connection at **20:21:55.661 UTC**. It is active again.
+
+The recovery slice is committed as `e72a50480`; `c52e98c9b` incorporates
+master `ebaeba40e` (agent onboarding, PR #13011). It preserves both sides of the
+HTTP credential-redaction test and chat experiment guards in the
 new always-on AgentDetail/sidebar. The merged server compatibility cohort
 passed **110/110** and fresh full chat integration passed **421/421**;
 the focused UI cohort passed **310/310**. A real merged typecheck failure
@@ -26,8 +69,8 @@ again visually. The first additional browser attempt failed before any test
 because embedded PostgreSQL could not initialize while host shared memory was
 full. Using the existing isolated PostgreSQL with a new database avoided that
 host limit; no unrelated process or global setting was changed. Final UI
-typecheck/build and token gates passed after the heading fix. Fresh remote
-CI and Greptile still must validate the pushed merge head.
+typecheck/build and token gates passed after the heading fix. Remote CI passed
+for that merge; new CI and explicit Greptile review must validate the follow-up.
 
 This section supersedes the older in-flight CI snapshot below. Documentation
 head `5988fb475` passed CI `34263294210`, including both required aggregates,
@@ -122,7 +165,10 @@ older than the new epoch floor. Continue other providers while real login or
 tenant gates remain; keep this temporary note until the remaining defects are
 fixed or moved to permanent documentation.
 
-## Landing status
+## Earlier landing checkpoints
+
+These records are historical. Use the current-work section above for the
+current source, deployment, dependency and review status.
 
 - Code head `ea8e45e17` is pushed and mergeable in PR #13038, **500 files**.
   Greptile reviewed that exact head at **5/5**, explicitly all 500 files,
@@ -269,7 +315,7 @@ fixed or moved to permanent documentation.
   let its jobs finish, inspect outcomes, and retry only failed jobs. Do not
   count unexecuted tests as passed or rewrite the lockfile.
 
-## Current deployed state and evidence
+## Earlier deployed state and evidence
 
 The live server was restarted at **18:20:56.016 UTC**, log
 `.paperclip-runtime/chat-adapters-live/server-experimental-landing-51.log`.
@@ -439,7 +485,7 @@ device`, with host usage at **32/32** segments. No positively identified
 
 1. **Finish landing verification.** Update/push the verified fixes and PR
    description, then obtain green CI and Greptile review. The final fresh chat
-   rerun is **390/390**; fix any new CI findings without weakening assertions.
+   rerun is **421/421**; fix any new CI findings without weakening assertions.
    Leave checklist items unchecked while their evidence is missing.
 2. **Protocol-fault follow-through.** The original
    authenticated digest mismatch can leave “using tools” visible until the

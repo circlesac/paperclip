@@ -1,5 +1,7 @@
 import { createDiscordAdapter } from "@chat-adapter/discord";
 import { createRequire } from "node:module";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { classifyChatPublicationError } from "./chat-publication-errors.js";
 
@@ -1533,7 +1535,7 @@ describe("Paperclip Discord adapter patch", () => {
 });
 
 type DiscordClientForLifecycleTest = {
-  destroy(): void;
+  destroy(): void | Promise<void>;
   emit(event: string, ...args: unknown[]): boolean;
   login(token?: string): Promise<string>;
 };
@@ -1542,14 +1544,400 @@ const discordRequire = createRequire(
   import.meta.resolve("@chat-adapter/discord"),
 );
 const { Client, Events } = discordRequire("discord.js") as {
-  Client: { prototype: DiscordClientForLifecycleTest };
-  Events: { Error: string };
+  Client: {
+    prototype: DiscordClientForLifecycleTest;
+    new (options: Record<string, unknown>): DiscordClientForLifecycleTest & {
+      rest: { get(...args: unknown[]): Promise<unknown> };
+    };
+  };
+  Events: {
+    Error: string;
+    ClientReady: string;
+    ShardReady: string;
+    ShardResume: string;
+  };
 };
 
 describe("pinned Discord Gateway lifecycle patch", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it.each([
+    "packet decoding",
+    "heartbeat lookup",
+    "identify throttle",
+    "ready persistence",
+  ])("fences a retired shard's pending %s", async (stage) => {
+    const discordWsRequire = createRequire(
+      discordRequire.resolve("discord.js"),
+    );
+    const { WebSocketShard, DefaultWebSocketManagerOptions } = discordWsRequire(
+      "@discordjs/ws",
+    ) as {
+      DefaultWebSocketManagerOptions: Record<string, unknown>;
+      WebSocketShard: new (
+        strategy: Record<string, unknown>,
+        id: number,
+      ) => {
+        status: number;
+        destroy(): Promise<void>;
+        heartbeat(): Promise<void>;
+        identify(): Promise<void>;
+        onMessage(data: string, binary: boolean): Promise<void>;
+        unpackMessage(): Promise<unknown>;
+        send(): Promise<void>;
+        waitForEvent(): Promise<{ ok: boolean }>;
+        on(event: string, handler: (...args: unknown[]) => void): void;
+      };
+    };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached!: () => void;
+    const started = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const pause = async () => {
+      reached();
+      await held;
+    };
+    const shard = new WebSocketShard(
+      {
+        options: { ...DefaultWebSocketManagerOptions, shardCount: 1 },
+        retrieveSessionInfo: async () => {
+          if (stage === "heartbeat lookup") await pause();
+          return null;
+        },
+        updateSessionInfo: async (_id: number, session: unknown) => {
+          if (stage === "ready persistence" && session) await pause();
+        },
+        waitForIdentify: pause,
+      },
+      0,
+    );
+    const ready = {
+      op: 0,
+      t: "READY",
+      s: 1,
+      d: {
+        session_id: "synthetic-session",
+        resume_gateway_url: "wss://example.invalid",
+      },
+    };
+    if (stage === "packet decoding")
+      vi.spyOn(shard, "unpackMessage").mockImplementation(async () => {
+        await pause();
+        return ready;
+      });
+    const send = vi.spyOn(shard, "send").mockResolvedValue(undefined);
+    vi.spyOn(shard, "waitForEvent").mockResolvedValue({ ok: true });
+    const emitted = vi.fn();
+    shard.on("ready", emitted);
+    shard.on("dispatch", emitted);
+    const pending =
+      stage === "heartbeat lookup"
+        ? shard.heartbeat()
+        : stage === "identify throttle"
+          ? shard.identify()
+          : shard.onMessage(JSON.stringify(ready), false);
+    await started;
+    await shard.destroy();
+    release();
+    await pending;
+    expect(shard.status).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    expect(emitted).not.toHaveBeenCalled();
+  });
+
+  it("does not restart a real Discord client retired during its outer gateway lookup", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached!: () => void;
+    const started = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const strategy = {
+      connect: vi.fn(async () => undefined),
+      destroy: vi.fn(async () => undefined),
+      spawn: vi.fn(async () => undefined),
+    };
+    const client = new Client({
+      intents: [],
+      ws: { buildStrategy: () => strategy },
+    });
+    vi.spyOn(client.rest, "get").mockImplementation(async () => {
+      reached();
+      await held;
+      return {
+        url: "ws://127.0.0.1",
+        shards: 1,
+        session_start_limit: { total: 100, remaining: 100, reset_after: 1_000 },
+      };
+    });
+    const login = client.login("synthetic-discord-token");
+    await started;
+    await client.destroy();
+    release();
+    await login;
+    expect(strategy.spawn).not.toHaveBeenCalled();
+    expect(strategy.connect).not.toHaveBeenCalled();
+    expect(strategy.destroy).toHaveBeenCalledOnce();
+  });
+
+  it.each(["gateway lookup", "shard spawn"])(
+    "does not connect retired shards after pending %s",
+    async (stage) => {
+      const discordWsRequire = createRequire(
+        discordRequire.resolve("discord.js"),
+      );
+      const { WebSocketManager } = discordWsRequire("@discordjs/ws") as {
+        WebSocketManager: new (options: Record<string, unknown>) => {
+          connect(): Promise<void>;
+          destroy(): Promise<void>;
+        };
+      };
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let reached!: () => void;
+      const started = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const strategy = {
+        connect: vi.fn(async () => undefined),
+        destroy: vi.fn(async () => undefined),
+        spawn: vi.fn(async () => {
+          if (stage === "shard spawn") {
+            reached();
+            await held;
+          }
+        }),
+      };
+      const manager = new WebSocketManager({
+        buildStrategy: () => strategy,
+        rest: {
+          get: async () => {
+            if (stage === "gateway lookup") {
+              reached();
+              await held;
+            }
+            return {
+              url: "ws://127.0.0.1",
+              shards: 1,
+              session_start_limit: { remaining: 100, reset_after: 1_000 },
+            };
+          },
+        },
+      });
+      const connecting = manager.connect();
+      await started;
+      await manager.destroy();
+      release();
+      await connecting;
+      expect(strategy.connect).not.toHaveBeenCalled();
+      if (stage === "gateway lookup")
+        expect(strategy.spawn).not.toHaveBeenCalled();
+      else expect(strategy.destroy).toHaveBeenCalledTimes(3); // Initial reset, retirement, then late-spawn cleanup.
+    },
+  );
+
+  it.each([
+    "retirement",
+    "timeout recovery",
+    "retired recovery",
+    "handshake timeout recovery",
+  ])("owns real socket teardown through %s", async (mode) => {
+    const discordWsRequire = createRequire(
+      discordRequire.resolve("discord.js"),
+    );
+    const script = String.raw`
+      import assert from "node:assert/strict";
+      import { createRequire } from "node:module";
+      import { createServer } from "node:net";
+      const require = createRequire(import.meta.url);
+      const { WebSocketShard, DefaultWebSocketManagerOptions } = require(process.argv[1]);
+      const mode = process.argv[2];
+      const sockets = new Set();
+      let accepted = 0;
+      let observeHandshake;
+      const handshake = new Promise(resolve => { observeHandshake = resolve; });
+      let observeRecovery;
+      const recoveredHandshake = new Promise(resolve => { observeRecovery = resolve; });
+      const server = createServer(socket => {
+        accepted += 1;
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.once("data", () => accepted === 1 ? observeHandshake() : observeRecovery());
+      });
+      await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      let sessionReads = 0;
+      const shard = new WebSocketShard({
+        options: {
+          ...DefaultWebSocketManagerOptions,
+          compression: null,
+          handshakeTimeout: mode === "handshake timeout recovery" ? 100 : 1_000,
+          helloTimeout: mode === "retirement" || mode === "handshake timeout recovery" ? 2_000 : 20,
+          gatewayInformation: { url: "ws://127.0.0.1:" + address.port },
+        },
+        retrieveSessionInfo: async () => { sessionReads += 1; return null; },
+        updateSessionInfo: async () => {},
+      }, 0);
+      const failures = [];
+      shard.on("error", event => failures.push(event.error?.name));
+      const connecting = shard.internalConnect();
+      await handshake;
+      const connection = shard.connection;
+      assert.equal(connection.readyState, 0);
+      const closed = new Promise(resolve => connection.once("close", resolve));
+      if (mode === "retirement") await shard.destroy();
+      await closed;
+      if (mode === "timeout recovery" || mode === "handshake timeout recovery") await recoveredHandshake;
+      if (mode === "retired recovery") await new Promise(resolve => setImmediate(resolve));
+      const replacement = shard.connection;
+      await shard.destroy();
+      await connecting;
+      assert.equal(connection.readyState, 3);
+      if (replacement) assert.equal(replacement.readyState, 3);
+      const expectedConnections = mode === "timeout recovery" || mode === "handshake timeout recovery" ? 2 : 1;
+      assert.equal(accepted, expectedConnections);
+      assert.equal(sessionReads, expectedConnections);
+      assert.deepEqual(failures, mode === "handshake timeout recovery" ? ["Error"] : []);
+      for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => server.close(resolve));
+      process.stdout.write("all owned sockets closed; expected reconnect and failure counts\n");
+    `;
+    const result = await promisify(execFile)(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        script,
+        discordWsRequire.resolve("@discordjs/ws"),
+        mode,
+      ],
+      { timeout: 5_000 },
+    );
+    expect(result.stdout).toBe(
+      "all owned sockets closed; expected reconnect and failure counts\n",
+    );
+    expect(result.stderr).toBe("");
+  });
+
+  it.each(["connecting callback", "credential lookup"])(
+    "never logs in after retirement during %s",
+    async (stage) => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let reached!: () => void;
+      const started = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const login = vi
+        .spyOn(Client.prototype, "login")
+        .mockResolvedValue("discord-token");
+      const destroy = vi
+        .spyOn(Client.prototype, "destroy")
+        .mockResolvedValue(undefined);
+      const { adapter, chat } = harness({
+        botToken: async () => {
+          if (stage === "credential lookup") {
+            reached();
+            await held;
+          }
+          return "discord-token";
+        },
+        onGatewayEvent: async (event: { type: string }) => {
+          if (stage === "connecting callback" && event.type === "connecting") {
+            reached();
+            await held;
+          }
+        },
+      });
+      await adapter.initialize(chat as never);
+      const abort = new AbortController();
+      let listener: Promise<unknown> | undefined;
+      await adapter.startGatewayListener(
+        {
+          waitUntil: (task) => {
+            listener = Promise.resolve(task);
+          },
+        },
+        60_000,
+        abort.signal,
+      );
+      await started;
+      abort.abort();
+      await listener;
+      release();
+      await held;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(login).not.toHaveBeenCalled();
+      expect(destroy).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("waits for client destruction and suppresses retired ready events", async () => {
+    let client!: DiscordClientForLifecycleTest;
+    vi.spyOn(Client.prototype, "login").mockImplementation(function (
+      this: DiscordClientForLifecycleTest,
+    ) {
+      client = this;
+      return Promise.resolve("discord-token");
+    });
+    let release!: () => void;
+    const destroyed = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const destroy = vi
+      .spyOn(Client.prototype, "destroy")
+      .mockReturnValue(destroyed);
+    const onGatewayEvent = vi.fn(async () => undefined);
+    const { adapter, chat, logger } = harness({ onGatewayEvent });
+    await adapter.initialize(chat as never);
+    const abort = new AbortController();
+    let listener: Promise<unknown> | undefined;
+    await adapter.startGatewayListener(
+      {
+        waitUntil: (task) => {
+          listener = Promise.resolve(task);
+        },
+      },
+      60_000,
+      abort.signal,
+    );
+    await vi.waitFor(() => expect(client).toBeDefined());
+    abort.abort();
+    await vi.waitFor(() => expect(destroy).toHaveBeenCalledOnce());
+    let settled = false;
+    void listener!.then(() => {
+      settled = true;
+    });
+    const priorEvents = onGatewayEvent.mock.calls.length;
+    client.emit(Events.ClientReady);
+    client.emit(Events.ShardReady);
+    client.emit(Events.ShardResume);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      expect(settled).toBe(false);
+      expect(onGatewayEvent.mock.calls).toHaveLength(priorEvents);
+      expect(logger.info).not.toHaveBeenCalledWith(
+        "Discord Gateway connected",
+        expect.anything(),
+      );
+    } finally {
+      release();
+      await listener;
+    }
+    expect(settled).toBe(true);
   });
 
   it("recovers an accepted root-thread request after its response is lost", async () => {
