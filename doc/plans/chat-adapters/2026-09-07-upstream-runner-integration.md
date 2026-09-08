@@ -1674,3 +1674,62 @@ stream, and never forwards event prose/payloads. Independent review and
 also passed. This removes avoidable polling latency; it is not evidence that
 Luna's own model turn or FIFO waiting time has become shorter. The combined
 build still requires the following live post-deployment qualification.
+
+### Post-deployment consecutive-turn proof — 2026-09-08
+
+The combined `6e47a2942` build started at 10:26:03.584Z on the existing
+private live instance. A fresh explicit Discord request sent at
+10:26:22.388Z produced succeeded native run
+`100fec90-b923-4d57-abdd-e2e73e3cc9de` and its visible book-swap answer at
+10:27:18.647Z. This is evidence of the normal new-request path, not a claim
+that the historically quarantined provider conversation was restored.
+Independent durable-state inspection confirms explicit continuity fallback
+from unavailable old provider session `01a0802b…` to new provider session
+`01a0808d-fe51-7e00-b6c5-e032a49f4e3d`, preserving the Paperclip task and
+normalized conversation binding. The following busy request and correction
+both resume that exact new provider session. Their archived/current runner
+roots all retain exact identities, completed stop/drain and suspend commands,
+and a suspended lifecycle. Actual rollout turn context independently records
+Luna for all three; the evidence is not limited to the agent configuration.
+
+A second request at 10:28:52.934Z produced
+`bc72fd3b-ec5b-40b6-9ea2-e0ea0c9420ca`. At 10:29:01.039Z, while its working
+message was visible, a correction was sent in the same CHA-4 Discord thread.
+The first run succeeded at 10:29:43.336Z and its final publication
+`744685dd-7a54-4a55-9724-9c0b8437a6ff` edited `1546829681213575258`
+at 10:29:43.860Z. The queued continuation
+`3ee1cfba-0cb2-4a13-be4d-81078a79b684` started at 10:29:43.409Z,
+succeeded at 10:29:57.651Z, and edited `1546829891733815326` to exactly
+`DC-HANDOFF-CEDAR` at 10:29:58.078Z. Both new working messages became their
+respective finals; every associated publication attempt was one. Browser
+accessibility and a screenshot confirm both ordered replies on the same task.
+The old failed test's stale working message was not silently rewritten.
+
+This busy correction took **57.039s** from browser send to provider final:
+the preceding request still had to finish under the documented FIFO contract.
+The short correction's own started-to-finished time was **14.242s**; the
+preceding 220-word turn took **49.349s**. The two final publication
+created-to-published intervals were **473ms** and **380ms**. Those intervals
+include reconciliation, current-authority checks, transport, and settlement;
+they do not isolate provider network latency or establish an overall SLA.
+
+A separate idle Slack request sent at 10:31:04.782Z produced
+`64e9a2f9-a8c2-4eda-b616-b3b4805bb740` and exactly `SLACK-LUNA-READY`
+at 10:31:20.672Z, **15.890s** end to end. Its working message
+`1788863466.965279` was updated in place, once; final publication
+`35675ea4-14cc-454f-9ba6-9490eb255462` took **346ms** from creation to
+published settlement. All these real runs use `codex_app_server`; Maya's
+persisted adapter/model remain `paperclip_runner` / `gpt-5.6-luna`.
+
+The fresh deterministic browser suite passed **9/9** on isolated port 3199.
+No external provider account was accessed by that Playwright suite.
+
+Two further quality findings remain explicit pending their follow-up fixes.
+The Discord plant-swap answer visibly rendered ordinary prose as “token
+[REDACTED]”; this is being checked against the credential redactor rather
+than accepting corrupted user-facing text. Also, review of the new wakeup
+bridge confirmed the normal committed-final path emits its signal, but
+native PRP progress events enter through a different durable port and still
+depend on polling. A short observed publication interval is not proof that
+those progress updates were event-triggered. Neither finding is hidden by
+the passing consecutive-turn test.
