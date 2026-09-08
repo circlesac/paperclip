@@ -1438,6 +1438,13 @@ test.describe.serial("native chat adapter UI", () => {
           name: "Allow direct messages",
         });
         await expect(directMessages).toBeVisible();
+        if (provider.provider === "discord") {
+          await expect(
+            page.getByText(
+              "People must also enable Direct Messages in their shared Discord server’s Privacy Settings.",
+            ),
+          ).toBeVisible();
+        }
         await directMessages.click();
         await expect.poll(() => mock.allowDirectMessages).toBe(true);
       }

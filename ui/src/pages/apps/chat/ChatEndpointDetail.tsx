@@ -395,7 +395,11 @@ function Settings({
           <h3 className="text-sm font-semibold">Private conversations</h3>
           <SettingToggle
             label="Allow direct messages"
-            detail="People can start or continue a task in a direct conversation."
+            detail={
+              endpoint.provider === "discord"
+                ? "People must also enable Direct Messages in their shared Discord server’s Privacy Settings."
+                : "People can start or continue a task in a direct conversation."
+            }
             checked={endpoint.allowDirectMessages ?? false}
             pending={updateEndpoint.isPending}
             onChange={(allowDirectMessages) =>

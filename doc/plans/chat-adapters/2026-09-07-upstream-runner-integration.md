@@ -1397,3 +1397,55 @@ only an agent configuration value. Native Runner remains the driver; no
 Terra substitution occurred. This test-it-for-real pass materially shaped
 the changes: genuine provider controls, visible delivery and timing from
 the current answer were checked beyond the deterministic test results.
+
+### Live Slack cancellation and Discord DM isolation — 2026-09-08
+
+These tests used the deployed `78a7e668e` server and the same Maya E2E
+`paperclip_runner` agent configured with `gpt-5.6-luna`; both new Discord
+runs and both Slack runs use `codex_app_server`. No model substitution,
+provider API shortcut, or direct database mutation was used.
+
+Slack's real **Stop maya-e2e** button was clicked at 09:30:43.635Z during
+run `59e58412-630f-47ea-a420-3531f473f7d6` on CHA-21. It immediately became
+disabled and showed “Stopping maya-e2e…”. The run finished cancelled at
+09:30:44.307Z with `native_session_interrupted`; audit
+`7471b687-6be4-4f81-9673-c6361c0f0448` records
+`chat.slack_session_stopped`. The existing working message
+`1788859829.322089` changed to “Maya E2E stopped at your request.” at
+09:30:45.262Z. No requested long checklist leaked out after cancellation.
+One fresh follow-up in the same provider thread started run
+`21fb27ed-3082-4f1f-ac17-a610cb52da52` and returned exactly
+`SLACK-STOP-RECOVERED` once at 09:31:20.505Z, **15.298 seconds** after the
+browser send action. Its working/final message ID is `1788859867.497279`.
+Every publication attempted delivery once; the task remained open.
+
+The first Discord DM failed at Discord itself: Clyde rejected it and
+Paperclip received no DM delivery. Although Paperclip's endpoint already
+allowed DMs, Clawd's per-server **Direct Messages** switch was off.
+This is a documented independent provider constraint in
+[Discord's DM troubleshooting guide](https://support.discord.com/hc/en-us/articles/360060145013-Why-isn-t-my-DM-going-through).
+Temporarily enabling that switch and reopening the bot's Message action
+allowed the actual test. The switch was subsequently restored to **off**;
+Message requests returned to its original disabled/off state. Share my
+activity and Activity joining remained unchanged. Paperclip's existing
+Allow direct messages setting was not changed. A short Discord-only hint
+now explains this prerequisite beside that setting.
+
+The accepted DM at 09:42:36.338Z created conversation
+`77234abc-885e-4420-a097-fb39959ea2b4` and a **new CHA-25 task**
+(`b76d64f5-2edb-442a-8cb8-0fb9e8a4733b`), not the guild thread's CHA-4.
+Source run `a983a99b-1139-481a-bdff-64bb9ad52c2a` displayed genuine
+Maple/Cedar choice buttons at 09:42:48.723Z. Clicking Cedar once at
+09:43:06.039Z changed that card to “Answered: Cedar.” and removed its
+choices. Continuation `8535a5c5-9ae4-41d6-818b-ee0534192bf6` succeeded;
+the final message contained exactly `Cedar` at 09:43:23.991Z,
+**17.952 seconds after the click**, editing working message
+`1546818157036048445`. Every publication attempted delivery once and
+CHA-25 remained open. The direct conversation is inspectable at
+[the Discord DM](https://discord.com/channels/@me/1546815225334865972).
+
+Teams Developer Portal was rechecked at `https://dev.teams.microsoft.com/apps`;
+it currently redirects to a fresh Microsoft sign-in page. An eligible
+work/school tenant and its app-upload policy are still required, as described
+in [Microsoft's prerequisites](https://learn.microsoft.com/en-us/microsoftteams/platform/toolkit/tools-prerequisites).
+No Teams bot event or successful live Teams qualification is claimed.

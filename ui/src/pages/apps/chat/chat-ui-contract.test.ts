@@ -61,6 +61,14 @@ describe("chat connector UI contract", () => {
     expect(detail).not.toContain("Delivery transport");
   });
 
+  it("explains Discord's independent per-server direct-message restriction", () => {
+    const detail = source("./ChatEndpointDetail.tsx");
+    expect(detail).toContain('endpoint.provider === "discord"');
+    expect(detail).toContain(
+      "People must also enable Direct Messages in their shared Discord server’s Privacy Settings.",
+    );
+  });
+
   it("offers only real connection lifecycle actions", () => {
     const detail = source("./ChatEndpointDetail.tsx");
     const settings = detail.slice(
