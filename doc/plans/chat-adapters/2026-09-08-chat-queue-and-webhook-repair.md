@@ -605,3 +605,142 @@ pass, with runner/server TypeScript checks. The composed real transport test
 was placed in the binary-built transport suite rather than adding native
 prerequisites to the scheduled lightweight runtime suite. The live server
 has not yet deployed this change.
+
+## Final-sanitization repair and four fresh long-answer proofs
+
+`f91282130` fixes the digest/sanitization ordering and preserves authored
+finish/block summaries up to the existing 12,000-Unicode-codepoint result
+contract. Generic diagnostics remain 4 KiB. Invalid incoming semantic digests
+are rejected before receipt lookup or queueing, and the persisted envelope is
+sealed over its final sanitized input. Existing invalid history is untouched.
+Independent review found no weakening of identity, replay, receipt or size
+guards. `d8bfdad98` fixes a test-only port-reuse collision in the provider
+lifetime-fence fixture without changing production ownership behavior.
+
+Root's final unrestricted core run passed **231/231**. A release build was
+staged and code-signature verified, then **88/88** tests passed against staged
+binary SHA-256
+`ea2986e2d9f24225d80093354a4361a71afee1859319e13814232046187e360c`.
+After confirming no active Maya runs, root gracefully replaced only this
+worktree's server at 14:32:32 UTC (PID 22469, log
+`server-experimental-landing-43.log`). Startup found no pending ownership
+claim or evidence reconciliation work. Historical blocked entries and
+quarantined state remained intact.
+
+The following fresh requests were sent through the signed-in in-app browser.
+Every persisted execution profile is native Codex app-server / `gpt-5.6-luna`.
+Times below distinguish runtime from submission-to-final-provider-publication.
+
+| Provider | Run                                    |  Runtime | End-to-end | Authored summary | Visible result                                                                                 |
+| -------- | -------------------------------------- | -------: | ---------: | ---------------: | ---------------------------------------------------------------------------------------------- |
+| Slack    | `3ccea4de-8f55-4219-895a-1702853b6e50` | 46.999 s |   49.281 s | 6,775 characters | Full thread reply, ending `SLACK-LONG-COMPLETE-0908`                                           |
+| Discord  | `fa3862fe-1c10-4d4e-ba8e-4452cf75e0d9` | 44.616 s |   47.426 s | 6,331 characters | 7 KB Markdown attachment expanded through its final `DC-WHOLE-ANSWER-COMPLETE-0908` marker     |
+| GitHub   | `741f9f7c-d334-4df9-94f6-ff14b76bbc24` | 45.183 s |   48.105 s | 5,803 characters | Full disposable PR conversation reply ending `GH-LONG-COMPLETE-0908`                           |
+| Telegram | `ae666e16-338c-400a-bc9b-7792f97c1770` | 42.526 s |   44.989 s | 5,876 characters | 6 KB Markdown attachment opened in Telegram Instant View through `TG-FRESH-LONG-COMPLETE-0908` |
+
+Both required ordinary sentences were retained in every result: “One token
+can equal one standard game.” and “Use a transparent token system for the game
+swap.” Each working/progress/final publication operation used one attempt.
+Slack reused message `1788877996.440839`; GitHub reused comment `5586825404`.
+Discord delivered one full file as message `1546891437210079363`; Telegram
+delivered one full file as `417200359:128`. Discord and Telegram's existing
+working message became the timeless message-limit explanation, not a stale
+claim that the attachment was still being prepared.
+
+Telegram fresh-task setup is important: `/new` was submitted at 14:40:29.672
+and its acknowledgment was published at 14:40:32.267. Only after that visible
+acknowledgment did `/task TG-FRESH-LONG-SUMMARY-FIX-0908` start new issue
+`CHA-26` at 14:40:45.615. Failed `CHA-24` and the unacknowledged historical
+semantic event were preserved. This is a fresh-task success, not proof that
+the corrupt session resumed. A read-only recovery audit also found that the
+targeted run-detail reset uses an issue UUID while the latest chat session can
+use its identifier; alias-aware operator reset is being qualified separately.
+
+Functional outcome: all four fresh long answers reached their provider and
+were usable beyond the former truncation boundary. Experience quality still
+needs improvement: ordinary phrases such as “token system” with other
+punctuation/context, “token design”, and other game-token wording still show
+`[REDACTED]`. No historical reply was edited to hide these defects. Permanent
+authenticated protocol faults also need prompt, typed user-facing failure
+instead of reconnecting until the execution deadline. Teams live qualification
+and multi-process Discord takeover remain open.
+
+Master is now incorporated through `0cc796b7b` in `baada1375`. Full workspace
+typecheck/build passed after the merge. Release-registry **109/109**, combined
+preview/ACPX **23/23**, and source-root patch-routing **6/6** passed; the last
+six use synthetic preimages derived from actual patch hunks, not fresh npm
+installs. CI on prior head `683067cea` passed build, typecheck/release,
+packaging, all browser shards, all workspace suites and four of five general
+server shards. The remaining general shard found one real stale-read race in
+concurrent identical Slack modal submissions (**2,261 passed, six skipped,
+one failed**). The race is being fixed with a deterministic regression. Review
+and CI remain merge gates; no Greptile review has completed yet.
+
+## Modal race, scoped resets and final prose regression
+
+`3182b0373` corrects concurrent Slack/Teams modal callbacks that both load an
+issued token before one commits its answer. The stale callback now rechecks
+current authorization under the existing locks and requires the exact processed
+token receipt, canonical answered interaction and original resolving user.
+Another token, revoked membership/link, or a relinked active operator cannot
+clear that form. The deterministic two-provider case failed before the fix;
+the final focused cohort passed **11/11**. Independent review found no new
+answer or wake authority and no weakened destination/runtime/identity checks.
+
+`6dab18bba` fixes targeted operator session resets when the UI supplies an
+issue UUID but saved chat sessions use the issue identifier. The DELETE resolves
+only the current same-company issue's aliases within its own snapshot and
+retains agent/adapter scoping. Arbitrary custom keys remain exact-match; model
+or run context grants no alias. Seven real-PostgreSQL cases passed twice,
+including a root rerun; the combined compatibility cohort passed **217/217**
+and server TypeScript checks passed. This does not clear quarantined native
+state or establish live corrupt-session recovery.
+
+Root's next full chat run was **389/390**. All modal cases passed. The sole
+GitHub lifecycle count failure was traced through the retained database:
+exactly four GitHub inbound actions had four wake receipts, each attempt one,
+and its seven lifecycle receipts had no wakes. An earlier synthetic Telegram
+retry-exhaustion fixture had left one issued action eligible after 30 seconds;
+the global worker correctly picked it up during the GitHub fixture. Test-only
+`finally` cleanup now removes that exact synthetic action after preserving its
+strict six-failure and retryability assertions. The GitHub four-wake assertion
+and production worker are unchanged. The fresh full rerun subsequently passed
+**390/390** in 91.68 seconds on
+`chat_adapters_test_20260908_confirmation_cleanup_laplace_full01`, after all
+254 normal migrations. Test/service hashes stayed unchanged during the run.
+The prior retry fixture plus GitHub lifecycle focused pair passed **2/2** and
+server TypeScript checks passed. Log:
+`landing-confirmation-cleanup-laplace-0908-full390.log`.
+
+`d99773a5c` extends only the closed grammatical exception for ordinary game-token
+phrases observed in the four long answers. Low-entropy bare token values,
+assignments, quotes, compound/CLI keys, credential suffixes and nested secrets
+remain redacted. Unknown token-noun phrases can still conservatively redact;
+there is no arbitrary-English-word or entropy-based exemption. Independent
+review passed. Root passed **231/231** core and **88/88** real transport tests
+against newly signed/staged binary SHA-256
+`e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
+
+After verifying no active Maya run, root gracefully replaced only this server
+at 14:52:05.363 UTC, log `server-experimental-landing-44.log`. Startup was ready
+at 14:52:11.882 with no ownership claims or awaiting-evidence runs. The
+previous five historical blocked run IDs remained unchanged.
+
+The exact observed prose paragraph was then sent in all four existing
+conversations. Every visible bot reply preserved economy, station,
+reconciliation, limits, rules, design, values, exchanges, count and one-token
+limit/rule wording, without a redaction substitution. No old reply was edited.
+Every run used native Codex app-server / Luna and succeeded; each working/final
+publication operation used one attempt.
+
+| Provider | Run                                    |  Runtime | Submission to final publication | Provider message      |
+| -------- | -------------------------------------- | -------: | ------------------------------: | --------------------- |
+| Slack    | `f91f3343-1df6-491e-a21f-430c9f65ff0e` | 23.945 s |                        26.578 s | `1788879170.708099`   |
+| Discord  | `3c39ed83-0409-4095-abc4-eb27c8d77653` | 24.645 s |                        26.546 s | `1546896106515071038` |
+| GitHub   | `2c839667-9c83-4963-b60e-f6941ab0f383` | 25.678 s |                        27.459 s | `5587104571`          |
+| Telegram | `7f1c72fd-c22d-48f8-a2f2-0cadb2df2c26` | 24.366 s |                        27.770 s | `417200359:130`       |
+
+These results qualify the observed prose repair and the four existing-task
+follow-ups. They do not settle intermittent upstream Telegram ingress delay,
+old corrupted-session recovery, prompt permanent-integrity failure feedback,
+unfamiliar prose redaction or the remaining Teams/multi-process/file cases.

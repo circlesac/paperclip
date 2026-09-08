@@ -1,206 +1,135 @@
 # Temporary chat qualification handoff
 
-This is a working note for the implementing agent. **Delete this note when
-the items below are fixed or recorded in permanent verification documentation.**
-Do not treat this list as a release-completion claim.
+This note is for the implementing agent. **Delete it when the remaining items
+are fixed or moved into permanent verification documentation.** It is not a
+release-completion claim. Completed work and historical failures are recorded
+in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md).
 
-## Landing priority
+## Landing status
 
-The user has now asked to prepare pull requests for master while testing
-continues. This supersedes the earlier instruction not to tend pull requests.
+- The user asked to prepare the PR while testing continues. This supersedes
+  the earlier instruction not to tend PRs.
+- [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
+  merged. Keep one PR: the current local diff is **481 files**, below 500.
+- The default-off **Experimental > Chat connectors** setting is implemented.
+  Production GitHub tools remain visible and open directly without the
+  chat/tool choice when disabled. Default-off and enabled browser flows passed.
+  This is a UI visibility gate: active connections continue delivering until
+  explicitly paused.
+- Master is incorporated through `0cc796b7b` in merge `baada1375`. Full
+  workspace typecheck/build passed after that merge. There is no PR lockfile
+  delta. Preserve the upstream migration prefix and all 254 current migrations.
+- CI at `683067cea` passed every substantive lane except one Slack modal
+  race in general-server shard 1/5. The fix is `3182b0373`: deterministic
+  Slack/Teams red-to-green, **11/11** focused tests and independent auth review.
+  A subsequent local full run was **389/390** because an earlier synthetic
+  Telegram retry fixture leaked into a later GitHub global drain. Exact fixture
+  cleanup then passed a fresh **390/390** rerun in 91.68 seconds after 254
+  normal migrations. The GitHub four-wake assertion and production worker are
+  unchanged. Focused tests and server TypeScript checks also pass.
+- Greptile auto-review refused its 100-file soft limit. The documented
+  `@greptile-apps` override was requested, but no acknowledgment or completed
+  review is visible. Request review once on the next stable pushed head. Do not
+  mark review accepted, CI green or the PR ready to merge without evidence.
 
-1. Put chat connector UI behind a default-off **experimental chat connectors**
-   setting. Keep existing production tool connectors, especially GitHub,
-   available without the chat/tool choice when the experiment is disabled.
-2. Master reconciliation is committed as `e91b236ff`, against upstream
-   `297d8741f`. The tested source and migration order are preserved; the merge
-   inherits upstream's lockfile with no PR lockfile delta.
-3. Use the fewest reviewable PRs. Check the actual changed-file count against
-   Greptile's 500-file limit; do not split channels unnecessarily. Retained
-   prototype/wireframe iterations currently inflate the branch's count.
-4. Fill the repository PR template, report verification limits honestly, and
-   obtain reviews before claiming the work ready to merge.
+## Current deployed state and evidence
 
-PR [#13038](https://github.com/paperclipai/paperclip/pull/13038) is open as
-one review below the 500-file maximum. It is mergeable; CI and review must still
-pass before landing. Master is incorporated through `b97101893` by
-`1a442f5a0`, including the new project repository selection flow. Independent
-compatibility checks passed 138 UI and 19 server tests. Full workspace
-typecheck and build passed again after that second merge.
+The live server started at **14:52:05 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-44.log`.
+It runs through `d99773a5c`; later fixture-only changes need no restart.
+Its private Board is at `http://127.0.0.1:3103`. Keep the public verified
+webhook proxy separate from the private Board.
 
-The visibility flag is committed as `56c096e5e`; the pasted-URL shortcut
-correction and exact recovery-test settlement wait are in `2feb8375f`.
-The real default-off GitHub tool flow and enabled chat catalog both passed
-browser inspection. Chat connectors are enabled on the existing live test
-instance so qualification can continue. Full workspace typecheck/build and
-the final 390-test chat integration rerun passed. The broad command stopped
-after its general-server phase: **8,117 passed, 34 skipped, four failed**.
-All four failures now have focused passing fixes (CLI guard, native recovery,
-parked-answer attestation, and formatted read-only route extraction). Other
-workspace/serialized phases still require CI; do not claim a full broad pass.
-The CLI guidance failure was caused by ignored historical runtime
-recordings, not current source guidance. Commit `9beee1d14` excludes only the
-root recordings directory; all 38 focused guard tests pass without changing
-the command allowlist. Do not upload the earlier failure log, which quotes
-captured prompts. The first browser run passed all six catalog/provider
-journeys, then found that the four Board-send fixtures still needed to opt
-into the new experiment. After correcting those mocks, the full browser suite
-passed **10/10** on isolated port 3199 and a fresh external PostgreSQL database. Local
-embedded PostgreSQL exhausted macOS IPC slots during concurrent test work;
-one orphan from this task's own completed browser run was cleared without
-deleting database files or touching another worktree's processes.
+All four active connections use immutable Maya E2E with **Paperclip Runner →
+Codex app-server → `gpt-5.6-luna`**, low reasoning. Verify the persisted
+execution profile for new runs; do not substitute a legacy adapter or silently
+switch to Terra. The signed/staged runner SHA-256 is
+`e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
 
-CI on the initial PR head is **not green**. Follow-up work covers the clipboard
-fallback guard, a uniform cross-company identity-preview response, legacy
-migration and route fixture compatibility, a buffered-tool diagnostic test
-race, and a bundled ACPX patch applicability failure. Native recovery now
-passes **9/9**, the migration rollback test **1/1**, and the corrected durable
-diagnostic assertion's full staged transport suite **87/87**. Greptile's
-automatic review refused the 100-file soft limit; the requested explicit
-`@greptile-apps` override is posted, but no review-start acknowledgment or
-completed review is visible yet. Do not report the review as accepted.
-The issue route fixtures also pass **92/92** after adding the missing left-join
-mock and the fifth database argument to comment assertions. The clipboard and
-identity-preview cohort passes **37/37**, with both server and UI typechecks.
-The parked-answer fixture now uses real durable linked-user lineage and checks
-revocation before dispatch: **16/16** batching tests pass. Both ACPX patch files
-were regenerated with pnpm after reproducing GNU patch's asymmetric-context
-failure; their resulting vendor files are byte-identical to the intended code.
-Packaging **15/15** and actual fresh GNU-patch staging **2/2** pass. No lockfile
-was edited. CI at `28dd9ee9f` confirms build, typecheck, canary packaging,
-all browser shards, and the non-server workspace tests. Three server shards
-failed; all three now have focused passing fixture corrections (read-only
-route formatting, the comment service's explicit database argument, and an
-exact durable slash-admission completion wait). The last correction is in
-`cba5aa51c`, independently verified by **390/390** full chat integration tests
-on another fresh database with all 254 migrations. CI must rerun before
-claiming it is green.
+- Root core **231/231** and real staged transport **88/88** passed after the
+  latest prose fix. Authored finish/block summaries preserve the existing
+  12,000-codepoint limit; generic diagnostics stay 4 KiB. Final sanitization
+  occurs before sealing the persisted semantic digest; invalid incoming
+  digests still fail closed before receipt lookup/enqueue.
+- Typed irrecoverable cleanup: runtime **74/74**, executor **159/159** and the
+  88 transport tests. Temporary failures still retry; retained ownership and
+  quarantine are not bypassed.
+- Targeted session reset `6dab18bba`: **217/217** compatibility tests,
+  including seven new real-PostgreSQL alias cases independently rerun by root.
+  Only the current same-company issue UUID/identifier is resolved; other
+  tasks, agents, adapters, custom keys and model-claimed aliases are preserved.
+  This fixes the UI UUID versus chat identifier mismatch, not runner quarantine.
+- Deterministic browser **10/10**, native question/wait **130/130** and
+  Experimental flag/UI/server/shared cohorts passed. Release compatibility
+  **109/109**, preview/ACPX **23/23** and patch-routing **6/6** passed. The last
+  six use synthetic actual-hunk fixtures, not fresh npm installs.
+- Fresh long answers reached Slack, Discord, GitHub and Telegram in **45–49
+  seconds** end to end; native Luna used **43–47 seconds**. Full provider
+  replies or opened Discord/Telegram files retained the ending beyond 4 KiB.
+  Discord/Telegram use a timeless message-limit explanation instead of stale
+  “preparing” text. Each publication operation used one attempt.
+- The later `PROSE-FINAL-0908` retest preserved all observed token-noun phrases
+  in all four providers in **26.5–27.8 seconds** end to end. Historical replies
+  were not edited. Closed grammar protects the known prose without exempting
+  arbitrary English words, credential-shaped values, assignments or nested keys.
+- The broad local `pnpm test:run` originally stopped after its general-server
+  phase: **8,117 passed, 34 skipped, four failed**. Those failures have focused
+  passing fixes and the later CI lanes provide broader evidence, but do not
+  claim that original full command passed. Do not upload that old log: its
+  CLI-guard failure quotes ignored historical runtime prompts.
 
-## Current tested/deployed state
+## Remaining work
 
-- The server fixes in `1c4a45f0e` are committed and pushed. The live server
-  was restarted with them; verify readiness before the next browser action.
-- All four active live connections use the immutable Maya E2E agent with
-  **Paperclip Runner → Codex app-server → `gpt-5.6-luna`**. Verify the actual
-  persisted execution profile for each new live run; do not substitute a
-  legacy adapter or silently switch to Terra.
-- Server-only qualification: full chat integration **390/390**, native
-  external-chat question/wait integration **130/130**, server source typecheck,
-  independent GitHub authority review **24/24**. A final strengthened Discord
-  Activity/target assertion also passed independently.
-- The narrow Rust prose-redaction fix is committed as `47ddc4f8e`. Root passed all
-  **223/223** runner-core tests, built/staged/signed the release binary, and
-  passed **87/87** staged Codex transport tests. The staged SHA-256 starts
-  `a61275f338b7`. Existing live sessions can still use the prior binary; a
-  fresh Slack reply now preserves all three exact regression sentences.
-  A full Discord document inspection still found other ordinary token phrases
-  redacted, so broader prose quality remains open.
-- Follow-up `7e4960695` narrowly preserves “a/the transparent token system”
-  and sentence-final punctuation without weakening credential canaries.
-  Root independently passed **225/225** core and **87/87** rebuilt/staged
-  transport tests. The new signed binary SHA-256 starts `dfb434e487ac`.
-  This newer binary has not yet received fresh live qualification.
+1. **Finish landing verification.** Update/push the verified fixes and PR
+   description, then obtain green CI and Greptile review. The final fresh chat
+   rerun is **390/390**; fix any new CI findings without weakening assertions.
+   Leave checklist items unchecked while their evidence is missing.
+2. **Prompt permanent protocol-fault feedback.** An authenticated semantic
+   digest mismatch currently closes the socket and can leave “using tools”
+   visible until the 900-second deadline. Independent design review calls for
+   a typed, latched integrity callback after exact correlation validation,
+   wired through transport, notification/backend and runtime boundaries.
+   Preserve the primary fault through cleanup failure; use the permanent
+   integrity disposition. Do not ACK/dispatch the bad event or replace its
+   provider. Add unauthenticated/wrong-identity, repeated replay, transient
+   commit and failed-suspension negatives before claiming a prompt failure path.
+3. **Damaged-session recovery.** Telegram `CHA-24` run
+   `a4938fcc-dc2c-4146-a776-12512cf4b613` failed at 14:17:07 with a suspended
+   runner but unacknowledged historical semantic event 44. Preserve that
+   evidence. The successful Telegram long answer used normal `/new`, waited
+   for its visible acknowledgment, then created **CHA-26**. This is not proof
+   of old-task recovery. Qualify normal operator reset or the guarded
+   corrupt-event → rejected warm attach → continuity-break replacement.
+   Never hand-repair the digest or clear safety state to force success.
+   The earlier first replacement request sacrificed to safe quarantine is
+   also an unresolved operator-UX gap.
+4. **Conservative prose redaction.** All observed game-token phrases now pass
+   live, but unfamiliar token-noun phrases can still be over-redacted. Preserve
+   low-entropy credential coverage; no arbitrary-word/entropy heuristic.
+5. **Telegram upstream latency.** One request spent 234.435 seconds before
+   reaching the local proxy; Luna then used 13.433 seconds. A later request
+   reached the proxy in 0.583 seconds and finished in 16.228 seconds without
+   configuration changes. Localized, not explained or fixed.
+6. **Remaining provider permutations.** Discord's real 30-second server pause
+   exceeded its 15-second lease and recovered a message/reaction once; later
+   continuity passed. Live second-process takeover is still unqualified.
+   Continue the remaining file/image/interaction cases in the browser runbook.
+   Do not merge or edit the disposable GitHub test repository during chat QA.
+7. **Teams external gate.** There is no qualified Microsoft 365 tenant/admin
+   setup. Deterministic tests are not live Teams qualification. Continue other
+   providers while this real external gate remains.
 
-## Immediate unfinished tests/fixes
+## Working guardrails
 
-- **GitHub:** the live native Quartz/Jade round trip passed after deployment.
-  The original linked user selected Jade on the actual Board question card;
-  the question was marked answered and exactly one Jade reply appeared in
-  the original GitHub thread. The continuation used native Luna and took
-  17.856 seconds. Separate negative tests cover governance and identity;
-  this live result alone does not prove every review gate. Do not merge or
-  edit the disposable test repository as part of this chat test.
-- **Runner prose redaction:** ordinary board-game prose containing phrases
-  such as “one token for” and “one token can equal” lost words. A narrow
-  grammar exception passed review and tests, with assignment, quoted, CLI, compound,
-  JWT/Bearer and known-secret canaries. The fresh Slack exact-sentence test
-  passed in 18.213 seconds end to end on native Luna. The new Discord whole
-  file preserved the required sentence but still showed “transparent token
-  [REDACTED]”, “one token [REDACTED]”, and “token [REDACTED]” elsewhere.
-  Investigate those false positives without granting broad redaction exemptions
-  or rewriting historical replies to manufacture a pass.
-- **Attachment handoff:** the stale “preparing” message was replaced in code
-  with a timeless message-limit explanation. Discord/Telegram long-document
-  retry/ambiguous-delivery tests passed; confirm the new wording on a fresh
-  live long response after deployment. Discord's fresh sapphire plan now
-  passed: the timeless handoff and real whole-file preview were verified;
-  final attachment arrived once in 61.372 seconds end to end. Native Luna
-  used 58.630 seconds. Telegram's equivalent fresh attempt failed at native
-  shutdown, so neither its handoff wording nor delivery passed that attempt.
-- **Telegram/native shutdown:** the fresh long-answer run
-  `f262ca93-3c29-4338-a625-0d2239757e38` accepted a successful native result,
-  but failed to durably suspend before checkpoint. Its transport quarantined
-  on provider-event teardown timeout, then repeatedly failed cleanup.
-  Telegram correctly showed failure rather than a fabricated success, but
-  the authored answer was not delivered. Investigate the event drain and
-  shutdown sequence; do not treat accepted result metadata as delivery proof.
-  Durable inspection found 128 delta events committed by the controller but
-  not yet ACK-persisted by the runner; stop and suspend commands were delayed
-  behind that traffic. A subsequent Slack run also failed on incomplete
-  prior-session cleanup, so further live sends are paused while the runner
-  fairness/cleanup regression is fixed. Do not clear safety state to force
-  a green result or increase deadlines in place of fixing command progress.
-  Commit `440ae9bbd` batches cumulative ACK persistence at 16 advances while
-  preserving replay and command/lifecycle save boundaries. Root passed all
-  **226/226** core tests, the refined before-command persistence assertion,
-  and **87/87** tests against signed binary SHA-256 `3c69ea061539…`. The real
-  socket backlog/suspension/rebind case is included in those 87 tests. Live
-  recovery and retesting remain pending; verify exact prior process ownership
-  and let startup reconciliation settle without changing durable history.
-  Root proved runner/group 85958 and provider 86338 dead, then gracefully
-  restarted at 13:55 UTC; no new startup evidence/ownership blocks appeared.
-  The next Telegram request failed immediately with `runner_state_identity_mismatch`:
-  the prior heartbeat was terminal but its checkpoint was not suspended.
-  Existing recovery safely retained that root in quarantine and deliberately
-  failed the first replacement request. That sacrificed request is a real UX
-  gap, not a new authority mismatch to bypass. After verifying the active root
-  absent, retained root present, and both old processes still dead, root sent
-  one fresh long Telegram request at 14:00:46.314 UTC. It failed, not passed:
-  run `a4938fcc-dc2c-4146-a776-12512cf4b613` reached `paperclip_finish` at
-  14:01:26.348, but source event 44 cannot commit. Its input was truncated
-  again after its digest was sealed; replay fails digest validation and
-  repeatedly reconnects. The model is not still thinking. Preserve the
-  fail-closed digest and identity checks; correct the final sanitization
-  boundary and add a deterministic long-answer regression before recovery.
-  The run exhausted recovery at 14:17:07.520 with incomplete cleanup. Root's
-  later Cancel click found no control and applied no cancellation. The
-  retained runner checkpoint is now suspended, with event 44 still unacked;
-  no new live request or manual state repair has been performed. Also fix the
-  original 4 KiB authored-answer truncation without relaxing diagnostic bounds.
-- **Irrecoverable cleanup latency:** transport close memoizes its rejected
-  promise after controller teardown. Generic runtime retries do no fresh work,
-  and server retries add two 30-second delays. A typed operator-recovery-required
-  path is committed as `65bd25a22` after independent review. Final cohorts:
-  runtime **74/74**, executor **159/159**, transport **88/88**, and runner/server
-  TypeScript checks. The real memoized-close test lives in the transport suite
-  whose prerequisites build native fixtures; the scheduled lightweight runtime
-  suite stays native-binary-free. Transient/live-owner cleanup remains retryable
-  and the quarantine ownership gate stays. Only TypeScript was emitted; the
-  live runner binary was not changed.
-- **Telegram latency:** one message took 234.435 seconds _before reaching the
-  local webhook proxy_, then Luna ran for 13.433 seconds. The next independent
-  message reached the proxy in 0.583 seconds and answered in 16.228 seconds
-  total without configuration changes. The intermittent upstream delay is
-  localized but not explained; do not call it fixed or blame model time.
-- **Discord recovery:** a real 30-second server pause exceeded the 15-second
-  Gateway lease. One paused message and reaction addition recovered once;
-  removal happened after resume and did not wake a run. The next live turn
-  succeeded in 15.817 seconds end to end. Live second-process takeover is
-  still unqualified; deterministic stale-owner/reconstruction tests pass.
-- **Teams:** no qualified Microsoft 365 tenant/admin setup is available.
-  Deterministic coverage is not live Teams qualification. Continue other
-  channels while this external gate remains.
+Work only in `/Users/dotta/paperclipai/branches/chat-adapters`, branch
+`codex/chat-adapters`; preserve uncommitted work. Root owns Git, the live
+server and signed-in in-app browser. Delegate disjoint implementation/tests.
+No filesystem/command approval prompts. Stop only for actual external login,
+MFA, admin consent or a required secret the product cannot generate.
 
-## Guardrails while continuing
-
-Work only in the existing chat-adapters worktree. Root owns live browser,
-server and Git operations; delegate disjoint local implementation/tests.
-Use the signed-in in-app browser for provider actions. Do not expose raw
-reasoning, tool arguments, logs, credentials or private file URLs in external
-chat. Preserve history, current permission checks and one-thread/one-task
-identity. Keep the private Board separate from public verified webhooks.
-
-Detailed run IDs, timestamps, test commands and historical failures are in
-`2026-09-08-chat-queue-and-webhook-repair.md` and the other qualification notes.
-Do not include instance-local identifiers or tailnet links in a public PR
-description.
+Never export raw reasoning, tool arguments, internal logs, credentials or
+private file URLs to chat. Preserve current permissions and one external
+thread / one task identity. Never replay `delivery_unknown` without the
+explicit audited resolution. Keep all real credentials and runtime artifacts
+out of Git. Do not put instance-local IDs or tailnet URLs into the public PR
+description. Use a fresh fixture database for every full integration run.
