@@ -3,11 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createCoalescedAsyncTrigger,
   isChatPublicationCommitSignal,
+  publishChatPublicationCommitSignal,
 } from "./chat-publication-reconciliation.js";
 import {
   publishGlobalLiveEvent,
   publishLiveEvent,
   subscribeAllCompanyLiveEvents,
+  subscribeCompanyLiveEvents,
+  subscribeGlobalLiveEvents,
 } from "./live-events.js";
 import { SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPES } from "./safe-native-chat-progress.js";
 
@@ -285,14 +288,34 @@ describe("chat publication commit signals", () => {
 
   it("observes company events without changing the public global event stream", () => {
     const observed: string[] = [];
+    const globallyObserved: string[] = [];
     const unsubscribe = subscribeAllCompanyLiveEvents((event) => {
       observed.push(`${event.companyId}:${event.type}`);
     });
+    const unsubscribeGlobal = subscribeGlobalLiveEvents((event) => {
+      globallyObserved.push(`${event.companyId}:${event.type}`);
+    });
     try {
+      expect(publishChatPublicationCommitSignal({
+        companyId: "publication-signal-company",
+        issueId: "publication-signal-issue",
+        runId: "publication-signal-run",
+        agentId: "publication-signal-agent",
+        seq: 7,
+        eventType: "tool.execution.started",
+      })).toBe(true);
+      expect(publishChatPublicationCommitSignal({
+        companyId: "publication-signal-company",
+        issueId: "publication-signal-issue",
+        runId: "publication-signal-run",
+        agentId: "publication-signal-agent",
+        seq: 8,
+        eventType: "provider.notice",
+      })).toBe(false);
       publishLiveEvent({
         companyId: "publication-signal-company",
-        type: "heartbeat.run.event",
-        payload: { eventType: "run.presentation.resolved" },
+        type: "heartbeat.run.status",
+        payload: {},
       });
       publishGlobalLiveEvent({
         type: "plugin.ui.updated",
@@ -300,11 +323,34 @@ describe("chat publication commit signals", () => {
       });
     } finally {
       unsubscribe();
+      unsubscribeGlobal();
     }
 
     expect(observed).toEqual([
       "publication-signal-company:heartbeat.run.event",
+      "publication-signal-company:heartbeat.run.status",
     ]);
+    expect(globallyObserved).toEqual(["*:plugin.ui.updated"]);
+  });
+
+  it("contains a live subscriber failure after the durable source committed", () => {
+    const unsubscribe = subscribeCompanyLiveEvents(
+      "publication-signal-listener-failure",
+      () => {
+        throw new Error("simulated_live_listener_failure");
+      },
+    );
+    try {
+      expect(publishChatPublicationCommitSignal({
+        companyId: "publication-signal-listener-failure",
+        issueId: "publication-signal-issue",
+        runId: "publication-signal-run",
+        agentId: "publication-signal-agent",
+        eventType: "run.presentation.resolved",
+      })).toBe(false);
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("ignores pre-publication lifecycle events and wakes only after the commit marker", async () => {

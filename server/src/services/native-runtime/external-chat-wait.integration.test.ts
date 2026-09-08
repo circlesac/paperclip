@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
@@ -63,6 +63,7 @@ import type { AskUserQuestionsInteraction } from "@paperclipai/shared";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
 import { createStorageService } from "../../storage/service.js";
+import { subscribeAllCompanyLiveEvents } from "../live-events.js";
 
 describe("native external-chat response wait", () => {
   let temporary: Awaited<
@@ -2627,18 +2628,43 @@ describe("native external-chat response wait", () => {
           .update(issueThreadInteractions)
           .set({ status: "accepted" })
           .where(eq(issueThreadInteractions.id, gate.id));
-      await finalizeNativeRun({
-        db,
-        runId: fixture.runId,
-        workspaceFinalizeStatus: "succeeded",
-        projectRunStatus: true,
+      const presentationSignals: Array<Record<string, unknown>> = [];
+      const visibilityChecks: Array<Promise<Array<{ runId: string | null }>>> = [];
+      const unsubscribe = subscribeAllCompanyLiveEvents((event) => {
+        if (
+          event.companyId !== fixture.companyId ||
+          event.type !== "heartbeat.run.event" ||
+          event.payload.runId !== fixture.runId ||
+          event.payload.eventType !== "run.presentation.resolved"
+        ) return;
+        presentationSignals.push(event.payload);
+        visibilityChecks.push(
+          db
+            .select({ runId: issueComments.createdByRunId })
+            .from(issueComments)
+            .where(and(
+              eq(issueComments.createdByRunId, fixture.runId),
+              eq(issueComments.authorType, "agent"),
+              ne(issueComments.id, selectedComment.id),
+            )),
+        );
       });
-      await finalizeNativeRun({
-        db,
-        runId: fixture.runId,
-        workspaceFinalizeStatus: "succeeded",
-        projectRunStatus: true,
-      });
+      try {
+        await finalizeNativeRun({
+          db,
+          runId: fixture.runId,
+          workspaceFinalizeStatus: "succeeded",
+          projectRunStatus: true,
+        });
+        await finalizeNativeRun({
+          db,
+          runId: fixture.runId,
+          workspaceFinalizeStatus: "succeeded",
+          projectRunStatus: true,
+        });
+      } finally {
+        unsubscribe();
+      }
       const [repaired] = await db
         .select()
         .from(heartbeatRuns)
@@ -2671,6 +2697,20 @@ describe("native external-chat response wait", () => {
             }),
           ]),
         );
+      }
+      if (state === "gate_changed" || state === "ownership_held") {
+        expect(presentationSignals).toEqual([]);
+        expect(visibilityChecks).toEqual([]);
+      } else {
+        expect(presentationSignals).toEqual([{
+          runId: fixture.runId,
+          agentId: fixture.agentId,
+          issueId: fixture.issueId,
+          eventType: "run.presentation.resolved",
+        }]);
+        await expect(Promise.all(visibilityChecks)).resolves.toEqual([
+          [{ runId: fixture.runId }],
+        ]);
       }
       expect(
         await db

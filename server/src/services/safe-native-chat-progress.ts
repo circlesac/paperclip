@@ -19,6 +19,16 @@ export const SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPES = [
 export type SafeNativeChatProgressEventType =
   (typeof SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPES)[number];
 
+const SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPE_SET = new Set<string>(
+  SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPES,
+);
+
+export function isSafeNativeChatProgressEventType(
+  eventType: string,
+): eventType is SafeNativeChatProgressEventType {
+  return SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPE_SET.has(eventType);
+}
+
 export type SafeNativeChatProgressPhase =
   | "preparing"
   | "researching"
@@ -67,10 +77,7 @@ export function safeNativeChatProgressForEvent(
   eventType: string,
   agentName: string,
 ): { phase: SafeNativeChatProgressPhase; text: string } | null {
-  if (!Object.hasOwn(SAFE_NATIVE_CHAT_PROGRESS_PHASES, eventType)) return null;
-  const phase =
-    SAFE_NATIVE_CHAT_PROGRESS_PHASES[
-      eventType as SafeNativeChatProgressEventType
-    ];
+  if (!isSafeNativeChatProgressEventType(eventType)) return null;
+  const phase = SAFE_NATIVE_CHAT_PROGRESS_PHASES[eventType];
   return { phase, text: SAFE_NATIVE_CHAT_PROGRESS_TEXT[phase](agentName) };
 }

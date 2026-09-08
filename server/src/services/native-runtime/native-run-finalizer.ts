@@ -29,6 +29,7 @@ import {
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
+import { publishChatPublicationCommitSignal } from "../chat-publication-reconciliation.js";
 import { nativeSha256 } from "./canonical.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
@@ -519,6 +520,13 @@ async function materializeCommittedReviewResponse(db: Db, runId: string) {
         authorizationReason: "allow_chat_run_presentation",
       },
     );
+    publishChatPublicationCommitSignal({
+      companyId: run.companyId,
+      issueId: run.nativeIssueId,
+      runId: run.id,
+      agentId: run.agentId,
+      eventType: "run.presentation.resolved",
+    });
   } catch (error) {
     // The durable committed proof remains retryable by the next reconciler
     // sweep. Presentation failure must not reclassify a successful native run.

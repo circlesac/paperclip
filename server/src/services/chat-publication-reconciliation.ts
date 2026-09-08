@@ -1,9 +1,13 @@
 import type { LiveEvent } from "@paperclipai/shared";
-import { SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPES } from "./safe-native-chat-progress.js";
+import { publishLiveEvent } from "./live-events.js";
+import { isSafeNativeChatProgressEventType } from "./safe-native-chat-progress.js";
 
-const SAFE_NATIVE_PROGRESS_EVENTS = new Set<string>(
-  SAFE_NATIVE_CHAT_PROGRESS_EVENT_TYPES,
-);
+const CHAT_PUBLICATION_PRESENTATION_COMMIT_EVENT = "run.presentation.resolved";
+
+function isChatPublicationCommitEventType(eventType: string): boolean {
+  return eventType === CHAT_PUBLICATION_PRESENTATION_COMMIT_EVENT ||
+    isSafeNativeChatProgressEventType(eventType);
+}
 
 /**
  * Only events emitted after durable run evidence is visible may wake the
@@ -17,10 +21,42 @@ export function isChatPublicationCommitSignal(
   if (event.type !== "heartbeat.run.event") return false;
   const eventType = event.payload.eventType;
   if (typeof eventType !== "string") return false;
-  return (
-    eventType === "run.presentation.resolved" ||
-    SAFE_NATIVE_PROGRESS_EVENTS.has(eventType)
-  );
+  return isChatPublicationCommitEventType(eventType);
+}
+
+/**
+ * Emit a company-scoped publication wake only after its durable source row is
+ * visible. The narrow primitive input prevents a PRP payload, message, tool
+ * name, target, result, or error from crossing into the public live stream.
+ */
+export function publishChatPublicationCommitSignal(input: {
+  companyId: string;
+  issueId: string;
+  runId: string;
+  agentId: string;
+  eventType: string;
+  seq?: number;
+}): boolean {
+  if (!isChatPublicationCommitEventType(input.eventType)) return false;
+  try {
+    publishLiveEvent({
+      companyId: input.companyId,
+      type: "heartbeat.run.event",
+      payload: {
+        runId: input.runId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+        ...(input.seq === undefined ? {} : { seq: input.seq }),
+        eventType: input.eventType,
+      },
+    });
+    return true;
+  } catch {
+    // This notification is an optional latency optimization. A subscriber
+    // failure must not reject an already-committed event/comment or skip its
+    // durable side effects; the periodic reconciliation poll remains recovery.
+    return false;
+  }
 }
 
 /**
