@@ -1061,7 +1061,7 @@ export async function createApp(
     await enqueueChatRunMilestones(db, {
       publicBaseUrl: opts.authPublicBaseUrl,
     });
-    await chatChannels.processPendingPublications();
+    await chatChannels.schedulePendingPublications();
   };
   const chatReconciliation = createChatReconciliationCoordinator({
     reconcileProviderRuntimes: () => chatChannels.reconcileProviderRuntimes(),

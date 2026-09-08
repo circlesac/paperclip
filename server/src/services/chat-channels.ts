@@ -583,6 +583,7 @@ const SLACK_FILE_RECEIPT_STALE_MS = 60_000;
 const ORPHAN_FOLLOW_UP_GRACE_MS = 5_000;
 const ORPHAN_FOLLOW_UP_MAX_ATTEMPTS = 12;
 const CREDENTIAL_MUTATION_LEASE_TTL_MS = 90_000;
+const PUBLICATION_ENDPOINT_CONCURRENCY = 4;
 const CREDENTIAL_MUTATION_LEASE_WAIT_MS = 10_000;
 const CREDENTIAL_MUTATION_LEASE_POLL_MS = 25;
 const DISCORD_GATEWAY_LEASE_KEY = "discord_gateway_runtime";
@@ -2570,6 +2571,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   const runtime = options.runtime ?? createChatSdkRuntime();
   const runtimeVersions = new Map<string, string>();
   const runtimeLocalEpochs = new Map<string, number>();
+  // One bounded publication lane per endpoint; credential/reconnect fencing
+  // still serializes a bot's sends while unrelated bots can make progress.
+  const publicationEndpointTasks = new Map<string, Promise<void>>();
   const runtimeContexts = new WeakMap<object, RuntimeContext>();
   const runtimeInitializations = new Map<
     string,
@@ -25129,7 +25133,681 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return actions.length;
   }
 
-  async function processPendingPublications(limit = 25) {
+  async function withPublicationAttemptLease(
+    publication: typeof chatPublications.$inferSelect,
+    operation: (lease: CredentialMutationLeaseGuard) => Promise<void>,
+  ): Promise<void> {
+    // A scheduled sweep may overlap a slow provider call (also on a standby
+    // server). Claim and exact-attempt ownership must become visible together:
+    // endpoint-wide activity is not evidence that this publication is alive.
+    const token = randomUUID();
+    const leaseKey = `publication:${publication.id}:${publication.attempts + 1}`;
+    const now = new Date();
+    const owned = and(
+      eq(chatEndpointLeases.companyId, publication.companyId),
+      eq(chatEndpointLeases.endpointId, publication.endpointId),
+      eq(chatEndpointLeases.leaseKey, leaseKey),
+      eq(chatEndpointLeases.token, token),
+    );
+    const claimed = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(chatPublications)
+        .set({
+          state: "streaming",
+          attempts: publication.attempts + 1,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(chatPublications.id, publication.id),
+            eq(chatPublications.state, publication.state),
+            eq(chatPublications.attempts, publication.attempts),
+          ),
+        )
+        .returning({ id: chatPublications.id });
+      if (!row) return false;
+      await tx.insert(chatEndpointLeases).values({
+        companyId: publication.companyId,
+        endpointId: publication.endpointId,
+        leaseKey,
+        token,
+        expiresAt: new Date(now.getTime() + CREDENTIAL_MUTATION_LEASE_TTL_MS),
+      });
+      return true;
+    });
+    if (!claimed) return;
+    let leaseLoss: Error | null = null;
+    const assertOwned: CredentialMutationLeaseGuard["assertOwned"] = async (
+      database = db,
+    ) => {
+      if (leaseLoss) throw leaseLoss;
+      try {
+        // Use a savepoint when the caller already owns a transaction. The
+        // decision clock is sampled only after the lease row lock resolves;
+        // an UPDATE predicate using a pre-lock clock can revive expired work.
+        await database.transaction(async (tx) => {
+          const current = await tx
+            .select({ expiresAt: chatEndpointLeases.expiresAt })
+            .from(chatEndpointLeases)
+            .where(owned)
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          const checkedAt = new Date();
+          if (
+            leaseLoss ||
+            !current ||
+            current.expiresAt.getTime() <= checkedAt.getTime()
+          ) {
+            throw new Error("Publication attempt lease is no longer owned");
+          }
+          await tx
+            .update(chatEndpointLeases)
+            .set({
+              expiresAt: new Date(
+                checkedAt.getTime() + CREDENTIAL_MUTATION_LEASE_TTL_MS,
+              ),
+              updatedAt: checkedAt,
+            })
+            .where(owned);
+        });
+      } catch (error) {
+        leaseLoss = Object.assign(
+          new Error(
+            "Chat publication attempt ownership was lost before completion",
+            { cause: error },
+          ),
+          { code: "CHAT_PUBLICATION_LEASE_LOST" },
+        );
+        throw leaseLoss;
+      }
+    };
+    let renewal: Promise<void> | null = null;
+    const timer = setInterval(() => {
+      if (renewal || leaseLoss) return;
+      renewal = assertOwned()
+        .catch(() => undefined)
+        .finally(() => {
+          renewal = null;
+        });
+    }, CREDENTIAL_MUTATION_LEASE_TTL_MS / 3);
+    timer.unref?.();
+    try {
+      await operation({ assertOwned });
+    } finally {
+      clearInterval(timer);
+      await renewal;
+      await db.delete(chatEndpointLeases).where(owned);
+    }
+  }
+
+  async function processSelectedPublication(
+    selectedPublication: typeof chatPublications.$inferSelect,
+  ): Promise<void> {
+    let publication: typeof chatPublications.$inferSelect;
+    try {
+      publication =
+        await ensureDurablePublicationTransport(selectedPublication);
+    } catch (error) {
+      try {
+        await settlePublicationPreparationFailure(selectedPublication, error);
+      } catch (settlementError) {
+        logger.error(
+          {
+            endpointId: selectedPublication.endpointId,
+            publicationId: selectedPublication.id,
+            error: redactError(settlementError),
+          },
+          "could not durably settle chat publication preparation failure",
+        );
+      }
+      return;
+    }
+    const earlierOpenPublication = await db
+      .select({ id: chatPublications.id })
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.conversationId, publication.conversationId),
+          or(
+            lt(chatPublications.createdAt, publication.createdAt),
+            and(
+              eq(chatPublications.createdAt, publication.createdAt),
+              lt(
+                publicationTransportOrderKey(chatPublications),
+                publication.payload.transportPart?.orderKey ?? publication.id,
+              ),
+            ),
+          ),
+          inArray(chatPublications.state, [
+            "pending",
+            "retry",
+            "streaming",
+            "delivery_unknown",
+          ]),
+        ),
+      )
+      .limit(1)
+      .then((result) => result[0] ?? null);
+    if (earlierOpenPublication) return;
+    await withPublicationAttemptLease(publication, async (publicationLease) => {
+      let providerAccepted = false;
+      let publicationRuntimeContext: RuntimeContext | null = null;
+      let failureHandledWithinCredentialLease = false;
+      let slackFileReceiptActionId: string | null = null;
+      const settlePublicationFailure = async (
+        error: unknown,
+        credentialLease?: CredentialMutationLeaseGuard,
+      ) => {
+        try {
+          await finalizePublicationFailure(
+            publication,
+            error,
+            providerAccepted,
+            publicationRuntimeContext,
+            credentialLease ?? publicationLease,
+          );
+        } catch (finalizationError) {
+          // If the provider accepted the message, a failed receipt write
+          // must remain streaming until the stale scan quarantines it. A
+          // later lifecycle mutation must not turn this into an implicit
+          // replay or allow a stale failure to overwrite the new runtime.
+          logger.error(
+            {
+              endpointId: publication.endpointId,
+              publicationId: publication.id,
+              error: redactError(finalizationError),
+            },
+            "could not durably finalize chat publication failure",
+          );
+        }
+      };
+      try {
+        const recordForLease = await endpointRecord(publication.endpointId);
+        if (!recordForLease)
+          throw new Error("Chat publication binding is unavailable");
+        const currentPublicationRuntimeContext =
+          runtimeContextForRecord(recordForLease);
+        publicationRuntimeContext = currentPublicationRuntimeContext;
+        const [endpoint, conversation] = await Promise.all([
+          db
+            .select()
+            .from(chatEndpoints)
+            .where(eq(chatEndpoints.id, publication.endpointId))
+            .then((result) => result[0] ?? null),
+          db
+            .select()
+            .from(chatConversations)
+            .where(eq(chatConversations.id, publication.conversationId))
+            .then((result) => result[0] ?? null),
+        ]);
+        if (!endpoint || !conversation)
+          throw new Error("Chat publication binding is unavailable");
+        const providerVisibleCompletion =
+          conversation.state === "completed" &&
+          !isExplicitOperatorPublication(publication) &&
+          (await hasCommittedTaskControlCompletion(conversation.id));
+        if (endpoint.status === "paused" || endpoint.status === "attention") {
+          await publicationLease.assertOwned();
+          await db
+            .update(chatPublications)
+            .set({
+              state: "pending",
+              attempts: publication.attempts,
+              // Pause can race the eligibility read. The query excludes
+              // inactive endpoints on the next pass, so retain only the
+              // original provider deadline rather than delaying Resume.
+              nextAttemptAt: publication.nextAttemptAt,
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatPublications.id, publication.id),
+                eq(chatPublications.state, "streaming"),
+                eq(chatPublications.attempts, publication.attempts + 1),
+              ),
+            );
+          return;
+        }
+        // The setup conversation is a real end-to-end test: once provider
+        // credentials are verified, its safe agent response must be able to
+        // reach the provider before the operator confirms the final wizard
+        // step. Draft, paused, revoked, and archived endpoints remain closed.
+        if (
+          !["active", "verifying"].includes(endpoint.status) ||
+          ["unavailable", "endpoint_removed"].includes(conversation.state) ||
+          providerVisibleCompletion
+        ) {
+          await publicationLease.assertOwned();
+          await db
+            .update(chatPublications)
+            .set({
+              state: "cancelled",
+              redactedError: providerVisibleCompletion
+                ? "Conversation was completed before delivery"
+                : "External destination is no longer active",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatPublications.id, publication.id),
+                eq(chatPublications.state, "streaming"),
+                eq(chatPublications.attempts, publication.attempts + 1),
+              ),
+            );
+          return;
+        }
+        if (conversation.isDirectMessage) {
+          if (!endpoint.allowDirectMessages) {
+            await publicationLease.assertOwned();
+            await db
+              .update(chatPublications)
+              .set({
+                state: "cancelled",
+                redactedError: "Direct messages are disabled in Paperclip",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(chatPublications.id, publication.id),
+                  eq(chatPublications.state, "streaming"),
+                  eq(chatPublications.attempts, publication.attempts + 1),
+                ),
+              );
+            return;
+          }
+        } else {
+          const resource = conversation.resourceId
+            ? await db
+                .select()
+                .from(chatEndpointResources)
+                .where(
+                  and(
+                    eq(chatEndpointResources.id, conversation.resourceId),
+                    eq(chatEndpointResources.endpointId, endpoint.id),
+                    eq(chatEndpointResources.companyId, endpoint.companyId),
+                  ),
+                )
+                .then((result) => result[0] ?? null)
+            : null;
+          if (!nonDirectDestinationAllowed(endpoint, resource)) {
+            await publicationLease.assertOwned();
+            await db
+              .update(chatPublications)
+              .set({
+                state: "cancelled",
+                redactedError: "Destination is disabled in Paperclip",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(chatPublications.id, publication.id),
+                  eq(chatPublications.state, "streaming"),
+                  eq(chatPublications.attempts, publication.attempts + 1),
+                ),
+              );
+            return;
+          }
+        }
+        const interactionId = publication.payload.interactionId;
+        const isInteractionPrompt =
+          Boolean(interactionId) &&
+          publication.idempotencyKey ===
+            `interaction:${interactionId}:${publication.endpointId}`;
+        if (isInteractionPrompt && publication.issueId) {
+          const currentInteraction = await db
+            .select({ status: issueThreadInteractions.status })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.id, interactionId!),
+                eq(issueThreadInteractions.companyId, publication.companyId),
+                eq(issueThreadInteractions.issueId, publication.issueId),
+              ),
+            )
+            .then((result) => result[0] ?? null);
+          if (!currentInteraction || currentInteraction.status !== "pending") {
+            await publicationLease.assertOwned();
+            await db
+              .update(chatPublications)
+              .set({
+                state: "cancelled",
+                attempts: publication.attempts,
+                nextAttemptAt: null,
+                redactedError: "Interaction resolved before provider delivery",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(chatPublications.id, publication.id),
+                  eq(chatPublications.state, "streaming"),
+                  eq(chatPublications.attempts, publication.attempts + 1),
+                ),
+              );
+            return;
+          }
+        }
+        if (await runProgressSupersededByPublishedInteraction(publication)) {
+          await publicationLease.assertOwned();
+          await db
+            .update(chatPublications)
+            .set({
+              state: "cancelled",
+              attempts: publication.attempts,
+              nextAttemptAt: null,
+              redactedError:
+                "Run progress was superseded by its provider interaction",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(chatPublications.id, publication.id),
+                eq(chatPublications.state, "streaming"),
+                eq(chatPublications.attempts, publication.attempts + 1),
+              ),
+            );
+          return;
+        }
+        // Status is sampled when it reaches the head of the provider lane,
+        // not when the command was admitted. If an already-streaming final
+        // publication won the race, this reply reflects Paperclip's latest
+        // authoritative task state after that earlier send commits.
+        const payload = await currentTaskControlPayload(publication);
+        const replaceProviderMessageId = CAPABILITIES[endpoint.provider]
+          .messageEdits
+          ? ((await interactionResolutionPublicationToReplace(
+              publication,
+              payload,
+            )) ??
+            (await interactionPromptPublicationToReplace(
+              publication,
+              payload,
+            )) ??
+            (await runPublicationToReplace(publication, payload)) ??
+            (await taskStatusPublicationToReplace(publication, payload)))
+          : null;
+        await withCredentialMutationLease(
+          recordForLease.endpoint,
+          async (credentialGuard) => {
+            const credentialLease: CredentialMutationLeaseGuard = {
+              assertOwned: async (database = db) => {
+                await credentialGuard.assertOwned(database);
+                await publicationLease.assertOwned(database);
+              },
+            };
+            try {
+              const authorizationClaim =
+                await claimPublicationTransportAuthorization({
+                  credentialLease,
+                  endpoint: recordForLease.endpoint,
+                  publication,
+                  runtimeContext: currentPublicationRuntimeContext,
+                });
+              if (!authorizationClaim) {
+                await db.transaction(async (tx) => {
+                  await credentialLease.assertOwned(tx);
+                  await tx
+                    .update(chatPublications)
+                    .set({
+                      state: "cancelled",
+                      nextAttemptAt: null,
+                      redactedError:
+                        "Task control requester or destination is no longer authorized",
+                      updatedAt: new Date(),
+                    })
+                    .where(
+                      and(
+                        eq(chatPublications.id, publication.id),
+                        eq(chatPublications.state, "streaming"),
+                        eq(chatPublications.attempts, publication.attempts + 1),
+                      ),
+                    );
+                  await tx
+                    .update(chatActions)
+                    .set({
+                      status: "cancelled",
+                      result: {
+                        code: "task_control_authorization_changed",
+                      },
+                      updatedAt: new Date(),
+                    })
+                    .where(
+                      and(
+                        eq(chatActions.endpointId, publication.endpointId),
+                        eq(
+                          chatActions.providerActionId,
+                          `task-control-authorization:${publication.id}`,
+                        ),
+                        eq(chatActions.status, "issued"),
+                      ),
+                    );
+                  await credentialLease.assertOwned(tx);
+                });
+                return;
+              }
+              // The durable claim above is the authorization linearization
+              // point. Provider I/O runs without a database transaction or
+              // row lock. The renewable lease preserves credential/runtime
+              // identity until conditional settlement.
+              const sent = await postSafePublication({
+                endpoint: authorizationClaim.endpoint,
+                conversation: authorizationClaim.conversation,
+                publication,
+                payload,
+                replaceProviderMessageId,
+                onSlackFileUploadAccepted: async (receipt) => {
+                  // uploadV2 has completed at this point. Mark acceptance
+                  // before the durable callback so a local write failure is
+                  // still quarantined and can never trigger an implicit upload.
+                  providerAccepted = true;
+                  slackFileReceiptActionId = await recordSlackFileUploadReceipt(
+                    {
+                      credentialLease,
+                      endpoint: authorizationClaim.endpoint,
+                      conversation: authorizationClaim.conversation,
+                      publication,
+                      receipt,
+                      runtimeContext: currentPublicationRuntimeContext,
+                    },
+                  );
+                },
+              });
+              providerAccepted = true;
+              const { authorizationActionId } = authorizationClaim;
+              const receiptRemovalActionIds: string[] = [];
+              await db.transaction(async (tx) => {
+                await credentialLease.assertOwned(tx);
+                const committedAt = new Date();
+                const [completedPublication] = await tx
+                  .update(chatPublications)
+                  .set({
+                    state: "published",
+                    payload,
+                    providerMessageId: sent.id,
+                    publishedAt: committedAt,
+                    redactedError: null,
+                    updatedAt: committedAt,
+                  })
+                  .where(
+                    and(
+                      eq(chatPublications.id, publication.id),
+                      eq(chatPublications.state, "streaming"),
+                      eq(chatPublications.attempts, publication.attempts + 1),
+                    ),
+                  )
+                  .returning({ id: chatPublications.id });
+                if (!completedPublication) {
+                  throw new Error(
+                    "Chat publication ownership changed before commit",
+                  );
+                }
+                if (slackFileReceiptActionId) {
+                  const [completedReceipt] = await tx
+                    .update(chatActions)
+                    .set({
+                      status: "processed",
+                      result: {
+                        code: "slack_file_upload_identity_confirmed",
+                        attempts: 1,
+                      },
+                      updatedAt: committedAt,
+                    })
+                    .where(
+                      and(
+                        eq(chatActions.id, slackFileReceiptActionId),
+                        eq(chatActions.kind, "slack_file_upload_receipt"),
+                        eq(chatActions.status, "received"),
+                        sql`(${chatActions.payload}->>'publicationId')::uuid = ${publication.id}`,
+                        sql`(${chatActions.payload}->>'publicationAttempt')::int = ${publication.attempts + 1}`,
+                      ),
+                    )
+                    .returning({ id: chatActions.id });
+                  if (!completedReceipt) {
+                    throw new Error(
+                      "Slack file upload receipt ownership changed before commit",
+                    );
+                  }
+                }
+                if (slackFileReceiptActionId) {
+                  await stageSlackFilePublicationSuccess(tx, {
+                    committedAt,
+                    endpoint: authorizationClaim.endpoint,
+                    publication,
+                    providerMessageId: sent.id,
+                    runtimeContext: currentPublicationRuntimeContext,
+                    stageSessionSync:
+                      !isExplicitOperatorPublication(publication) &&
+                      !publication.idempotencyKey.startsWith("control:status:"),
+                  });
+                } else {
+                  const messageLinkInsert = tx.insert(chatMessageLinks).values({
+                    companyId: publication.companyId,
+                    endpointId: publication.endpointId,
+                    conversationId: publication.conversationId,
+                    publicationId: publication.id,
+                    commentId: publication.commentId,
+                    providerMessageId: sent.id,
+                    direction: "outbound",
+                  });
+                  if (replaceProviderMessageId) {
+                    await messageLinkInsert.onConflictDoUpdate({
+                      target: [
+                        chatMessageLinks.endpointId,
+                        chatMessageLinks.conversationId,
+                        chatMessageLinks.providerMessageId,
+                      ],
+                      set: {
+                        publicationId: publication.id,
+                        commentId: publication.commentId,
+                      },
+                    });
+                  } else {
+                    await messageLinkInsert.onConflictDoNothing();
+                  }
+                  await tx
+                    .update(chatEndpoints)
+                    .set({
+                      lastPublicationAt: committedAt,
+                      updatedAt: committedAt,
+                    })
+                    .where(
+                      and(
+                        eq(chatEndpoints.id, authorizationClaim.endpoint.id),
+                        inArray(chatEndpoints.status, ["verifying", "active"]),
+                        sql`coalesce((${chatEndpoints.setup}->>'runtimeGeneration')::integer, 0) = ${currentPublicationRuntimeContext.generation}`,
+                      ),
+                    );
+                }
+                if (authorizationActionId) {
+                  const processedAuthorization = await tx
+                    .update(chatActions)
+                    .set({
+                      status: "processed",
+                      result: { code: "task_control_authorized_and_sent" },
+                      updatedAt: committedAt,
+                    })
+                    .where(
+                      and(
+                        eq(chatActions.id, authorizationActionId),
+                        eq(chatActions.status, "processing"),
+                        sql`(${chatActions.result}->>'attempts')::int = ${publication.attempts + 1}`,
+                      ),
+                    )
+                    .returning({ id: chatActions.id });
+                  if (!processedAuthorization.length) {
+                    throw new Error(
+                      "Task-control authorization ownership changed before commit",
+                    );
+                  }
+                }
+                await commitTaskControlCompletion(
+                  tx as unknown as Db,
+                  publication,
+                  committedAt,
+                );
+                if (
+                  !slackFileReceiptActionId &&
+                  authorizationClaim.endpoint.provider === "slack" &&
+                  !isExplicitOperatorPublication(publication) &&
+                  !publication.idempotencyKey.startsWith("control:status:")
+                ) {
+                  await stageSlackSessionSync(tx, {
+                    companyId: publication.companyId,
+                    endpointId: publication.endpointId,
+                    conversationId: publication.conversationId,
+                    runtimeGeneration:
+                      currentPublicationRuntimeContext.generation,
+                    credentialFingerprint:
+                      currentPublicationRuntimeContext.credentialFingerprint,
+                  });
+                }
+                receiptRemovalActionIds.push(
+                  ...(await stageDiscordReceiptReactionRemovals(
+                    tx as unknown as Db,
+                    {
+                      endpoint: authorizationClaim.endpoint,
+                      publication,
+                      payload,
+                      runtimeContext: currentPublicationRuntimeContext,
+                    },
+                  )),
+                );
+                await credentialLease.assertOwned(tx);
+              });
+              // Receipt cleanup is non-critical provider I/O. Dispatch it
+              // after the terminal reply and durable action commit so a
+              // slow reaction endpoint cannot hold the publication lane.
+              // If this process stops first, the action outbox resumes the
+              // idempotent removal on a later reconciliation sweep.
+              for (const actionId of receiptRemovalActionIds) {
+                scheduleMessageProcessing(() =>
+                  processReceiptReaction(actionId),
+                );
+              }
+            } catch (error) {
+              // Authentication, membership, and destination failures mutate
+              // endpoint/runtime state. Settle them before releasing the
+              // credential lease so a concurrent reconnect or provider
+              // recovery cannot be overwritten by this stale attempt.
+              failureHandledWithinCredentialLease = true;
+              // If ownership was already lost, leave the publication in its
+              // conservative streaming state for quarantine. Mutating health
+              // from this obsolete runtime would overwrite the new owner.
+              await settlePublicationFailure(error, credentialLease);
+            }
+          },
+        );
+      } catch (error) {
+        if (!failureHandledWithinCredentialLease)
+          await settlePublicationFailure(error);
+      }
+    });
+  }
+
+  async function processPendingPublications(
+    limit = 25,
+    { waitForCompletion = true }: { waitForCompletion?: boolean } = {},
+  ) {
+    if (shuttingDown) return 0;
     await reconcileTerminalConfirmationActions(limit);
     const now = new Date();
     const staleBefore = new Date(now.getTime() - 60_000);
@@ -25150,6 +25828,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         and(
           eq(chatPublications.state, "streaming"),
           lte(chatPublications.updatedAt, staleBefore),
+          notExists(
+            db
+              .select({ id: chatEndpointLeases.id })
+              .from(chatEndpointLeases)
+              .where(
+                and(
+                  eq(chatEndpointLeases.companyId, chatPublications.companyId),
+                  eq(
+                    chatEndpointLeases.endpointId,
+                    chatPublications.endpointId,
+                  ),
+                  sql`${chatEndpointLeases.leaseKey} = 'publication:' || ${chatPublications.id}::text || ':' || ${chatPublications.attempts}::text`,
+                  gt(chatEndpointLeases.expiresAt, now),
+                ),
+              ),
+          ),
         ),
       )
       .returning({ id: chatPublications.id });
@@ -25182,648 +25876,160 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       "earlier_chat_publications",
     );
     const attemptedIds: string[] = [];
-    while (attemptedIds.length < limit) {
-      // Select only each conversation's current head before applying the
-      // global limit. Re-query after every batch so one invocation can still
-      // drain a conversation's newly unblocked milestones in FIFO order.
-      const rows = await db
-        .select()
-        .from(chatPublications)
-        .where(
-          and(
-            inArray(chatPublications.state, ["pending", "retry"]),
-            // Inactive endpoints must not consume the eligibility page or
-            // acquire an artificial retry deadline. When an operator resumes
-            // them, due work is immediately eligible; genuine provider retry
-            // deadlines below remain unchanged.
-            notExists(
-              db
-                .select({ id: chatEndpoints.id })
-                .from(chatEndpoints)
-                .where(
-                  and(
-                    eq(chatEndpoints.id, chatPublications.endpointId),
-                    inArray(chatEndpoints.status, ["paused", "attention"]),
-                  ),
-                ),
-            ),
-            or(
-              isNull(chatPublications.nextAttemptAt),
-              lte(chatPublications.nextAttemptAt, now),
-            ),
-            attemptedIds.length > 0
-              ? notInArray(chatPublications.id, attemptedIds)
-              : undefined,
-            notExists(
-              db
-                .select({ id: earlierPublication.id })
-                .from(earlierPublication)
-                .where(
-                  and(
-                    eq(
-                      earlierPublication.conversationId,
-                      chatPublications.conversationId,
-                    ),
-                    publicationPrecedes(earlierPublication, chatPublications),
-                    inArray(earlierPublication.state, [
-                      "pending",
-                      "retry",
-                      "streaming",
-                      "delivery_unknown",
-                    ]),
-                  ),
-                ),
-            ),
-          ),
-        )
-        .orderBy(
-          asc(chatPublications.createdAt),
-          asc(publicationTransportOrderKey(chatPublications)),
-        )
-        .limit(limit - attemptedIds.length);
-      if (rows.length === 0) break;
-      for (const selectedPublication of rows) {
-        let publication: typeof chatPublications.$inferSelect;
-        try {
-          publication =
-            await ensureDurablePublicationTransport(selectedPublication);
-        } catch (error) {
-          attemptedIds.push(selectedPublication.id);
-          try {
-            await settlePublicationPreparationFailure(
-              selectedPublication,
-              error,
-            );
-          } catch (settlementError) {
-            logger.error(
-              {
-                endpointId: selectedPublication.endpointId,
-                publicationId: selectedPublication.id,
-                error: redactError(settlementError),
-              },
-              "could not durably settle chat publication preparation failure",
-            );
-          }
+    const ownedTasks = new Set<Promise<void>>();
+    let failed = false;
+    let firstError: unknown;
+    try {
+      while (attemptedIds.length < limit && !failed && !shuttingDown) {
+        if (publicationEndpointTasks.size >= PUBLICATION_ENDPOINT_CONCURRENCY) {
+          if (!waitForCompletion) break;
+          await Promise.race(publicationEndpointTasks.values());
           continue;
         }
-        attemptedIds.push(publication.id);
-        const earlierOpenPublication = await db
-          .select({ id: chatPublications.id })
+        const busyEndpointIds = [...publicationEndpointTasks.keys()];
+        // Select only each conversation's current head before applying the
+        // global limit. Re-query after every batch so one invocation can still
+        // drain a conversation's newly unblocked milestones in FIFO order.
+        const rows = await db
+          .select()
           .from(chatPublications)
           .where(
             and(
-              eq(chatPublications.conversationId, publication.conversationId),
-              or(
-                lt(chatPublications.createdAt, publication.createdAt),
-                and(
-                  eq(chatPublications.createdAt, publication.createdAt),
-                  lt(
-                    publicationTransportOrderKey(chatPublications),
-                    publication.payload.transportPart?.orderKey ??
-                      publication.id,
-                  ),
-                ),
-              ),
-              inArray(chatPublications.state, [
-                "pending",
-                "retry",
-                "streaming",
-                "delivery_unknown",
-              ]),
-            ),
-          )
-          .limit(1)
-          .then((result) => result[0] ?? null);
-        if (earlierOpenPublication) continue;
-        const claimWhere = [
-          eq(chatPublications.id, publication.id),
-          eq(chatPublications.state, publication.state),
-        ];
-        const claimed = await db
-          .update(chatPublications)
-          .set({
-            state: "streaming",
-            attempts: publication.attempts + 1,
-            updatedAt: now,
-          })
-          .where(and(...claimWhere))
-          .returning();
-        if (!claimed.length) continue;
-        let providerAccepted = false;
-        let publicationRuntimeContext: RuntimeContext | null = null;
-        let failureHandledWithinCredentialLease = false;
-        let slackFileReceiptActionId: string | null = null;
-        const settlePublicationFailure = async (
-          error: unknown,
-          credentialLease?: CredentialMutationLeaseGuard,
-        ) => {
-          try {
-            await finalizePublicationFailure(
-              publication,
-              error,
-              providerAccepted,
-              publicationRuntimeContext,
-              credentialLease,
-            );
-          } catch (finalizationError) {
-            // If the provider accepted the message, a failed receipt write
-            // must remain streaming until the stale scan quarantines it. A
-            // later lifecycle mutation must not turn this into an implicit
-            // replay or allow a stale failure to overwrite the new runtime.
-            logger.error(
-              {
-                endpointId: publication.endpointId,
-                publicationId: publication.id,
-                error: redactError(finalizationError),
-              },
-              "could not durably finalize chat publication failure",
-            );
-          }
-        };
-        try {
-          const recordForLease = await endpointRecord(publication.endpointId);
-          if (!recordForLease)
-            throw new Error("Chat publication binding is unavailable");
-          const currentPublicationRuntimeContext =
-            runtimeContextForRecord(recordForLease);
-          publicationRuntimeContext = currentPublicationRuntimeContext;
-          const [endpoint, conversation] = await Promise.all([
-            db
-              .select()
-              .from(chatEndpoints)
-              .where(eq(chatEndpoints.id, publication.endpointId))
-              .then((result) => result[0] ?? null),
-            db
-              .select()
-              .from(chatConversations)
-              .where(eq(chatConversations.id, publication.conversationId))
-              .then((result) => result[0] ?? null),
-          ]);
-          if (!endpoint || !conversation)
-            throw new Error("Chat publication binding is unavailable");
-          const providerVisibleCompletion =
-            conversation.state === "completed" &&
-            !isExplicitOperatorPublication(publication) &&
-            (await hasCommittedTaskControlCompletion(conversation.id));
-          if (endpoint.status === "paused" || endpoint.status === "attention") {
-            await db
-              .update(chatPublications)
-              .set({
-                state: "pending",
-                attempts: publication.attempts,
-                // Pause can race the eligibility read. The query excludes
-                // inactive endpoints on the next pass, so retain only the
-                // original provider deadline rather than delaying Resume.
-                nextAttemptAt: publication.nextAttemptAt,
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(chatPublications.id, publication.id),
-                  eq(chatPublications.state, "streaming"),
-                  eq(chatPublications.attempts, publication.attempts + 1),
-                ),
-              );
-            continue;
-          }
-          // The setup conversation is a real end-to-end test: once provider
-          // credentials are verified, its safe agent response must be able to
-          // reach the provider before the operator confirms the final wizard
-          // step. Draft, paused, revoked, and archived endpoints remain closed.
-          if (
-            !["active", "verifying"].includes(endpoint.status) ||
-            ["unavailable", "endpoint_removed"].includes(conversation.state) ||
-            providerVisibleCompletion
-          ) {
-            await db
-              .update(chatPublications)
-              .set({
-                state: "cancelled",
-                redactedError: providerVisibleCompletion
-                  ? "Conversation was completed before delivery"
-                  : "External destination is no longer active",
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(chatPublications.id, publication.id),
-                  eq(chatPublications.state, "streaming"),
-                  eq(chatPublications.attempts, publication.attempts + 1),
-                ),
-              );
-            return;
-          }
-          if (conversation.isDirectMessage) {
-            if (!endpoint.allowDirectMessages) {
-              await db
-                .update(chatPublications)
-                .set({
-                  state: "cancelled",
-                  redactedError: "Direct messages are disabled in Paperclip",
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(chatPublications.id, publication.id),
-                    eq(chatPublications.state, "streaming"),
-                    eq(chatPublications.attempts, publication.attempts + 1),
-                  ),
-                );
-              return;
-            }
-          } else {
-            const resource = conversation.resourceId
-              ? await db
-                  .select()
-                  .from(chatEndpointResources)
+              inArray(chatPublications.state, ["pending", "retry"]),
+              busyEndpointIds.length > 0
+                ? notInArray(chatPublications.endpointId, busyEndpointIds)
+                : undefined,
+              // Inactive endpoints must not consume the eligibility page or
+              // acquire an artificial retry deadline. When an operator resumes
+              // them, due work is immediately eligible; genuine provider retry
+              // deadlines below remain unchanged.
+              notExists(
+                db
+                  .select({ id: chatEndpoints.id })
+                  .from(chatEndpoints)
                   .where(
                     and(
-                      eq(chatEndpointResources.id, conversation.resourceId),
-                      eq(chatEndpointResources.endpointId, endpoint.id),
-                      eq(chatEndpointResources.companyId, endpoint.companyId),
+                      eq(chatEndpoints.id, chatPublications.endpointId),
+                      inArray(chatEndpoints.status, ["paused", "attention"]),
                     ),
-                  )
-                  .then((result) => result[0] ?? null)
-              : null;
-            if (!nonDirectDestinationAllowed(endpoint, resource)) {
-              await db
-                .update(chatPublications)
-                .set({
-                  state: "cancelled",
-                  redactedError: "Destination is disabled in Paperclip",
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(chatPublications.id, publication.id),
-                    eq(chatPublications.state, "streaming"),
-                    eq(chatPublications.attempts, publication.attempts + 1),
                   ),
-                );
-              return;
-            }
-          }
-          const interactionId = publication.payload.interactionId;
-          const isInteractionPrompt =
-            Boolean(interactionId) &&
-            publication.idempotencyKey ===
-              `interaction:${interactionId}:${publication.endpointId}`;
-          if (isInteractionPrompt && publication.issueId) {
-            const currentInteraction = await db
-              .select({ status: issueThreadInteractions.status })
-              .from(issueThreadInteractions)
-              .where(
-                and(
-                  eq(issueThreadInteractions.id, interactionId!),
-                  eq(issueThreadInteractions.companyId, publication.companyId),
-                  eq(issueThreadInteractions.issueId, publication.issueId),
-                ),
-              )
-              .then((result) => result[0] ?? null);
-            if (
-              !currentInteraction ||
-              currentInteraction.status !== "pending"
-            ) {
-              await db
-                .update(chatPublications)
-                .set({
-                  state: "cancelled",
-                  attempts: publication.attempts,
-                  nextAttemptAt: null,
-                  redactedError:
-                    "Interaction resolved before provider delivery",
-                  updatedAt: new Date(),
-                })
-                .where(
-                  and(
-                    eq(chatPublications.id, publication.id),
-                    eq(chatPublications.state, "streaming"),
-                    eq(chatPublications.attempts, publication.attempts + 1),
-                  ),
-                );
-              return;
-            }
-          }
-          if (await runProgressSupersededByPublishedInteraction(publication)) {
-            await db
-              .update(chatPublications)
-              .set({
-                state: "cancelled",
-                attempts: publication.attempts,
-                nextAttemptAt: null,
-                redactedError:
-                  "Run progress was superseded by its provider interaction",
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(chatPublications.id, publication.id),
-                  eq(chatPublications.state, "streaming"),
-                  eq(chatPublications.attempts, publication.attempts + 1),
-                ),
-              );
-            return;
-          }
-          // Status is sampled when it reaches the head of the provider lane,
-          // not when the command was admitted. If an already-streaming final
-          // publication won the race, this reply reflects Paperclip's latest
-          // authoritative task state after that earlier send commits.
-          const payload = await currentTaskControlPayload(publication);
-          const replaceProviderMessageId = CAPABILITIES[endpoint.provider]
-            .messageEdits
-            ? ((await interactionResolutionPublicationToReplace(
-                publication,
-                payload,
-              )) ??
-              (await interactionPromptPublicationToReplace(
-                publication,
-                payload,
-              )) ??
-              (await runPublicationToReplace(publication, payload)) ??
-              (await taskStatusPublicationToReplace(publication, payload)))
-            : null;
-          await withCredentialMutationLease(
-            recordForLease.endpoint,
-            async (credentialLease) => {
-              try {
-                const authorizationClaim =
-                  await claimPublicationTransportAuthorization({
-                    credentialLease,
-                    endpoint: recordForLease.endpoint,
-                    publication,
-                    runtimeContext: currentPublicationRuntimeContext,
-                  });
-                if (!authorizationClaim) {
-                  await db.transaction(async (tx) => {
-                    await credentialLease.assertOwned(tx);
-                    await tx
-                      .update(chatPublications)
-                      .set({
-                        state: "cancelled",
-                        nextAttemptAt: null,
-                        redactedError:
-                          "Task control requester or destination is no longer authorized",
-                        updatedAt: new Date(),
-                      })
-                      .where(
-                        and(
-                          eq(chatPublications.id, publication.id),
-                          eq(chatPublications.state, "streaming"),
-                          eq(
-                            chatPublications.attempts,
-                            publication.attempts + 1,
-                          ),
-                        ),
-                      );
-                    await tx
-                      .update(chatActions)
-                      .set({
-                        status: "cancelled",
-                        result: {
-                          code: "task_control_authorization_changed",
-                        },
-                        updatedAt: new Date(),
-                      })
-                      .where(
-                        and(
-                          eq(chatActions.endpointId, publication.endpointId),
-                          eq(
-                            chatActions.providerActionId,
-                            `task-control-authorization:${publication.id}`,
-                          ),
-                          eq(chatActions.status, "issued"),
-                        ),
-                      );
-                    await credentialLease.assertOwned(tx);
-                  });
-                  return;
-                }
-                // The durable claim above is the authorization linearization
-                // point. Provider I/O runs without a database transaction or
-                // row lock. The renewable lease preserves credential/runtime
-                // identity until conditional settlement.
-                const sent = await postSafePublication({
-                  endpoint: authorizationClaim.endpoint,
-                  conversation: authorizationClaim.conversation,
-                  publication,
-                  payload,
-                  replaceProviderMessageId,
-                  onSlackFileUploadAccepted: async (receipt) => {
-                    // uploadV2 has completed at this point. Mark acceptance
-                    // before the durable callback so a local write failure is
-                    // still quarantined and can never trigger an implicit upload.
-                    providerAccepted = true;
-                    slackFileReceiptActionId =
-                      await recordSlackFileUploadReceipt({
-                        credentialLease,
-                        endpoint: authorizationClaim.endpoint,
-                        conversation: authorizationClaim.conversation,
-                        publication,
-                        receipt,
-                        runtimeContext: currentPublicationRuntimeContext,
-                      });
-                  },
-                });
-                providerAccepted = true;
-                const { authorizationActionId } = authorizationClaim;
-                const receiptRemovalActionIds: string[] = [];
-                await db.transaction(async (tx) => {
-                  await credentialLease.assertOwned(tx);
-                  const committedAt = new Date();
-                  const [completedPublication] = await tx
-                    .update(chatPublications)
-                    .set({
-                      state: "published",
-                      payload,
-                      providerMessageId: sent.id,
-                      publishedAt: committedAt,
-                      redactedError: null,
-                      updatedAt: committedAt,
-                    })
-                    .where(
-                      and(
-                        eq(chatPublications.id, publication.id),
-                        eq(chatPublications.state, "streaming"),
-                        eq(chatPublications.attempts, publication.attempts + 1),
+              ),
+              or(
+                isNull(chatPublications.nextAttemptAt),
+                lte(chatPublications.nextAttemptAt, now),
+              ),
+              attemptedIds.length > 0
+                ? notInArray(chatPublications.id, attemptedIds)
+                : undefined,
+              notExists(
+                db
+                  .select({ id: earlierPublication.id })
+                  .from(earlierPublication)
+                  .where(
+                    and(
+                      eq(
+                        earlierPublication.conversationId,
+                        chatPublications.conversationId,
                       ),
-                    )
-                    .returning({ id: chatPublications.id });
-                  if (!completedPublication) {
-                    throw new Error(
-                      "Chat publication ownership changed before commit",
-                    );
-                  }
-                  if (slackFileReceiptActionId) {
-                    const [completedReceipt] = await tx
-                      .update(chatActions)
-                      .set({
-                        status: "processed",
-                        result: {
-                          code: "slack_file_upload_identity_confirmed",
-                          attempts: 1,
-                        },
-                        updatedAt: committedAt,
-                      })
-                      .where(
-                        and(
-                          eq(chatActions.id, slackFileReceiptActionId),
-                          eq(chatActions.kind, "slack_file_upload_receipt"),
-                          eq(chatActions.status, "received"),
-                          sql`(${chatActions.payload}->>'publicationId')::uuid = ${publication.id}`,
-                          sql`(${chatActions.payload}->>'publicationAttempt')::int = ${publication.attempts + 1}`,
-                        ),
-                      )
-                      .returning({ id: chatActions.id });
-                    if (!completedReceipt) {
-                      throw new Error(
-                        "Slack file upload receipt ownership changed before commit",
-                      );
-                    }
-                  }
-                  if (slackFileReceiptActionId) {
-                    await stageSlackFilePublicationSuccess(tx, {
-                      committedAt,
-                      endpoint: authorizationClaim.endpoint,
-                      publication,
-                      providerMessageId: sent.id,
-                      runtimeContext: currentPublicationRuntimeContext,
-                      stageSessionSync:
-                        !isExplicitOperatorPublication(publication) &&
-                        !publication.idempotencyKey.startsWith(
-                          "control:status:",
-                        ),
-                    });
-                  } else {
-                    const messageLinkInsert = tx
-                      .insert(chatMessageLinks)
-                      .values({
-                        companyId: publication.companyId,
-                        endpointId: publication.endpointId,
-                        conversationId: publication.conversationId,
-                        publicationId: publication.id,
-                        commentId: publication.commentId,
-                        providerMessageId: sent.id,
-                        direction: "outbound",
-                      });
-                    if (replaceProviderMessageId) {
-                      await messageLinkInsert.onConflictDoUpdate({
-                        target: [
-                          chatMessageLinks.endpointId,
-                          chatMessageLinks.conversationId,
-                          chatMessageLinks.providerMessageId,
-                        ],
-                        set: {
-                          publicationId: publication.id,
-                          commentId: publication.commentId,
-                        },
-                      });
-                    } else {
-                      await messageLinkInsert.onConflictDoNothing();
-                    }
-                    await tx
-                      .update(chatEndpoints)
-                      .set({
-                        lastPublicationAt: committedAt,
-                        updatedAt: committedAt,
-                      })
-                      .where(
-                        and(
-                          eq(chatEndpoints.id, authorizationClaim.endpoint.id),
-                          inArray(chatEndpoints.status, [
-                            "verifying",
-                            "active",
-                          ]),
-                          sql`coalesce((${chatEndpoints.setup}->>'runtimeGeneration')::integer, 0) = ${currentPublicationRuntimeContext.generation}`,
-                        ),
-                      );
-                  }
-                  if (authorizationActionId) {
-                    const processedAuthorization = await tx
-                      .update(chatActions)
-                      .set({
-                        status: "processed",
-                        result: { code: "task_control_authorized_and_sent" },
-                        updatedAt: committedAt,
-                      })
-                      .where(
-                        and(
-                          eq(chatActions.id, authorizationActionId),
-                          eq(chatActions.status, "processing"),
-                          sql`(${chatActions.result}->>'attempts')::int = ${publication.attempts + 1}`,
-                        ),
-                      )
-                      .returning({ id: chatActions.id });
-                    if (!processedAuthorization.length) {
-                      throw new Error(
-                        "Task-control authorization ownership changed before commit",
-                      );
-                    }
-                  }
-                  await commitTaskControlCompletion(
-                    tx as unknown as Db,
-                    publication,
-                    committedAt,
-                  );
-                  if (
-                    !slackFileReceiptActionId &&
-                    authorizationClaim.endpoint.provider === "slack" &&
-                    !isExplicitOperatorPublication(publication) &&
-                    !publication.idempotencyKey.startsWith("control:status:")
-                  ) {
-                    await stageSlackSessionSync(tx, {
-                      companyId: publication.companyId,
-                      endpointId: publication.endpointId,
-                      conversationId: publication.conversationId,
-                      runtimeGeneration:
-                        currentPublicationRuntimeContext.generation,
-                      credentialFingerprint:
-                        currentPublicationRuntimeContext.credentialFingerprint,
-                    });
-                  }
-                  receiptRemovalActionIds.push(
-                    ...(await stageDiscordReceiptReactionRemovals(
-                      tx as unknown as Db,
-                      {
-                        endpoint: authorizationClaim.endpoint,
-                        publication,
-                        payload,
-                        runtimeContext: currentPublicationRuntimeContext,
-                      },
-                    )),
-                  );
-                  await credentialLease.assertOwned(tx);
-                });
-                // Receipt cleanup is non-critical provider I/O. Dispatch it
-                // after the terminal reply and durable action commit so a
-                // slow reaction endpoint cannot hold the publication lane.
-                // If this process stops first, the action outbox resumes the
-                // idempotent removal on a later reconciliation sweep.
-                for (const actionId of receiptRemovalActionIds) {
-                  scheduleMessageProcessing(() =>
-                    processReceiptReaction(actionId),
-                  );
-                }
-              } catch (error) {
-                // Authentication, membership, and destination failures mutate
-                // endpoint/runtime state. Settle them before releasing the
-                // credential lease so a concurrent reconnect or provider
-                // recovery cannot be overwritten by this stale attempt.
-                failureHandledWithinCredentialLease = true;
-                // If ownership was already lost, leave the publication in its
-                // conservative streaming state for quarantine. Mutating health
-                // from this obsolete runtime would overwrite the new owner.
-                await settlePublicationFailure(error, credentialLease);
+                      publicationPrecedes(earlierPublication, chatPublications),
+                      inArray(earlierPublication.state, [
+                        "pending",
+                        "retry",
+                        "streaming",
+                        "delivery_unknown",
+                      ]),
+                    ),
+                  ),
+              ),
+            ),
+          )
+          .orderBy(
+            asc(chatPublications.createdAt),
+            asc(publicationTransportOrderKey(chatPublications)),
+          )
+          .limit(limit - attemptedIds.length);
+        if (rows.length === 0) {
+          // The query excluded the busy-endpoint snapshot above. A worker
+          // may have completed while PostgreSQL selected this empty page,
+          // exposing a new head that must be queried before declaring idle.
+          if (busyEndpointIds.some((id) => !publicationEndpointTasks.has(id)))
+            continue;
+          if (!waitForCompletion || publicationEndpointTasks.size === 0) break;
+          await Promise.race(publicationEndpointTasks.values());
+          continue;
+        }
+        let started = false;
+        for (const selectedPublication of rows) {
+          if (
+            publicationEndpointTasks.size >= PUBLICATION_ENDPOINT_CONCURRENCY ||
+            attemptedIds.length >= limit ||
+            failed ||
+            shuttingDown
+          )
+            break;
+          if (publicationEndpointTasks.has(selectedPublication.endpointId))
+            continue;
+          attemptedIds.push(selectedPublication.id);
+          started = true;
+          // Reserve synchronously before provider work; overlapping drains share
+          // this cap. Different conversations for one bot keep the existing
+          // endpoint-exclusive credential fence instead of timing out behind it.
+          const task = Promise.resolve()
+            .then(() => processSelectedPublication(selectedPublication))
+            .catch((error: unknown) => {
+              if (!failed) {
+                failed = true;
+                firstError = error;
               }
-            },
-          );
-        } catch (error) {
-          if (!failureHandledWithinCredentialLease)
-            await settlePublicationFailure(error);
+              if (!waitForCompletion) {
+                logger.error(
+                  {
+                    endpointId: selectedPublication.endpointId,
+                    publicationId: selectedPublication.id,
+                    error: redactError(error),
+                  },
+                  "scheduled chat publication worker failed",
+                );
+              }
+            })
+            .finally(() => {
+              if (
+                publicationEndpointTasks.get(selectedPublication.endpointId) ===
+                task
+              ) {
+                publicationEndpointTasks.delete(selectedPublication.endpointId);
+              }
+              ownedTasks.delete(task);
+            });
+          publicationEndpointTasks.set(selectedPublication.endpointId, task);
+          ownedTasks.add(task);
+        }
+        // Re-query while slots remain: one busy endpoint must not fill the
+        // candidate page and hide later eligible endpoints behind its backlog.
+        if (!started && publicationEndpointTasks.size > 0) {
+          if (!waitForCompletion) break;
+          await Promise.race(publicationEndpointTasks.values());
         }
       }
+    } catch (error) {
+      if (!failed) {
+        failed = true;
+        firstError = error;
+      }
+    } finally {
+      // Observe rejection immediately above and join every started worker
+      // before this invocation returns or propagates its original failure.
+      if (waitForCompletion) await Promise.all(ownedTasks);
     }
+    if (failed) throw firstError;
     await processPendingInteractionWakeups(limit);
     return attemptedIds.length;
+  }
+
+  // Cron refills free endpoint slots from the durable outbox each second.
+  // Work remains tracked by this service and is joined before runtime shutdown.
+  async function schedulePendingPublications(limit = 25) {
+    return processPendingPublications(limit, { waitForCompletion: false });
   }
 
   async function getIssueBinding(
@@ -25867,6 +26073,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publishBoardMessage,
     reconcileProviderRuntimes,
     processPendingPublications,
+    schedulePendingPublications,
     processPendingDeliveries,
     processPendingGitHubWebhookIngress,
     processPendingProviderEffects,
@@ -25877,6 +26084,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     getIssueBinding,
     shutdown: async () => {
       shuttingDown = true;
+      await Promise.allSettled([...publicationEndpointTasks.values()]);
       await Promise.allSettled([...backgroundMessageTasks]);
       scheduledConversationDrains.clear();
       liveInboundMessages.clear();

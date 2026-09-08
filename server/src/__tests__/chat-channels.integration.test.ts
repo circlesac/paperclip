@@ -18666,6 +18666,667 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
   });
 
+  async function publicationLaneFixture(count: number) {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const runtime = new FakeChatSdkRuntime();
+    const providerFetch = (input: string | URL | Request, init?: RequestInit) =>
+      fakeSlackFetch(
+        `U-LANE-${new Headers(init?.headers).get("authorization")}`,
+      )(input, init);
+    const { service } = createService(runtime, providerFetch as typeof fetch, {
+      storage: storage.storage,
+    });
+    const lanes = [];
+    for (let index = 0; index < count; index += 1) {
+      const endpoint = await service.create(
+        fixture.companyId,
+        {
+          provider: "slack",
+          assignedAgentId: fixture.assignedAgentId,
+        },
+        "owner-user",
+      );
+      await service.configure(
+        endpoint.id,
+        {
+          action: "configure",
+          credentials: {
+            botToken: `xoxb-lane-${endpoint.id}`,
+            signingSecret: `signing-${endpoint.id}`,
+          },
+        },
+        "owner-user",
+      );
+      await db
+        .update(chatEndpoints)
+        .set({ status: "active" })
+        .where(eq(chatEndpoints.id, endpoint.id));
+      const channelId = `C-LANE-${endpoint.id}`;
+      await db.insert(chatEndpointResources).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        type: "channel",
+        providerResourceId: channelId,
+        label: "publication-lane",
+        availability: "available",
+        enabled: true,
+      });
+      const callbacks = runtime.configurations.get(endpoint.id)?.callbacks;
+      if (!callbacks) throw new Error("Expected publication lane runtime");
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: makeThread({
+          channelId,
+          id: `slack:${channelId}:5000.1`,
+          name: "publication-lane",
+        }).thread,
+        message: makeMessage({
+          id: "5000.1",
+          text: "@maya publication lane",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, endpoint.id));
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!conversation || !providerRuntime)
+        throw new Error("Expected publication lane conversation");
+      lanes.push({ endpoint, conversation, providerRuntime });
+    }
+    const enqueue = async (
+      index: number,
+      text: string,
+      offset = index,
+      payload?: typeof chatPublications.$inferInsert.payload,
+    ) => {
+      const { endpoint, conversation } = lanes[index]!;
+      const [publication] = await db
+        .insert(chatPublications)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          idempotencyKey: `lane:${randomUUID()}`,
+          payload: payload ?? { text },
+          state: "pending",
+          createdAt: new Date(Date.UTC(2000, 0, 1) + offset),
+        })
+        .returning();
+      return publication!;
+    };
+    const cleanup = async () => {
+      await service.shutdown();
+      await db
+        .update(chatEndpoints)
+        .set({ status: "paused" })
+        .where(
+          inArray(
+            chatEndpoints.id,
+            lanes.map(({ endpoint }) => endpoint.id),
+          ),
+        );
+    };
+    return { ...fixture, storage, runtime, service, lanes, enqueue, cleanup };
+  }
+
+  it("refills four tracked publication endpoint lanes after a scheduled budget and joins shutdown", async () => {
+    const fixture = await publicationLaneFixture(6);
+    const { service, lanes, enqueue, storage } = fixture;
+    const releases: Array<() => void> = [];
+    const entered = new Set<number>();
+    let active = 0;
+    let maximumActive = 0;
+    const gates = lanes.map((lane, index) => {
+      const gate = new Promise<void>((resolve) => {
+        releases[index] = resolve;
+      });
+      lane.providerRuntime.postHook = async () => {
+        entered.add(index);
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        try {
+          await gate;
+        } finally {
+          active -= 1;
+        }
+      };
+      return gate;
+    });
+    let shutdown: Promise<void> | undefined;
+    try {
+      const comment = await issueService(db).addComment(
+        lanes[0]!.conversation.issueId,
+        "Slow upload",
+        { userId: "owner-user" },
+      );
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${lanes[0]!.conversation.issueId}`,
+        originalFilename: "slow.txt",
+        contentType: "text/plain",
+        body: Buffer.from("held file"),
+      });
+      const attachment = await issueService(db).createAttachment({
+        issueId: lanes[0]!.conversation.issueId,
+        issueCommentId: comment.id,
+        ...stored,
+        createdByUserId: "owner-user",
+      });
+      const first = await enqueue(0, "", 0, {
+        text: "",
+        attachmentIds: [attachment.id],
+      });
+      await db
+        .update(chatPublications)
+        .set({ commentId: comment.id })
+        .where(eq(chatPublications.id, first.id));
+      const tail = await enqueue(0, "Same conversation must wait", 100);
+      const initial = [first];
+      for (let index = 1; index < lanes.length; index += 1)
+        initial.push(await enqueue(index, `Final ${index}`));
+      let scheduledReturned = false;
+      const scheduled = service.schedulePendingPublications(4).then(() => {
+        scheduledReturned = true;
+      });
+      await vi.waitFor(() => {
+        expect(scheduledReturned).toBe(true);
+        expect(entered).toEqual(new Set([0, 1, 2, 3]));
+      });
+      await scheduled;
+      expect(maximumActive).toBe(4);
+      await service.schedulePendingPublications(4);
+      expect(entered.size).toBe(4);
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, tail.id)),
+      ).toEqual([{ state: "pending", attempts: 0 }]);
+
+      releases[1]!();
+      await vi.waitFor(async () => {
+        expect(
+          await db
+            .select({ state: chatPublications.state })
+            .from(chatPublications)
+            .where(eq(chatPublications.id, initial[1]!.id)),
+        ).toEqual([{ state: "published" }]);
+      });
+      const sourceRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: sourceRunId,
+        companyId: fixture.companyId,
+        agentId: fixture.assignedAgentId,
+        status: "succeeded",
+        contextSnapshot: {
+          issueId: lanes[1]!.conversation.issueId,
+          source: "automation",
+        },
+      });
+      const interaction = await issueThreadInteractionService(db).create(
+        { id: lanes[1]!.conversation.issueId, companyId: fixture.companyId },
+        {
+          kind: "ask_user_questions",
+          continuationPolicy: "wake_assignee",
+          sourceRunId,
+          title: "Late question",
+          payload: {
+            version: 1,
+            title: "Late question",
+            questions: [
+              {
+                id: "priority",
+                prompt: "Which priority?",
+                selectionMode: "single",
+                required: true,
+                options: [
+                  { id: "high", label: "High" },
+                  { id: "normal", label: "Normal" },
+                ],
+              },
+            ],
+          },
+        },
+        { agentId: fixture.assignedAgentId, runId: sourceRunId },
+      );
+      releases[4]!();
+      releases[5]!();
+      await vi.waitFor(
+        async () => {
+          await service.schedulePendingPublications(4);
+          expect(
+            await db
+              .select({ state: chatPublications.state })
+              .from(chatPublications)
+              .where(
+                eq(
+                  chatPublications.idempotencyKey,
+                  `interaction:${interaction.id}:${lanes[1]!.endpoint.id}`,
+                ),
+              ),
+          ).toEqual([{ state: "published" }]);
+        },
+        { timeout: 5_000 },
+      );
+      expect(entered).toEqual(new Set([0, 1, 2, 3, 4, 5]));
+      expect(maximumActive).toBe(4);
+      expect(lanes[0]!.providerRuntime.posts).toHaveLength(0);
+      expect(lanes[1]!.providerRuntime.posts).toHaveLength(2);
+      expect(lanes[1]!.providerRuntime.posts[1]!.text).toContain(
+        "Late question",
+      );
+      let shutdownDone = false;
+      shutdown = service.shutdown().then(() => {
+        shutdownDone = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(shutdownDone).toBe(false);
+      expect(lanes[0]!.providerRuntime.shutdown).not.toHaveBeenCalled();
+      expect(await service.schedulePendingPublications()).toBe(0);
+      releases.forEach((release) => release());
+      await shutdown;
+      expect(lanes[0]!.providerRuntime.posts).toHaveLength(1);
+      expect(lanes[0]!.providerRuntime.posts[0]!.files).toHaveLength(1);
+      expect(
+        await db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, tail.id)),
+      ).toEqual([{ state: "pending" }]);
+      expect(
+        await db
+          .select()
+          .from(chatEndpointLeases)
+          .where(
+            and(
+              eq(chatEndpointLeases.companyId, fixture.companyId),
+              like(chatEndpointLeases.leaseKey, "publication:%"),
+            ),
+          ),
+      ).toHaveLength(0);
+    } finally {
+      releases.forEach((release) => release());
+      await Promise.all(gates);
+      await shutdown;
+      await fixture.cleanup();
+    }
+  });
+
+  it("does not hide another endpoint behind a page of busy-bot conversation heads", async () => {
+    const fixture = await publicationLaneFixture(2);
+    const { service, lanes, enqueue } = fixture;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    lanes[0]!.providerRuntime.postHook = async () => {
+      entered = true;
+      await held;
+    };
+    let drain: Promise<number> | undefined;
+    try {
+      const first = await enqueue(0, "First in conversation");
+      const tail = await enqueue(0, "Second in conversation", 100);
+      for (let index = 0; index < 26; index += 1) {
+        const original = lanes[0]!.conversation;
+        const [conversation] = await db
+          .insert(chatConversations)
+          .values({
+            companyId: fixture.companyId,
+            endpointId: original.endpointId,
+            resourceId: original.resourceId,
+            issueId: original.issueId,
+            externalConversationId: original.externalConversationId,
+            externalThreadId: `slack:${original.externalConversationId}:${6000 + index}.1`,
+            externalLabel: `Backlog ${index}`,
+          })
+          .returning();
+        await db.insert(chatPublications).values({
+          companyId: fixture.companyId,
+          endpointId: original.endpointId,
+          conversationId: conversation!.id,
+          issueId: original.issueId,
+          idempotencyKey: `lane-backlog:${randomUUID()}`,
+          payload: { text: `Backlog ${index}` },
+          createdAt: new Date(Date.UTC(2000, 0, 1) + index + 1),
+        });
+      }
+      const ready = await enqueue(1, "Unrelated final", 200);
+      await service.schedulePendingPublications(25);
+      await vi.waitFor(async () => {
+        expect(entered).toBe(true);
+        expect(
+          await db
+            .select({ state: chatPublications.state })
+            .from(chatPublications)
+            .where(eq(chatPublications.id, ready.id)),
+        ).toEqual([{ state: "published" }]);
+      });
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, tail.id)),
+      ).toEqual([{ state: "pending", attempts: 0 }]);
+      release();
+      drain = service.processPendingPublications(50);
+      await drain;
+      const sameConversationPosts = lanes[0]!.providerRuntime.posts.filter(
+        (post) => post.threadId === lanes[0]!.conversation.externalThreadId,
+      );
+      expect(sameConversationPosts.map((post) => post.text)).toEqual([
+        "First in conversation",
+        "Second in conversation",
+      ]);
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(inArray(chatPublications.id, [first.id, tail.id])),
+      ).toEqual([
+        { state: "published", attempts: 1 },
+        { state: "published", attempts: 1 },
+      ]);
+    } finally {
+      release();
+      await drain;
+      await fixture.cleanup();
+    }
+  });
+
+  it("keeps an aged live publication owned across standby sweeps but quarantines only exact-lease orphans", async () => {
+    const fixture = await publicationLaneFixture(2);
+    const { service, lanes, enqueue } = fixture;
+    const standby = createService();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    lanes[0]!.providerRuntime.postHook = async () => {
+      entered = true;
+      await held;
+    };
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      const live = await enqueue(0, "Long running provider send");
+      await service.schedulePendingPublications(1);
+      await vi.waitFor(() => expect(entered).toBe(true));
+      const staleAt = new Date(Date.now() - 61_000);
+      await db
+        .update(chatPublications)
+        .set({ updatedAt: staleAt })
+        .where(eq(chatPublications.id, live.id));
+      const [lease] = await db
+        .select()
+        .from(chatEndpointLeases)
+        .where(eq(chatEndpointLeases.leaseKey, `publication:${live.id}:1`));
+      expect(lease).toMatchObject({
+        companyId: fixture.companyId,
+        endpointId: live.endpointId,
+      });
+      expect(lease!.expiresAt.getTime()).toBeGreaterThan(Date.now());
+      // Advance the renewal clock, not wall time. Both the first claim and
+      // its stale updatedAt now exceed 60s, while exact ownership renews.
+      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.waitFor(async () => {
+        const [renewed] = await db
+          .select()
+          .from(chatEndpointLeases)
+          .where(eq(chatEndpointLeases.id, lease!.id));
+        expect(renewed!.expiresAt.getTime()).toBeGreaterThan(
+          lease!.expiresAt.getTime(),
+        );
+      });
+      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.waitFor(async () => {
+        const [renewed] = await db
+          .select()
+          .from(chatEndpointLeases)
+          .where(eq(chatEndpointLeases.id, lease!.id));
+        expect(renewed!.expiresAt.getTime()).toBeGreaterThan(
+          Date.now() + 60_000,
+        );
+      });
+      const orphans = [];
+      for (const kind of [
+        "expired",
+        "wrong-attempt",
+        "wrong-endpoint",
+      ] as const) {
+        const orphan = await enqueue(1, kind);
+        await db
+          .update(chatPublications)
+          .set({ state: "streaming", attempts: 7, updatedAt: staleAt })
+          .where(eq(chatPublications.id, orphan.id));
+        await db.insert(chatEndpointLeases).values({
+          companyId: fixture.companyId,
+          endpointId:
+            kind === "wrong-endpoint"
+              ? lanes[0]!.endpoint.id
+              : orphan.endpointId,
+          leaseKey: `publication:${orphan.id}:${kind === "wrong-attempt" ? 6 : 7}`,
+          token: randomUUID(),
+          expiresAt: new Date(
+            Date.now() + (kind === "expired" ? -1_000 : 90_000),
+          ),
+        });
+        orphans.push(orphan);
+      }
+      await standby.service.schedulePendingPublications(0);
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, live.id)),
+      ).toEqual([{ state: "streaming", attempts: 1 }]);
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(
+            inArray(
+              chatPublications.id,
+              orphans.map((row) => row.id),
+            ),
+          ),
+      ).toEqual(
+        orphans.map(() => ({ state: "delivery_unknown", attempts: 7 })),
+      );
+      release();
+      await service.shutdown();
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, live.id)),
+      ).toEqual([{ state: "published", attempts: 1 }]);
+      expect(lanes[0]!.providerRuntime.posts).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      release();
+      await standby.service.shutdown();
+      await fixture.cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a provider-accepted publication after its exact attempt lease is lost", async () => {
+    const fixture = await publicationLaneFixture(1);
+    const { service, lanes, enqueue } = fixture;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    lanes[0]!.providerRuntime.postHook = async () => {
+      entered = true;
+      await held;
+    };
+    try {
+      const publication = await enqueue(0, "Accepted without lease authority");
+      await service.schedulePendingPublications(1);
+      await vi.waitFor(() => expect(entered).toBe(true));
+      await db
+        .update(chatEndpointLeases)
+        .set({ expiresAt: new Date(Date.now() - 1_000) })
+        .where(
+          eq(chatEndpointLeases.leaseKey, `publication:${publication.id}:1`),
+        );
+      release();
+      await service.processPendingPublications();
+      expect(lanes[0]!.providerRuntime.posts).toHaveLength(1);
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+            providerMessageId: chatPublications.providerMessageId,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).toEqual([{ state: "streaming", attempts: 1, providerMessageId: null }]);
+      await db
+        .update(chatPublications)
+        .set({ updatedAt: new Date(Date.now() - 61_000) })
+        .where(eq(chatPublications.id, publication.id));
+      await service.processPendingPublications();
+      await service.processPendingPublications();
+      expect(lanes[0]!.providerRuntime.posts).toHaveLength(1);
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).toEqual([{ state: "delivery_unknown", attempts: 1 }]);
+      expect(
+        await db
+          .select()
+          .from(chatMessageLinks)
+          .where(eq(chatMessageLinks.publicationId, publication.id)),
+      ).toHaveLength(0);
+    } finally {
+      release();
+      await fixture.cleanup();
+    }
+  });
+
+  it("does not resurrect publication ownership after waiting beyond expiry on a real lease row lock", async () => {
+    const fixture = await publicationLaneFixture(1);
+    const { service, lanes, enqueue } = fixture;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered = false;
+    lanes[0]!.providerRuntime.postHook = async () => {
+      entered = true;
+      await held;
+    };
+    let drain: Promise<number> | undefined;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const baseTime = Date.now();
+      const publication = await enqueue(
+        0,
+        "Accepted while receipt ownership waits",
+      );
+      await service.schedulePendingPublications(1);
+      await vi.waitFor(() => expect(entered).toBe(true));
+      const leaseKey = `publication:${publication.id}:1`;
+      await db
+        .update(chatEndpointLeases)
+        .set({ expiresAt: new Date(baseTime + 10_000) })
+        .where(eq(chatEndpointLeases.leaseKey, leaseKey));
+      await db.transaction(async (tx) => {
+        await tx
+          .select()
+          .from(chatEndpointLeases)
+          .where(eq(chatEndpointLeases.leaseKey, leaseKey))
+          .for("update");
+        const [backend] = (await tx.execute(
+          sql`select pg_backend_pid() as pid`,
+        )) as unknown as Array<{ pid: number }>;
+        release();
+        drain = service.processPendingPublications();
+        // Observe the real blocker; advancing a clock before the ownership
+        // query starts would not distinguish a stale pre-lock decision clock.
+        await vi.waitFor(async () => {
+          const [state] = (await db.execute(sql`select exists (
+            select 1 from pg_stat_activity where ${backend!.pid} = any(pg_blocking_pids(pid))
+          ) as waiting`)) as unknown as Array<{ waiting: boolean }>;
+          expect(state!.waiting).toBe(true);
+        });
+        expect(lanes[0]!.providerRuntime.posts).toHaveLength(1);
+        vi.setSystemTime(new Date(baseTime + 20_000));
+      });
+      await drain;
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            providerMessageId: chatPublications.providerMessageId,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).toEqual([{ state: "streaming", providerMessageId: null }]);
+      expect(
+        await db
+          .select()
+          .from(chatMessageLinks)
+          .where(eq(chatMessageLinks.publicationId, publication.id)),
+      ).toHaveLength(0);
+      await db
+        .update(chatPublications)
+        .set({ updatedAt: new Date(Date.now() - 61_000) })
+        .where(eq(chatPublications.id, publication.id));
+      await service.processPendingPublications();
+      expect(
+        await db
+          .select({
+            state: chatPublications.state,
+            attempts: chatPublications.attempts,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).toEqual([{ state: "delivery_unknown", attempts: 1 }]);
+      expect(lanes[0]!.providerRuntime.posts).toHaveLength(1);
+    } finally {
+      release();
+      await drain;
+      await fixture.cleanup();
+      vi.useRealTimers();
+    }
+  });
+
   it("publishes equal-time Slack outbox rows once in stable order across concurrent drains", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service } =
@@ -20258,45 +20919,65 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     };
 
     const originalWorker = service.processPendingPublications();
-    await postStarted;
-    await db
-      .update(chatPublications)
-      .set({ updatedAt: new Date(Date.now() - 120_000) })
-      .where(eq(chatPublications.id, publication.id));
-    await service.processPendingPublications();
-    await expect(
-      db
-        .select({ state: chatPublications.state })
-        .from(chatPublications)
-        .where(eq(chatPublications.id, publication.id)),
-    ).resolves.toEqual([{ state: "delivery_unknown" }]);
+    try {
+      await postStarted;
+      await db
+        .update(chatPublications)
+        .set({ updatedAt: new Date(Date.now() - 120_000) })
+        .where(eq(chatPublications.id, publication.id));
+      // An aged but renewed live worker is not orphaned. Explicitly expire its
+      // exact durable attempt before simulating the periodic recovery scan.
+      await db
+        .update(chatEndpointLeases)
+        .set({ expiresAt: new Date(0) })
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, endpoint.id),
+            eq(chatEndpointLeases.leaseKey, `publication:${publication.id}:1`),
+          ),
+        );
+      await service.schedulePendingPublications(0);
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).resolves.toEqual([{ state: "delivery_unknown" }]);
 
-    releasePost();
-    await originalWorker;
-    await service.processPendingPublications();
+      releasePost();
+      await originalWorker;
+      await service.processPendingPublications();
 
-    expect(endpointRuntime.posts).toEqual([
-      {
-        threadId: thread.thread.id,
-        text: "A slow provider accepted this exactly once",
-      },
-    ]);
-    await expect(
-      db
-        .select({
-          attempts: chatPublications.attempts,
-          providerMessageId: chatPublications.providerMessageId,
-          state: chatPublications.state,
-        })
-        .from(chatPublications)
-        .where(eq(chatPublications.id, publication.id)),
-    ).resolves.toEqual([
-      {
-        attempts: 1,
-        providerMessageId: null,
-        state: "delivery_unknown",
-      },
-    ]);
+      expect(endpointRuntime.posts).toEqual([
+        {
+          threadId: thread.thread.id,
+          text: "A slow provider accepted this exactly once",
+        },
+      ]);
+      await expect(
+        db
+          .select({
+            attempts: chatPublications.attempts,
+            providerMessageId: chatPublications.providerMessageId,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).resolves.toEqual([
+        {
+          attempts: 1,
+          providerMessageId: null,
+          state: "delivery_unknown",
+        },
+      ]);
+    } finally {
+      releasePost();
+      try {
+        await originalWorker;
+      } finally {
+        await service.shutdown();
+      }
+    }
   });
 
   it("releases task-control authorization locks before provider I/O and quarantines stale claims", async () => {
@@ -20384,81 +21065,98 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     };
 
     const originalWorker = service.processPendingPublications();
-    await postStarted;
-    await expect(
-      db
-        .select({ status: chatActions.status, result: chatActions.result })
-        .from(chatActions)
-        .where(eq(chatActions.id, authorization.id)),
-    ).resolves.toEqual([
-      {
-        status: "processing",
-        result: expect.objectContaining({
-          attempts: 1,
-          credentialFingerprint: expect.any(String),
-          runtimeGeneration: expect.any(Number),
-        }),
-      },
-    ]);
+    try {
+      await postStarted;
+      await expect(
+        db
+          .select({ status: chatActions.status, result: chatActions.result })
+          .from(chatActions)
+          .where(eq(chatActions.id, authorization.id)),
+      ).resolves.toEqual([
+        {
+          status: "processing",
+          result: expect.objectContaining({
+            attempts: 1,
+            credentialFingerprint: expect.any(String),
+            runtimeGeneration: expect.any(Number),
+          }),
+        },
+      ]);
 
-    const authorizationLockProbe = db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${fixture.companyId}:${principal.id}`}, 0))`,
-      );
-      return "authorization-lock-released" as const;
-    });
-    const lockOutcome = await Promise.race([
-      authorizationLockProbe,
-      new Promise<"authorization-lock-held">((resolve) =>
-        setTimeout(() => resolve("authorization-lock-held"), 500),
-      ),
-    ]);
-    if (lockOutcome !== "authorization-lock-released") {
+      const authorizationLockProbe = db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${fixture.companyId}:${principal.id}`}, 0))`,
+        );
+        return "authorization-lock-released" as const;
+      });
+      const lockOutcome = await Promise.race([
+        authorizationLockProbe,
+        new Promise<"authorization-lock-held">((resolve) =>
+          setTimeout(() => resolve("authorization-lock-held"), 500),
+        ),
+      ]);
+      if (lockOutcome !== "authorization-lock-released") {
+        releasePost();
+        await originalWorker;
+        await authorizationLockProbe;
+      }
+      expect(lockOutcome).toBe("authorization-lock-released");
+
+      await db
+        .update(chatPublications)
+        .set({ updatedAt: new Date(Date.now() - 120_000) })
+        .where(eq(chatPublications.id, publication.id));
+      await db
+        .update(chatEndpointLeases)
+        .set({ expiresAt: new Date(0) })
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, endpoint.id),
+            eq(chatEndpointLeases.leaseKey, `publication:${publication.id}:1`),
+          ),
+        );
+      await service.schedulePendingPublications(0);
+      await expect(
+        db
+          .select({ status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, authorization.id)),
+      ).resolves.toEqual([{ status: "delivery_unknown" }]);
+
       releasePost();
       await originalWorker;
-      await authorizationLockProbe;
+      await service.processPendingPublications();
+      expect(endpointRuntime.posts).toHaveLength(1);
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id)),
+      ).resolves.toEqual([{ state: "delivery_unknown" }]);
+
+      endpointRuntime.postHook = undefined;
+      await service.resolvePublication(
+        endpoint.id,
+        publication.id,
+        "retry_anyway",
+        "owner-user",
+      );
+      await service.processPendingPublications();
+      expect(endpointRuntime.posts).toHaveLength(2);
+      await expect(
+        db
+          .select({ status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.id, authorization.id)),
+      ).resolves.toEqual([{ status: "processed" }]);
+    } finally {
+      releasePost();
+      try {
+        await originalWorker;
+      } finally {
+        await service.shutdown();
+      }
     }
-    expect(lockOutcome).toBe("authorization-lock-released");
-
-    await db
-      .update(chatPublications)
-      .set({ updatedAt: new Date(Date.now() - 120_000) })
-      .where(eq(chatPublications.id, publication.id));
-    await service.processPendingPublications();
-    await expect(
-      db
-        .select({ status: chatActions.status })
-        .from(chatActions)
-        .where(eq(chatActions.id, authorization.id)),
-    ).resolves.toEqual([{ status: "delivery_unknown" }]);
-
-    releasePost();
-    await originalWorker;
-    await service.processPendingPublications();
-    expect(endpointRuntime.posts).toHaveLength(1);
-    await expect(
-      db
-        .select({ state: chatPublications.state })
-        .from(chatPublications)
-        .where(eq(chatPublications.id, publication.id)),
-    ).resolves.toEqual([{ state: "delivery_unknown" }]);
-
-    endpointRuntime.postHook = undefined;
-    await service.resolvePublication(
-      endpoint.id,
-      publication.id,
-      "retry_anyway",
-      "owner-user",
-    );
-    await service.processPendingPublications();
-    expect(endpointRuntime.posts).toHaveLength(2);
-    await expect(
-      db
-        .select({ status: chatActions.status })
-        .from(chatActions)
-        .where(eq(chatActions.id, authorization.id)),
-    ).resolves.toEqual([{ status: "processed" }]);
-    await service.shutdown();
   });
 
   it("does not let Slack reach disables return ahead of in-flight provider sends", async () => {

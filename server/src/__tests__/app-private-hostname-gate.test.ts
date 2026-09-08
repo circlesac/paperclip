@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   createChatReconciliationCoordinator,
@@ -5,6 +6,19 @@ import {
 } from "../app.ts";
 
 describe("createChatReconciliationCoordinator", () => {
+  it("wires periodic publication reconciliation to bounded scheduled refill rather than awaiting provider sends", () => {
+    const source = readFileSync(new URL("../app.ts", import.meta.url), "utf8");
+    const flush = source.slice(
+      source.indexOf("const flushChatPublications ="),
+      source.indexOf("const flushChatPublications =") + 600,
+    );
+    expect(flush).toContain("await chatChannels.schedulePendingPublications()");
+    expect(flush).not.toContain("chatChannels.processPendingPublications()");
+    // The service integration tests hold real publication workers while this
+    // scheduled method returns; app shutdown must also join those workers.
+    expect(source).toContain("await chatChannels.shutdown()");
+  });
+
   it("keeps slow optional recovery from suppressing later publication sweeps", async () => {
     let releaseDelivery!: () => void;
     let releaseSlackStatus!: () => void;

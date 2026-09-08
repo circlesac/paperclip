@@ -368,3 +368,31 @@ passes (`native-chat-arbitration-root-02.log`). The first test attempt exposed
 duplicate company prefixes in the new isolated fixtures; that seed defect was
 corrected before the successful rerun. This correction is not yet deployed;
 historical content inspection and live retry remain separate work.
+
+### Additional native hardening under verification
+
+The explicit external-chat wait correction passes **9/9** real-PostgreSQL tests
+(`native-chat-wait-root-03.log`): same-task liveness with no scheduled extra turn,
+current-authority revocation, and a contended endpoint proof that retries without
+the issue/endpoint deadlock. Governance and ordinary non-chat behavior retain
+their existing priority. Independent review found and prompted corrections to
+lock ordering and authority-loss classification before this pass. Earlier runs
+found fixture FK/prefix errors and an incorrect retry-count assertion (assessment
+rows intentionally deduplicate); those attempts are not counted as passes.
+
+File-preparation results now explicitly distinguish native attachment capability
+from GitHub/Teams private-task-only delivery and never claim confirmed sending.
+Focused coverage passed **32/32**, broader prompt/tool-authority coverage
+**119/119**, and adapter-utils/server typechecks passed before later reader work.
+The queued-publication change uses at most four independently owned endpoint
+lanes, preserving same-bot credential fencing and conversation order. Its
+focused queue/lease/app checks passed **8/8**, and broader receipt/FIFO/retry
+coverage passed **20/20**. The first full integration run passed 284/287: two
+old stale-worker fixtures needed exact lease expiry, and one failure exposed
+an empty-page race when an excluded busy endpoint became idle during selection.
+Those cases were corrected. A real row-lock regression also reproduced expiry
+resurrection before the new lease guard sampled its clock after acquiring the
+lock; the corrected guard rejects late settlement without replaying the send.
+The frozen full integration rerun passes **288/288** in 100.13 s
+(`chat-channels-full-root-hardening-02.log`), with app lifecycle checks **8/8**.
+These changes are not yet deployed.
