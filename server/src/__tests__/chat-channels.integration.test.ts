@@ -36799,6 +36799,164 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
+  it("replaces working with one safe ownership-attention message without terminalizing the run", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredTelegramEndpoint(fixture);
+    const chatId = "77112249";
+    const dm = makeThread({
+      channelId: `telegram:${chatId}`,
+      id: `telegram:${chatId}`,
+      isDM: true,
+      name: "Telegram direct message",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "telegram",
+      thread: dm.thread,
+      message: makeMessage({ id: `${chatId}:101`, text: "Recover this turn safely", userId: chatId }),
+      trigger: "direct_message",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id, chatId);
+    await service.test(endpoint.id, "owner-user");
+    const [conversation] = await db.select().from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    if (!conversation) throw new Error("Expected Telegram conversation");
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      contextSnapshot: await chatWakeContext({
+        endpointId: endpoint.id,
+        issueId: conversation.issueId,
+        provider: "telegram",
+        providerMessageId: `${chatId}:101`,
+      }),
+    });
+    await expect(enqueueChatRunMilestones(db)).resolves.toBe(1);
+    await service.processPendingPublications();
+    await db.update(heartbeatRuns).set({
+      errorCode: "native_execution_ownership_unverified",
+      error: "Private runner PID and executable authentication diagnostic",
+      updatedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, runId));
+    await expect(enqueueChatRunMilestones(db)).resolves.toBe(1);
+    await service.processPendingPublications();
+    await expect(enqueueChatRunMilestones(db)).resolves.toBe(0);
+    await service.processPendingPublications();
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    expect(providerRuntime?.posts).toEqual([
+      { threadId: dm.thread.id, text: "Maya is working…" },
+    ]);
+    expect(providerRuntime?.edits).toEqual([{
+      threadId: dm.thread.id,
+      messageId: "outbound-2",
+      text: "Maya needs a Paperclip admin to safely recover this turn before more work can start. Open the task in Paperclip for details.",
+    }]);
+    expect(JSON.stringify(providerRuntime?.edits)).not.toContain("Private runner");
+    const [retainedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(retainedRun).toMatchObject({ status: "running", finishedAt: null });
+  });
+
+  it.each(["queued", "working", "waiting_for_input"] as const)(
+    "does not let a late %s milestone replace authoritative ownership attention or final status",
+    async (lateMilestone) => {
+      const fixture = await seedCompany();
+      const { callbacks, endpoint, runtime, service } =
+        await configuredTelegramEndpoint(fixture);
+      const chatId = "77112250";
+      const dm = makeThread({
+        channelId: `telegram:${chatId}`,
+        id: `telegram:${chatId}`,
+        isDM: true,
+        name: "Telegram direct message",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "telegram",
+        thread: dm.thread,
+        message: makeMessage({
+          id: `${chatId}:101`,
+          text: "Recover safely",
+          userId: chatId,
+        }),
+        trigger: "direct_message",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id, chatId);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await db
+        .select()
+        .from(chatConversations)
+        .where(eq(chatConversations.endpointId, endpoint.id));
+      if (!conversation) throw new Error("Expected Telegram conversation");
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: fixture.companyId,
+        agentId: fixture.assignedAgentId,
+        status: lateMilestone === "queued" ? "running" : "queued",
+        contextSnapshot: await chatWakeContext({
+          endpointId: endpoint.id,
+          issueId: conversation.issueId,
+          provider: "telegram",
+          providerMessageId: `${chatId}:101`,
+        }),
+      });
+      await expect(enqueueChatRunMilestones(db)).resolves.toBe(1);
+      await service.processPendingPublications();
+      const terminal = lateMilestone === "waiting_for_input";
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: terminal ? "failed" : "running",
+          errorCode: terminal
+            ? "adapter_failed"
+            : "native_execution_ownership_unverified",
+          error: "Private diagnostic must not leave Paperclip",
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      await expect(enqueueChatRunMilestones(db)).resolves.toBe(1);
+      await service.processPendingPublications();
+      const providerRuntime = runtime.endpoints.get(endpoint.id);
+      if (!providerRuntime) throw new Error("Expected Telegram runtime");
+      const settledEdits = [...providerRuntime.edits];
+      expect(settledEdits).toHaveLength(1);
+      // Model a sweep that sampled an earlier run state, then finished its
+      // binding lookup after a newer milestone had already reached the provider.
+      const [stale] = await db
+        .insert(chatPublications)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          conversationId: conversation.id,
+          issueId: conversation.issueId,
+          idempotencyKey: `run:${runId}:${lateMilestone}:${endpoint.id}`,
+          payload: {
+            text: "Stale status must not replace the authoritative message",
+            progressState: lateMilestone,
+          },
+          state: "pending",
+        })
+        .returning();
+      await service.processPendingPublications();
+      expect(providerRuntime.posts).toHaveLength(1);
+      expect(providerRuntime.edits).toEqual(settledEdits);
+      expect(JSON.stringify(providerRuntime.edits)).not.toContain(
+        "Private diagnostic",
+      );
+      const [retained] = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.id, stale!.id));
+      expect(retained).toMatchObject({ state: "cancelled", attempts: 0 });
+    },
+  );
+
   it("keeps an internal Telegram run summary private and completes its progress message", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service } =

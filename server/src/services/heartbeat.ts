@@ -216,6 +216,12 @@ import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
 } from "./native-runtime/chat-attachment-reuse.js";
+import {
+  NativeRunnerOwnershipUnverifiedError,
+  isNativeRunnerOwnershipHeld,
+  nativeRunnerOwnershipNotHeldCondition,
+  NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
+} from "./native-runtime/native-runner-ownership.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { emitAgentTaskRun } from "./agent-task-run-telemetry.js";
@@ -534,8 +540,6 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
-const NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE =
-  "native_execution_ownership_unverified";
 const NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE =
   "Native execution ownership could not be verified; automatic recovery is blocked";
 // The reaper sweeps at most this many pending_cleanup leases per tick.
@@ -9421,6 +9425,8 @@ export function heartbeatService(
       sandboxResource: "keep_running" | "stop_and_reuse" | "destroy_after_turn";
     };
   }) {
+    const leaseOwnerRun = await getRun(input.runId);
+    if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
     if (input.providerResourceDisposition === "destroy") {
       const closeResult = await (
         options.closeWarmNativeSessionsForRun ??
@@ -11684,6 +11690,9 @@ export function heartbeatService(
         and(
           eq(heartbeatRuns.id, runId),
           inArray(heartbeatRuns.status, fromStatuses),
+          ...(isHeartbeatRunTerminalStatus(status)
+            ? [nativeRunnerOwnershipNotHeldCondition()]
+            : []),
         ),
       )
       .returning()
@@ -11721,6 +11730,7 @@ export function heartbeatService(
   async function terminalizeRunOnLeaseRelease(
     run: typeof heartbeatRuns.$inferSelect,
   ): Promise<typeof heartbeatRuns.$inferSelect> {
+    if (isNativeRunnerOwnershipHeld(run)) return run;
     if (isHeartbeatRunTerminalStatus(run.status)) return run;
     if (run.status !== "running" && run.status !== "queued") return run;
 
@@ -13964,6 +13974,7 @@ export function heartbeatService(
     const restartSuspendedRunIds: string[] = [];
 
     for (const { run, agent } of activeRuns) {
+      if (isNativeRunnerOwnershipHeld(run)) continue;
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -17661,14 +17672,19 @@ export function heartbeatService(
   async function markNativeOwnershipUnverified(
     run: typeof heartbeatRuns.$inferSelect,
     evidence: {
-      reason: "live_process_identifier" | "observed_owner_unverified";
+      reason:
+        | "live_process_identifier"
+        | "observed_owner_unverified"
+        | "adopted_runner_authentication_timeout";
       processPidAlive?: boolean;
       processGroupAlive?: boolean;
     },
   ) {
     if (
       run.errorCode === NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE &&
-      run.error === NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE
+      run.error === NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE &&
+      (evidence.reason !== "adopted_runner_authentication_timeout" ||
+        isNativeRunnerOwnershipHeld(run))
     )
       return run;
     const blockedStatus = run.status === "failed" ? "failed" : "running";
@@ -17679,6 +17695,12 @@ export function heartbeatService(
       {
         error: NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE,
         errorCode: NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
+        ...(evidence.reason === "adopted_runner_authentication_timeout"
+          ? {
+              nativePhase: "terminal_failure",
+              nativePhaseUpdatedAt: new Date(),
+            }
+          : {}),
       },
     );
     if (!blockedWrite.updated || !blockedWrite.run) {
@@ -17781,6 +17803,7 @@ export function heartbeatService(
       );
     const claimableNativeRunIds = new Set<string>();
     for (const { run } of retryableNativeProcesses) {
+      if (isNativeRunnerOwnershipHeld(run)) continue;
       if (!run.processPid && !run.processGroupId) {
         claimableNativeRunIds.add(run.id);
         continue;
@@ -17985,6 +18008,9 @@ export function heartbeatService(
       nativeControllerProcessStartedAt,
       nativeControllerLeaseExpiresAt,
     } of activeRuns) {
+      // Authentication timeout requires an explicit ownership resolution, not
+      // repeated reattachment or a process-gone guess on subsequent sweeps.
+      if (isNativeRunnerOwnershipHeld(run)) continue;
       const nativeRun = run.runtimeMode === "native";
       const nativeProcessPidAlive =
         nativeRun && !!run.processPid && isProcessAlive(run.processPid);
@@ -18121,25 +18147,33 @@ export function heartbeatService(
           monitorDispatchLostWithoutFutureWake);
       const baseMessage = buildProcessLossMessage(run);
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
-        finishedAt: now,
-        resultJson: (() => {
-          const result = mergeRunStopMetadataForAgent(
-            { adapterType, adapterConfig },
-            "failed",
-            {
-              resultJson: parseObject(run.resultJson),
-              errorCode: "process_lost",
-              errorMessage: shouldRetry
-                ? `${baseMessage}; retrying once`
-                : baseMessage,
-            },
-          );
-          return result;
-        })(),
-      });
+      const failureWrite = await setRunStatusFromLive(
+        run.id,
+        "failed",
+        ["running"],
+        {
+          error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+          errorCode: "process_lost",
+          finishedAt: now,
+          resultJson: (() => {
+            const result = mergeRunStopMetadataForAgent(
+              { adapterType, adapterConfig },
+              "failed",
+              {
+                resultJson: parseObject(run.resultJson),
+                errorCode: "process_lost",
+                errorMessage: shouldRetry
+                  ? `${baseMessage}; retrying once`
+                  : baseMessage,
+              },
+            );
+            return result;
+          })(),
+        },
+      );
+      if (!failureWrite.updated || !failureWrite.run) continue;
+      let finalizedRun: typeof heartbeatRuns.$inferSelect | null =
+        failureWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -18764,6 +18798,7 @@ export function heartbeatService(
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
     let nativeSessionResumeScheduled = false;
+    let nativeOwnershipHeld = false;
     let nativeWorkspaceFinalizeScheduled = false;
     let nativeWorkspaceSync: Awaited<
       ReturnType<typeof prepareNativeWorkspaceSync>
@@ -22490,6 +22525,10 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
+          if (adapterErr instanceof NativeRunnerOwnershipUnverifiedError) {
+            nativeOwnershipHeld = true;
+            throw adapterErr;
+          }
           const nativeResumeScheduled =
             nativeRuntimeResolution.kind === "native"
               ? await db
@@ -23217,6 +23256,15 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        if (err instanceof NativeRunnerOwnershipUnverifiedError) {
+          nativeOwnershipHeld = true;
+          const heldRun = await getRun(run.id);
+          if (heldRun)
+            await markNativeOwnershipUnverified(heldRun, {
+              reason: "adopted_runner_authentication_timeout",
+            });
+          return;
+        }
         if (err instanceof NativeCancellationPendingRecoveryError) {
           await cancelRunInternal(
             run.id,
@@ -23503,7 +23551,17 @@ export function heartbeatService(
         });
       }
     } catch (outerErr) {
-      if (isWorkspaceBusyDeferral(outerErr)) {
+      if (
+        nativeOwnershipHeld ||
+        outerErr instanceof NativeRunnerOwnershipUnverifiedError
+      ) {
+        nativeOwnershipHeld = true;
+        const heldRun = await getRun(run.id).catch(() => null);
+        if (heldRun)
+          await markNativeOwnershipUnverified(heldRun, {
+            reason: "adopted_runner_authentication_timeout",
+          }).catch(() => undefined);
+      } else if (isWorkspaceBusyDeferral(outerErr)) {
         // Expected contention on a shared project workspace, not a
         // failure: park the run as a bounded scheduled retry and leave the
         // holder undisturbed. The finally block below still releases
@@ -23694,6 +23752,9 @@ export function heartbeatService(
       }
     } finally {
       let latestRun = await getRun(run.id).catch(() => null);
+      nativeOwnershipHeld =
+        nativeOwnershipHeld ||
+        Boolean(latestRun && isNativeRunnerOwnershipHeld(latestRun));
       // Trace capture is debug-only and must settle independently of every
       // provider outcome. Adapter/setup failures used to skip the success-path
       // finalizer, leaving metadata permanently stuck at `capturing` even when
@@ -23722,7 +23783,8 @@ export function heartbeatService(
       if (
         latestRun &&
         !nativeSessionResumeScheduled &&
-        !nativeWorkspaceFinalizeScheduled
+        !nativeWorkspaceFinalizeScheduled &&
+        !nativeOwnershipHeld
       ) {
         latestRun = await terminalizeRunOnLeaseRelease(latestRun).catch(
           (terminalizeErr) => {
@@ -23737,12 +23799,19 @@ export function heartbeatService(
       // Warm retention is earned only by a fully successful turn. A failed,
       // cancelled, or timed-out run stops the reusable sandbox so the next
       // acquisition must revalidate and explicitly resume it.
+      nativeOwnershipHeld =
+        nativeOwnershipHeld ||
+        Boolean(latestRun && isNativeRunnerOwnershipHeld(latestRun));
       providerResourceDispositionForRun =
         providerResourceDispositionForTerminalRun(
           providerResourceDispositionForRun,
           latestRun?.status,
         );
-      if (!nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled) {
+      if (
+        !nativeSessionResumeScheduled &&
+        !nativeWorkspaceFinalizeScheduled &&
+        !nativeOwnershipHeld
+      ) {
         // Keep launchers during same-run recovery. At a terminal boundary all
         // operations have settled; clean before the remote lease can be stopped.
         if (

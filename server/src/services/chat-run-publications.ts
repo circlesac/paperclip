@@ -27,7 +27,13 @@ import { hasChatRunOwnedProviderInteraction } from "./chat-interaction-arbitrati
 import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON } from "./heartbeat-run-summary.js";
 import { resolveChatOriginPublicationBindings } from "./issues.js";
 
-type SafeRunMilestone = "queued" | "working" | "completed" | "failed";
+type SafeRunMilestone =
+  "queued" | "working" | "waiting_for_input" | "completed" | "failed";
+
+const OWNERSHIP_ATTENTION_CODES = [
+  "native_execution_ownership_unverified",
+  "native_adopted_runner_authentication_timeout",
+] as const;
 
 export { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON };
 
@@ -73,8 +79,16 @@ type ChatRunMilestoneCandidate = {
   agentName: string;
 };
 
-function milestoneForStatus(status: string): SafeRunMilestone | null {
+function milestoneForStatus(
+  status: string,
+  errorCode: string | null,
+): SafeRunMilestone | null {
   if (status === "queued") return "queued";
+  if (
+    status === "running" &&
+    OWNERSHIP_ATTENTION_CODES.some((code) => code === errorCode)
+  )
+    return "waiting_for_input";
   if (status === "running") return "working";
   if (status === "succeeded") return "completed";
   if (["failed", "timed_out", "cancelled"].includes(status)) return "failed";
@@ -96,11 +110,13 @@ export function safeMilestoneText(input: {
     return `${input.agentName} stopped at your request.`;
   const taskUrl = safeChatTaskUrl(input.publicBaseUrl, input.issueId);
   const recovery =
-    input.errorCode === "low_trust_isolation_unavailable"
-      ? `${input.agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.`
-      : input.errorCode === "native_provider_usage_limit"
-        ? `${input.agentName} couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying.`
-        : `${input.agentName} stopped before completing this turn.`;
+    input.milestone === "waiting_for_input"
+      ? `${input.agentName} needs a Paperclip admin to safely recover this turn before more work can start.`
+      : input.errorCode === "low_trust_isolation_unavailable"
+        ? `${input.agentName} couldn't safely start this turn because this task was started for an unlinked external guest and isolated guest execution isn't available. Ask a Paperclip admin to create a private identity link for this account or enable isolated guest execution, then start a new task.`
+        : input.errorCode === "native_provider_usage_limit"
+          ? `${input.agentName} couldn't complete this turn because the model provider's usage allowance is exhausted. A Paperclip admin needs to restore capacity before retrying.`
+          : `${input.agentName} stopped before completing this turn.`;
   return `${recovery}${
     taskUrl
       ? ` Open the task in Paperclip: ${taskUrl}`
@@ -130,6 +146,9 @@ export async function enqueueChatRunMilestones(
   )`;
   const milestoneFromStatus = sql<string>`case
     when ${heartbeatRuns.status} = 'queued' then 'queued'
+    when ${heartbeatRuns.status} = 'running'
+      and ${inArray(heartbeatRuns.errorCode, [...OWNERSHIP_ATTENTION_CODES])}
+      then 'waiting_for_input'
     when ${heartbeatRuns.status} = 'running' then 'working'
     when ${heartbeatRuns.status} = 'succeeded' then 'completed'
     else 'failed'
@@ -383,7 +402,7 @@ export async function enqueueChatRunMilestones(
 
     for (const row of rows) {
       if (inserted >= limit) break;
-      const milestone = milestoneForStatus(row.runStatus);
+      const milestone = milestoneForStatus(row.runStatus, row.runErrorCode);
       if (!milestone) continue;
       const bindingCacheKey = `${row.companyId}:${row.issueId}:${row.runId}`;
       let bindings = bindingsCache.get(bindingCacheKey);

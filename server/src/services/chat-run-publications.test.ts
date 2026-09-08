@@ -63,6 +63,19 @@ describe("chat run milestone projection", () => {
     );
   });
 
+  it("describes ownership recovery without claiming the retained process stopped", () => {
+    expect(
+      safeMilestoneText({
+        agentName: "Maya",
+        errorCode: "native_execution_ownership_unverified",
+        milestone: "waiting_for_input",
+        issueId: "issue-1",
+      }),
+    ).toBe(
+      "Maya needs a Paperclip admin to safely recover this turn before more work can start. Open the task in Paperclip for details.",
+    );
+  });
+
   it("explains an allowlisted native provider capacity failure without exposing provider details", () => {
     expect(
       safeMilestoneText({

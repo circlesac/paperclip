@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -253,6 +253,88 @@ describe("P6-25 pre-result native session recovery", () => {
   }, 30_000);
 
   afterAll(async () => temporary?.cleanup());
+
+  it("filters durable ownership holds before the bounded resume candidate limit", async () => {
+    const heldRunIds = Array.from(
+      { length: 26 },
+      (_, index) =>
+        `79100000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    );
+    const eligibleRunId = "79100000-0000-4000-8000-000000000099";
+    const candidateRunIds = [...heldRunIds, eligibleRunId];
+    await db.insert(heartbeatRuns).values(
+      candidateRunIds.map((candidateRunId) => ({
+        id: candidateRunId,
+        companyId,
+        agentId,
+        nativeIssueId: issueId,
+        status: "running",
+        runtimeMode: "native",
+        nativePhase:
+          candidateRunId === eligibleRunId
+            ? "retryable_failure"
+            : "terminal_failure",
+        errorCode:
+          candidateRunId === eligibleRunId
+            ? null
+            : "native_execution_ownership_unverified",
+        runnerProfileJson: {
+          ...persistedProfile,
+          nativeExecutionInput: {
+            ...persistedProfile.nativeExecutionInput,
+            binding: { runId: candidateRunId },
+          },
+          sessionCheckpoint: {
+            ...persistedProfile.sessionCheckpoint,
+            identity: { runId: candidateRunId },
+          },
+        },
+      })),
+    );
+    await db.insert(nativeRunFinalizations).values(
+      candidateRunIds.map((candidateRunId) => ({
+        runId: candidateRunId,
+        companyId,
+        issueId,
+        phase: "retryable_failure",
+        attempt: 1,
+        nextAttemptAt: new Date(0),
+        leaseExpiresAt: new Date(0),
+      })),
+    );
+    try {
+      expect(
+        await claimNativeSessionResumptions({
+          db,
+          runnerInstanceId: "bounded-reaper",
+          runIds: candidateRunIds,
+          limit: 1,
+        }),
+      ).toEqual([
+        {
+          runId: eligibleRunId,
+          leaseOwner: expect.stringContaining("bounded-reaper:resume:"),
+        },
+      ]);
+      const held = await db
+        .select()
+        .from(nativeRunFinalizations)
+        .where(inArray(nativeRunFinalizations.runId, heldRunIds));
+      expect(held).toHaveLength(26);
+      expect(
+        held.every(
+          (row) => row.phase === "retryable_failure" && row.leaseOwner === null,
+        ),
+      ).toBe(true);
+    } finally {
+      await db
+        .delete(nativeRunFinalizations)
+        .where(inArray(nativeRunFinalizations.runId, candidateRunIds));
+      await db
+        .delete(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, candidateRunIds));
+    }
+  });
 
   it("wins one database lease for the original result-less run without consulting the flag", async () => {
     const results = await Promise.all([

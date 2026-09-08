@@ -26,6 +26,10 @@ import {
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
+import {
+  isNativeRunnerOwnershipHeld,
+  nativeRunnerOwnershipNotHeldCondition,
+} from "../native-runtime/native-runner-ownership.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
@@ -659,6 +663,7 @@ export function recoveryService(
   deps: {
     enqueueWakeup: RecoveryWakeup;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
+    beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -3969,7 +3974,12 @@ export function recoveryService(
     // Act only on a run in "running" status. A "queued" run has no process yet,
     // and a "scheduled_retry" run has no process on purpose because it waits to
     // retry. Neither is orphaned, so this function must not terminalize them.
-    if (run.status !== "running") return { terminalized: false, status: run.status };
+    if (run.status !== "running")
+      return { terminalized: false, status: run.status };
+    // Authentication failure does not prove the retained provider stopped.
+    // PID observations and task status edits cannot resolve its ownership.
+    if (isNativeRunnerOwnershipHeld(run))
+      return { terminalized: false, status: run.status };
 
     const pid = run.processPid ?? null;
     const processGroupId = run.processGroupId ?? null;
@@ -3985,7 +3995,11 @@ export function recoveryService(
     let issueTerminalStatus: "succeeded" | "cancelled" | null =
       options?.referencingIssueTerminalStatus ?? null;
     const issueId = issueIdFromRunContext(run.contextSnapshot);
-    if (!issueTerminalStatus && !options?.runReferencedByActiveIssue && issueId) {
+    if (
+      !issueTerminalStatus &&
+      !options?.runReferencedByActiveIssue &&
+      issueId
+    ) {
       const issueStatus = await db
         .select({ status: issues.status })
         .from(issues)
@@ -4007,7 +4021,8 @@ export function recoveryService(
       if (typeof pid === "number" || typeof processGroupId === "number") {
         const processAlive =
           (typeof pid === "number" && isPidAlive(pid)) ||
-          (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
+          (typeof processGroupId === "number" &&
+            isProcessGroupAlive(processGroupId));
         processGone = !processAlive;
       }
     }
@@ -4029,10 +4044,10 @@ export function recoveryService(
         .where(eq(nativeRunFinalizations.runId, run.id))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      const nativeResumeOwnsRun = coordinator?.resultId === null && (
-        coordinator.phase === "retryable_failure"
-        || (coordinator.phase === "observed" && coordinator.attempt > 0)
-      );
+      const nativeResumeOwnsRun =
+        coordinator?.resultId === null &&
+        (coordinator.phase === "retryable_failure" ||
+          (coordinator.phase === "observed" && coordinator.attempt > 0));
       if (nativeResumeOwnsRun) {
         return { terminalized: false, status: run.status };
       }
@@ -4053,6 +4068,7 @@ export function recoveryService(
         ? "run terminalized by recovery backstop: issue reached a terminal status while heartbeat_runs.status stayed live"
         : "run terminalized by recovery backstop: process and sandbox gone while heartbeat_runs.status stayed live";
 
+    await deps.beforeOrphanedRunTerminalWrite?.(run.id);
     const now = new Date();
     const updated = await db
       .update(heartbeatRuns)
@@ -4060,10 +4076,18 @@ export function recoveryService(
         status: terminalStatus,
         finishedAt: run.finishedAt ?? now,
         error: run.error ?? (terminalStatus === "interrupted" ? message : null),
-        errorCode: run.errorCode ?? (terminalStatus === "interrupted" ? errorCode : null),
+        errorCode:
+          run.errorCode ??
+          (terminalStatus === "interrupted" ? errorCode : null),
         updatedAt: now,
       })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.status, "running"),
+          nativeRunnerOwnershipNotHeldCondition(),
+        ),
+      )
       .returning()
       .then((rows) => rows[0] ?? null);
     if (!updated) {
@@ -4106,7 +4130,15 @@ export function recoveryService(
       );
     }
     logger.warn(
-      { runId: run.id, authority, previousStatus: run.status, terminalStatus, issueId, pid, processGroupId },
+      {
+        runId: run.id,
+        authority,
+        previousStatus: run.status,
+        terminalStatus,
+        issueId,
+        pid,
+        processGroupId,
+      },
       "terminalized orphaned running heartbeat run in stale-lock sweep",
     );
     return { terminalized: true, status: updated.status };

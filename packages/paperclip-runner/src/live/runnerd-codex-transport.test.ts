@@ -61,9 +61,110 @@ import {
   withCodexCollaborationRuntimeInstructions,
 } from "./runnerd-codex-transport.js";
 
+it.each(["alive", "pending_liveness", "pending_registration"] as const)(
+  "bounds adopted runner authentication at its exact deadline with %s evidence",
+  async (mode) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-08T00:00:00.000Z"));
+    try {
+      const never = new Promise<never>(() => undefined);
+      let settled = false;
+      const result = runnerdRecoveryInternals
+        .awaitAdoptedRunnerAuthentication({
+          activeConnectionCount: () => 0,
+          isAlive: () => (mode === "pending_liveness" ? never : true),
+          throwIfFailed: () => undefined,
+          failure: never,
+          ...(mode === "pending_registration" ? { ready: () => never } : {}),
+          timeoutMs: 100,
+        })
+        .then(
+          () => {
+            settled = true;
+            return null;
+          },
+          (error: unknown) => {
+            settled = true;
+            return error;
+          },
+        );
+      await vi.advanceTimersByTimeAsync(99);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await result).toMatchObject({
+        message: expect.stringContaining(
+          "native_adopted_runner_authentication_timeout",
+        ),
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
+it.each([99, 100])(
+  "requires adopted runner authentication strictly before the deadline (%sms)",
+  async (authenticatedAtMs) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-08T00:00:00.000Z"));
+    try {
+      let connections = 0;
+      let resolveLiveness!: (alive: boolean) => void;
+      const liveness = new Promise<boolean>((resolveAlive) => {
+        resolveLiveness = resolveAlive;
+      });
+      const result = runnerdRecoveryInternals
+        .awaitAdoptedRunnerAuthentication({
+          activeConnectionCount: () => connections,
+          isAlive: () => liveness,
+          throwIfFailed: () => undefined,
+          failure: new Promise<never>(() => undefined),
+          timeoutMs: 100,
+        })
+        .then(
+          () => "authenticated",
+          (error: Error) => error.message,
+        );
+      await vi.advanceTimersByTimeAsync(authenticatedAtMs);
+      connections = 1;
+      resolveLiveness(true);
+      if (authenticatedAtMs < 100) {
+        expect(await result).toBe("authenticated");
+      } else {
+        expect(await result).toContain(
+          "native_adopted_runner_authentication_timeout",
+        );
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
+
 it("launches runnerd with its production durable outbox limits", () => {
   expect(runnerdLaunchProfileInternals.maxOutboxBytes).toBe(16 * 1024 * 1024);
   expect(runnerdLaunchProfileInternals.p0ReserveBytes).toBe(1024 * 1024);
+});
+
+it("requires an explicit retained state directory before adopting a runner", () => {
+  const launch = vi.fn();
+  const signal = vi.fn();
+  expect(() =>
+    createCapabilityRunnerdCodexTransport({
+      runnerProcessLauncher: launch,
+      adoptExistingRunner: {
+        pid: 123,
+        processGroupId: 123,
+        startedAt: new Date().toISOString(),
+        isAlive: () => true,
+        signal,
+      },
+    }),
+  ).toThrow("native_adopted_runner_state_directory_required");
+  expect(launch).not.toHaveBeenCalled();
+  expect(signal).not.toHaveBeenCalled();
 });
 
 it("carries the provider attachment seed across consecutive authority rotations", () => {
@@ -3056,10 +3157,14 @@ it("cold-restores a suspended provider session under its durable run binding", a
   }
 }, 30_000);
 
-async function verifyLiveRunnerAdoption(mismatchedCheckpoint: boolean) {
+async function verifyLiveRunnerAdoption(
+  mismatchedCheckpoint: boolean,
+  mismatchedArtifact = false,
+) {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-live-adopt-"));
   const server = createServer();
   let authority: DurablePrpControlPlane | null = null;
+  const checkpoint = vi.fn(async () => undefined);
   server.on("upgrade", (request, socket, head) => {
     if (!authority) {
       socket.destroy();
@@ -3077,6 +3182,7 @@ async function verifyLiveRunnerAdoption(mismatchedCheckpoint: boolean) {
     authority = next;
     return {
       connectUrl: `ws://127.0.0.1:${address.port}/runner`,
+      ...(mismatchedArtifact ? { checkpoint } : {}),
       release: async () => {
         if (authority === next) authority = null;
       },
@@ -3153,8 +3259,17 @@ async function verifyLiveRunnerAdoption(mismatchedCheckpoint: boolean) {
       throw new Error("duplicate runner spawn attempted");
     });
     const openedThread = opened.thread as Record<string, unknown>;
+    const signal = vi.fn(() => true);
     adopted = createCapabilityRunnerdCodexTransport({
       ...sharedOptions,
+      // Hash different stable bytes without replacing the real runner artifact
+      // used by concurrent tests. Adoption must never execute this path.
+      ...(mismatchedArtifact
+        ? {
+            runnerBinary: resolve(import.meta.dirname, "../../package.json"),
+            runnerReconnectGraceMs: 150,
+          }
+        : {}),
       resumeDynamicTools: [],
       resumeProviderSession: {
         driverSessionId: String(openedThread.id),
@@ -3167,6 +3282,7 @@ async function verifyLiveRunnerAdoption(mismatchedCheckpoint: boolean) {
         pid: runnerPid!,
         processGroupId: runnerPid,
         startedAt: new Date().toISOString(),
+        signal,
         isAlive: () => {
           try {
             process.kill(runnerPid!, 0);
@@ -3177,6 +3293,42 @@ async function verifyLiveRunnerAdoption(mismatchedCheckpoint: boolean) {
         },
       },
     });
+    if (mismatchedArtifact) {
+      await expect(
+        adopted.transport.request("thread/read", {}),
+      ).rejects.toThrow("native_adopted_runner_authentication_timeout");
+      expect(authority?.activeRunnerConnectionCount()).toBe(0);
+      await expect(
+        adopted.transport.request("turn/start", {
+          input: [{ type: "text", text: "must not be dispatched" }],
+        }),
+      ).rejects.toThrow("native_adopted_runner_authentication_timeout");
+      await adopted.transport.close();
+      expect(signal).not.toHaveBeenCalled();
+      expect(checkpoint).not.toHaveBeenCalled();
+      expect(duplicateLauncher).not.toHaveBeenCalled();
+      expect(() => process.kill(runnerPid!, 0)).not.toThrow();
+      const retained = JSON.parse(
+        await readFile(controlPlaneStatePath, "utf8"),
+      ) as {
+        identity: unknown;
+        commands: Array<{ type: string; status: string }>;
+      };
+      expect(retained.identity).toEqual(identity);
+      expect(
+        retained.commands.some(
+          (command) =>
+            command.type === "runner.drain" && command.status === "pending",
+        ),
+      ).toBe(true);
+      expect(retained.commands.map((command) => command.type)).not.toEqual(
+        expect.arrayContaining(["runner.suspend"]),
+      );
+      expect(retained.commands.map((command) => command.type)).not.toEqual(
+        expect.arrayContaining(["turn.stop"]),
+      );
+      return;
+    }
     if (mismatchedCheckpoint) {
       await expect(
         adopted.transport.request("thread/read", {}),
@@ -3224,6 +3376,12 @@ it(
   "adopts a live runner on the same durable authority without spawning a duplicate",
   () => verifyLiveRunnerAdoption(false),
   30_000,
+);
+
+it(
+  "blocks adopted runner artifact drift without duplicate launch, checkpoint replacement, or process signals",
+  () => verifyLiveRunnerAdoption(false, true),
+  15_000,
 );
 
 it(

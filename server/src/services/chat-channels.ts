@@ -22962,7 +22962,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publication: typeof chatPublications.$inferSelect,
   ): string | null {
     if (!publication.payload.progressState) return null;
-    const match = /^run:([^:]+):(?:queued|working|completed|failed):/.exec(
+    const match = /^run:([^:]+):(?:queued|working|waiting_for_input|completed|failed):/.exec(
       publication.idempotencyKey,
     );
     const runId = match?.[1] ?? null;
@@ -22970,6 +22970,50 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // manually repaired rows must not be allowed to turn the global
     // publication sweep into a PostgreSQL cast error.
     return isUuidLike(runId) ? runId : null;
+  }
+
+  async function runOwnershipMilestoneSupersessionReason(
+    publication: typeof chatPublications.$inferSelect,
+  ): Promise<string | null> {
+    const progress = publication.payload.progressState;
+    if (
+      !progress ||
+      !["queued", "working", "waiting_for_input"].includes(progress)
+    ) {
+      return null;
+    }
+    const runId = runIdFromMilestonePublication(publication);
+    if (!runId) return null;
+    const run = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, runId),
+          eq(heartbeatRuns.companyId, publication.companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${publication.issueId}`,
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    // Match only the closed ownership-attention projection. Historical progress
+    // without an extant run retains its existing delivery semantics.
+    const ownershipBlocked =
+      run?.status === "running" &&
+      [
+        "native_execution_ownership_unverified",
+        "native_adopted_runner_authentication_timeout",
+      ].includes(run.errorCode ?? "");
+    if (progress === "waiting_for_input") {
+      return ownershipBlocked
+        ? null
+        : "Run ownership attention no longer applies to the bound task";
+    }
+    return ownershipBlocked
+      ? "Run progress was superseded by ownership recovery attention"
+      : null;
   }
 
   async function runPublicationToReplace(
@@ -23375,7 +23419,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .orderBy(desc(chatPublications.createdAt), desc(chatPublications.id));
     const rowRunId = (row: (typeof rows)[number]) => {
       const milestoneMatch =
-        /^run:([^:]+):(?:queued|working|completed|failed):/.exec(
+        /^run:([^:]+):(?:queued|working|waiting_for_input|completed|failed):/.exec(
           row.idempotencyKey,
         );
       return milestoneMatch?.[1] ?? row.commentRunId ?? null;
@@ -23392,7 +23436,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const laneClosed = rows.some((row) => {
         if (rowRunId(row) !== runId) return false;
         return (
-          ["completed", "failed"].includes(row.payload.progressState ?? "") ||
+          ["waiting_for_input", "completed", "failed"].includes(row.payload.progressState ?? "") ||
           (row.commentId !== null && row.payload.progressState === undefined)
         );
       });
@@ -25486,7 +25530,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             return;
           }
         }
-        if (await runProgressSupersededByPublishedInteraction(publication)) {
+        // Milestone selection and insertion can overlap across sweeps. An old
+        // snapshot inserted after newer attention must not overwrite it simply
+        // because it now occupies the next FIFO slot.
+        const progressSupersessionReason =
+          (await runOwnershipMilestoneSupersessionReason(publication)) ??
+          ((await runProgressSupersededByPublishedInteraction(publication))
+            ? "Run progress was superseded by its provider interaction"
+            : null);
+        if (progressSupersessionReason) {
           await publicationLease.assertOwned();
           await db
             .update(chatPublications)
@@ -25494,8 +25546,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               state: "cancelled",
               attempts: publication.attempts,
               nextAttemptAt: null,
-              redactedError:
-                "Run progress was superseded by its provider interaction",
+              redactedError: progressSupersessionReason,
               updatedAt: new Date(),
             })
             .where(

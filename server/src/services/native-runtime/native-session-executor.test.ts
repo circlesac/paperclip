@@ -30,6 +30,7 @@ import {
 } from "./native-harness-backup-stamp.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { buildNativeHeartbeatPreparationSpans } from "./native-run-trace.js";
+import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 
 type BackendFactoryOptions = {
@@ -124,6 +125,7 @@ const state = vi.hoisted(() => ({
     },
   })),
   publishActivity: vi.fn(),
+  upsertRecoveryAction: vi.fn(async () => ({})),
   stageNativeRunnerWakeAttachments: vi.fn(
     async (): Promise<{
       attachments: Array<Record<string, unknown>>;
@@ -184,6 +186,12 @@ vi.mock("./current-wake-comments.js", () => ({
 vi.mock("../activity-log.js", () => ({
   persistActivity: state.persistActivity,
   publishActivity: state.publishActivity,
+}));
+
+vi.mock("../issue-recovery-actions.js", () => ({
+  issueRecoveryActionService: () => ({
+    upsertSourceScoped: state.upsertRecoveryAction,
+  }),
 }));
 
 vi.mock("./native-codex-runner.js", () => ({
@@ -2351,6 +2359,7 @@ function leaseDb(
   boundExecution: NativeExecutionInputV1 = execution,
   coordinatorOverrides: Partial<LeaseCoordinator> = {},
   runResultJson: Record<string, unknown> = {},
+  updates: Array<{ table: unknown; values: Record<string, unknown> }> = [],
 ): Db {
   const coordinator: LeaseCoordinator = {
     runId: boundExecution.binding.runId,
@@ -2363,9 +2372,10 @@ function leaseDb(
     resultId: null,
     ...coordinatorOverrides,
   };
-  const update = () => ({
-    set: () => ({
+  const update = (table: unknown) => ({
+    set: (values: Record<string, unknown>) => ({
       where: () => {
+        updates.push({ table, values });
         const result = Promise.resolve([]) as unknown as Promise<unknown[]> & {
           returning: () => Promise<Array<{ runId: string }>>;
         };
@@ -2375,30 +2385,36 @@ function leaseDb(
       },
     }),
   });
+  const select = () => ({
+    from: (table: unknown) => {
+      const rows =
+        table === nativeRunFinalizations
+          ? [coordinator]
+          : table === heartbeatRuns
+            ? [
+                {
+                  agentId: boundExecution.binding.agentId,
+                  companyId: boundExecution.binding.companyId,
+                  nativeIssueId: boundExecution.binding.issueId,
+                  resultJson: runResultJson,
+                  runtimeMode: "native",
+                },
+              ]
+            : [];
+      const query = {
+        where: () => query,
+        for: () => query,
+        limit: () => Promise.resolve(rows),
+      };
+      return query;
+    },
+  });
   const tx = {
-    select: () => ({
-      from: (table: unknown) => ({
-        where: () => ({
-          for: () => ({
-            limit: () =>
-              Promise.resolve([
-                table === nativeRunFinalizations
-                  ? coordinator
-                  : {
-                      agentId: boundExecution.binding.agentId,
-                      companyId: boundExecution.binding.companyId,
-                      nativeIssueId: boundExecution.binding.issueId,
-                      resultJson: runResultJson,
-                      runtimeMode: "native",
-                    },
-              ]),
-          }),
-        }),
-      }),
-    }),
+    select,
     update,
   };
   return {
+    select,
     transaction: async (operation: (transaction: Db) => Promise<unknown>) =>
       operation(tx as unknown as Db),
     update,
@@ -2412,6 +2428,7 @@ function cancellationDb(options?: {
     decisionId?: string | null;
   } | null;
   failResultJsonUpdateAt?: number;
+  ownershipHeld?: boolean;
 }) {
   const initialRun = {
     id: execution.binding.runId,
@@ -2419,6 +2436,13 @@ function cancellationDb(options?: {
     companyId: execution.binding.companyId,
     nativeIssueId: execution.binding.issueId,
     runtimeMode: "native",
+    ...(options?.ownershipHeld
+      ? {
+          status: "running",
+          nativePhase: "terminal_failure",
+          errorCode: "native_execution_ownership_unverified",
+        }
+      : {}),
     contextSnapshot: { issueId: "untrusted-context-issue" },
     resultJson: { staleSnapshot: true },
   };
@@ -2781,6 +2805,23 @@ describe("native session cancellation", () => {
     ).rejects.toThrow("native_cancellation_coordinator_missing");
     expect(persistence.updates).toEqual([]);
     expect(state.persistActivity).not.toHaveBeenCalled();
+  });
+
+  it("does not acknowledge an unverified retained runner as cancelled without an authenticated session", async () => {
+    const persistence = cancellationDb({ ownershipHeld: true });
+    await expect(
+      cancelNativeSession(
+        execution.binding.runId,
+        "Task closed while waiting",
+        {
+          db: persistence.db,
+          scope: "run",
+        },
+      ),
+    ).rejects.toBeInstanceOf(NativeRunnerOwnershipUnverifiedError);
+    expect(persistence.updates).toEqual([]);
+    expect(state.persistActivity).not.toHaveBeenCalled();
+    expect(state.cancel).not.toHaveBeenCalled();
   });
 });
 
@@ -3776,6 +3817,98 @@ describe("native warm session supervision", () => {
 });
 
 describe("native session bounded recovery", () => {
+  it.each(["persisted", "logging_failure", "recovery_write_failure"])(
+    "signals an ownership hold instead of terminal teardown after authentication timeout (%s)",
+    async (failureMode) => {
+      const updates: Array<{
+        table: unknown;
+        values: Record<string, unknown>;
+      }> = [];
+      state.execute
+        .mockReset()
+        .mockRejectedValueOnce(
+          new Error(
+            "native_adopted_runner_authentication_timeout: retained runner did not authenticate",
+          ),
+        );
+      state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+      if (failureMode === "recovery_write_failure") {
+        state.upsertRecoveryAction.mockRejectedValueOnce(
+          new Error("diagnostic_write_failed"),
+        );
+      }
+      await expect(
+        executePaperclipNativeSession({
+          db: leaseDb(execution, {}, {}, updates),
+          execution,
+          runnerInstanceId: "runner",
+          ...(failureMode === "logging_failure"
+            ? {
+                onLog: async () => {
+                  throw new Error("log_write_failed");
+                },
+              }
+            : {}),
+        }),
+      ).rejects.toBeInstanceOf(NativeRunnerOwnershipUnverifiedError);
+      expect(updates.filter((entry) => entry.table === issues)).toEqual([]);
+      if (failureMode !== "logging_failure") {
+        expect(
+          updates.find(
+            (entry) =>
+              entry.table === heartbeatRuns &&
+              entry.values.errorCode ===
+                "native_execution_ownership_unverified",
+          )?.values,
+        ).toMatchObject({
+          nativePhase: "terminal_failure",
+          errorCode: "native_execution_ownership_unverified",
+        });
+        expect(
+          updates.find(
+            (entry) =>
+              entry.table === nativeRunFinalizations &&
+              entry.values.phase === "terminal_failure",
+          )?.values,
+        ).toMatchObject({
+          phase: "terminal_failure",
+          recoveryState: "blocked",
+          nextAttemptAt: null,
+        });
+        expect(state.upsertRecoveryAction).toHaveBeenCalledWith(
+          expect.objectContaining({
+            ownerType: "board",
+            wakePolicy: null,
+          }),
+        );
+      }
+    },
+  );
+
+  it("makes unauthenticated adopted runner recovery Board-owned without an automatic retry", () => {
+    const code = nativeSessionFailureSourceCode(
+      new Error(
+        "native_adopted_runner_authentication_timeout: retained runner did not authenticate",
+      ),
+    );
+    expect(code).toBe("native_adopted_runner_authentication_timeout");
+    const disposition = nativeSessionFailureDisposition(1, new Date(), code);
+    expect(disposition).toEqual({
+      phase: "terminal_failure",
+      failureCode: "native_adopted_runner_authentication_timeout",
+      nextAttemptAt: null,
+    });
+    expect(
+      nativeSessionRecoveryProjection({ ...disposition, agentId: "agent" }),
+    ).toMatchObject({
+      issueStatus: null,
+      recoveryOwner: { kind: "board" },
+      recoveryActionOwnerType: "board",
+      recoveryActionOwnerAgentId: null,
+      recoveryActionCause: "native_adopted_runner_authentication_timeout",
+    });
+  });
+
   it("preserves stable provider and runner failure causes", () => {
     expect(
       nativeSessionFailureSourceCode(

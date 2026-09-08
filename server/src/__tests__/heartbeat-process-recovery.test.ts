@@ -122,7 +122,12 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
-import { currentNativeControllerIdentity } from "../services/native-runtime/native-restart-recovery.ts";
+import {
+  claimNativeRestartRecoveries,
+  currentNativeControllerIdentity,
+} from "../services/native-runtime/native-restart-recovery.ts";
+import { claimNativeSessionResumptions } from "../services/native-runtime/native-finalization-reconciler.ts";
+import { recoveryService } from "../services/recovery/service.ts";
 import {
   readHotRestartIntent,
   readProcessStartedAt,
@@ -637,6 +642,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runId: string;
     issueId: string;
     provider?: string;
+    driver?: string;
   }) {
     const environmentId = randomUUID();
     const leaseId = randomUUID();
@@ -646,7 +652,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       id: environmentId,
       companyId: input.companyId,
       name: "Local test environment",
-      driver: "local",
+      driver: input.driver ?? "local",
       status: "active",
       config: {},
       metadata: null,
@@ -1585,6 +1591,159 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
   });
+
+  it.each(["terminal_failure", "retryable_failure"])(
+    "retains authentication-blocked ownership after restart with coordinator phase %s",
+    async (coordinatorPhase) => {
+      const { companyId, agentId, runId, issueId, wakeupRequestId } =
+        await seedRunFixture({
+          adapterType: "paperclip_runner",
+          runtimeMode: "native",
+          runErrorCode: "native_execution_ownership_unverified",
+        });
+      await db
+        .update(heartbeatRuns)
+        .set({ nativeIssueId: issueId, nativePhase: "terminal_failure" })
+        .where(eq(heartbeatRuns.id, runId));
+      await db
+        .update(issues)
+        .set({ status: "in_review" })
+        .where(eq(issues.id, issueId));
+      const { leaseId } = await seedEnvironmentLeaseFixture({
+        companyId,
+        runId,
+        issueId,
+        driver: "ownership-test",
+      });
+      const interactionId = randomUUID();
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        sourceRunId: runId,
+        createdByUserId: "responsible-user",
+        payload: { prompt: "Review the task" },
+      });
+      await db.insert(nativeRunFinalizations).values({
+        runId,
+        companyId,
+        issueId,
+        phase: coordinatorPhase,
+        attempt: 1,
+        recoveryState: "blocked",
+        failureCode: "native_adopted_runner_authentication_timeout",
+        leaseExpiresAt: new Date(0),
+        nextAttemptAt:
+          coordinatorPhase === "retryable_failure" ? new Date(0) : null,
+      });
+      const heartbeat = heartbeatService(db);
+      const enqueueWakeup = vi.fn();
+      const recovery = recoveryService(db, { enqueueWakeup });
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({
+        reaped: 0,
+        runIds: [],
+      });
+      expect(
+        await claimNativeSessionResumptions({
+          db,
+          runnerInstanceId: "new-controller",
+          runIds: [runId],
+        }),
+      ).toEqual([]);
+      const claims = await claimNativeRestartRecoveries({
+        db,
+        restartKind: "hard",
+        runIds: [runId],
+      });
+      expect(claims.every((claim) => claim.kind === "blocked")).toBe(true);
+      expect(
+        await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), [
+          runId,
+        ]),
+      ).toMatchObject({
+        interrupted: 0,
+        interruptedRunIds: [],
+        retryRunIds: [],
+        restartSuspendedRunIds: [],
+      });
+      expect(
+        await db
+          .select()
+          .from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.runId, runId)),
+      ).toMatchObject([
+        {
+          phase: coordinatorPhase,
+          recoveryState: "blocked",
+          recoveryHistory: [],
+        },
+      ]);
+      const gracefulClaims = await claimNativeRestartRecoveries({
+        db,
+        restartKind: "graceful",
+        runIds: [runId],
+      });
+      expect(gracefulClaims.every((claim) => claim.kind === "blocked")).toBe(
+        true,
+      );
+      expect(
+        (await recovery.sweepStaleIssueLocks()).terminalizedRunIds,
+      ).toEqual([]);
+      await heartbeat.reconcileStrandedAssignedIssues();
+      expect(await heartbeat.getRun(runId)).toMatchObject({
+        status: "running",
+        nativePhase: "terminal_failure",
+        finishedAt: null,
+      });
+      expect(
+        await db.select().from(issues).where(eq(issues.id, issueId)),
+      ).toMatchObject([
+        {
+          status: "in_review",
+          executionRunId: runId,
+          checkoutRunId: runId,
+        },
+      ]);
+      expect(
+        await db
+          .select()
+          .from(environmentLeases)
+          .where(eq(environmentLeases.id, leaseId)),
+      ).toMatchObject([{ status: "active" }]);
+      expect(
+        await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, interactionId)),
+      ).toMatchObject([{ status: "pending" }]);
+      expect(
+        await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, wakeupRequestId)),
+      ).toMatchObject([{ status: "claimed" }]);
+      expect(
+        await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId)),
+      ).toHaveLength(1);
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      expect(mockTerminateLocalService).not.toHaveBeenCalled();
+      // Even a later Board task-status change cannot prove this process stopped.
+      await db
+        .update(issues)
+        .set({ status: "done" })
+        .where(eq(issues.id, issueId));
+      expect(
+        (await recovery.sweepStaleIssueLocks()).terminalizedRunIds,
+      ).toEqual([]);
+      expect((await heartbeat.getRun(runId))?.status).toBe("running");
+    },
+  );
 
   it("keeps a live native run owned by the current controller out of ambiguous recovery", async () => {
     const child = spawnAliveProcess();

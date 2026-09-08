@@ -585,3 +585,45 @@ The live browser retest did **not** pass all journeys:
 These live failures remain separate from passing automated tests. They are
 included in the production-quality assessment, not hidden by successful run
 status or a generic working indicator.
+
+### Ownership-safe recovery and native runtime audit (September 8)
+
+The actual Codex rollout `turn_context.model` confirms `gpt-5.6-luna` on both
+the original Slack turn and its recovery, not merely the agent configuration.
+The Board's native run inspector exposes canonical events and diagnostics;
+private reasoning/raw tools remain Board-only. No Terra fallback was used.
+
+The old Discord run finally failed at 05:44:58 UTC on the old server after its
+15-minute controller timeout. Its retained PID was then absent. No historical
+rows were rewritten and no manual process termination was used to manufacture
+a recovery result. That behavior remains a failed qualification, not a pass.
+
+New recovery handling bounds adopted-runner authentication without signaling an
+unauthenticated process. Authentication timeout holds the run, task locks, and
+environment ownership rather than treating timeout as proof that execution
+stopped. It blocks automatic replacement, reaping, restart recovery and implicit
+cancellation. Terminal writes use an atomic not-held predicate; cleanup occurs
+only after a successful compare-and-swap. Resume queries exclude held rows
+before their limit, preventing held rows from starving eligible work. This does
+not exempt held runs from configured concurrency limits.
+
+External chat receives one safe attention message with a Board recovery path,
+not an indefinite working message or a false claim that the provider stopped.
+Publication preflight cancels late queued/working updates and stale attention
+updates before provider I/O, including overlapping sweeps.
+
+Verification before deployment: full chat integration **292/292** on isolated
+PostgreSQL (`ownership-chat-integration-root-02.log`); native executor, ownership,
+teardown and restart cohorts **194/194**; heartbeat recovery/concurrency subset
+**17/17**; the pre-limit starvation regression **1/1**; server typecheck passed.
+Adopted transport tests passed **9/9**, real-process restart **8/8**. The safe
+completion-hint Rust integration/module cohorts passed **31/31** and **26/26**.
+These automated checks do not replace the pending rebuilt-server live retest.
+
+An independent filesystem audit found a further boundary to harden: linked
+native external tasks currently share the agent-home cwd, despite having
+different native workspace IDs. File registration validates current task/run
+and confined bytes but cannot prove another task did not produce a readable
+file. No actual leak was observed or private file contents inspected. Task-scoped
+native chat workspaces are being implemented; this issue and the previously
+documented inbound durable-wakeup race remain open production-readiness items.

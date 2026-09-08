@@ -32,6 +32,10 @@ import type { EnvironmentRuntimeService } from "../environment-runtime.js";
 import { classifyNativeEvidence } from "./evidence-classifier.js";
 import { recordNativeWorkAssessment } from "./work-assessments.js";
 import {
+  isNativeRunnerOwnershipHeld,
+  nativeRunnerOwnershipNotHeldCondition,
+} from "./native-runner-ownership.js";
+import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
   type NativeStatusDecision,
@@ -190,23 +194,35 @@ export async function claimNativeSessionResumptions(input: {
   limit?: number;
 }): Promise<NativeSessionResumeClaim[]> {
   const now = input.now ?? new Date();
-  const candidates = await input.db.select({ runId: heartbeatRuns.id })
+  const candidates = await input.db
+    .select({ runId: heartbeatRuns.id })
     .from(heartbeatRuns)
-    .innerJoin(nativeRunFinalizations, eq(nativeRunFinalizations.runId, heartbeatRuns.id))
-    .where(and(
-      eq(heartbeatRuns.runtimeMode, "native"),
-      isNull(heartbeatRuns.processPid),
-      isNull(heartbeatRuns.processGroupId),
-      isNull(nativeRunFinalizations.resultId),
-      eq(nativeRunFinalizations.phase, "retryable_failure"),
-      or(isNull(nativeRunFinalizations.nextAttemptAt), lte(nativeRunFinalizations.nextAttemptAt, now)),
-      or(
-        isNull(nativeRunFinalizations.leaseOwner),
-        isNull(nativeRunFinalizations.leaseExpiresAt),
-        lte(nativeRunFinalizations.leaseExpiresAt, now),
+    .innerJoin(
+      nativeRunFinalizations,
+      eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+    )
+    .where(
+      and(
+        eq(heartbeatRuns.runtimeMode, "native"),
+        nativeRunnerOwnershipNotHeldCondition(),
+        isNull(heartbeatRuns.processPid),
+        isNull(heartbeatRuns.processGroupId),
+        isNull(nativeRunFinalizations.resultId),
+        eq(nativeRunFinalizations.phase, "retryable_failure"),
+        or(
+          isNull(nativeRunFinalizations.nextAttemptAt),
+          lte(nativeRunFinalizations.nextAttemptAt, now),
+        ),
+        or(
+          isNull(nativeRunFinalizations.leaseOwner),
+          isNull(nativeRunFinalizations.leaseExpiresAt),
+          lte(nativeRunFinalizations.leaseExpiresAt, now),
+        ),
+        ...(input.runIds?.length
+          ? [inArray(heartbeatRuns.id, input.runIds)]
+          : []),
       ),
-      ...(input.runIds?.length ? [inArray(heartbeatRuns.id, input.runIds)] : []),
-    ))
+    )
     .limit(input.limit ?? 25);
 
   const claims: NativeSessionResumeClaim[] = [];
@@ -225,19 +241,20 @@ export async function claimNativeSessionResumptions(input: {
         .then((rows) => rows[0] ?? null);
       if (!row) return false;
       if (
-        row.run.runtimeMode !== "native"
-        || row.run.processPid !== null
-        || row.run.processGroupId !== null
-        || row.coordinator.resultId
-        || row.coordinator.phase !== "retryable_failure"
-        || (row.coordinator.nextAttemptAt && row.coordinator.nextAttemptAt > now)
-        || (
-          row.coordinator.leaseOwner
-          && row.coordinator.leaseExpiresAt
-          && row.coordinator.leaseExpiresAt > now
-        )
-        || !["running", "failed"].includes(row.run.status)
-      ) return false;
+        row.run.runtimeMode !== "native" ||
+        isNativeRunnerOwnershipHeld(row.run) ||
+        row.run.processPid !== null ||
+        row.run.processGroupId !== null ||
+        row.coordinator.resultId ||
+        row.coordinator.phase !== "retryable_failure" ||
+        (row.coordinator.nextAttemptAt &&
+          row.coordinator.nextAttemptAt > now) ||
+        (row.coordinator.leaseOwner &&
+          row.coordinator.leaseExpiresAt &&
+          row.coordinator.leaseExpiresAt > now) ||
+        !["running", "failed"].includes(row.run.status)
+      )
+        return false;
 
       const profile = row.run.runnerProfileJson ?? {};
       const persistedInput = profile.nativeExecutionInput;

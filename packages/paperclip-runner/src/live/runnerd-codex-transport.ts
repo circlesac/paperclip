@@ -672,6 +672,71 @@ async function awaitRunnerSuspensionBarrier(input: {
   return false;
 }
 
+async function awaitAdoptedRunnerAuthentication(input: {
+  activeConnectionCount: () => number;
+  isAlive: () => Promise<boolean> | boolean;
+  throwIfFailed: () => void;
+  failure: Promise<never>;
+  ready?: () => Promise<void>;
+  timeoutMs: number;
+}): Promise<void> {
+  if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
+    throw new Error("runnerReconnectGraceMs must be a positive safe integer");
+  }
+  const deadline = Date.now() + input.timeoutMs;
+  const timeoutError = () =>
+    new Error(
+      "native_adopted_runner_authentication_timeout: the existing runner did not authenticate within " +
+        `${input.timeoutMs}ms; preserve its process and durable session for operator recovery`,
+    );
+  let cancelled = false;
+  let pollTimer: NodeJS.Timeout | undefined;
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  const checkDeadline = () => {
+    if (Date.now() >= deadline) throw timeoutError();
+  };
+  const observe = async () => {
+    await input.ready?.();
+    while (!cancelled) {
+      input.throwIfFailed();
+      checkDeadline();
+      if (input.activeConnectionCount() === 1) return;
+      const alive = await input.isAlive();
+      if (cancelled) return;
+      input.throwIfFailed();
+      checkDeadline();
+      if (!alive) {
+        throw new Error(
+          "native_adopted_runner_exited: runner exited before PRP authentication",
+        );
+      }
+      if (input.activeConnectionCount() === 1) return;
+      await new Promise<void>((resolveWait) => {
+        pollTimer = setTimeout(
+          resolveWait,
+          Math.min(25, deadline - Date.now()),
+        );
+      });
+    }
+  };
+  try {
+    await Promise.race([
+      observe(),
+      input.failure,
+      new Promise<never>((_resolve, reject) => {
+        deadlineTimer = setTimeout(
+          () => reject(timeoutError()),
+          input.timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    cancelled = true;
+    clearTimeout(pollTimer);
+    clearTimeout(deadlineTimer);
+  }
+}
+
 function bridgedCodexQuestionParams(
   request: Record<string, unknown>,
   method: string,
@@ -1996,6 +2061,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #core: DurablePrpControlPlane | null = null;
   #handle: RunnerProcessHandle | null = null;
   #adoptedRunnerMonitor: NodeJS.Timeout | null = null;
+  #adoptedRunnerAuthenticated = false;
   #pump: NodeJS.Timeout | null = null;
   #eventSourceSeq = 0;
   #deferredTurnStartEvents: DurableRecoveryCommittedEvent[] = [];
@@ -2037,6 +2103,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string }>();
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
+    if (options.adoptExistingRunner && !options.stateDirectory?.trim()) {
+      throw new Error("native_adopted_runner_state_directory_required");
+    }
     if (options.provider === "acpx" && options.acpxAgent === "pi") {
       throw new Error("The Pi ACPX profile is not available");
     }
@@ -2721,6 +2790,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (
       this.#core !== null &&
       (this.#handle !== null || adoptedRunner !== undefined) &&
+      (adoptedRunner === undefined || this.#adoptedRunnerAuthenticated) &&
       (this.#failure === null || this.#startupComplete)
     ) {
       // A terminal provider frame can become visible one control loop before
@@ -2832,7 +2902,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     try {
       await releaseRunnerProcessOwnership({
         runnerSettled: runnerSuspended,
-        checkpoint: this.#controlPlaneCheckpoint,
+        // An alive PID does not authorize controlling or replacing a runner
+        // that never authenticated to this controller (for example after an
+        // executable upgrade). Retain its prior checkpoint without rewriting it.
+        checkpoint: adoptedRunner && !this.#adoptedRunnerAuthenticated
+          ? null
+          : this.#controlPlaneCheckpoint,
         forceKill: () => {
           this.#handle?.child.kill("SIGKILL");
         },
@@ -2848,7 +2923,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         "provider_transport_failed: runner did not durably suspend before checkpoint",
       );
     }
-    if (this.#ownsRoot) rmSync(this.#root, { recursive: true, force: true });
+    if (this.#ownsRoot && !adoptedRunner) {
+      rmSync(this.#root, { recursive: true, force: true });
+    }
     this.#publish();
   }
 
@@ -3701,7 +3778,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         );
       });
     }
-    await this.#awaitRegistrationReady(registration?.ready);
+    if (!adoptedRunner) await this.#awaitRegistrationReady(registration?.ready);
     if (adoptedRunner) {
       this.#evidence.runnerPid = adoptedRunner.pid;
       this.#evidence.runnerProcessGroupId = adoptedRunner.processGroupId;
@@ -3712,7 +3789,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     this.#publish();
     this.#pump = setInterval(() => this.#pumpEventsSafely(), 5);
-    if (adoptedRunner) await this.#awaitAdoptedRunnerConnection(adoptedRunner);
+    if (adoptedRunner) {
+      await this.#awaitAdoptedRunnerConnection(adoptedRunner, registration?.ready);
+    }
     if (runAttachment) {
       await this.#waitCommand("run.attach", runAttachment.commandId);
     }
@@ -4492,24 +4571,28 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     adoptedRunner: NonNullable<
       CapabilityRunnerdCodexTransportOptions["adoptExistingRunner"]
     >,
+    ready?: () => Promise<void>,
   ): Promise<void> {
     const core = this.#core;
     if (!core) throw new Error("native_runner_authority_unavailable");
     this.#diagnostic(
       `waiting for adopted runner ${adoptedRunner.pid} to authenticate to its durable PRP authority`,
     );
-    while (core.activeRunnerConnectionCount() !== 1) {
-      this.#throwIfFailed();
-      if (!(await adoptedRunner.isAlive())) {
-        throw new Error(
-          "native_adopted_runner_exited: runner exited before PRP authentication",
-        );
-      }
-      await Promise.race([
-        new Promise<void>((resolveWait) => setTimeout(resolveWait, 25)),
-        this.#failureSignal,
-      ]);
+    try {
+      await awaitAdoptedRunnerAuthentication({
+        activeConnectionCount: () => core.activeRunnerConnectionCount(),
+        isAlive: () => adoptedRunner.isAlive(),
+        throwIfFailed: () => this.#throwIfFailed(),
+        failure: this.#failureSignal,
+        ready,
+        timeoutMs: this.options.runnerReconnectGraceMs ?? 30_000,
+      });
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.#failTransport(failure);
+      throw failure;
     }
+    this.#adoptedRunnerAuthenticated = true;
     this.#diagnostic(
       `adopted runner ${adoptedRunner.pid} authenticated to its durable PRP authority`,
     );
@@ -4757,6 +4840,7 @@ export const runnerdLaunchProfileInternals = Object.freeze({
 });
 
 export const runnerdRecoveryInternals = Object.freeze({
+  awaitAdoptedRunnerAuthentication,
   awaitRunnerSuspensionBarrier,
   providerDrainStateFromSnapshot,
   providerTurnIsActiveFromCommittedEvents,

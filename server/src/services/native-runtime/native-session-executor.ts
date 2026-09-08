@@ -106,6 +106,12 @@ import {
 import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import {
+  NativeRunnerOwnershipUnverifiedError,
+  isNativeRunnerOwnershipHeld,
+  NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
+  NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT,
+} from "./native-runner-ownership.js";
+import {
   currentNativeControllerIdentity,
   nextNativeProviderAttempt,
   type NativeControllerIdentity,
@@ -2614,6 +2620,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
     sourceFailureCode === "native_current_wake_comments_unread" ||
     sourceFailureCode === "native_current_wake_comments_changed_after_read" ||
+    sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
     sourceFailureCode === "native_provider_usage_limit";
   const exhausted = permanentFailure || attempt >= 3;
   return {
@@ -2637,7 +2644,11 @@ export function nativeSessionRecoveryProjection(input: {
   const exhausted = input.phase === "terminal_failure";
   return {
     exhausted,
-    issueStatus: exhausted ? ("in_review" as const) : null,
+    issueStatus:
+      exhausted &&
+      input.failureCode !== NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT
+        ? ("in_review" as const)
+        : null,
     recoveryOwner: exhausted
       ? { kind: "board" as const }
       : { kind: "agent" as const, agentId: input.agentId },
@@ -2654,6 +2665,7 @@ export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
   | "native_provider_usage_limit"
+  | "native_adopted_runner_authentication_timeout"
   | "runner_remote_provider_artifact_incompatible"
   | "provider_process_exited"
   | "provider_stdout_closed"
@@ -2672,6 +2684,9 @@ export function nativeSessionFailureSourceCode(
   | "native_current_wake_comments_changed_after_read"
   | "native_session_interrupted" {
   const message = error instanceof Error ? error.message : String(error);
+  if (/native_adopted_runner_authentication_timeout/i.test(message)) {
+    return "native_adopted_runner_authentication_timeout";
+  }
   if (/runner_remote_provider_artifact_incompatible/i.test(message)) {
     return "runner_remote_provider_artifact_incompatible";
   }
@@ -3120,12 +3135,17 @@ export async function cancelNativeSession(
         companyId: heartbeatRuns.companyId,
         nativeIssueId: heartbeatRuns.nativeIssueId,
         runtimeMode: heartbeatRuns.runtimeMode,
+        status: heartbeatRuns.status,
+        nativePhase: heartbeatRuns.nativePhase,
+        errorCode: heartbeatRuns.errorCode,
       })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (run?.runtimeMode === "native") {
+      if (isNativeRunnerOwnershipHeld(run))
+        throw new NativeRunnerOwnershipUnverifiedError();
       const issueId = run.nativeIssueId;
       if (!issueId) throw new Error("native_cancellation_binding_missing");
       const issue = await options.db
@@ -3192,6 +3212,9 @@ export async function cancelNativeSession(
           nativeIssueId: heartbeatRuns.nativeIssueId,
           resultJson: heartbeatRuns.resultJson,
           runtimeMode: heartbeatRuns.runtimeMode,
+          status: heartbeatRuns.status,
+          nativePhase: heartbeatRuns.nativePhase,
+          errorCode: heartbeatRuns.errorCode,
         })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
@@ -3207,6 +3230,8 @@ export async function cancelNativeSession(
       ) {
         throw new Error("native_cancellation_binding_changed");
       }
+      if (isNativeRunnerOwnershipHeld(lockedRun))
+        throw new NativeRunnerOwnershipUnverifiedError();
       const coordinator = await tx
         .select({ runId: nativeRunFinalizations.runId })
         .from(nativeRunFinalizations)
@@ -4726,132 +4751,149 @@ async function executePaperclipNativeSessionWithinScope(
     clearSteeringDeliveries(input.execution.binding.runId);
     clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
   } catch (error) {
-    await leaseRenewal.stop().catch(() => undefined);
-    const failedAtMs = Date.now();
-    const executionFailureMessage = redactSensitiveText(
-      error instanceof Error ? error.message : String(error),
-    ).slice(-4_096);
-    await input.onLog?.(
-      "stderr",
-      `[paperclip-runner] native session execution failed: ${executionFailureMessage}\n`,
-    );
-    if (runnerSessionStartupScope) {
-      await trace.end(runnerSessionStartupScope, {
-        endedAtMs: failedAtMs,
-        outcome: "failed",
-      });
-    }
-    if (agentTurnScope) {
-      await trace.end(agentTurnScope, {
-        endedAtMs: failedAtMs,
-        outcome: "failed",
-      });
-    }
-    if (!taskSettleScope) {
-      taskSettleScope = trace.start("task.settle", {
-        parentName: "task.run",
-        startedAtMs: failedAtMs,
-      });
-    }
-    trace.activate(taskSettleScope);
-    activeNativeSessions.delete(input.execution.binding.runId);
-    clearSteeringDeliveries(input.execution.binding.runId);
-    clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
-    if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
-      await releaseWarmNativeSession(
-        warmSessionId,
-        warmSessionOwnerToken,
-        lifecyclePolicy.idleTimeoutMs,
-        true,
+    const ownershipUnverified =
+      nativeSessionFailureSourceCode(error) ===
+      NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT;
+    try {
+      await leaseRenewal.stop().catch(() => undefined);
+      const failedAtMs = Date.now();
+      const executionFailureMessage = redactSensitiveText(
+        error instanceof Error ? error.message : String(error),
+      ).slice(-4_096);
+      await input.onLog?.(
+        "stderr",
+        `[paperclip-runner] native session execution failed: ${executionFailureMessage}\n`,
       );
-    }
-    if (
-      error instanceof NativeResultPendingFinalizationError ||
-      error instanceof NativeCancellationPendingRecoveryError
-    ) {
-      // This is not a provider failure and must not overwrite the durable
-      // result/coordinator state. The heartbeat boundary will either hand an
-      // already-materialized result to the finalizer or retain the durable
-      // cancellation intent for cancellation recovery.
-      if (taskSettleScope) {
-        await trace.end(taskSettleScope, { outcome: "ok" });
+      if (runnerSessionStartupScope) {
+        await trace.end(runnerSessionStartupScope, {
+          endedAtMs: failedAtMs,
+          outcome: "failed",
+        });
       }
-      await trace.finish("ok");
-      throw error;
-    }
-    const now = new Date();
-    const sourceFailureCode = providerUsageLimitObserved
-      ? ("native_provider_usage_limit" as const)
-      : nativeSessionFailureSourceCode(error);
-    const recoveryEvidence = await nativeProviderRecoveryEvidence({
-      db: input.db,
-      runId: input.execution.binding.runId,
-      sourceFailureCode,
-    });
-    const disposition = nativeSessionFailureDisposition(
-      attempt,
-      now,
-      sourceFailureCode,
-    );
-    const phase =
-      recoveryEvidence.recoveryMode === "ambiguous_state"
-        ? ("terminal_failure" as const)
-        : disposition.phase;
-    const failureCode =
-      recoveryEvidence.recoveryMode === "ambiguous_state"
-        ? sourceFailureCode
-        : disposition.failureCode;
-    const nextAttemptAt =
-      recoveryEvidence.recoveryMode === "ambiguous_state"
-        ? null
-        : disposition.nextAttemptAt;
-    const recoveryProjection = nativeSessionRecoveryProjection({
-      phase,
-      failureCode,
-      agentId: input.execution.binding.agentId,
-    });
-    const { exhausted } = recoveryProjection;
-    const integrityFailure =
-      sourceFailureCode === "native_event_replay_conflict";
-    const message =
-      error instanceof Error
-        ? error.message.slice(0, 2_000)
-        : String(error).slice(0, 2_000);
-    const sanitizedStderrTail = redactSensitiveText(message).slice(-4_096);
-    await input.db.transaction(async (tx) => {
-      const updated = await tx
-        .update(nativeRunFinalizations)
-        .set({
-          phase,
-          leaseOwner: null,
-          leaseExpiresAt: null,
-          recoveryState:
-            phase === "retryable_failure" ? "resuming_session" : "blocked",
-          failureCode,
-          failureDetail: {
-            message,
-            originalFailureCode: sourceFailureCode,
-            recoveryMode: recoveryEvidence.recoveryMode,
-            providerSessionEstablished:
-              recoveryEvidence.providerSessionEstablished,
-            providerEventsExist: recoveryEvidence.providerEventsExist,
-            checkpointExists: recoveryEvidence.checkpointExists,
-            recoveryOwner: recoveryProjection.recoveryOwner,
-            nextAction:
-              recoveryEvidence.recoveryMode === "ambiguous_state"
-                ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
-                : integrityFailure
-                  ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
-                  : sourceFailureCode === "native_provider_usage_limit"
-                    ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
-                    : exhausted
-                    ? "Inspect the persisted native session after its bounded resume budget was exhausted."
-                    : recoveryEvidence.recoveryMode === "bootstrap_retry"
-                      ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
-                      : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
-          },
-          nextAttemptAt,
-          recoveryHistory: sql`(
+      if (agentTurnScope) {
+        await trace.end(agentTurnScope, {
+          endedAtMs: failedAtMs,
+          outcome: "failed",
+        });
+      }
+      if (!taskSettleScope) {
+        taskSettleScope = trace.start("task.settle", {
+          parentName: "task.run",
+          startedAtMs: failedAtMs,
+        });
+      }
+      trace.activate(taskSettleScope);
+      activeNativeSessions.delete(input.execution.binding.runId);
+      clearSteeringDeliveries(input.execution.binding.runId);
+      clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
+      if (
+        !ownershipUnverified &&
+        warmSessionId !== null &&
+        lifecyclePolicy.mode === "warm"
+      ) {
+        await releaseWarmNativeSession(
+          warmSessionId,
+          warmSessionOwnerToken,
+          lifecyclePolicy.idleTimeoutMs,
+          true,
+        );
+      }
+      if (
+        error instanceof NativeResultPendingFinalizationError ||
+        error instanceof NativeCancellationPendingRecoveryError
+      ) {
+        // This is not a provider failure and must not overwrite the durable
+        // result/coordinator state. The heartbeat boundary will either hand an
+        // already-materialized result to the finalizer or retain the durable
+        // cancellation intent for cancellation recovery.
+        if (taskSettleScope) {
+          await trace.end(taskSettleScope, { outcome: "ok" });
+        }
+        await trace.finish("ok");
+        throw error;
+      }
+      const now = new Date();
+      const sourceFailureCode = providerUsageLimitObserved
+        ? ("native_provider_usage_limit" as const)
+        : nativeSessionFailureSourceCode(error);
+      const recoveryEvidence = await nativeProviderRecoveryEvidence({
+        db: input.db,
+        runId: input.execution.binding.runId,
+        sourceFailureCode,
+      }).catch((recoveryError) => {
+        if (ownershipUnverified)
+          throw new NativeRunnerOwnershipUnverifiedError();
+        throw recoveryError;
+      });
+      const disposition = nativeSessionFailureDisposition(
+        attempt,
+        now,
+        sourceFailureCode,
+      );
+      const phase =
+        recoveryEvidence.recoveryMode === "ambiguous_state"
+          ? ("terminal_failure" as const)
+          : disposition.phase;
+      const failureCode =
+        recoveryEvidence.recoveryMode === "ambiguous_state"
+          ? sourceFailureCode
+          : disposition.failureCode;
+      const nextAttemptAt =
+        recoveryEvidence.recoveryMode === "ambiguous_state"
+          ? null
+          : disposition.nextAttemptAt;
+      const recoveryProjection = nativeSessionRecoveryProjection({
+        phase,
+        failureCode,
+        agentId: input.execution.binding.agentId,
+      });
+      const { exhausted } = recoveryProjection;
+      const integrityFailure =
+        sourceFailureCode === "native_event_replay_conflict";
+      const message =
+        error instanceof Error
+          ? error.message.slice(0, 2_000)
+          : String(error).slice(0, 2_000);
+      const sanitizedStderrTail = redactSensitiveText(message).slice(-4_096);
+      await input.db
+        .transaction(async (tx) => {
+          const updated = await tx
+            .update(nativeRunFinalizations)
+            .set({
+              phase,
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              recoveryState:
+                phase === "retryable_failure" ? "resuming_session" : "blocked",
+              failureCode,
+              failureDetail: {
+                message,
+                originalFailureCode: sourceFailureCode,
+                recoveryMode: recoveryEvidence.recoveryMode,
+                providerSessionEstablished:
+                  recoveryEvidence.providerSessionEstablished,
+                providerEventsExist: recoveryEvidence.providerEventsExist,
+                checkpointExists: recoveryEvidence.checkpointExists,
+                recoveryOwner: recoveryProjection.recoveryOwner,
+                nextAction:
+                  recoveryEvidence.recoveryMode === "ambiguous_state"
+                    ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
+                    : integrityFailure
+                      ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
+                      : sourceFailureCode === "native_provider_usage_limit"
+                        ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
+                        : sourceFailureCode ===
+                            "native_adopted_runner_authentication_timeout"
+                          ? "Inspect the existing runner's executable and authenticated connection. Its process and durable checkpoint are retained; do not launch a replacement until ownership is safely resolved."
+                          : exhausted
+                            ? "Inspect the persisted native session after its bounded resume budget was exhausted."
+                            : recoveryEvidence.recoveryMode ===
+                                "bootstrap_retry"
+                              ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
+                              : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
+              },
+              nextAttemptAt,
+              recoveryHistory: sql`(
             select coalesce(jsonb_agg(item order by ordinal), '[]'::jsonb)
             from jsonb_array_elements(
               coalesce(${nativeRunFinalizations.recoveryHistory}, '[]'::jsonb)
@@ -4889,95 +4931,120 @@ async function executePaperclipNativeSessionWithinScope(
               0
             )
           )`,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(nativeRunFinalizations.runId, input.execution.binding.runId),
-            eq(
-              nativeRunFinalizations.companyId,
-              input.execution.binding.companyId,
-            ),
-            eq(nativeRunFinalizations.issueId, input.execution.binding.issueId),
-            eq(nativeRunFinalizations.leaseOwner, leaseOwner),
-            eq(nativeRunFinalizations.attempt, attempt),
-            eq(nativeRunFinalizations.controllerBootId, controller.bootId),
-            eq(nativeRunFinalizations.controllerPid, controller.pid),
-            eq(
-              nativeRunFinalizations.controllerProcessStartedAt,
-              controller.processStartedAt,
-            ),
-            gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
-          ),
-        )
-        .returning({ runId: nativeRunFinalizations.runId })
-        .then((rows) => rows[0] ?? null);
-      if (!updated) throw new Error("native_session_lease_lost");
-      await tx
-        .update(heartbeatRuns)
-        .set({
-          nativePhase: phase,
-          nativePhaseUpdatedAt: now,
-          error: message,
-          errorCode: sourceFailureCode,
-          updatedAt: now,
-        })
-        .where(eq(heartbeatRuns.id, input.execution.binding.runId));
-      if (recoveryProjection.issueStatus) {
-        await issueService(tx as unknown as Db).update(
-          input.execution.binding.issueId,
-          { status: recoveryProjection.issueStatus },
-          tx,
-        );
-      }
-      await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
-        companyId: input.execution.binding.companyId,
-        sourceIssueId: input.execution.binding.issueId,
-        kind: "active_run_watchdog",
-        ownerType: recoveryProjection.recoveryActionOwnerType,
-        ownerAgentId: recoveryProjection.recoveryActionOwnerAgentId,
-        returnOwnerAgentId: input.execution.binding.agentId,
-        cause: recoveryProjection.recoveryActionCause,
-        fingerprint: createHash("sha256")
-          .update(`${input.execution.binding.runId}:${failureCode}`)
-          .digest("hex"),
-        evidence: {
-          runId: input.execution.binding.runId,
-          coordinatorAttempt: attempt,
-          sourceFailureCode,
-          recoveryDisposition: failureCode,
-          recoveryMode: recoveryEvidence.recoveryMode,
-          providerSessionEstablished:
-            recoveryEvidence.providerSessionEstablished,
-        },
-        nextAction:
-          recoveryEvidence.recoveryMode === "ambiguous_state"
-            ? "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session."
-            : integrityFailure
-              ? "Inspect the persisted runner event collision and explicitly repair or replace the run; automatic retries are disabled."
-              : sourceFailureCode === "native_provider_usage_limit"
-                ? "Restore model provider usage capacity, then explicitly retry the task; automatic retries are stopped."
-                : exhausted
-                ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
-                : recoveryEvidence.recoveryMode === "bootstrap_retry"
-                  ? "Retry bootstrap on the same run without manufacturing a provider checkpoint."
-                  : "Resume the exact persisted native session on the same heartbeat run.",
-        wakePolicy: nextAttemptAt
-          ? {
-              kind: "resume_native_run",
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(nativeRunFinalizations.runId, input.execution.binding.runId),
+                eq(
+                  nativeRunFinalizations.companyId,
+                  input.execution.binding.companyId,
+                ),
+                eq(
+                  nativeRunFinalizations.issueId,
+                  input.execution.binding.issueId,
+                ),
+                eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+                eq(nativeRunFinalizations.attempt, attempt),
+                eq(nativeRunFinalizations.controllerBootId, controller.bootId),
+                eq(nativeRunFinalizations.controllerPid, controller.pid),
+                eq(
+                  nativeRunFinalizations.controllerProcessStartedAt,
+                  controller.processStartedAt,
+                ),
+                gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+              ),
+            )
+            .returning({ runId: nativeRunFinalizations.runId })
+            .then((rows) => rows[0] ?? null);
+          if (!updated) throw new Error("native_session_lease_lost");
+          await tx
+            .update(heartbeatRuns)
+            .set({
+              nativePhase: phase,
+              nativePhaseUpdatedAt: now,
+              error: message,
+              errorCode: ownershipUnverified
+                ? NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE
+                : sourceFailureCode,
+              updatedAt: now,
+            })
+            .where(eq(heartbeatRuns.id, input.execution.binding.runId));
+          if (recoveryProjection.issueStatus) {
+            await issueService(tx as unknown as Db).update(
+              input.execution.binding.issueId,
+              { status: recoveryProjection.issueStatus },
+              tx,
+            );
+          }
+          await issueRecoveryActionService(
+            tx as unknown as Db,
+          ).upsertSourceScoped({
+            companyId: input.execution.binding.companyId,
+            sourceIssueId: input.execution.binding.issueId,
+            kind: "active_run_watchdog",
+            ownerType: recoveryProjection.recoveryActionOwnerType,
+            ownerAgentId: recoveryProjection.recoveryActionOwnerAgentId,
+            returnOwnerAgentId: input.execution.binding.agentId,
+            cause: recoveryProjection.recoveryActionCause,
+            fingerprint: createHash("sha256")
+              .update(`${input.execution.binding.runId}:${failureCode}`)
+              .digest("hex"),
+            evidence: {
               runId: input.execution.binding.runId,
-              notBefore: nextAttemptAt.toISOString(),
-            }
-          : null,
-        maxAttempts: 3,
-        supersedeOnIdentityChange: recoveryProjection.supersedeOnIdentityChange,
-      });
-    });
-    if (taskSettleScope) {
-      await trace.end(taskSettleScope, { outcome: "failed" });
+              coordinatorAttempt: attempt,
+              sourceFailureCode,
+              recoveryDisposition: failureCode,
+              recoveryMode: recoveryEvidence.recoveryMode,
+              providerSessionEstablished:
+                recoveryEvidence.providerSessionEstablished,
+            },
+            nextAction:
+              recoveryEvidence.recoveryMode === "ambiguous_state"
+                ? "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session."
+                : integrityFailure
+                  ? "Inspect the persisted runner event collision and explicitly repair or replace the run; automatic retries are disabled."
+                  : sourceFailureCode === "native_provider_usage_limit"
+                    ? "Restore model provider usage capacity, then explicitly retry the task; automatic retries are stopped."
+                    : sourceFailureCode ===
+                        "native_adopted_runner_authentication_timeout"
+                      ? "Resolve the retained runner's authentication or executable compatibility before an explicit recovery; do not blindly restart, cancel, or replace its provider session."
+                      : exhausted
+                        ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
+                        : recoveryEvidence.recoveryMode === "bootstrap_retry"
+                          ? "Retry bootstrap on the same run without manufacturing a provider checkpoint."
+                          : "Resume the exact persisted native session on the same heartbeat run.",
+            wakePolicy: nextAttemptAt
+              ? {
+                  kind: "resume_native_run",
+                  runId: input.execution.binding.runId,
+                  notBefore: nextAttemptAt.toISOString(),
+                }
+              : null,
+            maxAttempts: 3,
+            supersedeOnIdentityChange:
+              recoveryProjection.supersedeOnIdentityChange,
+          });
+        })
+        .catch((recoveryError) => {
+          // Even a failed diagnostic write cannot turn unverified ownership into
+          // permission for heartbeat to release the task or stop its environment.
+          if (ownershipUnverified)
+            throw new NativeRunnerOwnershipUnverifiedError();
+          throw recoveryError;
+        });
+      if (taskSettleScope) {
+        await trace.end(taskSettleScope, { outcome: "failed" });
+      }
+      await trace.finish("failed");
+      if (ownershipUnverified) throw new NativeRunnerOwnershipUnverifiedError();
+      throw error;
+    } finally {
+      // Logging, trace persistence, and recovery-state writes may fail too.
+      // None of those failures prove the retained runner stopped or authorize
+      // heartbeat to release its environment and task execution ownership.
+      if (ownershipUnverified) throw new NativeRunnerOwnershipUnverifiedError();
     }
-    await trace.finish("failed");
-    throw error;
   }
   if (
     planSynchronizations.length === 0 &&

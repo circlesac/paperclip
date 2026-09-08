@@ -11,6 +11,7 @@ import {
 import { readProcessStartedAt } from "../hot-restart.js";
 import { getServerInfoSnapshot } from "../../server-info.js";
 import { redactSensitiveText } from "../../redaction.js";
+import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 
 export type NativeControllerIdentity = {
   bootId: string;
@@ -485,6 +486,13 @@ export async function claimNativeRestartRecoveries(input: {
           kind: "blocked",
           runId: candidate.runId,
           reason: "recovery_rows_missing",
+        } as const;
+      }
+      if (isNativeRunnerOwnershipHeld(row.run)) {
+        return {
+          kind: "blocked",
+          runId: row.run.id,
+          reason: "native_execution_ownership_unverified",
         } as const;
       }
       if (row.coordinator.resultId) {
