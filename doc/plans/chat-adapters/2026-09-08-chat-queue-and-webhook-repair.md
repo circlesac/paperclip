@@ -2543,3 +2543,24 @@ successful retry; the new answer is clear but the historical presentation is
 not yet a polished recovery experience. Telegram's retained cleanup and file B
 request remain unresolved. The browser became available again after host sleep;
 no provider credential or permission change was needed for this retry.
+
+### Revoked-editor source invalidation
+
+A provider-authenticated edit of an already-admitted source now records a
+content-free invalidation even when its actor no longer has Paperclip admission
+rights. Regranting that actor cannot resurrect the stale file or make an exact
+old-source retry admissible. GitHub bot edits can invalidate only an exact linked
+inbound source; unknown, self and outbound echoes remain suppressed. New edited
+content is not admitted, and this path creates no comments, wakes or downloads.
+
+Focused verification passed 25/25 and the final fresh full integration suite
+passed **560/560**, zero skips, in 124.07s. Server typechecking passed. The first
+full attempt was 558/560: an overbroad test worker swept unrelated queued Slack
+work, and a historical expectation still required filtering rather than the
+new content-free processed invalidation. Exact ingress processing and stronger
+before/after-regrant assertions corrected these without changing the production
+fix. The next attempt was 557/560 with three timeouts; host power logs showed
+matching 453-second and 186-second sleep intervals. The final run used only a
+process-scoped idle-sleep assertion. No test timeout or safety assertion was
+weakened. Server 60 still runs the preceding source version; live revoked-editor
+qualification after deployment remains outstanding.

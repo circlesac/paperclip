@@ -15133,6 +15133,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             );
           return;
         }
+        let githubBotSourceEdit = false;
         if (
           currentEndpoint.provider === "github" &&
           activeDelivery.eventKind === "message_updated"
@@ -15141,34 +15142,36 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           // its message link. The Boolean comes only from GitHub's verified
           // sender/comment-author type, never from comment text. Legacy rows
           // lack it, so also recognize exact already-published outbound links.
-          const outbound = lifecycle.isBotMessage
-            ? null
-            : await tx
-                .select({ id: chatMessageLinks.id })
-                .from(chatMessageLinks)
-                .innerJoin(
-                  chatConversations,
-                  and(
-                    eq(chatConversations.id, chatMessageLinks.conversationId),
-                    eq(chatConversations.companyId, chatMessageLinks.companyId),
-                    eq(
-                      chatConversations.endpointId,
-                      chatMessageLinks.endpointId,
-                    ),
-                  ),
-                )
-                .where(
-                  and(
-                    eq(chatMessageLinks.companyId, currentEndpoint.companyId),
-                    eq(chatMessageLinks.endpointId, currentEndpoint.id),
-                    eq(chatMessageLinks.direction, "outbound"),
-                    eq(chatMessageLinks.providerMessageId, lifecycle.messageId),
-                    eq(chatConversations.externalThreadId, lifecycle.threadId),
-                  ),
-                )
-                .limit(1)
-                .then((rows) => rows[0] ?? null);
-          if (lifecycle.isBotMessage || outbound) {
+          const linkedMessages = await tx
+            .select({ direction: chatMessageLinks.direction })
+            .from(chatMessageLinks)
+            .innerJoin(
+              chatConversations,
+              and(
+                eq(chatConversations.id, chatMessageLinks.conversationId),
+                eq(chatConversations.companyId, chatMessageLinks.companyId),
+                eq(chatConversations.endpointId, chatMessageLinks.endpointId),
+              ),
+            )
+            .where(
+              and(
+                eq(chatMessageLinks.companyId, currentEndpoint.companyId),
+                eq(chatMessageLinks.endpointId, currentEndpoint.id),
+                eq(chatMessageLinks.providerMessageId, lifecycle.messageId),
+                eq(chatConversations.externalThreadId, lifecycle.threadId),
+              ),
+            );
+          const outbound = linkedMessages.some(
+            (row) => row.direction === "outbound",
+          );
+          // A bot editor can change an already-admitted human source. That
+          // authenticated change revokes the old source, but never admits the
+          // bot's new content. Unknown/self/outbound updates remain suppressed.
+          githubBotSourceEdit =
+            lifecycle.isBotMessage &&
+            !outbound &&
+            linkedMessages.some((row) => row.direction === "inbound");
+          if (outbound || (lifecycle.isBotMessage && !githubBotSourceEdit)) {
             const filteredAt = new Date();
             await tx
               .update(chatDeliveries)
@@ -15429,6 +15432,65 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 .for("update")
                 .then((rows) => rows[0] ?? null)
             : null;
+        const retainSourceInvalidation = async (
+          principalId: string | null,
+          reason: string,
+        ): Promise<boolean> => {
+          if (
+            !currentConversation ||
+            activeDelivery.eventKind !== "message_updated"
+          )
+            return false;
+          const invalidatedAt = new Date();
+          // Provider authentication proves the exact source changed. The
+          // editor's current Paperclip rights govern admitting new content,
+          // not whether a later regrant can resurrect the stale old source.
+          await tx
+            .update(chatDeliveries)
+            .set({
+              state: "processed",
+              conversationId: currentConversation.id,
+              principalId,
+              normalizedEvent: {
+                providerEventId:
+                  activeDelivery.normalizedEvent.providerEventId ??
+                  activeDelivery.providerEventId,
+                kind: activeDelivery.eventKind,
+                runtimeContext: {
+                  generation: admittedRuntimeContext.generation,
+                  credentialFingerprint:
+                    admittedRuntimeContext.credentialFingerprint,
+                },
+                conversation: { externalThreadId: lifecycle.threadId },
+                message: {
+                  providerMessageId: lifecycle.messageId,
+                  targetProviderEventId: lifecycle.targetProviderEventId,
+                  providerSentAt: lifecycle.providerSentAt,
+                },
+                filtering: { contentRetained: false },
+              },
+              nextAttemptAt: null,
+              processedAt: invalidatedAt,
+              redactedError: reason,
+              updatedAt: invalidatedAt,
+            })
+            .where(
+              and(
+                eq(chatDeliveries.id, activeDelivery.id),
+                eq(chatDeliveries.state, "processing"),
+              ),
+            );
+          return true;
+        };
+        if (
+          githubBotSourceEdit &&
+          (await retainSourceInvalidation(
+            null,
+            "Provider bot edit invalidated an existing source without admitting bot content",
+          ))
+        )
+          return;
+
         let lifecyclePrincipalId: string | null = null;
         const requiresLifecycleActorAuthorization =
           (activeDelivery.eventKind === "message_updated" ||
@@ -15483,6 +15545,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             ? (lifecyclePrincipal?.id ?? null)
             : null;
           if (!authorizedPrincipalId) {
+            if (
+              await retainSourceInvalidation(
+                lifecyclePrincipal?.id ?? null,
+                "Provider edit invalidation retained without admitting content from an unauthorized actor",
+              )
+            )
+              return;
             const filteredAt = new Date();
             await tx
               .update(chatDeliveries)

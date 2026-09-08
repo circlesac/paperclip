@@ -33,14 +33,19 @@ Rust verification: 239 unit tests, 70 Codex provider tests, and 10 native-select
 tests passed; the existing ignored subprocess helper executed separately and
 passed. The normal release build succeeded, but has not been staged or deployed.
 
-Source-revocation full-suite verification is pending a fresh repeat. Full01 was
+Source-revocation full-suite verification now passes **560/560** on fresh database
+`chat_adapters_revoked_edits_20260908_full03` (124.07s), with focused 25/25 and
+server typechecking also passing. The exact provider edit remains an invalidation
+after the editor is revoked and later regranted; it never admits new content,
+downloads a file, or wakes the agent. Full01 was
 558/560: one broad fixture queue sweep admitted unrelated earlier Slack work,
 and one old expectation still required filtering rather than content-free
 invalidation. Both were corrected without weakening no-wake/no-content checks.
 Full02 was 557/560 with three timeouts aligning with recorded Mac sleep periods
 (including 453-second and 186-second sleeps). Do not increase test deadlines or
-claim either full run passed; the next repeat uses command-scoped idle-sleep
-prevention, never a thermal-safety override.
+claim either earlier full run passed; the successful repeat used command-scoped
+idle-sleep prevention, never a thermal-safety override. These source fixes are
+not yet deployed to server 60.
 
 Latest checkpoint: `9ef354692` is pushed and deployed as server 60 (PID 11488,
 port 3103; log `server-experimental-landing-60.log`). The earlier recovered-answer
