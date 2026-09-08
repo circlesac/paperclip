@@ -22,7 +22,7 @@ continues. This supersedes the earlier instruction not to tend pull requests.
    obtain reviews before claiming the work ready to merge.
 
 PR [#13038](https://github.com/paperclipai/paperclip/pull/13038) is open as
-one 473-file review against master. It is mergeable; CI and review must still
+one review below the 500-file maximum. It is mergeable; CI and review must still
 pass before landing. Master is incorporated through `b97101893` by
 `1a442f5a0`, including the new project repository selection flow. Independent
 compatibility checks passed 138 UI and 19 server tests. Full workspace
@@ -33,8 +33,12 @@ correction and exact recovery-test settlement wait are in `2feb8375f`.
 The real default-off GitHub tool flow and enabled chat catalog both passed
 browser inspection. Chat connectors are enabled on the existing live test
 instance so qualification can continue. Full workspace typecheck/build and
-the final 390-test chat integration rerun passed. The broad suite is still
-running. Its CLI guidance failure was caused by ignored historical runtime
+the final 390-test chat integration rerun passed. The broad command stopped
+after its general-server phase: **8,117 passed, 34 skipped, four failed**.
+All four failures now have focused passing fixes (CLI guard, native recovery,
+parked-answer attestation, and formatted read-only route extraction). Other
+workspace/serialized phases still require CI; do not claim a full broad pass.
+The CLI guidance failure was caused by ignored historical runtime
 recordings, not current source guidance. Commit `9beee1d14` excludes only the
 root recordings directory; all 38 focused guard tests pass without changing
 the command allowlist. Do not upload the earlier failure log, which quotes
@@ -63,7 +67,14 @@ revocation before dispatch: **16/16** batching tests pass. Both ACPX patch files
 were regenerated with pnpm after reproducing GNU patch's asymmetric-context
 failure; their resulting vendor files are byte-identical to the intended code.
 Packaging **15/15** and actual fresh GNU-patch staging **2/2** pass. No lockfile
-was edited. These fixes are committed; the next CI run must confirm them.
+was edited. CI at `28dd9ee9f` confirms build, typecheck, canary packaging,
+all browser shards, and the non-server workspace tests. Three server shards
+failed; all three now have focused passing fixture corrections (read-only
+route formatting, the comment service's explicit database argument, and an
+exact durable slash-admission completion wait). The last correction is in
+`cba5aa51c`, independently verified by **390/390** full chat integration tests
+on another fresh database with all 254 migrations. CI must rerun before
+claiming it is green.
 
 ## Current tested/deployed state
 
@@ -136,6 +147,36 @@ was edited. These fixes are committed; the next CI run must confirm them.
   socket backlog/suspension/rebind case is included in those 87 tests. Live
   recovery and retesting remain pending; verify exact prior process ownership
   and let startup reconciliation settle without changing durable history.
+  Root proved runner/group 85958 and provider 86338 dead, then gracefully
+  restarted at 13:55 UTC; no new startup evidence/ownership blocks appeared.
+  The next Telegram request failed immediately with `runner_state_identity_mismatch`:
+  the prior heartbeat was terminal but its checkpoint was not suspended.
+  Existing recovery safely retained that root in quarantine and deliberately
+  failed the first replacement request. That sacrificed request is a real UX
+  gap, not a new authority mismatch to bypass. After verifying the active root
+  absent, retained root present, and both old processes still dead, root sent
+  one fresh long Telegram request at 14:00:46.314 UTC. It failed, not passed:
+  run `a4938fcc-dc2c-4146-a776-12512cf4b613` reached `paperclip_finish` at
+  14:01:26.348, but source event 44 cannot commit. Its input was truncated
+  again after its digest was sealed; replay fails digest validation and
+  repeatedly reconnects. The model is not still thinking. Preserve the
+  fail-closed digest and identity checks; correct the final sanitization
+  boundary and add a deterministic long-answer regression before recovery.
+  The run exhausted recovery at 14:17:07.520 with incomplete cleanup. Root's
+  later Cancel click found no control and applied no cancellation. The
+  retained runner checkpoint is now suspended, with event 44 still unacked;
+  no new live request or manual state repair has been performed. Also fix the
+  original 4 KiB authored-answer truncation without relaxing diagnostic bounds.
+- **Irrecoverable cleanup latency:** transport close memoizes its rejected
+  promise after controller teardown. Generic runtime retries do no fresh work,
+  and server retries add two 30-second delays. A typed operator-recovery-required
+  path is committed as `65bd25a22` after independent review. Final cohorts:
+  runtime **74/74**, executor **159/159**, transport **88/88**, and runner/server
+  TypeScript checks. The real memoized-close test lives in the transport suite
+  whose prerequisites build native fixtures; the scheduled lightweight runtime
+  suite stays native-binary-free. Transient/live-owner cleanup remains retryable
+  and the quarantine ownership gate stays. Only TypeScript was emitted; the
+  live runner binary was not changed.
 - **Telegram latency:** one message took 234.435 seconds _before reaching the
   local webhook proxy_, then Luna ran for 13.433 seconds. The next independent
   message reached the proxy in 0.583 seconds and answered in 16.228 seconds

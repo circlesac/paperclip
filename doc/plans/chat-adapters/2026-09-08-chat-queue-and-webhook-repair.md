@@ -537,3 +537,71 @@ also failed. Run `2c17e336-f6b2-4763-9d8f-ba9a3c8b296a`, native Luna,
 The visible working message became a truthful failure. Further live sends
 are paused until safe recovery and the shutdown regression are addressed;
 the newly staged prose fix is not claimed to have passed live on this attempt.
+
+## CI follow-through and the next live failure boundary
+
+The broad local command completed its general-server phase with **8,117
+passed, 34 skipped, and four failed**, then stopped. Each failure has a
+focused passing correction: ignored-recording CLI guidance, exact native
+recovery ownership, durable parked-answer attestation, and formatted
+read-only route extraction. This is not a full broad-suite pass. CI at
+`28dd9ee9f` subsequently passed build, typecheck, canary packaging, all three
+browser shards, and non-server workspace tests. Three server shards still
+failed. All three now have focused passing fixture corrections: comment-call
+arguments, formatted route extraction, and waiting for the exact completed
+slash-admission receipt rather than an earlier mock wake callback. The last
+fix (`cba5aa51c`) also passed an independent full **390/390** chat integration
+rerun on a fresh database after 254 normal migrations. CI still needs to
+confirm these follow-ups. Greptile has not completed review.
+
+The ACK persistence correction in `440ae9bbd` passed **226/226** core and
+**87/87** staged transport tests, including the real socket backlog,
+suspension, and authority-rebind case. Binary SHA-256 is
+`3c69ea06153944eff3573b28e439de5eed31b5972ff3b18da4c54f1147b47492`.
+Before the controlled server restart at 13:55 UTC, root verified that the
+old runner process/group and provider process were absent. Startup found
+no new unresolved ownership claim. No durable rows or checkpoint files
+were manually cleared.
+
+The next Telegram request, run `d0ae1646-c13d-497c-bf6b-a0fef0ff6693`,
+failed immediately at 13:57:15 with `runner_state_identity_mismatch`.
+The prior heartbeat was terminal while its checkpoint was not suspended;
+existing product recovery safely retained the old state in quarantine and
+deliberately rejected that first replacement request. This sacrificed turn
+is an operator-recovery UX gap, not a reason to bypass identity checks.
+
+After verifying that retention and the absence of the old processes, root
+submitted `TG-AFTER-RETIRED-CHECKPOINT-0908` at 14:00:46.314. Run
+`a4938fcc-dc2c-4146-a776-12512cf4b613` started at 14:00:47.771 using
+Paperclip Runner, Codex app-server, and Luna with low reasoning effort.
+The provider produced `paperclip_finish` at 14:01:26.348, but the run stayed
+active without delivering its answer. Working/progress publications each
+used one attempt against Telegram message `417200359:123`.
+
+Read-only inspection isolated a different defect: the only pending runner
+outbox event, semantic tool input source sequence 44, passes schema and
+identity/correlation checks but fails its content digest. The finish summary
+was sanitized/truncated before hashing and then truncated again while
+enqueuing the envelope. Controller commit remains at 43; repeated connection
+resets replay the same uncommittable event. This is not model inference or
+outbox backpressure. A narrow final-sanitization-boundary fix and long-input
+regression are in progress. Do not count this run as a successful delivery
+or repair its persisted digest by hand.
+
+The run eventually failed at 14:17:07.520 with
+`native_session_retry_exhausted` / incomplete cleanup. Root attempted the
+normal Board Cancel only afterward; the control had disappeared and no
+cancellation was applied. At 14:19 UTC there were no active Maya runs. The
+retained runner checkpoint was suspended with source 44 still unacknowledged;
+the provider checkpoint was prepared. No chat-adapters runner/provider process
+appeared in the process inventory. Other worktrees' native test processes
+were left alone. This state remains evidence, not a success to reinterpret.
+
+Commit `65bd25a22` separately makes the exact irrecoverable, memoized cleanup
+failure a typed operator-recovery hold. Independent review confirmed that
+temporary failures still retry and new admission cannot bypass retained
+ownership. Runtime **74/74**, executor **159/159**, and transport **88/88**
+pass, with runner/server TypeScript checks. The composed real transport test
+was placed in the binary-built transport suite rather than adding native
+prerequisites to the scheduled lightweight runtime suite. The live server
+has not yet deployed this change.
