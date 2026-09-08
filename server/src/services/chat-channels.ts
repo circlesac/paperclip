@@ -8459,6 +8459,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     issueCommentId: string;
     attachments: Attachment[];
     attachmentLimitOmissions?: number;
+    unavailableReferenceCount?: number;
     actorUserId: string | null;
   }): Promise<{
     storedIds: string[];
@@ -8469,6 +8470,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       omissionReasons[reason] = (omissionReasons[reason] ?? 0) + count;
     };
     const boundedAttachments = input.attachments.slice(0, 20);
+    if (
+      input.endpoint.provider === "microsoft-teams" &&
+      input.unavailableReferenceCount
+    ) {
+      // A channel/group reference is not a download capability. Still tell
+      // the exact current-turn consumer that those bytes are unavailable,
+      // including when there are no ingestible attachments at all.
+      omit("download_unavailable", input.unavailableReferenceCount);
+    }
     if (
       input.endpoint.provider === "github" &&
       input.attachmentLimitOmissions
@@ -10468,6 +10478,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           issueCommentId: inboundCommentId,
           attachments: nativeInboundAttachments,
           attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
+          unavailableReferenceCount:
+            endpoint.provider === "microsoft-teams" && !thread.isDM
+              ? Math.min(message.attachments.length, 20)
+              : 0,
           actorUserId: rebound.authorUserId,
         });
         if (
@@ -11400,6 +11414,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         issueCommentId: comment.id,
         attachments: nativeInboundAttachments,
         attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
+        unavailableReferenceCount:
+          endpoint.provider === "microsoft-teams" && !thread.isDM
+            ? Math.min(message.attachments.length, 20)
+            : 0,
         actorUserId,
       });
       if (
@@ -11979,7 +11997,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         providerMessageId?: unknown;
         text?: unknown;
         mentionedBot?: unknown;
-        attachments?: Array<{ recovery?: unknown }>;
+        attachments?: Array<{
+          name?: unknown;
+          mimeType?: unknown;
+          size?: unknown;
+          recovery?: unknown;
+        }>;
         attachmentLimitOmissions?: unknown;
       };
       conversation?: { providerUrl?: unknown };
@@ -11988,15 +12011,50 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const externalId = normalized.principal?.externalId;
     if (typeof providerMessageId !== "string" || typeof externalId !== "string")
       return null;
-    const attachments = (normalized.message?.attachments ?? [])
-      .map((attachment) =>
-        attachment.recovery
+    const referenceOnlyTeamsAttachments =
+      endpointRuntime.provider === "microsoft-teams" && !thread.isDM;
+    const storedAttachments = normalized.message?.attachments ?? [];
+    const attachments = (
+      referenceOnlyTeamsAttachments
+        ? storedAttachments.slice(0, 20)
+        : storedAttachments
+    )
+      .map((attachment) => {
+        if (!attachment || typeof attachment !== "object") return null;
+        if (referenceOnlyTeamsAttachments) {
+          // Non-personal Teams attachments deliberately have no recovery
+          // locator. Preserve only bounded audit metadata across deferred
+          // admission/restart, so both the reference-only task comment and
+          // its unavailable-current-file notice survive. Even a legacy
+          // locator must never turn this surface into a download capability.
+          return {
+            type: "file",
+            name:
+              sanitizeFilename(
+                typeof attachment.name === "string"
+                  ? attachment.name
+                  : undefined,
+              ) ?? undefined,
+            mimeType: normalizeContentType(
+              typeof attachment.mimeType === "string"
+                ? attachment.mimeType
+                : undefined,
+            ).slice(0, 255),
+            size:
+              typeof attachment.size === "number" &&
+              Number.isSafeInteger(attachment.size) &&
+              attachment.size >= 0
+                ? attachment.size
+                : undefined,
+          } as Attachment;
+        }
+        return attachment.recovery
           ? endpointRuntime.rehydrateAttachment(attachment.recovery, {
               threadId: thread.id,
               messageId: providerMessageId,
             })
-          : null,
-      )
+          : null;
+      })
       .filter((attachment): attachment is Attachment => Boolean(attachment));
     const message = {
       id: providerMessageId,

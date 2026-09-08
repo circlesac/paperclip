@@ -13530,6 +13530,251 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toHaveLength(1);
   });
 
+  it.each([
+    { surface: "channel", mode: "immediate" },
+    { surface: "channel", mode: "deferred" },
+    { surface: "channel", mode: "restart" },
+    { surface: "channel", mode: "retry_restart" },
+    { surface: "group", mode: "immediate" },
+    { surface: "group", mode: "deferred" },
+    { surface: "group", mode: "restart" },
+    { surface: "group", mode: "retry_restart" },
+  ] as const)(
+    "preserves unavailable Teams $surface file references through $mode admission",
+    async ({ surface, mode }) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const context = await configuredTeamsEndpoint(fixture, {
+        storage: storage.storage,
+        deferWebhookProcessing:
+          mode !== "immediate" && mode !== "retry_restart",
+        scheduleDeferredWork: () => undefined,
+      });
+      const { callbacks, endpoint, service } = context;
+      const serviceUrl = "https://smba.trafficmanager.net/amer/";
+      const conversationId = `19:teams-unavailable-${surface}-${mode}@thread.${surface === "channel" ? "tacv2" : "v2"}`;
+      const rootId = "1740000000391";
+      const thread = makeThread({
+        channelId: `teams:${Buffer.from(conversationId).toString("base64url")}:${Buffer.from(serviceUrl).toString("base64url")}`,
+        id: `teams:${Buffer.from(`${conversationId}${surface === "channel" ? `;messageid=${rootId}` : ""}`).toString("base64url")}:${Buffer.from(serviceUrl).toString("base64url")}`,
+        name: "Unavailable current files",
+      });
+      const fetchData = vi.fn(async () => Buffer.from("must not download"));
+      const providerUrl =
+        "https://private.example/file?signature=do-not-persist";
+      const attachments = [
+        {
+          type: "image",
+          name: "../current-photo.png",
+          mimeType: "image/png",
+          size: 128,
+          url: providerUrl,
+          fetchData,
+          fetchMetadata: { authorization: "do-not-persist" },
+        },
+        {
+          type: "file",
+          name: "current-plan.txt",
+          mimeType: "text/plain; charset=utf-8",
+          size: 32,
+          url: providerUrl,
+          fetchData,
+        },
+      ] as Attachment[];
+      let active = context;
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        if (surface === "group") {
+          await service.update(
+            endpoint.id,
+            { allowGroupChats: true },
+            "owner-user",
+          );
+        }
+        await db.insert(chatEndpointResources).values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          type: surface === "channel" ? "channel" : "group_chat",
+          providerResourceId: conversationId,
+          label: "Unavailable current files",
+          availability: "available",
+          enabled: true,
+        });
+        for (const [index, text] of [
+          "Inspect this current image and file",
+          "",
+        ].entries()) {
+          if (mode === "retry_restart" && index === 0) {
+            thread.subscribe.mockRejectedValueOnce(
+              new Error("subscription unavailable"),
+            );
+          }
+          const deliveryAttempt = deliverMessage({
+            callbacks:
+              index === 0
+                ? callbacks
+                : active.runtime.configurations.get(endpoint.id)!.callbacks,
+            endpointId: endpoint.id,
+            provider: "microsoft-teams",
+            thread: thread.thread,
+            message: makeMessage({
+              id: String(Number(rootId) + index),
+              text,
+              mentioned: true,
+              attachments,
+            }),
+            trigger: "mention",
+          });
+          if (mode === "retry_restart" && index === 0) {
+            await expect(deliveryAttempt).rejects.toThrow(
+              "subscription unavailable",
+            );
+          } else {
+            await deliveryAttempt;
+          }
+          const [delivery] = await db
+            .select()
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.endpointId, endpoint.id),
+                like(
+                  chatDeliveries.providerEventId,
+                  `%:${Number(rootId) + index}`,
+                ),
+              ),
+            );
+          expect(delivery).toBeDefined();
+          expect(delivery!.normalizedEvent).toMatchObject({
+            message: {
+              attachments: [
+                {
+                  name: "current-photo.png",
+                  mimeType: "image/png",
+                  size: 128,
+                  recovery: null,
+                },
+                {
+                  name: "current-plan.txt",
+                  mimeType: "text/plain",
+                  size: 32,
+                  recovery: null,
+                },
+              ],
+            },
+          });
+          expect(JSON.stringify(delivery!.normalizedEvent)).not.toContain(
+            "do-not-persist",
+          );
+          if (mode !== "immediate") {
+            expect(delivery!.state).toBe(
+              mode === "retry_restart" && index === 0 ? "retry" : "received",
+            );
+            if (
+              (mode === "restart" || mode === "retry_restart") &&
+              index === 0
+            ) {
+              await service.shutdown();
+              restarted = createService(new FakeChatSdkRuntime(), undefined, {
+                storage: storage.storage,
+                deferWebhookProcessing: true,
+                scheduleDeferredWork: () => undefined,
+              });
+              active = { ...context, ...restarted };
+            }
+            await db
+              .update(chatDeliveries)
+              .set({ nextAttemptAt: new Date(0) })
+              .where(eq(chatDeliveries.id, delivery!.id));
+            await active.service.processPendingDeliveries();
+          }
+          const [processed] = await db
+            .select()
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.id, delivery!.id));
+          expect(processed).toMatchObject({
+            state: "processed",
+            redactedError:
+              "2 external attachments were omitted (download unavailable: 2)",
+          });
+          const [link] = await db
+            .select()
+            .from(chatMessageLinks)
+            .where(
+              and(
+                eq(chatMessageLinks.deliveryId, delivery!.id),
+                eq(chatMessageLinks.direction, "inbound"),
+              ),
+            );
+          const [comment] = await db
+            .select()
+            .from(issueComments)
+            .where(eq(issueComments.id, link!.commentId!));
+          expect(comment!.body).toBe(
+            text || "Shared 2 Microsoft Teams file references.",
+          );
+          const requests = [
+            ...context.wakeup.mock.calls,
+            ...(restarted?.wakeup.mock.calls ?? []),
+          ]
+            .map(([, request]) => request)
+            .filter(
+              (request) =>
+                request.contextSnapshot?.wakeCommentId === comment!.id,
+            );
+          expect(requests).toHaveLength(1);
+          expect(requests[0]!.contextSnapshot).toMatchObject({
+            externalAttachmentOmissions: [
+              {
+                commentId: comment!.id,
+                reasons: { download_unavailable: 2 },
+              },
+            ],
+          });
+          const [intent] = await db
+            .select()
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.deliveryId, delivery!.id),
+                eq(chatActions.kind, "inbound_wakeup"),
+              ),
+            );
+          expect(intent!.payload).toMatchObject({
+            commentId: comment!.id,
+            attachmentOmissionReasons: { download_unavailable: 2 },
+          });
+        }
+        await active.service.processPendingDeliveries();
+        expect(
+          context.wakeup.mock.calls.length +
+            (restarted?.wakeup.mock.calls.length ?? 0),
+        ).toBe(2);
+        expect(fetchData).not.toHaveBeenCalled();
+        expect(storage.putFile).not.toHaveBeenCalled();
+        expect(
+          active.runtime.endpoints.get(endpoint.id)!
+            .rehydratedAttachmentDescriptors,
+        ).toEqual([]);
+        await expect(
+          db
+            .select({ id: issueAttachments.id })
+            .from(issueAttachments)
+            .where(eq(issueAttachments.companyId, fixture.companyId)),
+        ).resolves.toEqual([]);
+        await expect(
+          db
+            .select({ id: issueComments.id })
+            .from(issueComments)
+            .where(eq(issueComments.companyId, fixture.companyId)),
+        ).resolves.toHaveLength(2);
+      } finally {
+        await service.shutdown();
+        await restarted?.service.shutdown();
+      }
+    },
+  );
+
   it("holds a delayed first Teams setup reply until its older root mention enables the channel", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, service, wakeup } =
