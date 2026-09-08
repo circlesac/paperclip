@@ -12,13 +12,22 @@ continues. This supersedes the earlier instruction not to tend pull requests.
 1. Put chat connector UI behind a default-off **experimental chat connectors**
    setting. Keep existing production tool connectors, especially GitHub,
    available without the chat/tool choice when the experiment is disabled.
-2. Reconcile the existing `codex/chat-adapters` branch with freshly fetched
-   `origin/master`. Preserve work and upstream code. Do not edit the lockfile.
+2. Master reconciliation is committed as `e91b236ff`, against upstream
+   `297d8741f`. The tested source and migration order are preserved; the merge
+   inherits upstream's lockfile with no PR lockfile delta.
 3. Use the fewest reviewable PRs. Check the actual changed-file count against
    Greptile's 500-file limit; do not split channels unnecessarily. Retained
    prototype/wireframe iterations currently inflate the branch's count.
 4. Fill the repository PR template, report verification limits honestly, and
    obtain reviews before claiming the work ready to merge.
+
+The visibility flag is committed as `56c096e5e`; the pasted-URL shortcut
+correction and exact recovery-test settlement wait are in `2feb8375f`.
+The real default-off GitHub tool flow and enabled chat catalog both passed
+browser inspection. Chat connectors are enabled on the existing live test
+instance so qualification can continue. Full workspace typecheck/build and
+the final 390-test chat integration rerun passed. The broad suite is still
+running and has reported a CLI guidance allowlist failure under investigation.
 
 ## Current tested/deployed state
 
@@ -32,33 +41,41 @@ continues. This supersedes the earlier instruction not to tend pull requests.
   external-chat question/wait integration **130/130**, server source typecheck,
   independent GitHub authority review **24/24**. A final strengthened Discord
   Activity/target assertion also passed independently.
-- Native binary still uses the previously qualified `a0fd2789…` build. The
-  pending Rust prose-redaction change is not deployed merely because HEAD
-  changed. Complete tests, build/stage/sign, and test the staged binary before
-  assigning it live-qualified status.
+- The narrow Rust prose-redaction fix is committed as `47ddc4f8e`. Root passed all
+  **223/223** runner-core tests, built/staged/signed the release binary, and
+  passed **87/87** staged Codex transport tests. The staged SHA-256 starts
+  `a61275f338b7`. Existing live sessions can still use the prior binary; a
+  fresh Slack reply now preserves all three exact regression sentences.
+  A full Discord document inspection still found other ordinary token phrases
+  redacted, so broader prose quality remains open.
 
 ## Immediate unfinished tests/fixes
 
-- **GitHub:** a live native Quartz/Jade question is already pending on the
-  disposable test PR. The normal GitHub link opened its actual Paperclip
-  Board card. After confirming the new server is ready, answer the card as
-  the original linked user; verify exactly one reply in the same GitHub
-  thread and an untouched governance review. The code fix has already passed
-  negative authority/identity/reach/generation/receipt tests. Do not merge or
+- **GitHub:** the live native Quartz/Jade round trip passed after deployment.
+  The original linked user selected Jade on the actual Board question card;
+  the question was marked answered and exactly one Jade reply appeared in
+  the original GitHub thread. The continuation used native Luna and took
+  17.856 seconds. Separate negative tests cover governance and identity;
+  this live result alone does not prove every review gate. Do not merge or
   edit the disposable test repository as part of this chat test.
 - **Runner prose redaction:** ordinary board-game prose containing phrases
   such as “one token for” and “one token can equal” lost words. A narrow
-  grammar exception is in progress, with assignment, quoted, CLI, compound,
-  JWT/Bearer and known-secret canaries. No broad redaction exemption. Test an
-  actual fresh live reply after staging the reviewed binary; do not rewrite
-  historical messages to manufacture a pass.
+  grammar exception passed review and tests, with assignment, quoted, CLI, compound,
+  JWT/Bearer and known-secret canaries. The fresh Slack exact-sentence test
+  passed in 18.213 seconds end to end on native Luna. The new Discord whole
+  file preserved the required sentence but still showed “transparent token
+  [REDACTED]”, “one token [REDACTED]”, and “token [REDACTED]” elsewhere.
+  Investigate those false positives without granting broad redaction exemptions
+  or rewriting historical replies to manufacture a pass.
 - **Attachment handoff:** the stale “preparing” message was replaced in code
   with a timeless message-limit explanation. Discord/Telegram long-document
   retry/ambiguous-delivery tests passed; confirm the new wording on a fresh
-  live long response after deployment. The existing Discord file was opened
-  in whole-file preview, exposing the separate redaction issue above.
-- **Telegram latency:** one message took 234.435 seconds *before reaching the
-  local webhook proxy*, then Luna ran for 13.433 seconds. The next independent
+  live long response after deployment. Discord's fresh sapphire plan now
+  passed: the timeless handoff and real whole-file preview were verified;
+  final attachment arrived once in 61.372 seconds end to end. Native Luna
+  used 58.630 seconds. Telegram's equivalent fresh wording remains untested.
+- **Telegram latency:** one message took 234.435 seconds _before reaching the
+  local webhook proxy_, then Luna ran for 13.433 seconds. The next independent
   message reached the proxy in 0.583 seconds and answered in 16.228 seconds
   total without configuration changes. The intermittent upstream delay is
   localized but not explained; do not call it fixed or blame model time.

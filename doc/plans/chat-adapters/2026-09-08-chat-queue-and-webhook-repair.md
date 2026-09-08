@@ -416,5 +416,85 @@ Independent review of the GitHub Board fallback found no additional blocker
 and reran **24/24** authorization cases successfully. The Discord reconstruction
 test was strengthened to assert one exact Activity row plus its original
 thread/message/reaction target across a repeated drain; that final focused
-case also passed. The server corrections are ready for deployment; the Rust
-prose-redaction change remains a separate test/build/deployment batch.
+case also passed. The server corrections were subsequently deployed from
+`1c4a45f0e`; the Rust change remained a separate build and qualification batch.
+
+## Deployed GitHub Board answer and runner build
+
+After server readiness, root selected Jade on the actual linked Board
+question `fb33198f-975c-4e1a-b674-4e8e6f0c9ef6`. The native Luna continuation
+`73a59f86-9a7c-40f8-9a67-00100ee8cac9` ran from 13:05:30.342 to
+13:05:48.198 UTC, **17.856 seconds**, and succeeded. The original question
+message `5585486661` changed to “Answered: Jade.” The new working message
+`5585598569` became a single Jade final reply at 13:05:49.207. Each publication
+used one attempt. The actual GitHub thread was opened and visibly verified.
+This confirms the real link-only Board-answer transport; separate negative
+tests, not this visible reply alone, establish governance and authority denials.
+
+The narrow game-token prose redaction correction was committed in
+`47ddc4f8e`. Root's unrestricted local runner-core suite passed **223/223**;
+the earlier sandbox-only socket failures are not failures of this rerun.
+The standard release build staged and signed binary SHA-256
+`a61275f338b78b7272633490ef4f48684a3c1dca4bf285ec2846fd477c12da41`.
+The staged Codex transport suite then passed **87/87** in 67.01 seconds.
+These are build/transport results, not a fresh live prose qualification.
+
+## Master reconciliation and review preparation
+
+Merge `e91b236ff` incorporates upstream `297d8741f`. All sixteen conflicts
+were inspected and resolved to the already tested branch implementation.
+An automatically duplicated tool-authority test was removed. An exact-content
+check confirmed that these resolutions preserve the pre-merge source.
+Upstream's 244 migration journal entries are the exact prefix of the branch's
+254; no migration renumbering was necessary. The merge inherits upstream's
+lockfile, with no lockfile change relative to master.
+
+Release preparation adds a default-off chat-connector visibility experiment
+without removing production GitHub tools. Superseded generated wireframes are
+archived in Git history so one review can remain below the 500-file limit.
+Broad post-merge checks and experimental-gate browser coverage are in progress;
+neither PR creation nor these focused results is a production-readiness claim.
+
+## Fresh prose and attachment follow-up
+
+Slack's fresh `TOKEN-PROSE-LIVE-0908` submission at 13:16:27.903 UTC produced
+all three requested ordinary game-token sentences without redaction. Run
+`001e58df-687b-459e-ac02-8bb6e076af59` used actual Codex app-server Luna,
+13:16:29.648–13:16:45.771 (**16.123 seconds**). Its working message
+`1788873390.611459` was edited to the final at 13:16:46.116, one attempt,
+**18.213 seconds end to end**, visibly verified in the original thread.
+
+Discord's fresh sapphire plan was submitted at 13:16:40.547. Run
+`fb1665bd-059b-4b88-be6d-d735e45e5816` used actual native Luna for
+**58.630 seconds**. Working/progress message `1546871910300917770` became
+the timeless message-limit explanation; attachment `1546872156825198685`
+arrived at 13:17:41.919, **61.372 seconds end to end**. Every publication
+used one attempt. Root opened the actual whole-file preview and verified the
+required “One token can equal one standard game.” sentence. Other ordinary
+token phrases in that same document were still redacted. The narrow regression
+passes; overall prose-redaction quality is not yet fully fixed.
+
+Post-merge full workspace `pnpm -r typecheck` and `pnpm build` both passed.
+A fresh final chat integration rerun passed **390/390** in 119.23 seconds.
+The broad `pnpm test:run` is still running and has reported a CLI guidance
+allowlist failure; no broad-suite pass is claimed. Experimental-gate focused
+coverage passed 252 UI, 96 server settings, and 32 shared tests, with token
+gates clean. Independent merge regression coverage initially passed 1,228 of
+1,229 tests; one heartbeat fixture read agent state before asynchronous
+settlement completed. Its exact bounded state-wait correction passed both
+the isolated case and all **141/141** recovery tests. No runtime permission
+or dispatch behavior changed. The remaining ten merge-regression files passed.
+
+Independent review also found a pasted-URL shortcut around the hidden gallery.
+One visibility-filtered list now feeds both cards and URL matching, with
+**106/106** AppsConnect tests passing, including hidden Telegram/Discord URLs,
+GitHub tool links, and custom MCP compatibility.
+
+The live server restarted from `56c096e5e` at 13:18:39 UTC and reached ready
+at 13:18:48. Root verified the actual default-off Apps catalog: GitHub tools
+remain visible and the Connect GitHub button opens the normal account/access
+flow without a chat choice. Chat-only providers and existing chat connection
+rows are hidden. Root then enabled the actual Experimental Settings switch
+on this qualification instance and verified that all four existing active
+chat connections and Microsoft Teams setup reappeared. Other instance flags
+and provider lifecycles were unchanged.
