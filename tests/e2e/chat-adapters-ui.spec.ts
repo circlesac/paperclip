@@ -1830,6 +1830,9 @@ test.describe("Board send delivery refresh", () => {
       let canonicalAttachmentReadsAfterSend = 0;
       let canonicalCommentReadsAfterSend = 0;
       let status = "streaming";
+      await page.route("**/api/instance/settings/experimental", (route) =>
+        fulfill(route, { enableChatConnectors: true }),
+      );
       await page.route(`**/api/issues/${issue.id}/chat-binding`, (route) =>
         fulfill(route, {
           endpointId,
