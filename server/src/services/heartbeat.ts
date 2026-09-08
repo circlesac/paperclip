@@ -64,6 +64,7 @@ import {
   approvals,
   assets,
   chatConversations,
+  chatDeliveries,
   chatEndpoints,
   chatMessageLinks,
   companyMemberships,
@@ -175,7 +176,10 @@ import {
   assertManagedProfileRecoveryBinding,
   resolvePaperclipRunnerNativeProviderInput,
 } from "./native-runtime/provider-profile.js";
-import type { NativeRunHistoricalSpan } from "./native-runtime/native-run-trace.js";
+import {
+  buildNativeHeartbeatPreparationSpans,
+  type NativeRunHistoricalSpan,
+} from "./native-runtime/native-run-trace.js";
 import {
   parseNativeExecutionInput,
   type NativeExecutionInput,
@@ -208,6 +212,10 @@ import {
   MAX_EXCERPT_BYTES,
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import {
+  authorizeChatConversationForBoundRun,
+  isExternalChatWaitAuthorizationContention,
+} from "./native-runtime/chat-attachment-reuse.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { emitAgentTaskRun } from "./agent-task-run-telemetry.js";
@@ -523,6 +531,8 @@ const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
   "paperclipai/paperclip/paperclip-converting-plans-to-tasks";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
+const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
+  "paperclipExternalChatExecutionBound";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE =
   "native_execution_ownership_unverified";
@@ -6960,6 +6970,8 @@ export function mergeCoalescedContextSnapshot(
   const incomingSource = readNonEmptyString(incoming.source);
   const preservesExternalChatOrigin =
     existingSource?.startsWith("chat:") === true &&
+    readNonEmptyString(existing.issueId) !== null &&
+    existing.issueId === incoming.issueId &&
     incomingSource === "native_status_decision" &&
     readNonEmptyString(incoming.statusDecisionSource) ===
       "native_status_decision";
@@ -6967,6 +6979,9 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // Only executeRun can mint this proof. Coalescence may retain an unchanged
+  // admitted proof, but must never accept a new marker from an incoming wake.
+  delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
   const mergedAttachmentOmissions = mergeExternalAttachmentOmissions(
     existing,
     incoming,
@@ -6998,6 +7013,36 @@ export function mergeCoalescedContextSnapshot(
     // The merged context should carry canonical comment ids; the next wake will
     // regenerate any structured payload from those ids.
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
+  }
+  const existingWake = parseObject(existing[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+  const existingCommentIds = extractWakeCommentIds(existing);
+  const payloadCommentIds = Array.isArray(existingWake.commentIds)
+    ? existingWake.commentIds
+    : [];
+  const preservesAdmittedWake =
+    preservesExternalChatOrigin &&
+    parseObject(existingWake.issue).id === existing.issueId &&
+    CHAT_PROVIDERS.some(
+      (provider) =>
+        existingWake.externalChatProvider === provider &&
+        (existingSource === `chat:${provider}` ||
+          existingSource === `chat:${provider}:recovery`),
+    ) &&
+    existingCommentIds.length > 0 &&
+    mergedCommentIds.length === existingCommentIds.length &&
+    mergedCommentIds.every((id, index) => id === existingCommentIds[index]) &&
+    payloadCommentIds.length === existingCommentIds.length &&
+    payloadCommentIds.every((id, index) => id === existingCommentIds[index]) &&
+    ((existing[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true &&
+      existingWake.checkedOutByHarness === true) ||
+      (existing[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] === true &&
+        existingWake.externalChatExecutionBound === true));
+  if (preservesAdmittedWake) {
+    merged[PAPERCLIP_WAKE_PAYLOAD_KEY] = existingWake;
+    merged.wakeReason = existing.wakeReason;
+    if (existing[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] === true) {
+      merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] = true;
+    }
   }
   if (
     !hasInteractionContinuationWakeContext(incoming) &&
@@ -7031,7 +7076,9 @@ export async function resolveExternalChatWakeProvider(input: {
     !input.agentId ||
     !input.issueId ||
     commentIds.length === 0 ||
-    input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] !== true
+    (input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] !== true &&
+      input.contextSnapshot[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] !==
+        true)
   ) {
     return null;
   }
@@ -7074,6 +7121,169 @@ export async function resolveExternalChatWakeProvider(input: {
     commentIds.every((id) => linkedCommentIds.has(id))
     ? provider
     : null;
+}
+
+/** Bind an already-claimed review turn without checking out or approving it. */
+export async function attestReviewedExternalChatRun(input: {
+  db: Db;
+  companyId: string;
+  agentId: string;
+  issueId: string;
+  runId: string;
+  contextSnapshot: Record<string, unknown>;
+}): Promise<boolean> {
+  const attempt = () =>
+    input.db.transaction(
+      async (transaction): Promise<boolean | "pending_delivery"> => {
+        const tx = transaction as unknown as Db;
+        const [issue] = await tx
+          .select()
+          .from(issues)
+          .where(
+            and(
+              eq(issues.id, input.issueId),
+              eq(issues.companyId, input.companyId),
+            ),
+          )
+          .for("update", { noWait: true })
+          .limit(1);
+        const [run] = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, input.runId),
+              eq(heartbeatRuns.companyId, input.companyId),
+              eq(heartbeatRuns.agentId, input.agentId),
+            ),
+          )
+          .for("update", { noWait: true })
+          .limit(1);
+        const [actor] = await tx
+          .select({ status: agents.status })
+          .from(agents)
+          .where(
+            and(
+              eq(agents.id, input.agentId),
+              eq(agents.companyId, input.companyId),
+            ),
+          )
+          .for("update", { noWait: true })
+          .limit(1);
+        if (
+          !issue ||
+          !run ||
+          !actor ||
+          issue.status !== "in_review" ||
+          issue.assigneeAgentId !== input.agentId ||
+          issue.executionRunId !== input.runId ||
+          run.status !== "running" ||
+          (run.nativeIssueId !== null && run.nativeIssueId !== input.issueId) ||
+          ["paused", "terminated", "pending_approval", "error"].includes(
+            actor.status,
+          )
+        )
+          return false;
+        const admittedContext = parseObject(run.contextSnapshot);
+        const admittedIds = extractWakeCommentIds(admittedContext);
+        const suppliedIds = extractWakeCommentIds(input.contextSnapshot);
+        if (
+          admittedContext.issueId !== input.issueId ||
+          input.contextSnapshot.issueId !== input.issueId ||
+          admittedContext.source !== input.contextSnapshot.source ||
+          admittedIds.length === 0 ||
+          admittedIds.length !== suppliedIds.length ||
+          admittedIds.some((id, index) => id !== suppliedIds[index])
+        )
+          return false;
+        try {
+          // The marker is built here only after proving the real execution owner.
+          // The shared boundary then verifies current provider/resource/principal
+          // access for every admitted message; no lifecycle state is mutated.
+          await authorizeChatConversationForBoundRun(
+            tx,
+            input,
+            {
+              ...admittedContext,
+              [PAPERCLIP_HARNESS_CHECKOUT_KEY]: false,
+              [PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY]: true,
+            },
+            "nonblocking",
+          );
+          return true;
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message === "paperclip_runner_chat_attachment_binding_denied"
+          ) {
+            // Inbound processing commits the message/link before dispatching its
+            // wake, but completes subscription and marks delivery processed after
+            // dispatch. Wait for that exact committed batch, never admit it early.
+            const links = await tx
+              .select({
+                commentId: chatMessageLinks.commentId,
+                state: chatDeliveries.state,
+              })
+              .from(chatMessageLinks)
+              .innerJoin(
+                chatDeliveries,
+                and(
+                  eq(chatDeliveries.id, chatMessageLinks.deliveryId),
+                  eq(chatDeliveries.companyId, chatMessageLinks.companyId),
+                  eq(chatDeliveries.endpointId, chatMessageLinks.endpointId),
+                  eq(
+                    chatDeliveries.conversationId,
+                    chatMessageLinks.conversationId,
+                  ),
+                ),
+              )
+              .where(
+                and(
+                  eq(chatMessageLinks.companyId, input.companyId),
+                  eq(chatMessageLinks.direction, "inbound"),
+                  inArray(chatMessageLinks.commentId, admittedIds),
+                ),
+              );
+            if (
+              admittedIds.every((id) =>
+                links.some((link) => link.commentId === id),
+              ) &&
+              links.some((link) => link.state === "processing") &&
+              links.every(
+                (link) =>
+                  link.state === "processing" || link.state === "processed",
+              )
+            ) {
+              return "pending_delivery";
+            }
+          }
+          if (
+            error instanceof Error &&
+            [
+              "paperclip_runner_chat_attachment_binding_denied",
+              "paperclip_runner_chat_attachment_destination_denied",
+              "paperclip_runner_chat_attachment_principal_denied",
+            ].includes(error.message)
+          )
+            return false;
+          throw error;
+        }
+      },
+    );
+  // Release every lock before retrying and re-prove the current execution
+  // owner, admitted batch, and policy. Routine control-plane contention is not
+  // evidence that the user lost access; neither is it permission to bypass it.
+  for (let attemptNumber = 0; attemptNumber < 51; attemptNumber += 1) {
+    try {
+      const result = await attempt();
+      if (result !== "pending_delivery") return result;
+    } catch (error) {
+      if (!isExternalChatWaitAuthorizationContention(error)) throw error;
+    }
+    if (attemptNumber < 50)
+      await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("reviewed_chat_execution_binding_not_ready");
 }
 
 export async function buildPaperclipWakePayload(input: {
@@ -7563,6 +7773,8 @@ export async function buildPaperclipWakePayload(input: {
       Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
     checkedOutByHarness:
       input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
+    externalChatExecutionBound:
+      input.contextSnapshot[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] === true,
     simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,
     dependencyBlockedInteraction:
       input.contextSnapshot.dependencyBlockedInteraction === true,
@@ -18441,6 +18653,7 @@ export function heartbeatService(
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
     } = {},
   ) {
+    const attemptStartedAtMs = Date.now();
     if ((await getSchedulingSuppression()).suppressed) {
       try {
         await releaseRunClaimedJustBeforeSuppression(runId);
@@ -18590,6 +18803,9 @@ export function heartbeatService(
 
       const runtime = await ensureRuntimeState(agent);
       const context = parseObject(run.contextSnapshot);
+      // Never adopt a chat-execution attestation supplied in a wake payload.
+      // Reviewed chat turns rebuild it from the current durable owner below.
+      delete context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
       const providerTraceRequested =
         parseObject(context.debug).providerTrace === "raw";
       if (providerTraceRequested) {
@@ -18701,6 +18917,27 @@ export function heartbeatService(
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = false;
         }
         issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+      }
+      if (
+        issueId &&
+        issueContext?.status === "in_review" &&
+        CHAT_PROVIDERS.some(
+          (provider) =>
+            context.source === `chat:${provider}` ||
+            context.source === `chat:${provider}:recovery`,
+        )
+      ) {
+        const attested = await attestReviewedExternalChatRun({
+          db,
+          companyId: agent.companyId,
+          agentId: agent.id,
+          issueId,
+          runId: run.id,
+          contextSnapshot: context,
+        });
+        if (!attested)
+          throw new Error("reviewed_chat_execution_binding_not_authorized");
+        context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY] = true;
       }
       const wakeCommentId = deriveCommentId(context, null);
       const wakeCommentContext =
@@ -21964,30 +22201,14 @@ export function heartbeatService(
               });
             }
             nativeRunnerPreparationSpans.push(
-              {
-                name: "heartbeat.queue",
-                parentName: "task.run",
-                startedAtMs: runCreatedAtMs,
-                endedAtMs: Math.max(runCreatedAtMs, runStartedAtMs),
-              },
-              {
-                name: "heartbeat.prepare_before_environment",
-                parentName: "task.run",
-                startedAtMs: runStartedAtMs,
-                endedAtMs: Math.max(
-                  runStartedAtMs,
-                  environmentAcquireStartedAtMs,
-                ),
-              },
-              {
-                name: "heartbeat.prepare_after_environment",
-                parentName: "task.run",
-                startedAtMs: Math.min(
-                  nativeDispatchAtMs,
-                  environmentRealizeEndedAtMs,
-                ),
-                endedAtMs: nativeDispatchAtMs,
-              },
+              ...buildNativeHeartbeatPreparationSpans({
+                runCreatedAtMs,
+                runStartedAtMs,
+                attemptStartedAtMs,
+                environmentAcquireStartedAtMs,
+                environmentRealizeEndedAtMs,
+                nativeDispatchAtMs,
+              }),
             );
             // Native Git/gh uses the same authenticated remote callback
             // transport as managed adapters. A bridge failure must not make

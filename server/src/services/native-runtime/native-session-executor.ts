@@ -98,6 +98,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { resolvePaperclipRunnerBinary } from "./native-codex-runner.js";
 import {
   createNativeRunTrace,
+  nativeRunPreparationStarts,
   type NativeRunHistoricalSpan,
   type NativeRunSpanScope,
   type NativeRunTrace,
@@ -3850,19 +3851,19 @@ async function executePaperclipNativeSessionWithinScope(
       "paperclip_runner_provider_unsupported: ACPX Pi is unavailable until descriptor-confined verified launch is implemented",
     );
   }
-  const earliestPreparationStart = input.preparationSpans?.reduce(
-    (earliest, span) => Math.min(earliest, span.startedAtMs),
+  const preparationSpans = input.preparationSpans ?? [];
+  const preparationStarts = nativeRunPreparationStarts(
+    preparationSpans,
     Date.now(),
   );
   const trace = createNativeRunTrace({
     runId: input.execution.binding.runId,
-    startedAtMs: earliestPreparationStart,
+    startedAtMs: preparationStarts.runStartedAtMs,
     onEvent: input.onEvent,
   });
-  const preparationSpans = input.preparationSpans ?? [];
   const taskPrepareScope = trace.start("task.prepare", {
     parentName: "task.run",
-    startedAtMs: earliestPreparationStart,
+    startedAtMs: preparationStarts.preparationStartedAtMs,
   });
   const environmentSpans = preparationSpans.filter(
     (span) =>

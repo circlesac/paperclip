@@ -302,7 +302,12 @@ export async function resolveCurrentWakeCommentsBinding(
   if (
     !provider ||
     !EXTERNAL_CHAT_PROVIDERS.has(provider) ||
-    wake.checkedOutByHarness !== true ||
+    (wake.checkedOutByHarness !== true &&
+      !(
+        wake.externalChatExecutionBound === true &&
+        record(bound.run.contextSnapshot)
+          .paperclipExternalChatExecutionBound === true
+      )) ||
     wake.fallbackFetchNeeded !== true ||
     commentIds.length === 0 ||
     wake.latestCommentId !== commentIds[commentIds.length - 1] ||

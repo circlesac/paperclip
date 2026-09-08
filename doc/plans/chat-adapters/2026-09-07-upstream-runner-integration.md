@@ -479,3 +479,59 @@ provider turn without replaying its work. Retest these exact provider journeys
 after deploying those fixes. Teams still needs the previously documented
 work/school tenant and bot-registration/admin setup; personal Teams login is
 not qualification.
+
+### Corrections from those live failures
+
+Recovery commit `d2c3e87d0` reconciles the exact previously active provider turn
+before returning a recovered session. Native execution consumes a newly adopted
+terminal without resending the original work and without checkpointing that
+terminal before its event is durable. Tests cover completed/interrupted turns,
+failed append followed by recovery, unchanged identities and exactly-once
+finalization. Driver/backend/runtime coverage passed **299/299** during combined
+integration (`native-recovery-root-05.log`); the expanded runtime suite alone
+passed **74/74** and its typecheck passed.
+
+Reviewed follow-ups now receive a distinct, server-minted chat execution binding
+only after proving current run ownership and current endpoint, resource and
+principal authorization. It is explicitly not checkout or approval; a real
+pending governance interaction remains unchanged. Current/historical readers
+retain their full permission checks. Pure same-issue status coalescence keeps
+the exact admitted chat payload; changed source/comment scope cannot reuse its
+authority. The reviewed binding has a five-second bounded retry for normal row
+contention or the exact inbound delivery still finishing, releasing locks and
+rechecking authority between attempts. Its focused real-PostgreSQL/prompt/reader
+coverage passed **202/202**, with server and adapter-utils typechecks.
+
+The explicit wait failure was also a tool-contract gap: the generic run-result
+schema allowed a yield, but Codex's completion tool and runnerd rejected it.
+`paperclip_finish` now accepts `yielded` only with a `response_wake` continuation;
+an immediate `same_agent` continuation remains rejected. Tool fingerprint v6
+rotates v5 catalogs. Focused runner checks passed **36/36**, resume checks
+**31/31**, exact Rust admission checks **2/2**, and Rust format/TypeScript checks
+passed. A broader Rust substring command overmatched unrelated ACPX port tests
+and failed three host-port reservations; that command is not reported as green.
+
+Preparation timings now begin at the current dispatch attempt, not the original
+run start before sleep. Original queue/comment history and total elapsed run
+time remain intact. The actual executor wiring and timing cases pass
+**154/154** (`native-timing-root-01.log`). The combined full server/runner build,
+including semantic contracts, generated catalogs, binary and replay golden
+checks, passed (`native-followup-root-build-01.log`). Live requalification of
+these corrections is still required.
+
+An independent **73/73** safety/transcript check confirms native commentary,
+reasoning, tool activity and timing are Board-visible but not copied into chat.
+External surfaces receive safe lifecycle, authorized final replies, projected
+questions and selected attachment handoffs. External progress remains coarse.
+Same-bot uploads intentionally serialize, while independent endpoint lanes
+avoid cross-bot head-of-line blocking. Eligible new Slack/Telegram long posts
+still incur bounded synthetic streaming delay (about one second per 4,000
+characters); edited working messages bypass it.
+
+The inbound dispatch-order audit found a remaining durability concern: both
+initial ingress and committed-link recovery can dispatch the wake before
+subscription and the `processed` delivery transition finish. The bounded
+reviewed-attestation retry mitigates that startup window, but is not an atomic
+outbox. Reordering those writes naively would lose wakeups after a crash. A
+separate delivery-bound durable wake-intent design is being reviewed; no claim
+of full production readiness should omit this remaining race.

@@ -139,6 +139,17 @@ const artifactsSchema = {
   },
 } as const;
 
+const responseWakeContinuationSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["kind", "summary", "idempotencyKey"],
+  properties: {
+    kind: { type: "string", const: "response_wake" },
+    summary: { type: "string", minLength: 1 },
+    idempotencyKey: { type: "string", minLength: 1 },
+  },
+} as const;
+
 const commonResultProperties = {
   schema: { type: "string", const: "paperclip.run_result.v1" },
   summary: { type: "string", minLength: 1 },
@@ -163,7 +174,8 @@ export const PRP_COMPLETION_RESULT_OUTPUT_SCHEMA = {
   ],
   properties: {
     ...commonResultProperties,
-    reportedWorkDisposition: { enum: ["done", "needs_review"] },
+    reportedWorkDisposition: { enum: ["done", "needs_review", "yielded"] },
+    continuation: responseWakeContinuationSchema,
   },
   allOf: [
     {
@@ -173,6 +185,10 @@ export const PRP_COMPLETION_RESULT_OUTPUT_SCHEMA = {
     {
       if: { properties: { reportedWorkDisposition: { const: "needs_review" } }, required: ["reportedWorkDisposition"] },
       then: { properties: { attentionRequests: { minItems: 1 } } },
+    },
+    {
+      if: { properties: { reportedWorkDisposition: { const: "yielded" } }, required: ["reportedWorkDisposition"] },
+      then: { required: ["continuation"] },
     },
   ],
 } as const;
@@ -323,10 +339,15 @@ export const PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA = {
   ],
   properties: {
     ...providerCommonResultProperties,
-    reportedWorkDisposition: { enum: ["done", "needs_review", "completed"] },
+    reportedWorkDisposition: { enum: ["done", "needs_review", "yielded", "completed"] },
     verification: providerVerificationCompatibilitySchema,
     attentionRequests: providerAttentionCompatibilitySchema,
+    continuation: responseWakeContinuationSchema,
   },
+  allOf: [{
+    if: { properties: { reportedWorkDisposition: { const: "yielded" } }, required: ["reportedWorkDisposition"] },
+    then: { required: ["continuation"] },
+  }],
 } as const;
 
 export const PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA = {

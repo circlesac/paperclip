@@ -154,6 +154,50 @@ const PRE_STRUCTURED_HUMAN_INPUT_TOOL_CONTRACT_FINGERPRINT = `sha256:${createHas
   )
   .digest("hex")}`;
 
+const PRE_RESPONSE_WAKE_YIELD_TOOL_CONTRACT_FINGERPRINT = `sha256:${createHash(
+  "sha256",
+)
+  .update(
+    JSON.stringify({
+      schema: "paperclip.native-tool-contract.v5",
+      executionTargetKind: "local",
+      advertisementPolicy: {
+        readCurrentWakeComments: "always_advertised_binding_gated.v1",
+        historicalChatAttachments:
+          "always_advertised_conversation_binding_gated.v1",
+        registerDeliverable: "local_workspace_only.v1",
+        readChatAttachment: "always_advertised_run_scope_local_staging.v1",
+        structuredHumanInput:
+          "always_advertised_run_issue_agent_binding_gated.v1",
+      },
+      tools: [
+        { name: "register_deliverable", version: 1 },
+        {
+          name: "read_current_wake_comments",
+          semanticContract: "paperclip.server-current-wake-comments.v1",
+          version: 1,
+        },
+        {
+          name: "list_chat_attachments",
+          semanticContract: "paperclip.server-chat-attachment-reuse.v1",
+          version: 1,
+        },
+        {
+          name: "reuse_chat_attachment",
+          semanticContract: "paperclip.server-chat-attachment-reuse.v1",
+          version: 1,
+        },
+        {
+          name: "read_chat_attachment",
+          semanticContract: "paperclip.server-chat-attachment-read.v1",
+          version: 1,
+        },
+        { name: "request_human_input", version: 1 },
+      ],
+    }),
+  )
+  .digest("hex")}`;
+
 function execution(
   runId: string,
   cwd = "/workspace",
@@ -1009,6 +1053,21 @@ describe("rebindNativeSessionCheckpoint", () => {
         previousRun: previousRun({
           nativeToolContractFingerprint:
             PRE_STRUCTURED_HUMAN_INPUT_TOOL_CONTRACT_FINGERPRINT,
+        }),
+        currentExecution: execution(currentRunId),
+      }),
+    ).toBeNull();
+  });
+
+  it("rotates direct provider threads whose retained completion tool cannot yield for a response", () => {
+    expect(PRE_RESPONSE_WAKE_YIELD_TOOL_CONTRACT_FINGERPRINT).not.toBe(
+      NATIVE_TOOL_CONTRACT_FINGERPRINT,
+    );
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: previousRun({
+          nativeToolContractFingerprint:
+            PRE_RESPONSE_WAKE_YIELD_TOOL_CONTRACT_FINGERPRINT,
         }),
         currentExecution: execution(currentRunId),
       }),

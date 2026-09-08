@@ -6,7 +6,7 @@ import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.j
 import type { CodexRpcServerRequest } from "./app-server-transport.js";
 import {
   boundedCodexValue,
-  codexToolAcceptsDisposition as toolAcceptsDisposition,
+  codexToolAcceptsResult as toolAcceptsResult,
   isCodexSemanticTool as isSemanticTool,
   isRetainableCodexPayload,
   redactCodexValue,
@@ -184,7 +184,7 @@ async function handleServerRequestBody(
         };
       }
       if (
-        !toolAcceptsDisposition(tool, validation.result.reportedWorkDisposition)
+        !toolAcceptsResult(tool, validation.result)
       ) {
         return {
           success: false,
@@ -194,7 +194,7 @@ async function handleServerRequestBody(
               text:
                 tool === CODEX_BLOCK_TOOL_NAME
                   ? "paperclip_block requires reportedWorkDisposition=blocked."
-                  : "paperclip_finish accepts only done or needs_review.",
+                  : "paperclip_finish accepts done, needs_review, or yielded with a response_wake continuation.",
             },
           ],
         };

@@ -29,6 +29,29 @@ describe("provider-neutral completion result schema", () => {
     expect(validate(structuredClone(baseResult))).toBe(true);
   });
 
+  it("allows only a response-wake continuation when completion explicitly yields", () => {
+    const yielded = {
+      ...structuredClone(baseResult),
+      reportedWorkDisposition: "yielded",
+      completionClaim: {
+        ...structuredClone(baseResult.completionClaim),
+        objectiveSatisfied: false,
+        remainingWork: [{ description: "Wait for the next response.", blocksCompletion: true }],
+      },
+      continuation: {
+        kind: "response_wake",
+        summary: "Resume after the next response.",
+        idempotencyKey: "response-wake-1",
+      },
+    };
+    expect(validate(yielded)).toBe(true);
+    expect(validate({ ...yielded, continuation: undefined })).toBe(false);
+    expect(validate({
+      ...yielded,
+      continuation: { ...yielded.continuation, kind: "same_agent" },
+    })).toBe(false);
+  });
+
   it("allows provider tool callers to omit the constant schema discriminator", () => {
     const providerValidate = new Ajv2020({ allErrors: true, strict: false })
       .compile(PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA);

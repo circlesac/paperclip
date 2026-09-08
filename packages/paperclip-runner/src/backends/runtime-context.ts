@@ -26,7 +26,7 @@ export function nativeSystemInstructions(input: NativeExecutionInput): string {
 
 export function nativeTaskConstraints(input: NativeExecutionInput): string[] {
   const finalResponseConstraint =
-    "Invoke paperclip_finish or paperclip_block exactly once before writing the complete user-facing final response. After the semantic tool succeeds, write that response exactly once and do not call another tool.";
+    "Invoke paperclip_finish or paperclip_block exactly once before writing the complete user-facing final response. Use paperclip_finish with yielded and a response_wake continuation only when explicitly waiting for the next response. After the semantic tool succeeds, write that response exactly once and do not call another tool.";
   if (!("runtimeContext" in input)) {
     return [
       "Do not discover or invoke skills.",

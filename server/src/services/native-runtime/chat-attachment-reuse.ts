@@ -359,7 +359,8 @@ async function principalAuthorized(
   return endpoint.sponsorUserId ? activeMember(endpoint.sponsorUserId) : true;
 }
 
-async function authorizedConversation(
+/** Caller must independently verify the current run/issue execution owner. */
+export async function authorizeChatConversationForBoundRun(
   tx: Db,
   binding: ChatReuseBinding,
   contextSnapshot: unknown,
@@ -380,7 +381,8 @@ async function authorizedConversation(
   const commentIds = wakeCommentIds(context);
   if (
     !provider ||
-    context.paperclipHarnessCheckedOut !== true ||
+    (context.paperclipHarnessCheckedOut !== true &&
+      context.paperclipExternalChatExecutionBound !== true) ||
     commentIds.length === 0
   ) {
     throw new Error("paperclip_runner_chat_attachment_binding_denied");
@@ -511,10 +513,14 @@ function externalChatWaitCandidate(
     : [];
   if (
     !provider ||
-    context.paperclipHarnessCheckedOut !== true ||
+    !(
+      (context.paperclipHarnessCheckedOut === true &&
+        wake.checkedOutByHarness === true) ||
+      (context.paperclipExternalChatExecutionBound === true &&
+        wake.externalChatExecutionBound === true)
+    ) ||
     commentIds.length === 0 ||
     wake.externalChatProvider !== provider ||
-    wake.checkedOutByHarness !== true ||
     wakeIssue.id !== binding.issueId ||
     payloadCommentIds.length !== commentIds.length ||
     payloadCommentIds.some((id, index) => id !== commentIds[index])
@@ -662,7 +668,12 @@ export async function resolveExternalChatResponseWaitAuthorizationInTransaction(
     return "revoked";
   }
   try {
-    await authorizedConversation(tx, binding, run.contextSnapshot, lockMode);
+    await authorizeChatConversationForBoundRun(
+      tx,
+      binding,
+      run.contextSnapshot,
+      lockMode,
+    );
     return "authorized";
   } catch (error) {
     if (
@@ -936,7 +947,7 @@ export async function listAuthorizedChatAttachments(input: {
     ) {
       throw new Error("paperclip_runner_tool_binding_not_authorized");
     }
-    const conversation = await authorizedConversation(
+    const conversation = await authorizeChatConversationForBoundRun(
       tx as unknown as Db,
       input.binding,
       current.run.contextSnapshot,
@@ -1123,7 +1134,7 @@ export async function authorizeChatAttachmentReuse(input: {
   /** Inspection may open empty files; publication retains its nonempty bound. */
   allowEmpty?: boolean;
 }): Promise<ChatAttachmentReuseSource> {
-  const conversation = await authorizedConversation(
+  const conversation = await authorizeChatConversationForBoundRun(
     input.db,
     input.binding,
     input.contextSnapshot,

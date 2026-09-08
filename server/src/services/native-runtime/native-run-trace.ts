@@ -22,6 +22,65 @@ export interface NativeRunHistoricalSpan {
   attributes?: Record<string, string | number | boolean>;
 }
 
+export function buildNativeHeartbeatPreparationSpans(input: {
+  runCreatedAtMs: number;
+  runStartedAtMs: number;
+  attemptStartedAtMs: number;
+  environmentAcquireStartedAtMs: number;
+  environmentRealizeEndedAtMs: number;
+  nativeDispatchAtMs: number;
+}): NativeRunHistoricalSpan[] {
+  return [
+    {
+      name: "heartbeat.queue",
+      parentName: "task.run",
+      startedAtMs: input.runCreatedAtMs,
+      endedAtMs: Math.max(input.runCreatedAtMs, input.runStartedAtMs),
+    },
+    {
+      name: "heartbeat.prepare_before_environment",
+      parentName: "task.run",
+      // A same-run resume retains startedAt for wall-time accounting; it is
+      // not the beginning of this dispatch attempt's preparation.
+      startedAtMs: input.attemptStartedAtMs,
+      endedAtMs: Math.max(
+        input.attemptStartedAtMs,
+        input.environmentAcquireStartedAtMs,
+      ),
+    },
+    {
+      name: "heartbeat.prepare_after_environment",
+      parentName: "task.run",
+      startedAtMs: Math.min(
+        input.nativeDispatchAtMs,
+        input.environmentRealizeEndedAtMs,
+      ),
+      endedAtMs: input.nativeDispatchAtMs,
+    },
+  ];
+}
+
+export function nativeRunPreparationStarts(
+  spans: NativeRunHistoricalSpan[],
+  nowMs: number,
+): { runStartedAtMs: number; preparationStartedAtMs: number } {
+  const runStartedAtMs = spans.reduce(
+    (earliest, span) => Math.min(earliest, span.startedAtMs),
+    nowMs,
+  );
+  // Queue and accepted-comment latency remain run-level history. Including
+  // them in task.prepare would charge previous attempts and recovery delays
+  // to every resumed attempt, even if its actual startup took milliseconds.
+  const preparationStartedAtMs = spans
+    .filter(
+      (span) =>
+        span.name !== "heartbeat.queue" &&
+        span.name !== "comment.to_run_created",
+    )
+    .reduce((earliest, span) => Math.min(earliest, span.startedAtMs), nowMs);
+  return { runStartedAtMs, preparationStartedAtMs };
+}
+
 export interface NativeRunSpanScope {
   readonly name: string;
   readonly parentName: string;

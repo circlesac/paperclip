@@ -770,6 +770,7 @@ type PaperclipWakePayload = {
   recovery: PaperclipWakeRecovery | null;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
+  externalChatExecutionBound: boolean;
   externalChatProvider: PaperclipExternalChatProvider | null;
   skillTest: boolean;
   // Experimental: write user-interaction content in ASD-STE100 Simplified
@@ -1763,6 +1764,7 @@ export function normalizePaperclipWakePayload(
     recovery,
     issue,
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
+    externalChatExecutionBound: payload.externalChatExecutionBound === true,
     externalChatProvider: normalizePaperclipExternalChatProvider(
       payload.externalChatProvider,
     ),
@@ -1860,7 +1862,8 @@ function hasNormalizedPaperclipExternalChatContext(
 } {
   if (
     !normalized?.externalChatProvider ||
-    !normalized.checkedOutByHarness ||
+    (!normalized.checkedOutByHarness &&
+      !normalized.externalChatExecutionBound) ||
     !normalized.issue?.id ||
     !PAPERCLIP_EXTERNAL_CHAT_WAKE_REASONS.has(normalized.reason ?? "")
   ) {
@@ -2104,7 +2107,9 @@ export function renderPaperclipWakePrompt(
     ? [
         "## External chat response contract",
         "",
-        `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip already authorized and bound the provider message, assigned this immutable agent, and checked out the issue for this run.`,
+        normalized.checkedOutByHarness
+          ? `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip already authorized and bound the provider message, assigned this immutable agent, and checked out the issue for this run.`
+          : `This is a server-authenticated ${normalized.externalChatProvider} chat turn. Paperclip verified the provider message and this agent's current execution binding. The task remains in review: this binding is not a checkout, approval, or permission to change its status or bypass any review gate.`,
         ...(externalChatReaderTurn
           ? [
               "The inline comment batch is incomplete. Before answering, call `read_current_wake_comments` without a cursor, then pass each returned `nextCursor` until `complete` is true. That closed reader exposes only the exact comments accepted for this run. Attachment entries marked `metadata_only` are not readable bytes; state that limitation instead of inferring their contents.",

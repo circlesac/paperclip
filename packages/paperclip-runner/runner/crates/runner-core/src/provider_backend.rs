@@ -363,7 +363,15 @@ fn admit_terminal_tool_authority(
     .to_owned();
     let fingerprint = semantic_value_digest(input);
     let disposition_matches_operation = match operation_id {
-        "paperclip_finish" => matches!(disposition.as_str(), "done" | "needs_review"),
+        "paperclip_finish" => {
+            matches!(disposition.as_str(), "done" | "needs_review")
+                || (disposition == "yielded"
+                    && input
+                        .get("continuation")
+                        .and_then(|continuation| continuation.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("response_wake"))
+        }
         "paperclip_block" => disposition == "blocked",
         _ => false,
     };
@@ -3462,6 +3470,41 @@ mod tests {
             "needs_review"
         );
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn accepted_terminal_tool_preserves_an_explicit_response_wait() {
+        let mut state = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["reportedWorkDisposition"] = json!("yielded");
+        result["continuation"] = json!({
+            "kind": "response_wake",
+            "summary": "Wait for the next response.",
+            "idempotencyKey": "response-wake-1"
+        });
+
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false).unwrap();
+        let terminal = terminal_events(&state, "turn.completed");
+
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload["reportedWorkDisposition"], "yielded");
+        assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn terminal_tool_authority_rejects_an_unbound_yield() {
+        let mut state = opencode_result_state();
+        let mut result = valid_opencode_result();
+        result["reportedWorkDisposition"] = json!("yielded");
+        result["continuation"] = json!({
+            "kind": "same_agent",
+            "summary": "Continue immediately.",
+            "idempotencyKey": "same-agent-1"
+        });
+
+        assert!(
+            admit_terminal_tool_authority(&mut state, "paperclip_finish", &result, false,).is_err()
+        );
     }
 
     #[test]

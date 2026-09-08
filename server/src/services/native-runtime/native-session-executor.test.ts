@@ -29,6 +29,8 @@ import {
   verifyNativeHarnessBackupStamp,
 } from "./native-harness-backup-stamp.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { buildNativeHeartbeatPreparationSpans } from "./native-run-trace.js";
+import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 
 type BackendFactoryOptions = {
   runnerInstanceId?: string;
@@ -2503,6 +2505,64 @@ function cancellationDb(options?: {
     tx,
   };
 }
+
+describe("native resumed preparation timing", () => {
+  it("uses attempt-local preparation in the executor without truncating run elapsed time", async () => {
+    const attemptStartedAtMs = Date.now();
+    const runStartedAtMs = attemptStartedAtMs - 983_000;
+    const events: AdapterRuntimeEvent[] = [];
+    state.execute.mockReset().mockResolvedValueOnce({
+      result: { summary: "cancelled" },
+      terminal: { runTerminalState: "cancelled" },
+      turnId: "turn",
+      normalizedSessionId: "session",
+      providerSessionId: null,
+      driverKind: "test",
+      driverVersion: "1",
+      nativeEventCount: 1,
+      highestContiguousSourceSeq: 1,
+    });
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(attemptStartedAtMs + 50);
+    try {
+      await executePaperclipNativeSession({
+        db: leaseDb(),
+        execution,
+        runnerInstanceId: "runner",
+        preparationSpans: buildNativeHeartbeatPreparationSpans({
+          runCreatedAtMs: runStartedAtMs - 1_000,
+          runStartedAtMs,
+          attemptStartedAtMs,
+          environmentAcquireStartedAtMs: attemptStartedAtMs + 20,
+          environmentRealizeEndedAtMs: attemptStartedAtMs + 30,
+          nativeDispatchAtMs: attemptStartedAtMs + 40,
+        }),
+        onEvent: async (event) => {
+          events.push(event);
+        },
+      });
+    } finally {
+      clock.mockRestore();
+    }
+    const payloadFor = (name: string) =>
+      events.find((event) => event.payload?.span === name)?.payload;
+    expect(payloadFor("heartbeat.prepare_before_environment")).toMatchObject({
+      durationMs: 20,
+    });
+    expect(payloadFor("task.prepare")).toMatchObject({
+      durationMs: 50,
+      startOffsetMs: 984_000,
+    });
+    expect(payloadFor("heartbeat.queue")).toMatchObject({
+      durationMs: 1_000,
+      startOffsetMs: 0,
+    });
+    expect(payloadFor("task.run.measured")).toMatchObject({
+      durationMs: 984_050,
+    });
+  });
+});
 
 describe("native session cancellation", () => {
   beforeEach(() => {

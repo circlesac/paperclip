@@ -1027,6 +1027,45 @@ describe("renderPaperclipWakePrompt", () => {
     ).toBe(false);
   });
 
+  it("describes authenticated reviewed chat as an execution binding, not a checkout or approval", () => {
+    const reviewed = {
+      ...ordinaryExternalChatWake,
+      checkedOutByHarness: false,
+      externalChatExecutionBound: true,
+      issue: { ...ordinaryExternalChatWake.issue, status: "in_review" },
+    };
+    expect(isPaperclipExternalChatContractTurn(reviewed)).toBe(true);
+    const normalized = JSON.parse(
+      stringifyPaperclipWakePayload(reviewed) ?? "{}",
+    );
+    expect(normalized).toMatchObject({
+      checkedOutByHarness: false,
+      externalChatExecutionBound: true,
+    });
+    const prompt = renderPaperclipWakePrompt(reviewed);
+    expect(prompt).toContain("server-authenticated github chat turn");
+    expect(prompt).toContain("The task remains in review");
+    expect(prompt).toContain("not a checkout, approval");
+    expect(prompt).not.toContain("checked out the issue for this run");
+    for (const externalChatExecutionBound of [false, "true", 1, undefined]) {
+      expect(
+        isPaperclipExternalChatContractTurn({
+          ...reviewed,
+          externalChatExecutionBound,
+        }),
+      ).toBe(false);
+    }
+    expect(
+      isPaperclipExternalChatContractTurn({
+        ...reviewed,
+        externalChatProvider: null,
+      }),
+    ).toBe(false);
+    expect(
+      isPaperclipExternalChatContractTurn({ ...reviewed, issue: null }),
+    ).toBe(false);
+  });
+
   it("renders one authoritative direct-response contract for fresh and resumed external-chat turns", () => {
     for (const prompt of [
       renderPaperclipWakePrompt(ordinaryExternalChatWake),
