@@ -1801,6 +1801,7 @@ function isSupportedTelegramWebhookBaseUrl(value: string | null): boolean {
 
 type GitHubLifecycleEvent = {
   actor?: LifecycleActor;
+  isBotMessage?: true;
   eventKind: "message_updated" | "message_deleted";
   messageId: string;
   providerEventId?: string;
@@ -2094,11 +2095,12 @@ async function githubLifecycleEventFromRequest(
       in_reply_to_id?: unknown;
       body?: unknown;
       updated_at?: unknown;
+      user?: { type?: unknown };
     };
     issue?: { number?: unknown; pull_request?: unknown };
     pull_request?: { number?: unknown };
     repository?: { name?: unknown; owner?: { login?: unknown } };
-    sender?: { id?: unknown; login?: unknown };
+    sender?: { id?: unknown; login?: unknown; type?: unknown };
   };
   if (payload.action !== "edited" && payload.action !== "deleted") return null;
   const owner = payload.repository?.owner?.login;
@@ -2168,6 +2170,9 @@ async function githubLifecycleEventFromRequest(
       : undefined;
   return {
     ...(actor ? { actor } : {}),
+    ...(payload.comment?.user?.type === "Bot" || payload.sender?.type === "Bot"
+      ? { isBotMessage: true as const }
+      : {}),
     eventKind,
     messageId: String(messageId),
     ...(deliveryId ? { providerEventId: `github:delivery:${deliveryId}` } : {}),
@@ -12387,6 +12392,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function recordLifecycleDelivery(
     input: {
       actor?: LifecycleActor;
+      isBotMessage?: true;
       endpointId: string;
       threadId: string;
       messageId: string;
@@ -12461,6 +12467,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             message: {
               providerMessageId: input.messageId,
               targetProviderEventId,
+              ...(endpoint.provider === "github" && input.isBotMessage === true
+                ? { isBotMessage: true }
+                : {}),
               providerMessageSequence: input.providerMessageSequence ?? null,
               providerSentAt: input.providerSentAt ?? null,
               providerUpdateId: input.providerUpdateId ?? null,
@@ -12519,6 +12528,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   function lifecycleMessageFromDelivery(delivery: DeliveryRow): {
     actor: LifecycleActor | null;
+    isBotMessage: boolean;
     messageId: string;
     providerSentAt: string | null;
     targetProviderEventId: string;
@@ -12538,6 +12548,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         handle?: unknown;
       };
       message?: {
+        isBotMessage?: unknown;
         providerMessageId?: unknown;
         providerSentAt?: unknown;
         targetProviderEventId?: unknown;
@@ -12570,6 +12581,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       threadId !== null
       ? {
           actor,
+          isBotMessage: normalized.message?.isBotMessage === true,
           messageId,
           providerSentAt:
             typeof providerSentAt === "string" ? providerSentAt : null,
@@ -12648,6 +12660,75 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               ),
             );
           return;
+        }
+        if (
+          currentEndpoint.provider === "github" &&
+          activeDelivery.eventKind === "message_updated"
+        ) {
+          // Bot callbacks can arrive before the outbound publication commits
+          // its message link. The Boolean comes only from GitHub's verified
+          // sender/comment-author type, never from comment text. Legacy rows
+          // lack it, so also recognize exact already-published outbound links.
+          const outbound = lifecycle.isBotMessage
+            ? null
+            : await tx
+                .select({ id: chatMessageLinks.id })
+                .from(chatMessageLinks)
+                .innerJoin(
+                  chatConversations,
+                  and(
+                    eq(chatConversations.id, chatMessageLinks.conversationId),
+                    eq(chatConversations.companyId, chatMessageLinks.companyId),
+                    eq(
+                      chatConversations.endpointId,
+                      chatMessageLinks.endpointId,
+                    ),
+                  ),
+                )
+                .where(
+                  and(
+                    eq(chatMessageLinks.companyId, currentEndpoint.companyId),
+                    eq(chatMessageLinks.endpointId, currentEndpoint.id),
+                    eq(chatMessageLinks.direction, "outbound"),
+                    eq(chatMessageLinks.providerMessageId, lifecycle.messageId),
+                    eq(chatConversations.externalThreadId, lifecycle.threadId),
+                  ),
+                )
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+          if (lifecycle.isBotMessage || outbound) {
+            const filteredAt = new Date();
+            await tx
+              .update(chatDeliveries)
+              .set({
+                state: "filtered",
+                principalId: null,
+                nextAttemptAt: null,
+                processedAt: filteredAt,
+                updatedAt: filteredAt,
+                redactedError:
+                  "Provider bot or outbound message updates do not create inbound work",
+                normalizedEvent: {
+                  providerEventId:
+                    activeDelivery.normalizedEvent.providerEventId ??
+                    activeDelivery.providerEventId,
+                  kind: activeDelivery.eventKind,
+                  conversation: { externalThreadId: lifecycle.threadId },
+                  message: {
+                    providerMessageId: lifecycle.messageId,
+                    targetProviderEventId: lifecycle.targetProviderEventId,
+                  },
+                  filtering: { contentRetained: false },
+                },
+              })
+              .where(
+                and(
+                  eq(chatDeliveries.id, activeDelivery.id),
+                  eq(chatDeliveries.state, "processing"),
+                ),
+              );
+            return;
+          }
         }
         if (
           activeDelivery.eventKind === "message_updated" ||

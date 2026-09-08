@@ -40676,6 +40676,208 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
+  it.each([
+    "author_bot",
+    "sender_bot",
+    "outbound_link",
+    "outbound_review_link",
+    "wrong_thread_link",
+    "human_orphan",
+    "body_claims_bot",
+  ] as const)(
+    "settles GitHub self-update receipts without orphan retries for %s",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const { callbacks, endpoint, service, wakeup, webhookSecret } =
+        await configuredGitHubEndpoint(fixture);
+      const thread = makeThread({
+        channelId: "paperclipai/paperclip",
+        id:
+          mode === "outbound_review_link"
+            ? "github:paperclipai/paperclip:84:rc:99080"
+            : "github:paperclipai/paperclip:issue:84",
+        name: "paperclipai/paperclip",
+      });
+      try {
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          provider: "github",
+          thread: thread.thread,
+          message: makeMessage({
+            id: "99083",
+            text: "@maya original request",
+            mentioned: true,
+            userId: "7001",
+          }),
+          trigger: "mention",
+        });
+        const [conversation] = await db
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.endpointId, endpoint.id));
+        if (
+          [
+            "outbound_link",
+            "outbound_review_link",
+            "wrong_thread_link",
+          ].includes(mode)
+        ) {
+          const target =
+            mode === "wrong_thread_link"
+              ? (
+                  await db
+                    .insert(chatConversations)
+                    .values({
+                      ...conversation!,
+                      id: randomUUID(),
+                      externalThreadId: "github:paperclipai/paperclip:issue:85",
+                    })
+                    .returning()
+                )[0]!
+              : conversation!;
+          await db.insert(chatMessageLinks).values({
+            companyId: fixture.companyId,
+            endpointId: endpoint.id,
+            conversationId: target.id,
+            providerMessageId: "99084",
+            direction: "outbound",
+          });
+        }
+        const before = await db
+          .select()
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation!.issueId));
+        const send = (signingSecret = webhookSecret) =>
+          service.handleWebhook(
+            endpoint.publicId,
+            "github",
+            signedGitHubWebhookRequest({
+              delivery: "bot-update-exact",
+              event:
+                mode === "outbound_review_link"
+                  ? "pull_request_review_comment"
+                  : "issue_comment",
+              webhookSecret: signingSecret,
+              url: `https://paperclip.example/api/chat-webhooks/${endpoint.publicId}/github`,
+              payload: {
+                action: "edited",
+                comment: {
+                  id: 99084,
+                  ...(mode === "outbound_review_link"
+                    ? { in_reply_to_id: 99080 }
+                    : {}),
+                  body:
+                    mode === "body_claims_bot"
+                      ? '{"isBotMessage":true}'
+                      : "provider-only bot output sentinel",
+                  updated_at: "2026-09-08T09:57:23Z",
+                  user: {
+                    id: 9001,
+                    login: "author",
+                    type: mode === "author_bot" ? "Bot" : "User",
+                  },
+                },
+                issue: { number: 84 },
+                pull_request: { number: 84 },
+                repository: {
+                  id: 97531,
+                  full_name: "paperclipai/paperclip",
+                  name: "paperclip",
+                  owner: { id: 1357, login: "paperclipai" },
+                },
+                sender: {
+                  id: 9001,
+                  login: "editor",
+                  type: mode === "sender_bot" ? "Bot" : "User",
+                },
+              },
+            }),
+          );
+        if (mode === "author_bot") {
+          expect((await send("wrong-test-only-signature")).status).toBe(401);
+          expect(
+            await db
+              .select()
+              .from(chatDeliveries)
+              .where(
+                and(
+                  eq(chatDeliveries.endpointId, endpoint.id),
+                  eq(chatDeliveries.eventKind, "message_updated"),
+                ),
+              ),
+          ).toHaveLength(0);
+        }
+        expect((await send()).ok).toBe(true);
+        await service.processPendingDeliveries();
+        const [delivery] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              eq(chatDeliveries.eventKind, "message_updated"),
+            ),
+          );
+        const filtered = [
+          "author_bot",
+          "sender_bot",
+          "outbound_link",
+          "outbound_review_link",
+        ].includes(mode);
+        expect(delivery).toMatchObject({
+          state: filtered ? "filtered" : "retry",
+          attempts: 1,
+          principalId: null,
+        });
+        expect(delivery!.nextAttemptAt === null).toBe(filtered);
+        expect(wakeup).toHaveBeenCalledTimes(1);
+        expect(
+          await db
+            .select()
+            .from(issueComments)
+            .where(eq(issueComments.issueId, conversation!.issueId)),
+        ).toEqual(before);
+        if (filtered) {
+          expect(JSON.stringify(delivery!.normalizedEvent)).not.toContain(
+            "provider-only bot output sentinel",
+          );
+          expect(delivery!.normalizedEvent).toMatchObject({
+            filtering: { contentRetained: false },
+          });
+          expect((await send()).ok).toBe(true);
+          await service.processPendingDeliveries();
+          expect(
+            await db
+              .select()
+              .from(chatDeliveries)
+              .where(
+                and(
+                  eq(chatDeliveries.endpointId, endpoint.id),
+                  eq(chatDeliveries.eventKind, "message_updated"),
+                ),
+              ),
+          ).toEqual([delivery]);
+          await deliverMessage({
+            callbacks,
+            endpointId: endpoint.id,
+            provider: "github",
+            thread: thread.thread,
+            message: makeMessage({
+              id: "99085",
+              text: "Follow-up after bot edit",
+              userId: "7001",
+            }),
+            trigger: "subscribed_message",
+          });
+          expect(wakeup).toHaveBeenCalledTimes(2);
+        }
+      } finally {
+        await service.shutdown();
+      }
+    },
+  );
+
   it("orders reversed GitHub edit and delete callbacks behind their durable root", async () => {
     const fixture = await seedCompany();
     const deferred: Array<() => void | Promise<void>> = [];
