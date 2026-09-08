@@ -11317,10 +11317,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       "follow-up 7",
       "follow-up 8",
     ]);
-    expect(wakeup).toHaveBeenCalledTimes(8);
-    expect(
-      wakeup.mock.calls.map((call) => call[1]?.payload?.wakeCommentId),
-    ).toEqual(comments.map((comment) => comment.id));
+    // Comment admission commits before the durable wake. Wait for this
+    // company's last wake too, not merely its already-visible last comment.
+    // The competing sweep may legitimately reconcile another fixture company.
+    await vi.waitFor(() => {
+      const calls = wakeup.mock.calls.filter(
+        (call) => call[0] === fixture.assignedAgentId,
+      );
+      expect(calls).toHaveLength(8);
+      expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
+        comments.map((comment) => comment.id),
+      );
+    });
     // The last comment and wakeup commit inside the lease. Under full-suite
     // load the assertions above can observe those effects one microtask before
     // the deferred owner's `finally` deletes its lease. Require prompt eventual
@@ -40690,6 +40698,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const fixture = await seedCompany();
       const { callbacks, endpoint, service, wakeup, webhookSecret } =
         await configuredGitHubEndpoint(fixture);
+      // Recovery sweeps all companies. Only this endpoint's assigned agent
+      // proves whether its bot edit incorrectly created new work.
+      const fixtureWakeups = () =>
+        wakeup.mock.calls.filter((call) => call[0] === fixture.assignedAgentId);
       const thread = makeThread({
         channelId: "paperclipai/paperclip",
         id:
@@ -40831,7 +40843,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           principalId: null,
         });
         expect(delivery!.nextAttemptAt === null).toBe(filtered);
-        expect(wakeup).toHaveBeenCalledTimes(1);
+        expect(fixtureWakeups()).toHaveLength(1);
         expect(
           await db
             .select()
@@ -40858,6 +40870,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
                 ),
               ),
           ).toEqual([delivery]);
+          expect(fixtureWakeups()).toHaveLength(1);
           await deliverMessage({
             callbacks,
             endpointId: endpoint.id,
@@ -40870,7 +40883,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             }),
             trigger: "subscribed_message",
           });
-          expect(wakeup).toHaveBeenCalledTimes(2);
+          expect(fixtureWakeups()).toHaveLength(2);
         }
       } finally {
         await service.shutdown();
