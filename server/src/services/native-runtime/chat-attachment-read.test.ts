@@ -747,7 +747,121 @@ describe("native same-conversation historical attachment reading", () => {
     }
   });
 
-  it("reports a retryable read when policy locks are contended instead of blocking", async () => {
+  it("retries brief run-event lock contention without asking the model to retry", async () => {
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      acquired = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .for("update");
+      acquired();
+      await blocked;
+    });
+    await ready;
+    const reader = scope();
+    const releaseTimer = setTimeout(release, 100);
+    try {
+      const result = await reader.read(selection());
+      expect(
+        await readFile(path.join(workspaceRoot, result.workspaceRelativePath)),
+      ).toEqual(sourceBody);
+      expect(result.selectedForPublication).toBe(false);
+    } finally {
+      clearTimeout(releaseTimer);
+      release();
+      await holder;
+      await reader.close();
+    }
+  });
+
+  it("rechecks policy after contention clears and rejects a revocation before reading bytes", async () => {
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      acquired = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx
+        .select()
+        .from(chatEndpoints)
+        .where(eq(chatEndpoints.id, endpointId))
+        .for("update");
+      acquired();
+      await blocked;
+      await tx
+        .update(chatEndpoints)
+        .set({ status: "paused" })
+        .where(eq(chatEndpoints.id, endpointId));
+    });
+    await ready;
+    const getObject = vi.fn(storage.getObject.bind(storage));
+    const reader = scope({ storage: { ...storage, getObject } });
+    const releaseTimer = setTimeout(release, 100);
+    try {
+      await expect(reader.read(selection())).rejects.toThrow(
+        "read_not_authorized",
+      );
+      expect(getObject).not.toHaveBeenCalled();
+    } finally {
+      clearTimeout(releaseTimer);
+      release();
+      await holder;
+      await reader.close();
+      await db
+        .update(chatEndpoints)
+        .set({ status: "active" })
+        .where(eq(chatEndpoints.id, endpointId));
+    }
+  });
+
+  it("cancels an authorization retry without reading or staging bytes", async () => {
+    let release!: () => void;
+    let acquired!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      acquired = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .for("update");
+      acquired();
+      await blocked;
+    });
+    await ready;
+    const getObject = vi.fn(storage.getObject.bind(storage));
+    const reader = scope({ storage: { ...storage, getObject } });
+    const pending = expect(reader.read(selection())).rejects.toThrow(
+      "scope_closed",
+    );
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      await reader.close();
+      await pending;
+      expect(getObject).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await holder;
+      await reader.close();
+    }
+  });
+
+  it("bounds retries when policy locks remain contended", async () => {
     let release!: () => void;
     let acquired!: () => void;
     const ready = new Promise<void>((resolve) => {

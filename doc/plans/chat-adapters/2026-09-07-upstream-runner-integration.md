@@ -627,3 +627,45 @@ and confined bytes but cannot prove another task did not produce a readable
 file. No actual leak was observed or private file contents inspected. Task-scoped
 native chat workspaces are being implemented; this issue and the previously
 documented inbound durable-wakeup race remain open production-readiness items.
+
+### Rebuilt live qualification on `981233481` (September 8, 05:58 UTC)
+
+The full server/runner build, Rust release binary, semantic catalogs and replay
+golden checks passed (`native-ownership-root-build-01.log`). Recovery stale-lock
+tests also passed **14/14** on root's fresh PostgreSQL fixture; the subagent's
+sandbox had skipped this cohort. The server restarted with no active Maya turns
+and reported clean `981233481` at 05:58:05 UTC, ready at 05:58:10 UTC.
+
+New real messages were sent through the signed-in provider interfaces:
+
+- Slack run `e606f147-610b-4d19-ba79-bc5a37f9d816` completed in **17.90s** and
+  GitHub run `a2f8192c-0d3d-4b16-801e-f9bddc73777b` in **19.11s**. Both accepted
+  canonical `yielded` / `response_wake` with the exact requested marker and
+  server decision `external_chat_response_waiting`, without semantic retries.
+  However, both displayed only “Maya E2E completed this turn.” The response
+  materializer still suppressed every yielded summary. The new narrow fix
+  permits the canonical summary only after committed native response-wait proof
+  and current durable chat authorization; generic control-plane waits and raw
+  final prose remain suppressed. Resolver tests passed **41/41**, server
+  typecheck passed. A live response retest remains required.
+- Telegram run `0b0f20da-f92d-499a-abd5-a27ebcaa047d` now listed the exact earlier
+  unnamed JPEG (221,327 bytes, unchanged SHA-256), proving the filename fix.
+  Byte reads repeatedly returned `read_busy`; no photo was returned. Discord
+  run `340b9802-9183-442f-b765-0a32827f1585` also found the original fixtures but
+  could not read or prepare them. These runs' successful native termination
+  does not mean their requested file outcome succeeded.
+- A single-conversation Telegram retry reproduced the read refusal with no
+  other active Maya turn. A bounded read-only PostgreSQL monitor observed the
+  reader's NOWAIT check overlapping native event persistence on the run row.
+  The reader previously treated any immediate lock miss as “policy is changing.”
+  It now retries the entire authorization transaction for at most one second,
+  rechecking current policy on each attempt and again after reading storage,
+  without holding locks during backoff or filesystem work. Permanent revocation
+  is not retried; cancellation stops the retry. Reader/reuse tests passed
+  **26/26**, including brief run-row contention, revocation while blocked and
+  cancellation during retry; server typecheck passed.
+
+The simple completion latency improved substantially, but these visible output
+failures still make the interaction quality unacceptable. No file delivery or
+response-wake journey is marked qualified until the corrected server is tested
+through the actual provider UI again.

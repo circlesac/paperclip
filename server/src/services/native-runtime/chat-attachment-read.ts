@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { eq, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import { MAX_ATTACHMENT_BYTES } from "../../attachment-types.js";
@@ -96,44 +97,61 @@ export class NativeChatAttachmentReadScope {
     sourceCommentId: string;
     attachmentId: string;
   }): Promise<ChatAttachmentReuseSource> {
-    return this.options.db
-      .transaction(async (transaction) => {
-        const tx = transaction as unknown as Db;
-        // Source rows are also locked by the existing lineage reader. Bound
-        // their waits so an inverse source-writer lock order cannot deadlock.
-        await tx.execute(sql`set local lock_timeout = '50ms'`);
-        const authorization =
-          await resolveExternalChatResponseWaitAuthorizationInTransaction(
-            tx,
-            this.options.binding,
-            "nonblocking",
-          );
-        if (authorization !== "authorized")
-          throw new Error(
-            "paperclip_runner_chat_attachment_read_not_authorized",
-          );
-        const [run] = await tx
-          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, this.options.binding.runId));
-        const source = await authorizeChatAttachmentReuse({
-          db: tx,
-          binding: this.options.binding,
-          contextSnapshot: run!.contextSnapshot,
-          allowEmpty: true,
-          ...input,
-        });
+    // Run-event persistence also briefly locks heartbeat_runs. A NOWAIT miss
+    // is not evidence of policy revocation: retry the whole authorization in
+    // a fresh transaction, never hold partial locks while backing off.
+    const deadline = Date.now() + 1_000;
+    for (;;) {
+      this.#assertOpen();
+      try {
+        return await this.#authorizeOnce(input);
+      } catch (error) {
         this.#assertOpen();
-        return source;
-      })
-      .catch((error: unknown) => {
-        if (isExternalChatWaitAuthorizationContention(error)) {
+        if (!isExternalChatWaitAuthorizationContention(error)) throw error;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
           throw new Error(
-            "paperclip_runner_chat_attachment_read_busy: current chat policy is changing; retry this read shortly",
+            "paperclip_runner_chat_attachment_read_busy: chat authorization is temporarily busy; retry this read shortly",
           );
         }
-        throw error;
+        await delay(Math.min(50, remaining), undefined, {
+          signal: this.#abort.signal,
+        }).catch(() => this.#assertOpen());
+      }
+    }
+  }
+
+  async #authorizeOnce(input: {
+    sourceCommentId: string;
+    attachmentId: string;
+  }): Promise<ChatAttachmentReuseSource> {
+    return this.options.db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      // Source rows are also locked by the existing lineage reader. Bound
+      // their waits so an inverse source-writer lock order cannot deadlock.
+      await tx.execute(sql`set local lock_timeout = '50ms'`);
+      const authorization =
+        await resolveExternalChatResponseWaitAuthorizationInTransaction(
+          tx,
+          this.options.binding,
+          "nonblocking",
+        );
+      if (authorization !== "authorized")
+        throw new Error("paperclip_runner_chat_attachment_read_not_authorized");
+      const [run] = await tx
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, this.options.binding.runId));
+      const source = await authorizeChatAttachmentReuse({
+        db: tx,
+        binding: this.options.binding,
+        contextSnapshot: run!.contextSnapshot,
+        allowEmpty: true,
+        ...input,
       });
+      this.#assertOpen();
+      return source;
+    });
   }
 
   async #read(input: { sourceCommentId: string; attachmentId: string }) {
