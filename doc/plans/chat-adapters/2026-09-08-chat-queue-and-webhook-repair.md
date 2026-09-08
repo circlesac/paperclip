@@ -744,3 +744,73 @@ These results qualify the observed prose repair and the four existing-task
 follow-ups. They do not settle intermittent upstream Telegram ingress delay,
 old corrupted-session recovery, prompt permanent-integrity failure feedback,
 unfamiliar prose redaction or the remaining Teams/multi-process/file cases.
+
+## Current-master skill preparation merge
+
+`6f90d368a` incorporates master `c723bb4df` (validated runtime skill revision
+caching). The two additive import conflicts retain both the chat ingress and
+heartbeat preparation timing helpers and upstream failed-skill-preparation
+tracing. Independent review found no change to safe external-chat progress or
+permission/continuation behavior. Full workspace typecheck and build passed.
+Focused merged-source verification passed **80/80** skill service/cache,
+**203/203** workspace/session, **38/38** native trace/runtime/progress and
+**2/2** native preparation executor tests. The staged runner binary is unchanged.
+
+Greptile completed review of `cd5970276` with **4/5**, finding one P2: the
+renumbered interaction-wake migration retains its original 0245 label in
+deduplication metadata and operator error text. Migration-history hash
+compatibility must be preserved while correcting that provenance. CI and a
+clean review of the final pushed head remain merge gates.
+
+After verifying no active Maya run, root gracefully restarted the isolated
+server with merged source at 15:04 UTC, log `server-experimental-landing-45.log`.
+Startup preserved the same five historical blocked IDs, with no claimed or
+awaiting-evidence runs. In the existing Slack thread, a normal follow-up at
+15:05:14.176 produced exactly `SKILL-CACHE-MERGE-READY`. Native Luna run
+`8b9e0a0e-3d0d-4e86-9009-679783d80799` ran from 15:05:17.542 to 15:05:33.125
+(15.583 seconds). Final publication at 15:05:33.462 makes end-to-end time
+19.286 seconds. Working/final operations each used one attempt and updated the
+same message, `1788879918.356759`. The provider UI visibly cleared its working
+indicator and showed one clean final reply. This checks post-merge continuation
+on one provider; it does not replace the broader earlier qualification.
+
+## Forward-only migration provenance repair
+
+Greptile's migration label finding is addressed by `e3cfc400e`. The original
+0251 SQL remains byte-for-byte identical to its deployed 0245 form, SHA-256
+`5e181169a724173d17865d537bd84c385e97e6f78e71aa795cad91734cd37ea0`.
+Changing those bytes would break hash-based history recognition and could
+replay the duplicate-wake repair. New custom Drizzle migration 0256 instead
+corrects only exact legacy `migrationDedupe.migration` values and the matching
+generated final audit line. It preserves all wake state, run links, keys,
+timestamps, unrelated payload and free-form errors. Primary-key batches are
+bounded to 500 rows; locks still last through the migration transaction.
+
+The new cases failed **2/2** with an empty migration, then the complete
+reconciliation cohort passed **5/5**, including fresh and deployed-history
+upgrades, unchanged original hashes, malformed/unrelated metadata, later
+terminalized history, unrelated-only batches and idempotent reapplication.
+Root independently passed **48/48** migration/client/snapshot/safety tests.
+A fixture JSON typing error found by root's build was corrected; DB build and
+typecheck then passed. Independent final SQL/test review found no issue.
+The generated snapshot adds no schema delta; the journal now has 255 entries,
+11 beyond master. No migration client behavior or historical SQL was changed.
+
+## Database-pool master merge
+
+Master advanced again to `023e640a7` with database pool defaults and orderly
+pool closure. Merge `21061f4de` preserves the chat teardown in the sole app
+shutdown conflict: unsubscribe publication signals, stop reconciliation and
+its timer, await producer/consumer drain, then await chat runtime cleanup.
+Upstream's final shutdown awaits that app cleanup before ending the database
+pools. The scheduler is stopped once within the awaited app teardown.
+
+Full workspace typecheck/build passed again. A merged-source six-file cohort
+passed **71/71**: database client options, client, provenance reconciliation,
+server shutdown, chat publication reconciliation and app lifecycle coverage.
+Independent ordering review found no regression. Log:
+`landing-db-pool-shutdown-merge-laplace-0908.log`. The PR remains one branch,
+**483 changed files**, with no lockfile delta relative to current master.
+The live server still runs the earlier skill-cache merge (`6f90d368a`);
+this last pool/shutdown merge has automated checks, not a new live restart
+qualification. CI and final-head Greptile confirmation remain outstanding.

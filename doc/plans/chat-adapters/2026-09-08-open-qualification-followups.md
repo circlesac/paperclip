@@ -10,15 +10,22 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
-  merged. Keep one PR: the current local diff is **481 files**, below 500.
+  merged. Keep one PR: the current local diff is **483 files**, below 500.
 - The default-off **Experimental > Chat connectors** setting is implemented.
   Production GitHub tools remain visible and open directly without the
   chat/tool choice when disabled. Default-off and enabled browser flows passed.
   This is a UI visibility gate: active connections continue delivering until
   explicitly paused.
-- Master is incorporated through `0cc796b7b` in merge `baada1375`. Full
-  workspace typecheck/build passed after that merge. There is no PR lockfile
-  delta. Preserve the upstream migration prefix and all 254 current migrations.
+- Master is incorporated through `023e640a7` in merge `21061f4de`. Full
+  workspace typecheck/build passed after this latest database-pool/shutdown
+  merge. Chat reconciliation and runtime shutdown remain awaited before pool
+  closure. The merged database/shutdown compatibility cohort passed **71/71**.
+  The earlier skill-cache merge passed 80 skill-cache,
+  203 workspace/session, 38 native trace/progress and two preparation tests.
+  Both chat ingress timing and upstream skill-preparation tracing are retained.
+  There is no PR lockfile delta. Preserve the upstream migration prefix and
+  all deployed SQL hashes. A new provenance-only migration follows the
+  original 254 migrations instead of changing their contents.
 - CI at `683067cea` passed every substantive lane except one Slack modal
   race in general-server shard 1/5. The fix is `3182b0373`: deterministic
   Slack/Teams red-to-green, **11/11** focused tests and independent auth review.
@@ -27,16 +34,21 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   cleanup then passed a fresh **390/390** rerun in 91.68 seconds after 254
   normal migrations. The GitHub four-wake assertion and production worker are
   unchanged. Focused tests and server TypeScript checks also pass.
-- Greptile auto-review refused its 100-file soft limit. The documented
-  `@greptile-apps` override was requested, but no acknowledgment or completed
-  review is visible. Request review once on the next stable pushed head. Do not
+- Greptile reviewed `cd5970276` after the explicit soft-limit override and
+  scored it **4/5**. Its one P2 is stale migration provenance: migration 0251
+  still names its former 0245 number. Fix `e3cfc400e` adds forward-only 0256;
+  it preserves all deployed SQL hashes and changes only exact provenance and
+  generated audit text, never replaying retirement or rekeying. Two tests went
+  red-to-green; the final reconciliation cohort is **5/5**, root's migration/
+  client/snapshot/safety cohort **48/48**, and DB build/typecheck passed.
+  Independent code review found no issue. Request final-head review. Do not
   mark review accepted, CI green or the PR ready to merge without evidence.
 
 ## Current deployed state and evidence
 
-The live server started at **14:52:05 UTC**, log
-`.paperclip-runtime/chat-adapters-live/server-experimental-landing-44.log`.
-It runs through `d99773a5c`; later fixture-only changes need no restart.
+The live server was restarted after the master merge at **15:04 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-45.log`.
+It runs through `6f90d368a`; later fixture/documentation-only changes need no restart.
 Its private Board is at `http://127.0.0.1:3103`. Keep the public verified
 webhook proxy separate from the private Board.
 
@@ -72,6 +84,11 @@ switch to Terra. The signed/staged runner SHA-256 is
   in all four providers in **26.5–27.8 seconds** end to end. Historical replies
   were not edited. Closed grammar protects the known prose without exempting
   arbitrary English words, credential-shaped values, assignments or nested keys.
+- Post-master Slack continuation also passed: `SKILL-CACHE-MERGE-READY` arrived
+  in **19.286 seconds**, including **15.583 seconds** native Luna execution.
+  The working indicator cleared, the same provider message was updated, and
+  each operation used one attempt. This is one post-merge smoke check, not a
+  repeat of the entire four-provider qualification.
 - The broad local `pnpm test:run` originally stopped after its general-server
   phase: **8,117 passed, 34 skipped, four failed**. Those failures have focused
   passing fixes and the later CI lanes provide broader evidence, but do not
