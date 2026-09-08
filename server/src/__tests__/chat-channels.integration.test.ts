@@ -38,6 +38,7 @@ import {
   chatIdentityLinks,
   chatMessageLinks,
   chatPublications,
+  completionContracts,
   companySecretBindings,
   companySecrets,
   companies,
@@ -50,6 +51,7 @@ import {
   issueQuestionResponseDeliveries,
   issueThreadInteractions,
   issues,
+  nativeRunResults,
   principalPermissionGrants,
   toolConnections,
 } from "@paperclipai/db";
@@ -58,6 +60,10 @@ import { isPaperclipExternalChatTurn } from "@paperclipai/adapter-utils/server-u
 import type { Attachment, Author, Message, Thread } from "chat";
 import { errorHandler } from "../middleware/index.js";
 import { unadmittedChatWakeupCondition } from "../services/durable-chat-wakeup.js";
+import {
+  createChatWebhookDiagnostics,
+  type ChatWebhookDiagnosticEvent,
+} from "../services/chat-webhook-diagnostics.js";
 import {
   chatChannelRoutes,
   chatWebhookRoutes,
@@ -95,6 +101,12 @@ import {
 } from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
+import type {
+  PrpStructuredRunResult,
+  PrpTerminalState,
+} from "../vendor/paperclip-runner/index.js";
+import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
+import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -823,8 +835,12 @@ function routesApp(
   return app;
 }
 
-function webhookApp(service: ChatChannelService) {
+function webhookApp(
+  service: ChatChannelService,
+  diagnostics?: (event: ChatWebhookDiagnosticEvent) => void,
+) {
   const app = express();
+  if (diagnostics) app.use(createChatWebhookDiagnostics({ emit: diagnostics }));
   app.use(express.raw({ type: "*/*" }));
   app.use(chatWebhookRoutes(service));
   app.use(errorHandler);
@@ -14570,23 +14586,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         },
       );
 
-    const forged = await service.handleWebhook(
-      endpoint.publicId,
-      "slack",
-      new Request(
-        `https://paperclip.example/api/chat-webhooks/${endpoint.publicId}/slack`,
-        {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-slack-request-timestamp": timestamp,
-            "x-slack-signature": "v0=forged",
-          },
-          body,
-        },
-      ),
-    );
+    const timingEvents: ChatWebhookDiagnosticEvent[] = [];
+    const observedApp = webhookApp(service, (event) => timingEvents.push(event));
+    const observedRequest = (retry = false, signatureOverride?: string) =>
+      request(observedApp)
+        .post(`/api/chat-webhooks/${endpoint.publicId}/slack`)
+        .set(Object.fromEntries(providerRequest(retry).headers))
+        .set("x-slack-signature", signatureOverride ?? signature)
+        .send(body);
+    const forged = await observedRequest(false, "v0=forged");
     expect(forged.status).toBe(401);
+    expect(
+      timingEvents.some((event) => event.stage === "durable_receipt"),
+    ).toBe(false);
+    expect(timingEvents.at(-1)?.statusCode).toBe(401);
     expect(
       await db
         .select()
@@ -14598,13 +14611,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .spyOn(db, "transaction")
       .mockRejectedValueOnce(new Error("injected durable admission failure"));
 
-    const rejected = await service.handleWebhook(
-      endpoint.publicId,
-      "slack",
-      providerRequest(),
-    );
+    timingEvents.length = 0;
+    const rejected = await observedRequest();
     expect(rejected.status).toBe(503);
-    expect(rejected.headers.get("retry-after")).toBe("1");
+    expect(rejected.headers["retry-after"]).toBe("1");
+    expect(timingEvents.map((event) => event.stage)).toEqual([
+      "http_received",
+      "handler_started",
+      "endpoint_resolved",
+      "runtime_requested",
+      "runtime_ready",
+      "response_ready",
+      "response_finished",
+    ]);
+    expect(timingEvents.at(-1)?.statusCode).toBe(503);
     expect(
       await db
         .select()
@@ -14613,11 +14633,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).toHaveLength(0);
 
     transactionSpy.mockRestore();
-    const acceptedRetry = await service.handleWebhook(
-      endpoint.publicId,
-      "slack",
-      providerRequest(true),
-    );
+    await service.runtime.removeEndpoint(endpoint.id);
+    timingEvents.length = 0;
+    const acceptedRetry = await observedRequest(true);
     expect(acceptedRetry.status).toBe(200);
     await vi.waitFor(async () => {
       const deliveries = await db
@@ -14635,11 +14653,35 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       initialDelivery.normalizedEvent.deduplication?.duplicateCount ?? 0,
     );
     expect(initialDuplicateCount).toBe(0);
-    const acceptedRedelivery = await service.handleWebhook(
-      endpoint.publicId,
-      "slack",
-      providerRequest(true),
+    const receiptEvent = timingEvents.find(
+      (event) => event.stage === "durable_receipt",
     );
+    expect(receiptEvent).toMatchObject({
+      endpointId: endpoint.id,
+      receiptId: initialDelivery.id,
+      receiptKind: "message_delivery",
+      slackRetryNumHint: 1,
+    });
+    expect(timingEvents.map((event) => event.stage)).toEqual([
+      "http_received",
+      "handler_started",
+      "endpoint_resolved",
+      "runtime_requested",
+      "runtime_initializing",
+      "runtime_ready",
+      "durable_receipt",
+      "response_ready",
+      "response_finished",
+    ]);
+    expect(timingEvents.indexOf(receiptEvent!)).toBeLessThan(
+      timingEvents.findIndex((event) => event.stage === "response_ready"),
+    );
+    expect(JSON.stringify(timingEvents)).not.toContain(signingSecret);
+    expect(JSON.stringify(timingEvents)).not.toContain(
+      "@maya prove durable receipt",
+    );
+    expect(JSON.stringify(timingEvents)).not.toContain(signature);
+    const acceptedRedelivery = await observedRequest(true);
     expect(acceptedRedelivery.status).toBe(200);
     await vi.waitFor(async () => {
       const [delivery] = await db
@@ -41036,5 +41078,567 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(safeEndpoint.status).toBe("active");
     expect(JSON.stringify(safeEndpoint)).not.toContain(firstToken);
     expect(JSON.stringify(safeEndpoint)).not.toContain(replacementToken);
+  });
+
+  async function committedNativeReviewPublicationFixture(label: string) {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture, { storage: storage.storage });
+    const providerMessageId = `review-transport-${label}-${randomUUID()}`;
+    const channel = makeThread({
+      channelId: `C-REVIEW-${label.toUpperCase()}`,
+      id: `slack:C-REVIEW-${label.toUpperCase()}:${Date.now()}.1`,
+      name: `review-${label}`,
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      thread: channel.thread,
+      message: makeMessage({
+        id: providerMessageId,
+        text: "@maya return the exact response and files, then wait",
+        mentioned: true,
+      }),
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id, "owner-user");
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.endpointId, endpoint.id));
+    if (!conversation) throw new Error("Expected review transport conversation");
+    const inbound = await db
+      .select({
+        commentId: chatMessageLinks.commentId,
+        principalId: chatDeliveries.principalId,
+      })
+      .from(chatMessageLinks)
+      .innerJoin(
+        chatDeliveries,
+        eq(chatDeliveries.id, chatMessageLinks.deliveryId),
+      )
+      .where(
+        and(
+          eq(chatMessageLinks.endpointId, endpoint.id),
+          eq(chatMessageLinks.conversationId, conversation.id),
+          eq(chatMessageLinks.providerMessageId, providerMessageId),
+          eq(chatMessageLinks.direction, "inbound"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!inbound?.commentId || !inbound.principalId) {
+      throw new Error("Expected exact inbound requester lineage");
+    }
+    await db
+      .insert(chatIdentityLinks)
+      .values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        principalId: inbound.principalId,
+        paperclipUserId: "owner-user",
+        status: "linked",
+        confirmedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [chatIdentityLinks.endpointId, chatIdentityLinks.principalId],
+        set: {
+          paperclipUserId: "owner-user",
+          status: "linked",
+          confirmedAt: new Date(),
+          revokedAt: null,
+          updatedAt: new Date(),
+        },
+      });
+
+    const issueId = conversation.issueId;
+    const runId = randomUUID();
+    const sessionId = randomUUID();
+    const runnerInstanceId = randomUUID();
+    const contractId = randomUUID();
+    const contractSha256 = `review-transport-${randomUUID()}`;
+    const contextSnapshot = {
+      issueId,
+      source: "chat:slack",
+      wakeCommentId: inbound.commentId,
+      wakeCommentIds: [inbound.commentId],
+      paperclipHarnessCheckedOut: true,
+      paperclipWake: {
+        reason: "External chat message received",
+        externalChatProvider: "slack",
+        checkedOutByHarness: true,
+        issue: { id: issueId, workMode: "standard" },
+        commentIds: [inbound.commentId],
+      },
+    };
+    await db.insert(completionContracts).values({
+      id: contractId,
+      companyId: fixture.companyId,
+      issueId,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "phase6-v3",
+      risk: "low",
+      completionAuthority: "agent_claim_policy",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {
+        revision: "review-transport-v1",
+        objective: "Return the exact requested response and files",
+        criteria: [{ id: "response", requirement: "Return the response" }],
+      },
+      canonicalSha256: contractSha256,
+      createdByActorType: "system",
+      createdByActorId: "test",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      runtimeMode: "native",
+      nativeIssueId: issueId,
+      nativeSessionId: sessionId,
+      runnerInstanceId,
+      completionContractId: contractId,
+      completionContractSha256: contractSha256,
+      contextSnapshot,
+    });
+    await db
+      .update(issues)
+      .set({
+        status: "in_progress",
+        assigneeAgentId: fixture.assignedAgentId,
+        executionRunId: runId,
+      })
+      .where(eq(issues.id, issueId));
+    const port = new PaperclipControlPlanePort(db, {
+      companyId: fixture.companyId,
+      issueId,
+      runId,
+      agentId: fixture.assignedAgentId,
+      sessionId,
+      completionContractId: contractId,
+      completionContractSha256: contractSha256,
+      sourceInstanceId: runnerInstanceId,
+      controlPlaneSourceInstanceId: `review-transport-${runId}`,
+    });
+    await port.openRun({
+      identity: {
+        companyId: fixture.companyId,
+        issueId,
+        runId,
+        agentId: fixture.assignedAgentId,
+        sessionId,
+      },
+      backendKind: "mock",
+      sourceInstanceId: runnerInstanceId,
+    });
+    const responseResult: PrpStructuredRunResult = {
+      schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "yielded",
+      summary: "The exact response and files are prepared. I will wait.",
+      completionClaim: {
+        contractRevision: "review-transport-v1",
+        objectiveSatisfied: true,
+        criteria: [
+          {
+            criterionId: "response",
+            status: "satisfied",
+            evidenceRefs: [],
+          },
+        ],
+        remainingWork: [],
+      },
+      evidence: [],
+      verification: [],
+      attentionRequests: [],
+      artifacts: [],
+      continuation: {
+        kind: "response_wake",
+        summary: "Wait for the next authorized Slack message.",
+        idempotencyKey: `review-transport-wait:${conversation.id}`,
+      },
+    };
+    const terminal: PrpTerminalState = {
+      schema: "paperclip.prp.terminal.v1",
+      turnTerminalState: "completed",
+      runTerminalState: "succeeded",
+      reportedWorkDisposition: "yielded",
+      workAssessmentId: randomUUID(),
+      statusDecisionId: randomUUID(),
+    };
+    await port.completeRun({
+      result: responseResult,
+      terminal,
+      callerResultId: `review-response-${runId}`,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { nativeResult: responseResult } })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const [accepted] = await db
+      .select()
+      .from(nativeRunResults)
+      .where(eq(nativeRunResults.runId, runId));
+    if (!accepted) throw new Error("Expected accepted native result");
+    const reviewRunId = randomUUID();
+    const reviewSessionId = randomUUID();
+    const reviewRunnerInstanceId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: reviewRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.assignedAgentId,
+      status: "running",
+      runtimeMode: "native",
+      nativeIssueId: issueId,
+      nativeSessionId: reviewSessionId,
+      runnerInstanceId: reviewRunnerInstanceId,
+      completionContractId: contractId,
+      completionContractSha256: contractSha256,
+      contextSnapshot: {},
+      createdAt: new Date(Date.now() - 60_000),
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: reviewRunId })
+      .where(eq(issues.id, issueId));
+    const reviewPort = new PaperclipControlPlanePort(db, {
+      companyId: fixture.companyId,
+      issueId,
+      runId: reviewRunId,
+      agentId: fixture.assignedAgentId,
+      sessionId: reviewSessionId,
+      completionContractId: contractId,
+      completionContractSha256: contractSha256,
+      sourceInstanceId: reviewRunnerInstanceId,
+      controlPlaneSourceInstanceId: `review-gate-${reviewRunId}`,
+    });
+    await reviewPort.openRun({
+      identity: {
+        companyId: fixture.companyId,
+        issueId,
+        runId: reviewRunId,
+        agentId: fixture.assignedAgentId,
+        sessionId: reviewSessionId,
+      },
+      backendKind: "mock",
+      sourceInstanceId: reviewRunnerInstanceId,
+    });
+    const reviewResult = {
+      ...(accepted.resultJson.result as PrpStructuredRunResult),
+      reportedWorkDisposition: "needs_review" as const,
+      attentionRequests: [],
+    };
+    delete reviewResult.continuation;
+    await reviewPort.completeRun({
+      result: reviewResult,
+      terminal: {
+        ...(accepted.resultJson.terminal as PrpTerminalState),
+        reportedWorkDisposition: "needs_review",
+      },
+      callerResultId: `review-gate-${reviewRunId}`,
+    });
+    await finalizeNativeRun({
+      db,
+      runId: reviewRunId,
+      workspaceFinalizeStatus: "succeeded",
+      projectRunStatus: true,
+    });
+    const [gate] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.sourceRunId, reviewRunId));
+    if (!gate) throw new Error("Expected genuine native completion review");
+    expect(gate).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      effectiveResolverPolicy: "human_only",
+      createdByAgentId: null,
+      createdByUserId: null,
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: runId })
+      .where(eq(issues.id, issueId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot,
+        startedAt: new Date(gate.createdAt.getTime() + 1),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const selection = await issueService(db).addComment(
+      issueId,
+      "Prepared the exact requested files for this response.",
+      { agentId: fixture.assignedAgentId, runId },
+      { authorizationReason: "paperclip_runner_protocol" },
+    );
+    const attachments = [];
+    for (const [originalFilename, contentType, body] of [
+      ["review-note.txt", "text/plain", Buffer.from("review note", "utf8")],
+      ["review-image.png", "image/png", Buffer.from("review image", "utf8")],
+    ] as const) {
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${issueId}`,
+        originalFilename,
+        contentType,
+        body,
+      });
+      attachments.push(
+        await issueService(db).createAttachment({
+          issueId,
+          issueCommentId: selection.id,
+          provider: stored.provider,
+          objectKey: stored.objectKey,
+          contentType: stored.contentType,
+          byteSize: stored.byteSize,
+          sha256: stored.sha256,
+          originalFilename: stored.originalFilename,
+          createdByAgentId: fixture.assignedAgentId,
+          createdByRunId: runId,
+        }),
+      );
+    }
+    await finalizeNativeRun({
+      db,
+      runId,
+      workspaceFinalizeStatus: "succeeded",
+      projectRunStatus: true,
+    });
+    const [committedRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(committedRun).toMatchObject({
+      status: "succeeded",
+      resultJson: {
+        finalizationPhase: "committed",
+        finalizationReasonCode: "governed_response_waiting",
+        externalChatReviewPresentation: {
+          runId,
+          gateId: gate.id,
+        },
+      },
+    });
+    const publications = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.issueId, issueId),
+          eq(chatPublications.state, "pending"),
+        ),
+      );
+    expect(publications).toHaveLength(3);
+    expect(publications).toEqual(
+      expect.arrayContaining(
+        attachments.map((attachment) =>
+          expect.objectContaining({
+            commentId: selection.id,
+            idempotencyKey: `attachment:${attachment.id}:${endpoint.id}`,
+            payload: expect.objectContaining({
+              attachmentIds: [attachment.id],
+            }),
+          }),
+        ),
+      ),
+    );
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!providerRuntime) throw new Error("Expected Slack provider runtime");
+    providerRuntime.posts.length = 0;
+    providerRuntime.edits.length = 0;
+    providerRuntime.slackFilePublicationAttempts = 0;
+    providerRuntime.slackFileReceiptLookups.length = 0;
+    return {
+      attachments,
+      conversation,
+      endpoint,
+      fixture,
+      gate,
+      providerRuntime,
+      publications,
+      runId,
+      service,
+    };
+  }
+
+  it.each(["principal_revoked", "gate_changed"] as const)(
+    "blocks a committed native review response and selected files at transport after %s",
+    async (kind) => {
+      const committed = await committedNativeReviewPublicationFixture(kind);
+      if (kind === "principal_revoked") {
+        await db
+          .update(companyMemberships)
+          .set({ status: "suspended", updatedAt: new Date() })
+          .where(
+            and(
+              eq(companyMemberships.companyId, committed.fixture.companyId),
+              eq(companyMemberships.principalId, "owner-user"),
+            ),
+          );
+      } else {
+        await db
+          .update(issueThreadInteractions)
+          .set({ effectiveResolverPolicy: "anyone", updatedAt: new Date() })
+          .where(eq(issueThreadInteractions.id, committed.gate.id));
+      }
+
+      await expect(
+        committed.service.processPendingPublications(100),
+      ).resolves.toBe(3);
+      expect(committed.providerRuntime.posts).toEqual([]);
+      expect(committed.providerRuntime.edits).toEqual([]);
+      expect(committed.providerRuntime.slackFilePublicationAttempts).toBe(0);
+      expect(committed.providerRuntime.slackFileReceiptLookups).toEqual([]);
+      const publicationIds = committed.publications.map(({ id }) => id);
+      await expect(
+        db
+          .select({
+            attempts: chatPublications.attempts,
+            providerMessageId: chatPublications.providerMessageId,
+            redactedError: chatPublications.redactedError,
+            state: chatPublications.state,
+          })
+          .from(chatPublications)
+          .where(inArray(chatPublications.id, publicationIds)),
+      ).resolves.toEqual(
+        expect.arrayContaining(
+          publicationIds.map(() => ({
+            attempts: 1,
+            providerMessageId: null,
+            redactedError:
+              "Task control requester or destination is no longer authorized",
+            state: "cancelled",
+          })),
+        ),
+      );
+      await expect(
+        db
+          .select({ id: chatMessageLinks.id })
+          .from(chatMessageLinks)
+          .where(inArray(chatMessageLinks.publicationId, publicationIds)),
+      ).resolves.toEqual([]);
+      await expect(
+        db
+          .select({ status: issues.status })
+          .from(issues)
+          .where(eq(issues.id, committed.conversation.issueId)),
+      ).resolves.toEqual([{ status: "in_review" }]);
+      await expect(
+        db
+          .select({ status: issueThreadInteractions.status })
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, committed.gate.id)),
+      ).resolves.toEqual([{ status: "pending" }]);
+    },
+  );
+
+  it("retries a contended committed review response before transport, then publishes it and its files once", async () => {
+    const committed = await committedNativeReviewPublicationFixture("busy");
+    let releaseGate!: () => void;
+    let gateLocked!: () => void;
+    const gateRelease = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const gateLockObserved = new Promise<void>((resolve) => {
+      gateLocked = resolve;
+    });
+    const holder = db.transaction(async (tx) => {
+      await tx
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, committed.gate.id))
+        .for("update");
+      gateLocked();
+      await gateRelease;
+    });
+    await gateLockObserved;
+    try {
+      await expect(
+        committed.service.processPendingPublications(100),
+      ).resolves.toBe(1);
+    } finally {
+      releaseGate();
+      await holder;
+    }
+    expect(committed.providerRuntime.posts).toEqual([]);
+    expect(committed.providerRuntime.edits).toEqual([]);
+    expect(committed.providerRuntime.slackFilePublicationAttempts).toBe(0);
+    expect(committed.providerRuntime.slackFileReceiptLookups).toEqual([]);
+    const [retrying] = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          inArray(
+            chatPublications.id,
+            committed.publications.map(({ id }) => id),
+          ),
+          eq(chatPublications.state, "retry"),
+        ),
+      );
+    expect(retrying).toMatchObject({
+      attempts: 1,
+      providerMessageId: null,
+      nextAttemptAt: expect.any(Date),
+      redactedError:
+        "Chat response authorization is temporarily busy; no provider delivery was attempted",
+    });
+    await db
+      .update(chatPublications)
+      .set({ nextAttemptAt: new Date(0), updatedAt: new Date() })
+      .where(eq(chatPublications.id, retrying!.id));
+
+    await expect(
+      committed.service.processPendingPublications(100),
+    ).resolves.toBe(3);
+    expect(committed.providerRuntime.posts).toHaveLength(3);
+    expect(committed.providerRuntime.edits).toEqual([]);
+    expect(committed.providerRuntime.slackFilePublicationAttempts).toBe(2);
+    expect(committed.providerRuntime.slackFileReceiptLookups).toEqual([]);
+    const publicationIds = committed.publications.map(({ id }) => id);
+    await expect(
+      db
+        .select({
+          attempts: chatPublications.attempts,
+          providerMessageId: chatPublications.providerMessageId,
+          state: chatPublications.state,
+        })
+        .from(chatPublications)
+        .where(inArray(chatPublications.id, publicationIds)),
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          attempts: 2,
+          providerMessageId: expect.any(String),
+          state: "published",
+        }),
+        expect.objectContaining({
+          attempts: 1,
+          providerMessageId: expect.any(String),
+          state: "published",
+        }),
+        expect.objectContaining({
+          attempts: 1,
+          providerMessageId: expect.any(String),
+          state: "published",
+        }),
+      ]),
+    );
+    await expect(
+      db
+        .select({ id: chatMessageLinks.id })
+        .from(chatMessageLinks)
+        .where(inArray(chatMessageLinks.publicationId, publicationIds)),
+    ).resolves.toHaveLength(3);
+    await expect(
+      committed.service.processPendingPublications(100),
+    ).resolves.toBe(0);
+    expect(committed.providerRuntime.posts).toHaveLength(3);
+    expect(committed.providerRuntime.slackFilePublicationAttempts).toBe(2);
   });
 });

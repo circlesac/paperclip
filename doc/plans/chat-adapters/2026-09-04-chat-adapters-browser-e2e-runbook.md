@@ -32,7 +32,7 @@ Direct verified webhooks are the required transport for Slack, GitHub, Teams, an
 
 A webhook provider is not deployment-qualified merely because it passed through a temporary tunnel. Live development may use an ephemeral HTTPS tunnel to find product defects, but stable release evidence requires a durable public ingress origin whose callback URLs survive process restarts and whose Paperclip secrets master key is preserved with the instance.
 
-### Current setup gates — 2026-09-07 UTC
+### Current setup gates — 2026-09-08 UTC
 
 Slack, GitHub, Discord, and Telegram are configured and active in the isolated
 live instance. The GitHub PEM, Discord bot installation/token, and replacement
@@ -40,12 +40,14 @@ Slack/Telegram credentials have been supplied. Webhook providers use the stable
 Tailscale Funnel origin on port 8443; Discord uses its outbound Gateway.
 The public proxy exposes verified webhook routes, not the private Board or files.
 
-Maya E2E now uses native Paperclip Runner with Codex `gpt-5.6-luna`. The
-[native qualification report](./2026-09-07-native-runner-chat-qualification.md)
-records real text, queue, and media results as well as failures and fixes. Further
-model-dependent qualification is blocked by the Codex account's actual
-`usageLimitExceeded` response, not missing provider login. Teams still requires
-an eligible Microsoft 365 work/school tenant and its admin-controlled setup.
+Maya E2E uses native Paperclip Runner with Codex `gpt-5.6-luna`; actual native
+turn records confirm the model, with no Terra substitution. The
+[current native qualification ledger](./2026-09-07-upstream-runner-integration.md)
+records resumed model capacity, successful text replies on all four connected
+providers, native files on Slack/Discord/Telegram, honest GitHub file fallbacks,
+and the remaining defects. Earlier quota and GitHub/Discord login gates are
+historical, not current blockers. Teams still requires an eligible Microsoft
+365 work/school tenant and its admin-controlled setup.
 The [reach audit](./2026-09-07-native-chat-reach-audit.md) records subsequent
 model-independent live checks. These are scenario-specific evidence, not a
 complete final-source qualification of every provider and feature.
