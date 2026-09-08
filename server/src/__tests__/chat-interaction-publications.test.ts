@@ -473,6 +473,72 @@ describeEmbeddedPostgres(
       ]);
     });
 
+    it("settles form answers without claiming a surface or exposing free text", async () => {
+      const fixture = await seedBoundIssue();
+      const service = issueThreadInteractionService(db);
+      const interaction = await service.create(
+        { id: fixture.issueId, companyId: fixture.companyId },
+        {
+          kind: "ask_user_questions",
+          payload: {
+            version: 1,
+            questions: [
+              {
+                id: "choice",
+                prompt: "Choose a tree",
+                selectionMode: "single",
+                allowOther: false,
+                options: [{ id: "cedar", label: "Cedar" }],
+              },
+              {
+                id: "label",
+                prompt: "Enter a label",
+                selectionMode: "single",
+                allowOther: true,
+                options: [
+                  { id: "text", label: "Write a label", freeText: true },
+                ],
+              },
+            ],
+          },
+        },
+        { agentId: fixture.agentId },
+      );
+      await markInteractionCardsPublished(fixture.companyId, interaction.id);
+      await service.answerQuestions(
+        { id: fixture.issueId, companyId: fixture.companyId },
+        interaction.id,
+        {
+          answers: [
+            { questionId: "choice", optionIds: ["cedar"] },
+            {
+              questionId: "label",
+              optionIds: [],
+              otherText: "private free-text label",
+            },
+          ],
+        },
+        { userId: "board-user" },
+      );
+      const settlements = (
+        await publicationsForInteraction(fixture.companyId, interaction.id)
+      ).filter((row) => row.state === "pending");
+      expect(settlements).toHaveLength(2);
+      for (const settlement of settlements) {
+        expect(settlement.payload).toMatchObject({
+          text: "Answered.",
+          card: { kind: "question", body: "Answered." },
+        });
+        expect(settlement.payload.card?.actions ?? []).toHaveLength(0);
+        expect(JSON.stringify(settlement.payload)).not.toContain(
+          "private free-text label",
+        );
+        expect(JSON.stringify(settlement.payload)).not.toContain(
+          "Answered in Paperclip",
+        );
+      }
+    });
+
     it("settles UI answers and skips on every provider-native card with no live actions", async () => {
       const fixture = await seedBoundIssue();
       const service = issueThreadInteractionService(db);

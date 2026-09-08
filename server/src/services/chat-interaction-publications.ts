@@ -81,9 +81,7 @@ function terminalNativeInteractionCopy(
             (candidate) => candidate.id === answer.optionIds[0],
           )
         : null;
-    const body = option
-      ? `Answered: ${option.label}.`
-      : "Answered in Paperclip.";
+    const body = option ? `Answered: ${option.label}.` : "Answered.";
     return { body, text: body };
   }
   if (interaction.status === "cancelled") {
