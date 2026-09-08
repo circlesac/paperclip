@@ -1566,3 +1566,111 @@ All work is pushed on `codex/chat-adapters`; the lockfile is unchanged.
 An additional fetch confirms `origin/master` remains `297d8741f5f192c66abbec325b1e956cf0e5e667`.
 The temporary keep-awake process expired; the live server and restricted
 webhook proxy remain running.
+
+### Busy-thread follow-up qualification — 2026-09-08
+
+The live Maya configuration was re-read: `paperclip_runner`, model
+`gpt-5.6-luna`; actual new runs use `codex_app_server`. No legacy adapter or
+Terra substitution was used. On the running `27c6dc4f8` code, a Slack picnic
+request was sent at 10:11:51.174Z and a replacement request at 10:11:58.362Z
+while the first turn was visibly working. The documented FIFO behavior held:
+run `666e9a6e-0d65-4298-88d8-3492fc4abe1c` finished first, and continuation
+`f3d86bb2-cea7-4cd8-8c32-8d740e333160` then returned exactly
+`SLACK-QUEUE-COBALT` once. Both stayed on CHA-21. The first final edited
+`1788862313.653509` at 10:12:25.598Z; the correction edited
+`1788862346.729459` at 10:12:37.627Z. All publication attempts were one.
+
+This qualifies the earlier latency interpretation: **9ms heartbeat queue
+time does not mean a busy-thread follow-up waited only 9ms**. The correction's
+`comment.to_run_created` span was **24.639s** before its run existed, then
+its heartbeat queue span was 9ms. Browser send to the final was **39.265s**.
+Its aggregate `task.run.measured` span was 37.070s, not a provider-delivery
+measurement. The pending input received an eyes receipt, but no explicit
+“queued next” feedback before the next run's working message. FIFO ordering
+is functional; instant steering or cancellation is not claimed.
+
+The same Discord journey failed and is **not qualified**. Initial run
+`6831cef6-58e5-4653-bf8f-032d297d417d` succeeded at 10:13:05.978Z.
+The queued correction's run `8908ed2f-0803-4d10-9bf9-8446853fa563` then
+failed at 10:13:06.171Z with `runner_state_identity_mismatch`. The browser
+showed “stopped before completing this turn,” while the first run's working
+message `1546825549438128158` still showed “making progress.” Its final
+publication `0dd150ef-66fc-4a45-88bb-70fee4a0ce5a` was cancelled with
+“Task control requester or destination is no longer authorized,” despite
+its committed final comment. No successful queued Discord answer is claimed.
+Native session lifecycle and final-publication authorization are being
+investigated independently; no identity fence was disabled or receipt
+rewritten to manufacture recovery.
+
+Telegram's corresponding FIFO check passed on the same running code.
+Initial send at 10:16:02.756Z created run
+`920f9b5a-43c8-4969-9afe-60e5f6961db6`; the correction sent at
+10:16:28.671Z created continuation `7395655e-18dc-4665-aa31-f70a5523d2a7`
+only after that first run finished. Both succeeded on the original CHA-24.
+The first final edited `417200359:105` at 10:16:40.791Z (two publication
+attempts, not duplicate provider messages). The final `TG-QUEUE-MINT`
+edited `417200359:107` at 10:16:51.710Z once, **23.039s** after the
+correction send. Its pre-run comment wait was 9.497s, heartbeat queue 15ms,
+preparation 144ms, and agent turn 10.100s. The browser showed both ordered
+answers, with no residual working placeholder. This passing sample does not
+negate the separate Discord runner shutdown failure.
+
+Commit `eec06a9e3` removes the GitHub bot-edit orphan retry churn. Signed
+comment-author/editor bot metadata or an exact company/endpoint/thread-bound
+outbound message link now filters the update on attempt one. The retained
+receipt excludes message text. Unverified signatures, human orphan edits,
+wrong-thread links, and message-body claims of bot identity do not acquire
+that shortcut. Ten focused PostgreSQL cases passed. Full chat integration
+then exposed two fixture races: the Slack burst test observed the last
+comment before its wake, and a global sweep validly woke an earlier fixture
+company. Commit `9d893daa3` waits for the exact scoped wake sequence and scopes
+the bot-edit assertion to its assigned agent. The fresh full suite passed
+**325/325**; these were test corrections, not relaxed production ordering.
+
+Commit `649869dab` fixes the completed-answer cancellation race. A later
+failed run can set shared `agents.status` to `error`; that is runtime health,
+not revocation of an earlier succeeded run's exact committed response proof.
+Only that transient status is removed from this presentation-specific denial.
+Explicit pause (including budget pause), termination, pending approval,
+current membership, endpoint/destination, review gate, and exact result/context
+checks still apply. The change does not authorize execution or new tool/file
+effects. Same-task and concurrent-other-task failures reproduced the defect;
+the concurrent lock test still requires a retry while the agent row is held.
+**91/91** external-wait tests and server typecheck passed, with a final
+**16/16** targeted run after adding revocation while the agent remains in
+error. The historical cancelled live publication was not rewritten or replayed.
+
+Commit `de43b250b` hardens local runner shutdown. The live failed handoff had
+a pending stop/suspend command and an ACK backlog: the previous close spent
+its entire grace period stopping/draining, then could kill a still-ready
+runner and report success. Local close now reserves a suspension window and
+requires both the completed suspend command and exact current durable
+identity in suspended state, as remote close already required. Completed
+historical suspension receipts cannot certify a resumed ready runner. No
+session-rotation or quarantine guard was relaxed. Failure to establish proof
+rejects close while retaining durable evidence; it does not invite a blind
+rerun of committed tool effects.
+
+Verification includes **85/85** real-process transport tests, **154/154**
+native executor tests, runner TypeScript validation, and an independent
+**8/8** transport regression review. A 144-delta process fixture verifies
+backlog to durable suspension to the same provider conversation under fresh
+run authority. Readiness/wrong-identity and stale-completed-command cases
+fail closed. The configured grace bounds acceptance of proof, not an overall
+wall-time SLA for an independently bounded remote state read. The already
+quarantined live Discord root was not restored. A fresh explicit message
+may follow the existing safe replacement policy; that must not be described
+as recovery of the quarantined provider's original history.
+
+Publication reconciliation now also wakes on exact committed native progress
+and final-presentation event types, rather than depending only on the
+one-second sweep. The initial notification schedules an immediate scan;
+sustained notifications coalesce with a dirty bit and at least 100ms between
+scan starts. Recovery polling remains, never adds dirty work to an active
+scan, and shutdown cancels deferred scans while joining active work. This
+uses a separate internal company-event observer, not the public global event
+stream, and never forwards event prose/payloads. Independent review and
+**19/19** helper/application tests passed. Shared, server, and UI typechecks
+also passed. This removes avoidable polling latency; it is not evidence that
+Luna's own model turn or FIFO waiting time has become shorter. The combined
+build still requires the following live post-deployment qualification.
