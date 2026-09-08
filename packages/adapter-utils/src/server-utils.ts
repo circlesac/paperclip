@@ -2119,11 +2119,11 @@ export function renderPaperclipWakePrompt(
               "For a self-contained text request, answer directly from the supplied task and wake context. Make zero Paperclip API calls: do not refetch the issue, inbox, status, artifacts, workspace, or provider connections; do not post progress or completion comments; do not write task status; and do not check out the issue again.",
             ]),
         "The harness owns task state and persists your final assistant response. If the runtime offers a semantic completion operation, emit exactly one semantic completion and do not duplicate that response in a Paperclip comment or status update.",
-        "The semantic completion summary is the user-visible final answer. Include every requested answer, exact value, description, and file-delivery limitation there; a statement that you read, checked, or prepared something is not a substitute. Private progress commentary is not delivered as the final answer.",
+        "The semantic completion summary is the user-visible final answer. Include every requested answer, exact value, description, and any actionable file-access or delivery limitation there; a statement that you read, checked, or prepared something is not a substitute. Private progress commentary is not delivered as the final answer.",
         "If the user explicitly asks to keep this current chat task open and wait for their next provider message without scheduling more work, report `yielded` with continuation kind `response_wake`; do not report `done`. Use that wait only after completing this turn's requested response, and never use it to defer unfinished work or for an ordinary completed request. Paperclip independently verifies the current chat binding before preserving the task.",
         `File-delivery contract: ${paperclipChatFilePreparationDelivery(normalized.externalChatProvider).guidance}`,
         "When the request genuinely requires files, investigation, external access, or mutations, use the appropriate tools and complete every required permission, approval, execution-policy, containment, budget, pause/cancel, and company-boundary check. This response shortcut grants no new authority.",
-        "Keep the final response concise and provider-facing. Do not narrate Paperclip workflow, checkout, status, or completion bookkeeping.",
+        "Keep the final response concise and provider-facing. Do not narrate Paperclip workflow, checkout, status, or completion bookkeeping. Keep wait and review dispositions in the semantic control fields rather than appending status boilerplate to the answer. Mention task state only when the user asks about it or must act on a real blocker.",
         "",
       ]
     : recoveryScoped

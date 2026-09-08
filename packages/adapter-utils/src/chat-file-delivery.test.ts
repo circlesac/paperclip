@@ -54,6 +54,19 @@ describe("chat file preparation delivery contract", () => {
       expect(delivery.guidance).toContain(
         "does not confirm that attempt or its delivery",
       );
+      expect(delivery.guidance).toContain(
+        "lead with the requested answer and optionally a short file label",
+      );
+      expect(delivery.guidance).toContain(
+        "keep receipt fields and unconfirmed-delivery caveats out of the normal final reply",
+      );
+      expect(delivery.guidance).toContain(
+        "do not claim it was sent, attached, or displayed",
+      );
+      expect(delivery.guidance).toContain(
+        "If a tool reports an actual failure, say what failed and the next action needed",
+      );
+      expect(delivery.guidance).not.toContain("Say the file is prepared");
     },
   );
 
