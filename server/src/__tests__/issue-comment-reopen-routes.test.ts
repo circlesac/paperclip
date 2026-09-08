@@ -1151,14 +1151,25 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       "Paperclip needs a disposition before this issue can continue.",
-      { agentId: undefined, userId: "local-board", runId: null, onBehalfOfUserId: undefined },
       {
+        agentId: undefined,
+        userId: "local-board",
+        runId: null,
+        onBehalfOfUserId: undefined,
+      },
+      {
+        attachmentIds: undefined,
         authorType: "user",
         authorizationReason: "allow_board_actor",
-        presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false },
+        presentation: {
+          kind: "system_notice",
+          tone: "warning",
+          detailsDefaultOpen: false,
+        },
         metadata,
         sourceTrust: null,
       },
+      mockDb,
     );
   });
 
@@ -1211,6 +1222,7 @@ describe.sequential("issue comment reopen routes", () => {
         onBehalfOfUserId: null,
       },
       expect.objectContaining({
+        attachmentIds: undefined,
         authorType: "agent",
         presentation: {
           kind: "system_notice",
@@ -1220,6 +1232,7 @@ describe.sequential("issue comment reopen routes", () => {
           density: "compact",
         },
       }),
+      mockDb,
     );
   });
 
@@ -1240,7 +1253,8 @@ describe.sequential("issue comment reopen routes", () => {
         runId: "run-1",
         onBehalfOfUserId: null,
       },
-      expect.objectContaining({ presentation: null }),
+      expect.objectContaining({ attachmentIds: undefined, presentation: null }),
+      mockDb,
     );
   });
 
@@ -1273,7 +1287,8 @@ describe.sequential("issue comment reopen routes", () => {
         runId: "run-1",
         onBehalfOfUserId: null,
       },
-      expect.objectContaining({ presentation: null }),
+      expect.objectContaining({ attachmentIds: undefined, presentation: null }),
+      mockDb,
     );
   });
 
