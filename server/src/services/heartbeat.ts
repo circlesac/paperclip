@@ -151,7 +151,9 @@ import {
   ensureNativeCompletionContract,
   executePaperclipNativeSession,
   finalizeNativeRun,
+  findNativeSessionResumeRun,
   isNativeSessionId,
+  isUnusedNativeSessionBootstrap,
   isUnusedLegacyNativeRetryReplacement,
   isRunnerIngressAuthorized,
   materializeLegacyQuestionResponseWakeProjection,
@@ -159,6 +161,7 @@ import {
   nativeCompletionRequestsForComments,
   NativeCancellationPendingRecoveryError,
   nativeToolContractFingerprintForTarget,
+  prepareNativeSessionBootstrapPersistence,
   prepareNativeWorkspaceSync,
   readNativeWorkspaceSyncReference,
   recordNativeFinalizationFailure,
@@ -21121,32 +21124,35 @@ export function heartbeatService(
                 .limit(1)
                 .then((rows) => rows[0] ?? null)
             : null;
-          const legacyRetryHasProviderEvidence = legacyRetrySource
-            ? await db
-                .select({ id: heartbeatRunEvents.id })
-                .from(heartbeatRunEvents)
-                .where(
-                  and(
-                    eq(heartbeatRunEvents.runId, run.id),
-                    inArray(heartbeatRunEvents.eventType, [
-                      "harness.ready",
-                      "session.started",
-                      "session.resumed",
-                      "session.updated",
-                      "turn.started",
-                      "provider.event",
-                      "provider.rpc_result",
-                    ]),
-                  ),
-                )
-                .limit(1)
-                .then((rows) => rows.length > 0)
-            : false;
+          const nativeBootstrapHasProviderEvidence =
+            legacyRetrySource ||
+            run.nativeSessionId ||
+            persistedNativeExecutionInput
+              ? await db
+                  .select({ id: heartbeatRunEvents.id })
+                  .from(heartbeatRunEvents)
+                  .where(
+                    and(
+                      eq(heartbeatRunEvents.runId, run.id),
+                      inArray(heartbeatRunEvents.eventType, [
+                        "harness.ready",
+                        "session.started",
+                        "session.resumed",
+                        "session.updated",
+                        "turn.started",
+                        "provider.event",
+                        "provider.rpc_result",
+                      ]),
+                    ),
+                  )
+                  .limit(1)
+                  .then((rows) => rows.length > 0)
+              : false;
           const compatibleLegacyRetrySource =
             isUnusedLegacyNativeRetryReplacement({
               replacement: run,
               source: legacyRetrySource,
-              hasProviderEvents: legacyRetryHasProviderEvidence,
+              hasProviderEvents: nativeBootstrapHasProviderEvidence,
             })
               ? legacyRetrySource
               : null;
@@ -21161,33 +21167,26 @@ export function heartbeatService(
           const resumableTaskSessionId = taskResumeRunId
             ? taskNativeSessionId
             : (legacyRetrySessionId ?? null);
-          const priorNativeRunId =
-            taskResumeRunId ?? compatibleLegacyRetrySource?.id ?? null;
+          const requestedNativeSessionId =
+            run.nativeSessionId ?? resumableTaskSessionId;
+          // A task-session lastRunId can lag a failed turn or point at an older
+          // normalized session. Find the newest exact-session authority instead.
+          // Rows that already acquired provider authority are progress barriers,
+          // even when they do not contain a usable checkpoint.
           const previousNativeRun =
-            resumableTaskSessionId && priorNativeRunId
-              ? await db
-                  .select({
-                    id: heartbeatRuns.id,
-                    companyId: heartbeatRuns.companyId,
-                    agentId: heartbeatRuns.agentId,
-                    runnerInstanceId: heartbeatRuns.runnerInstanceId,
-                    nativeSessionId: heartbeatRuns.nativeSessionId,
-                    processPid: heartbeatRuns.processPid,
-                    processGroupId: heartbeatRuns.processGroupId,
-                    processStartedAt: heartbeatRuns.processStartedAt,
-                    runnerProfileJson: heartbeatRuns.runnerProfileJson,
-                  })
-                  .from(heartbeatRuns)
-                  .where(
-                    and(
-                      eq(heartbeatRuns.id, priorNativeRunId),
-                      eq(heartbeatRuns.companyId, agent.companyId),
-                      eq(heartbeatRuns.agentId, agent.id),
-                      eq(heartbeatRuns.nativeSessionId, resumableTaskSessionId),
-                    ),
-                  )
-                  .limit(1)
-                  .then((rows) => rows[0] ?? null)
+            requestedNativeSessionId &&
+            isUnusedNativeSessionBootstrap(
+              run,
+              nativeBootstrapHasProviderEvidence,
+            )
+              ? await findNativeSessionResumeRun(db, {
+                  companyId: agent.companyId,
+                  agentId: agent.id,
+                  issueId: issueRef.id,
+                  normalizedSessionId: requestedNativeSessionId,
+                  currentRunId: run.id,
+                  beforeCreatedAt: run.createdAt,
+                })
               : null;
           nativeRunnerInstanceId =
             previousNativeRun?.runnerInstanceId &&
@@ -21243,6 +21242,23 @@ export function heartbeatService(
               throw new Error(
                 "native_execution_input_persisted_binding_mismatch",
               );
+            // A failed pre-bootstrap attempt may have persisted its immutable
+            // input before discovering that lastRunId no longer names this
+            // session. Restore only an exactly compatible prior checkpoint;
+            // never rewrite the admitted input or skip current provider work.
+            if (
+              previousNativeRun &&
+              isUnusedNativeSessionBootstrap(
+                run,
+                nativeBootstrapHasProviderEvidence,
+              )
+            ) {
+              nativeResumeCheckpoint = rebindNativeSessionCheckpoint({
+                previousRun: previousNativeRun,
+                currentExecution: nativeExecution,
+                executionTargetKind: executionTarget?.kind ?? "local",
+              });
+            }
             if (nativeExecution.provider.kind === "claude_managed") {
               const recoveryProfile = await managedAgentProfileService(
                 db,
@@ -21358,10 +21374,7 @@ export function heartbeatService(
             });
             const nativeExecutionWithCheckpoint =
               buildNativeExecutionWithCheckpoint({
-                previousRun:
-                  nativeSessionId === resumableTaskSessionId
-                    ? previousNativeRun
-                    : null,
+                previousRun: previousNativeRun,
                 normalizedSessionId: nativeSessionId,
                 executionTargetKind: executionTarget?.kind ?? "local",
                 buildExecution: ({ normalizedSessionId, resumedSession }) =>
@@ -21429,6 +21442,12 @@ export function heartbeatService(
               });
             nativeExecution = nativeExecutionWithCheckpoint.execution;
             nativeResumeCheckpoint = nativeExecutionWithCheckpoint.checkpoint;
+            if (
+              nativeSessionId !==
+              nativeExecutionWithCheckpoint.normalizedSessionId
+            ) {
+              nativeRunnerInstanceId = randomUUID();
+            }
             nativeSessionId = nativeExecutionWithCheckpoint.normalizedSessionId;
           }
           const nativeSandboxLifecycle = resolveNativeSandboxLifecycle({
@@ -21485,6 +21504,13 @@ export function heartbeatService(
               throw new Error("native_runtime_mode_conflict");
             }
             const lockedProfile = parseObject(lockedRun.runnerProfileJson);
+            const persistedNativeSessionId =
+              await prepareNativeSessionBootstrapPersistence(tx, {
+                run: lockedRun,
+                selectedSessionId: nativeSessionId,
+                execution: nativeExecution!,
+                restoringCheckpoint: nativeResumeCheckpoint !== null,
+              });
             await tx
               .update(heartbeatRuns)
               .set({
@@ -21514,7 +21540,7 @@ export function heartbeatService(
                     nativeToolContractFingerprintForTarget(
                       executionTarget?.kind ?? "local",
                     ),
-                  ...(lockedProfile.sessionCheckpoint !== undefined
+                  ...(lockedProfile.sessionCheckpoint != null
                     ? { sessionCheckpoint: lockedProfile.sessionCheckpoint }
                     : nativeResumeCheckpoint
                       ? {
@@ -21528,12 +21554,12 @@ export function heartbeatService(
                 },
                 runnerInstanceId:
                   previousNativeRun?.runnerInstanceId &&
-                  lockedRun.nativeSessionId !== null &&
-                  lockedRun.nativeSessionId ===
-                    previousNativeRun.nativeSessionId
+                  persistedNativeSessionId === previousNativeRun.nativeSessionId
                     ? previousNativeRun.runnerInstanceId
-                    : (lockedRun.runnerInstanceId ?? nativeRunnerInstanceId),
-                nativeSessionId: lockedRun.nativeSessionId ?? nativeSessionId,
+                    : lockedRun.nativeSessionId !== persistedNativeSessionId
+                      ? nativeRunnerInstanceId
+                      : (lockedRun.runnerInstanceId ?? nativeRunnerInstanceId),
+                nativeSessionId: persistedNativeSessionId,
                 processPid:
                   lockedRun.processPid ??
                   (previousNativeRun?.nativeSessionId === nativeSessionId

@@ -234,8 +234,19 @@ attachment access across unrelated tasks or identities.
 
 Functional text/queue outcomes are good in the exercised Slack, GitHub and
 Telegram paths; experience quality is not yet signed off across all providers.
-Teams tenant setup, GitHub inline-review live delivery, Discord recovery and
+Teams tenant setup, Discord recovery and
 remaining attachment failure/recovery journeys are still explicit gaps.
+
+The existing disposable GitHub PR #3 line-review thread was also exercised on
+the new native runner. A plain reply without another bot mention, review comment
+`3954194584`, mapped to the existing `:rc:3950666444` conversation and one native
+Luna run `a57802aa-4df8-4415-9b19-41444eb3caa0`. The run finished in 14.0 s and
+published `GH-INLINE-LUNA-READY` as review comment `3954194907`, under the same
+line thread rather than the PR main discussion. The response was inspected after
+refreshing GitHub's classic PR page, which did not insert the new reply live.
+[Inline reply proof](https://github.com/cryppadotta/paperclip-chat-e2e-enabled/pull/3#discussion_r3954194907).
+This closes fresh native inline-reply delivery, not every inline edit/delete or
+file-fallback journey. No test PR was merged and no implementation PR was tended.
 
 ### Discord host-pause admission hardening
 
@@ -255,3 +266,40 @@ drains its own receipt after clearing the test-only due time, without weakening
 the subsequent linked-authority/reach assertions. The cleanup pair separately
 passed **2/2**. Direct server TypeScript checking also passed for the gateway fix.
 These are deterministic admission proofs, not a live forced-host-sleep claim.
+
+### Native checkpoint-selection correction
+
+Native bootstrap now searches exact company/agent/issue/session history rather
+than trusting a stale task-session `lastRunId`. Only terminal attempts with no
+checkpoint, process or established-provider events can be skipped. Newer
+provider authority is a barrier, never a checkpoint to adopt or roll back past.
+Compatibility checks for provider, workspace, runtime context and native tools
+remain strict. A new, uninitialized run with no compatible checkpoint receives
+a fresh normalized session/durable root and full task context. Previously
+admitted immutable inputs are not rewritten, and old history is retained.
+
+The locked persistence step rereads provider evidence and checks the immutable
+input before accepting a recovered checkpoint or fresh session ID. This also
+fixes prefilled native session IDs overriding an explicitly selected fresh ID.
+Real PostgreSQL regressions cover scoped lookup, newer progress barriers,
+incompatible checkpoints, fresh-ID persistence and a provider event committed
+while recovery waits on the run-row lock.
+
+Root's frozen-snapshot resume/runner-selection/cancellation/status-context cohort
+passed **61/61** (`native-resume-recovery-root-01.log`); this includes **28/28**
+resume tests. Direct server TypeScript checking passed. The separate heartbeat
+process-recovery file passed **133/133** on a clean rerun. An earlier combined
+run reported two failures while files were changing; one recovery-case failure
+was truncated and its cause was not established. It is not counted as a pass.
+Live deployment and the original Discord retry are the next required checks.
+
+The frozen native fix also passed the full server build and formatting checks.
+An independent read-only review found no concrete findings in the scoped diff.
+
+The subsequent native GitHub inline-file run
+`c90e0948-1512-41b3-81af-bb14d4e93ada` succeeded in 30.3 s, but exposed a
+wording defect: the model claimed the file was attached in the review thread,
+while the transport correctly explained that GitHub App comments cannot upload
+file bytes and saved the file on the private Paperclip task. This is not signed
+off as native GitHub attachment delivery; capability/result guidance needs to
+prevent the conflicting claim.

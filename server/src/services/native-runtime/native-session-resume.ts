@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import type {
   NativeExecutionInput,
   PersistedNativeSession,
@@ -62,13 +65,17 @@ export const NATIVE_TOOL_CONTRACT_FINGERPRINT =
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : {};
 }
 
 export function isNativeSessionId(value: unknown): value is string {
-  return typeof value === "string"
-    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  );
 }
 
 const LEGACY_RETRY_SOURCE_TERMINAL_STATUSES = new Set([
@@ -78,6 +85,208 @@ const LEGACY_RETRY_SOURCE_TERMINAL_STATUSES = new Set([
   "cancelled",
   "timed_out",
 ]);
+
+export type NativeSessionBootstrapState = {
+  processPid: number | null;
+  processGroupId: number | null;
+  processStartedAt: Date | null;
+  runnerProfileJson: unknown;
+};
+
+export function isUnusedNativeSessionBootstrap(
+  run: NativeSessionBootstrapState,
+  hasProviderEvents: boolean,
+): boolean {
+  return (
+    run.processPid === null &&
+    run.processGroupId === null &&
+    run.processStartedAt === null &&
+    record(run.runnerProfileJson).sessionCheckpoint == null &&
+    !hasProviderEvents
+  );
+}
+
+/** Newest-first rows for one exact task/session; never skip provider progress. */
+export function selectNativeSessionResumeRun<
+  T extends NativeSessionBootstrapState & {
+    id: string;
+    companyId: string;
+    agentId: string;
+    nativeIssueId: string | null;
+    nativeSessionId: string | null;
+    runtimeMode: string | null;
+    status: string;
+    createdAt: Date;
+  },
+>(input: {
+  runs: readonly T[];
+  companyId: string;
+  agentId: string;
+  issueId: string;
+  normalizedSessionId: string;
+  currentRunId: string;
+  beforeCreatedAt: Date;
+  providerEvidenceRunIds: ReadonlySet<string>;
+}): T | null {
+  for (const run of input.runs) {
+    if (
+      run.id === input.currentRunId ||
+      run.companyId !== input.companyId ||
+      run.agentId !== input.agentId ||
+      run.nativeIssueId !== input.issueId ||
+      run.nativeSessionId !== input.normalizedSessionId
+    )
+      continue;
+    if (
+      run.runtimeMode !== "native" ||
+      !LEGACY_RETRY_SOURCE_TERMINAL_STATUSES.has(run.status)
+    )
+      return null;
+    // Even an incompatible checkpoint is a progress barrier. The caller must
+    // reject it or start a fresh session, not fall back to an older checkpoint.
+    if (record(run.runnerProfileJson).sessionCheckpoint != null)
+      return run.createdAt > input.beforeCreatedAt ? null : run;
+    if (
+      !isUnusedNativeSessionBootstrap(
+        run,
+        input.providerEvidenceRunIds.has(run.id),
+      )
+    )
+      return null;
+  }
+  return null;
+}
+
+export async function nativeSessionProviderEvidence(
+  db: Pick<Db, "select">,
+  runIds: string[],
+): Promise<Set<string>> {
+  if (!runIds.length) return new Set();
+  const rows = await db
+    .select({ runId: heartbeatRunEvents.runId })
+    .from(heartbeatRunEvents)
+    .where(
+      and(
+        inArray(heartbeatRunEvents.runId, runIds),
+        inArray(heartbeatRunEvents.eventType, [
+          "harness.ready",
+          "session.started",
+          "session.resumed",
+          "session.updated",
+          "turn.started",
+          "provider.event",
+          "provider.rpc_result",
+        ]),
+      ),
+    )
+    .groupBy(heartbeatRunEvents.runId);
+  return new Set(rows.map((row) => row.runId));
+}
+
+export async function findNativeSessionResumeRun(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    normalizedSessionId: string;
+    currentRunId: string;
+    beforeCreatedAt: Date;
+  },
+) {
+  if (!isNativeSessionId(input.normalizedSessionId)) return null;
+  const runs = await db
+    .select({
+      id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId,
+      runnerInstanceId: heartbeatRuns.runnerInstanceId,
+      nativeSessionId: heartbeatRuns.nativeSessionId,
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      runtimeMode: heartbeatRuns.runtimeMode,
+      status: heartbeatRuns.status,
+      createdAt: heartbeatRuns.createdAt,
+      processPid: heartbeatRuns.processPid,
+      processGroupId: heartbeatRuns.processGroupId,
+      processStartedAt: heartbeatRuns.processStartedAt,
+      runnerProfileJson: heartbeatRuns.runnerProfileJson,
+    })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        ne(heartbeatRuns.id, input.currentRunId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        eq(heartbeatRuns.nativeIssueId, input.issueId),
+        eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId),
+      ),
+    )
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+    .limit(32);
+  return selectNativeSessionResumeRun({
+    ...input,
+    runs,
+    providerEvidenceRunIds: await nativeSessionProviderEvidence(
+      db,
+      runs.map((run) => run.id),
+    ),
+  });
+}
+
+/** A preassigned session id may rotate only before immutable native admission. */
+export function nativeSessionIdForBootstrapPersistence(input: {
+  run: NativeSessionBootstrapState & { nativeSessionId: string | null };
+  selectedSessionId: string;
+  hasProviderEvents: boolean;
+}): string {
+  if (input.run.nativeSessionId === input.selectedSessionId)
+    return input.selectedSessionId;
+  if (
+    record(input.run.runnerProfileJson).nativeExecutionInput !== undefined ||
+    !isUnusedNativeSessionBootstrap(input.run, input.hasProviderEvents)
+  ) {
+    throw new Error("native_session_bootstrap_identity_conflict");
+  }
+  return input.selectedSessionId;
+}
+
+/** Caller holds the run row lock; recheck authority after waiting for that lock. */
+export async function prepareNativeSessionBootstrapPersistence(
+  db: Pick<Db, "select">,
+  input: {
+    run: NativeSessionBootstrapState & {
+      id: string;
+      nativeSessionId: string | null;
+    };
+    selectedSessionId: string;
+    execution: NativeExecutionInput;
+    restoringCheckpoint: boolean;
+  },
+) {
+  const hasProviderEvents = (
+    await nativeSessionProviderEvidence(db, [input.run.id])
+  ).has(input.run.id);
+  const profile = record(input.run.runnerProfileJson);
+  if (
+    profile.nativeExecutionInput !== undefined &&
+    !isDeepStrictEqual(
+      parseNativeExecutionInput(profile.nativeExecutionInput),
+      input.execution,
+    )
+  ) {
+    throw new Error("native_execution_input_persisted_binding_mismatch");
+  }
+  if (
+    input.restoringCheckpoint &&
+    !isUnusedNativeSessionBootstrap(input.run, hasProviderEvents)
+  ) {
+    throw new Error("native_session_bootstrap_identity_conflict");
+  }
+  return nativeSessionIdForBootstrapPersistence({
+    ...input,
+    hasProviderEvents,
+  });
+}
 
 /**
  * Legacy compatibility is deliberately narrower than ordinary task-session
@@ -100,16 +309,11 @@ export function isUnusedLegacyNativeRetryReplacement(input: {
   } | null;
   hasProviderEvents: boolean;
 }): boolean {
-  const replacementProfile = record(input.replacement.runnerProfileJson);
   return Boolean(
     input.source?.runtimeMode === "native" &&
-      LEGACY_RETRY_SOURCE_TERMINAL_STATUSES.has(input.source.status) &&
-      isNativeSessionId(input.source.nativeSessionId) &&
-      input.replacement.processPid === null &&
-      input.replacement.processGroupId === null &&
-      input.replacement.processStartedAt === null &&
-      replacementProfile.sessionCheckpoint == null &&
-      !input.hasProviderEvents,
+    LEGACY_RETRY_SOURCE_TERMINAL_STATUSES.has(input.source.status) &&
+    isNativeSessionId(input.source.nativeSessionId) &&
+    isUnusedNativeSessionBootstrap(input.replacement, input.hasProviderEvents),
   );
 }
 
@@ -147,22 +351,26 @@ function sameWorkspaceScope(input: {
   previousRunId: string;
   currentExecution: NativeExecutionInput;
 }): boolean {
-  return JSON.stringify(
-    nativeCheckpointWorkspaceScope(
-      input.previousExecution,
-      input.previousRunId,
-    ),
-  ) === JSON.stringify(
-    nativeCheckpointWorkspaceScope(
-      input.currentExecution,
-      input.currentExecution.binding.runId,
-    ),
+  return (
+    JSON.stringify(
+      nativeCheckpointWorkspaceScope(
+        input.previousExecution,
+        input.previousRunId,
+      ),
+    ) ===
+    JSON.stringify(
+      nativeCheckpointWorkspaceScope(
+        input.currentExecution,
+        input.currentExecution.binding.runId,
+      ),
+    )
   );
 }
 
 /** A resume delta is valid only if the provider checkpoint really can be used. */
 export function buildNativeExecutionWithCheckpoint(input: {
-  previousRun: Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
+  previousRun:
+    Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
   executionTargetKind?: NativeToolExecutionTargetKind;
   buildExecution: (options: {
@@ -178,13 +386,19 @@ export function buildNativeExecutionWithCheckpoint(input: {
     normalizedSessionId: input.normalizedSessionId,
     resumedSession: input.previousRun !== null,
   });
-  if (!input.previousRun) return { execution, checkpoint: null, normalizedSessionId: input.normalizedSessionId };
-  const checkpoint = rebindNativeSessionCheckpoint({
-    previousRun: input.previousRun,
-    currentExecution: execution,
-    executionTargetKind: input.executionTargetKind,
-  });
-  if (checkpoint) return { execution, checkpoint, normalizedSessionId: input.normalizedSessionId };
+  const checkpoint = input.previousRun
+    ? rebindNativeSessionCheckpoint({
+        previousRun: input.previousRun,
+        currentExecution: execution,
+        executionTargetKind: input.executionTargetKind,
+      })
+    : null;
+  if (checkpoint)
+    return {
+      execution,
+      checkpoint,
+      normalizedSessionId: input.normalizedSessionId,
+    };
   // Rebuild both task context and wake instructions. Merely rotating the ID
   // leaves a fresh provider with a compact delta and missing task context.
   const normalizedSessionId = randomUUID();
@@ -217,9 +431,7 @@ export function rebindNativeSessionCheckpoint(input: {
   const previousProfile = record(input.previousRun.runnerProfileJson);
   if (
     previousProfile.nativeToolContractFingerprint !==
-    nativeToolContractFingerprintForTarget(
-      input.executionTargetKind ?? "local",
-    )
+    nativeToolContractFingerprintForTarget(input.executionTargetKind ?? "local")
   ) {
     return null;
   }
@@ -228,52 +440,60 @@ export function rebindNativeSessionCheckpoint(input: {
   const current = input.currentExecution;
   const normalizedSessionId = current.session.normalizedSessionId;
   if (
-    !isNativeSessionId(normalizedSessionId)
-    || input.previousRun.companyId !== current.binding.companyId
-    || input.previousRun.agentId !== current.binding.agentId
-    || input.previousRun.nativeSessionId !== normalizedSessionId
-    || typeof rawCheckpoint.sessionId !== "string"
-    || checkpointIdentity.runId !== input.previousRun.id
-    || checkpointIdentity.companyId !== current.binding.companyId
-    || checkpointIdentity.issueId !== current.binding.issueId
-    || checkpointIdentity.agentId !== current.binding.agentId
-    || checkpointIdentity.sessionId !== normalizedSessionId
-  ) return null;
+    !isNativeSessionId(normalizedSessionId) ||
+    input.previousRun.companyId !== current.binding.companyId ||
+    input.previousRun.agentId !== current.binding.agentId ||
+    input.previousRun.nativeSessionId !== normalizedSessionId ||
+    typeof rawCheckpoint.sessionId !== "string" ||
+    checkpointIdentity.runId !== input.previousRun.id ||
+    checkpointIdentity.companyId !== current.binding.companyId ||
+    checkpointIdentity.issueId !== current.binding.issueId ||
+    checkpointIdentity.agentId !== current.binding.agentId ||
+    checkpointIdentity.sessionId !== normalizedSessionId
+  )
+    return null;
 
   let previousExecution: NativeExecutionInput;
   try {
-    previousExecution = parseNativeExecutionInput(previousProfile.nativeExecutionInput);
+    previousExecution = parseNativeExecutionInput(
+      previousProfile.nativeExecutionInput,
+    );
   } catch {
     return null;
   }
   if (
-    previousExecution.binding.runId !== input.previousRun.id
-    || previousExecution.binding.companyId !== current.binding.companyId
-    || previousExecution.binding.issueId !== current.binding.issueId
-    || previousExecution.binding.agentId !== current.binding.agentId
-    || previousExecution.session.normalizedSessionId !== normalizedSessionId
-    || previousExecution.session.driverKind !== current.session.driverKind
-    || !sameWorkspaceScope({
+    previousExecution.binding.runId !== input.previousRun.id ||
+    previousExecution.binding.companyId !== current.binding.companyId ||
+    previousExecution.binding.issueId !== current.binding.issueId ||
+    previousExecution.binding.agentId !== current.binding.agentId ||
+    previousExecution.session.normalizedSessionId !== normalizedSessionId ||
+    previousExecution.session.driverKind !== current.session.driverKind ||
+    !sameWorkspaceScope({
       previousExecution,
       previousRunId: input.previousRun.id,
       currentExecution: current,
-    })
-    || previousExecution.task.workMode !== current.task.workMode
-    || ("executionMode" in previousExecution ? previousExecution.executionMode : "default")
-      !== ("executionMode" in current ? current.executionMode : "default")
-    || !sameProvider(previousExecution.provider, current.provider)
-    || previousExecution.schema !== current.schema
-    || ("runtimeContext" in previousExecution && "runtimeContext" in current
-      && previousExecution.runtimeContext.aggregateDigest !== current.runtimeContext.aggregateDigest)
-  ) return null;
+    }) ||
+    previousExecution.task.workMode !== current.task.workMode ||
+    ("executionMode" in previousExecution
+      ? previousExecution.executionMode
+      : "default") !==
+      ("executionMode" in current ? current.executionMode : "default") ||
+    !sameProvider(previousExecution.provider, current.provider) ||
+    previousExecution.schema !== current.schema ||
+    ("runtimeContext" in previousExecution &&
+      "runtimeContext" in current &&
+      previousExecution.runtimeContext.aggregateDigest !==
+        current.runtimeContext.aggregateDigest)
+  )
+    return null;
 
   const priorSemanticResult = record(rawCheckpoint.semanticResult);
   const priorContinuation = record(priorSemanticResult.continuation);
   const providerRecoveryPolicy =
-    priorSemanticResult.reportedWorkDisposition === "yielded"
-    && priorContinuation.kind === "response_wake"
-      ? "allow_replacement_after_governed_wait" as const
-      : "allow_replacement_after_resume_failure" as const;
+    priorSemanticResult.reportedWorkDisposition === "yielded" &&
+    priorContinuation.kind === "response_wake"
+      ? ("allow_replacement_after_governed_wait" as const)
+      : ("allow_replacement_after_resume_failure" as const);
 
   return {
     ...(structuredClone(rawCheckpoint) as unknown as PersistedNativeSession),
