@@ -720,6 +720,254 @@ describe("Chat SDK published adapter integration", () => {
     }
   });
 
+  describe("signed Slack file-only message changes", () => {
+    const firstFile = {
+      id: "F-FIRST",
+      name: "first.png",
+      mimetype: "image/png",
+      size: 128,
+      original_w: 16,
+      original_h: 8,
+      url_private: "https://files.slack.com/files-pri/T-TEST/F-FIRST/first.png",
+    };
+    const secondFile = {
+      ...firstFile,
+      id: "F-SECOND",
+      name: "second.png",
+      url_private:
+        "https://files.slack.com/files-pri/T-TEST/F-SECOND/second.png",
+    };
+    const unchangedFiles = [firstFile, secondFile];
+    const cases = [
+      { name: "removal", files: [secondFile], changed: true },
+      { name: "removal of all files", files: [], changed: true },
+      { name: "removal with files omitted", files: undefined, changed: true },
+      {
+        name: "first file addition",
+        previousFiles: [],
+        files: [firstFile],
+        changed: true,
+      },
+      {
+        name: "absent versus empty files",
+        previousFiles: [],
+        files: undefined,
+        changed: false,
+      },
+      {
+        name: "addition",
+        files: [...unchangedFiles, { ...firstFile, id: "F-THIRD" }],
+        changed: true,
+      },
+      {
+        name: "replacement ID",
+        files: [{ ...firstFile, id: "F-REPLACEMENT" }, secondFile],
+        changed: true,
+      },
+      { name: "reordering", files: [secondFile, firstFile], changed: true },
+      {
+        name: "name change",
+        files: [{ ...firstFile, name: "renamed.png" }, secondFile],
+        changed: true,
+      },
+      {
+        name: "MIME type change",
+        files: [{ ...firstFile, mimetype: "application/pdf" }, secondFile],
+        changed: true,
+      },
+      {
+        name: "size change",
+        files: [{ ...firstFile, size: 256 }, secondFile],
+        changed: true,
+      },
+      {
+        name: "width change",
+        files: [{ ...firstFile, original_w: 32 }, secondFile],
+        changed: true,
+      },
+      {
+        name: "height change",
+        files: [{ ...firstFile, original_h: 32 }, secondFile],
+        changed: true,
+      },
+      {
+        name: "non-hidden removal",
+        files: [secondFile],
+        changed: true,
+        hidden: false,
+      },
+      {
+        name: "identical files",
+        files: unchangedFiles.map((file) => ({ ...file })),
+        changed: false,
+      },
+      {
+        name: "private URL rotation",
+        files: [
+          { ...firstFile, url_private: `${firstFile.url_private}?rotation=2` },
+          secondFile,
+        ],
+        changed: false,
+      },
+      {
+        name: "unused title change",
+        files: [{ ...firstFile, title: "Different preview title" }, secondFile],
+        changed: false,
+      },
+      {
+        name: "unfurl-only update",
+        files: unchangedFiles,
+        changed: false,
+        unfurl: true,
+      },
+      {
+        name: "invalid webhook signature",
+        files: [secondFile],
+        changed: false,
+        invalidSignature: true,
+      },
+    ];
+
+    it.each(cases)(
+      "handles $name without changing text or edit time",
+      async (testCase) => {
+        const signingSecret = "slack-file-lifecycle-signing-secret";
+        const onMessage = vi.fn<ChatSdkRuntimeCallbacks["onMessage"]>(
+          async () => undefined,
+        );
+        const onMessageUpdated = vi.fn<
+          NonNullable<ChatSdkRuntimeCallbacks["onMessageUpdated"]>
+        >(async () => undefined);
+        const onMessageDeleted = vi.fn(async () => undefined);
+        const runtime = createChatSdkEndpointRuntime({
+          callbacks: { onMessage, onMessageUpdated, onMessageDeleted },
+          companyId: "company-slack-file-lifecycle",
+          endpointId: "endpoint-slack-file-lifecycle",
+          logger: "silent",
+          persistence: memoryPersistence(),
+          providerConfig: {
+            provider: "slack",
+            userName: "paperclip-agent",
+            credentials: {
+              botToken: "xoxb-test",
+              botUserId: "U-PAPERCLIP-BOT",
+              signingSecret,
+            },
+          },
+        });
+        const providerFetch = vi.fn(async () => {
+          throw new Error(
+            "Slack file lifecycle intake must not download files",
+          );
+        });
+        vi.stubGlobal("fetch", providerFetch);
+        const adapter = runtime.getProviderAdapter() as unknown as {
+          _client: { apiCall(...args: unknown[]): Promise<unknown> };
+        };
+        const providerApi = vi
+          .spyOn(adapter._client, "apiCall")
+          .mockRejectedValue(
+            new Error(
+              "Slack file lifecycle intake must not call provider APIs",
+            ),
+          );
+        try {
+          await runtime.initialize();
+          const previousMessage = {
+            type: "message",
+            user: "U-OPERATOR",
+            username: "operator",
+            text: "Please inspect the attached images.",
+            ts: "1788.500",
+            thread_ts: "1788.400",
+            edited: { user: "U-OPERATOR", ts: "1788.600" },
+            files: testCase.previousFiles ?? unchangedFiles,
+          };
+          const response = await runtime.handleWebhook(
+            signedSlackEventRequest(
+              testCase.invalidSignature
+                ? "wrong-signing-secret"
+                : signingSecret,
+              {
+                type: "event_callback",
+                team_id: "T-PAPERCLIP",
+                event_id: "Ev-slack-files-only",
+                event: {
+                  type: "message",
+                  subtype: "message_changed",
+                  hidden: testCase.hidden ?? true,
+                  channel: "C-PAPERCLIP",
+                  channel_type: "channel",
+                  event_ts: "1788.700",
+                  message: {
+                    ...previousMessage,
+                    files: testCase.files,
+                    ...(testCase.unfurl
+                      ? {
+                          attachments: [
+                            {
+                              from_url: "https://example.com",
+                              title: "Preview only",
+                            },
+                          ],
+                        }
+                      : {}),
+                  },
+                  previous_message: previousMessage,
+                },
+              },
+            ),
+          );
+          expect(response.status).toBe(testCase.invalidSignature ? 401 : 200);
+          expect(onMessageUpdated).toHaveBeenCalledTimes(
+            testCase.changed ? 1 : 0,
+          );
+          expect(onMessage).not.toHaveBeenCalled();
+          expect(onMessageDeleted).not.toHaveBeenCalled();
+          expect(providerApi).not.toHaveBeenCalled();
+          expect(providerFetch).not.toHaveBeenCalled();
+          if (testCase.changed) {
+            const update = onMessageUpdated.mock.calls[0]![0];
+            expect(update.provider).toBe("slack");
+            expect(update.thread.id).toBe("slack:C-PAPERCLIP:1788.400");
+            expect(update.message.id).toBe(previousMessage.ts);
+            expect(update.message.text).toBe(previousMessage.text);
+            expect(update.message.metadata.editedAt).toEqual(
+              new Date(1788.6 * 1_000),
+            );
+            expect((update.message.raw as { files?: unknown }).files).toEqual(
+              testCase.files,
+            );
+            expect(update.previousMessage?.raw).toEqual(
+              expect.objectContaining({ files: previousMessage.files }),
+            );
+            expect(update.message.attachments).toHaveLength(
+              testCase.files?.length ?? 0,
+            );
+            expect(update.previousMessage?.attachments).toHaveLength(
+              previousMessage.files.length,
+            );
+            for (const [index, file] of (testCase.files ?? []).entries()) {
+              expect(update.message.attachments[index]).toEqual(
+                expect.objectContaining({
+                  name: file.name,
+                  mimeType: file.mimetype,
+                  size: file.size,
+                  width: file.original_w,
+                  height: file.original_h,
+                }),
+              );
+            }
+          }
+        } finally {
+          await runtime.shutdown();
+          providerApi.mockRestore();
+          vi.unstubAllGlobals();
+        }
+      },
+    );
+  });
+
   it("parses signed Slack reaction add and remove events through the pinned adapter", async () => {
     const signingSecret = "slack-reaction-signing-secret";
     const onReaction = vi.fn<

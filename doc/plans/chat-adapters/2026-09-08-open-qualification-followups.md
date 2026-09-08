@@ -7,13 +7,30 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
-Latest checkpoint: `93d958946` is pushed. Live server 59 still runs `b4b6f5777`;
-the recovered-answer replacement and Telegram sizing fixes are not deployed yet.
+Latest checkpoint: `9ef354692` is pushed and deployed as server 60 (PID 11488,
+port 3103; log `server-experimental-landing-60.log`). The earlier recovered-answer
+replacement and Telegram sizing fixes are also deployed, but their changed
+behavior still needs live UI retesting.
 The previous qualification turn made progress: Telegram's original accepted
 photo answer was automatically presented, without another heartbeat or provider
 run. The next turn handled only the requested PR image removal; qualification
 has now resumed. Physical session cleanup and the original file retry remain
-unproved. Read the current live outcome below before relying on historical notes.
+unproved. Read this latest live outcome before relying on historical notes:
+
+Server 60 authenticated and attempted automatic maintenance at 22:52:39.684 UTC,
+request `native-cleanup:8065a025-239b-4f83-8589-57d58e75819e`. It recorded 91
+content-free cleanup events, then stopped with `operator_required`. The new
+staging directory is the exact scope's `cleanup-A2FMbq`; its original pending
+stop/suspend commands now report supervised `codex` spawn `ENOENT`. Inspection
+found the maintenance caller omitted the native host environment: unlike normal
+execution, it supplied neither executable search path nor source login home.
+The copied provider state is byte-identical to the original, generation 21 with
+128 pending events and no new provider identity. The runner is suspended with
+empty outbox; canonical state is still empty. No new heartbeat was created and
+all three original quarantine hashes are unchanged. Do not retry from the older
+original snapshot, clear history, or manually move this failed copy. James owns
+the bounded environment fix and a proof-driven continuation of this exact
+no-launch maintenance failure. The original Telegram/GitHub requests stay intact.
 
 The Codex already-ended-on-resume shutdown repair (`4bc52cdbe`) passed
 the full provider target (69 passed, one deliberate subprocess helper ignored).
@@ -104,12 +121,21 @@ reproduced red-to-green in the joint **7/7** cohort without weakening the
 one-message expectation. The final fresh complete suite passed **542/542**;
 server typecheck passed again. The verified slice is ready to deploy.
 
-Read-only follow-ups found two additional gaps: disabled-channel edits can
-lose source invalidation, and Slack's pinned adapter drops a file-only change
-when both text and edit timestamp are unchanged. Its lifecycle revision also
-needs to distinguish attachment changes. Separately, exact native retry must
-keep the provider thread and account/session identities distinct. These are
-next bounded repairs, not completed behavior or live qualification claims.
+The next Slack slice now passes the complete fresh **550/550** integration
+suite. Authorized disabled-channel edits preserve content-free invalidation;
+the pinned adapter recognizes file-only changes with unchanged text/time, and
+the lifecycle revision includes a digest of stable attachment metadata. The
+signed real-adapter suite passed **74/74** and focused service cohort **26/26**,
+with red regressions captured before implementation. This slice is being
+checkpointed, not yet deployed or live-qualified.
+
+Another read-only audit found revoked-actor edit followed by relink/regrant can
+still restore stale attachment authority. Boole owns separating verified source
+invalidation from permission to admit new edited content, with exact source,
+runtime, provider revision and feedback-loop protections. Separately, exact
+native retry must keep provider thread and account/session identities distinct;
+that fix is deferred behind the actual maintenance failure. Neither follow-up
+is complete or live-qualified.
 
 Base `63c8b5d8d` is pushed. All 24 CI jobs, quality, and Greptile's explicit
 500-file review passed; PR #13038 still requires CODEOWNER approval and is not

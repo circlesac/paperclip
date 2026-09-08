@@ -38822,12 +38822,17 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       )
       .then((rows) => rows[0]);
     expect(lifecycle).toMatchObject({
-      state: "filtered",
-      principalId: null,
+      state: "processed",
+      conversationId: conversation!.id,
+      principalId: expect.any(String),
       redactedError:
-        "Destination is no longer enabled for message lifecycle events",
-      normalizedEvent: { filtering: { contentRetained: false } },
+        "Provider edit invalidation retained without task content while destination access is disabled",
+      normalizedEvent: {
+        filtering: { contentRetained: false },
+        message: { providerSentAt: "2026-09-05T15:11:00.000Z" },
+      },
     });
+    expect(lifecycle.normalizedEvent.message).not.toHaveProperty("text");
     expect(JSON.stringify(lifecycle?.normalizedEvent)).not.toContain(
       secretEdit,
     );
@@ -38844,9 +38849,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ).resolves.toEqual([]);
   });
 
-  it.each(["image/png", "text/plain"] as const)(
-    "keeps a verified disabled-channel Slack deletion authoritative for %s read and reuse after re-enable",
-    async (contentType) => {
+  it.each(
+    (["deletion", "edit", "file_removal"] as const).flatMap((kind) =>
+      (["image/png", "text/plain"] as const).map((contentType) => ({
+        kind,
+        contentType,
+      })),
+    ),
+  )(
+    "keeps a verified disabled-channel Slack $kind authoritative for $contentType read and reuse after re-enable",
+    async ({ kind, contentType }) => {
       const fixture = await seedCompany();
       const storage = createStorageService();
       const { callbacks, endpoint, runtime, service, wakeup } =
@@ -38874,6 +38886,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           id: "7060.1",
           text: "@maya retain this exact file",
           mentioned: true,
+          raw: {
+            files: [
+              {
+                id: "F-ORIGINAL",
+                name: "source",
+                mimetype: contentType,
+                size: body.length,
+              },
+            ],
+          },
           attachments: [
             {
               type: contentType === "image/png" ? "image" : "file",
@@ -38923,16 +38945,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             commentIds: [attachment.issueCommentId!],
           },
         };
-        await db
-          .insert(heartbeatRuns)
-          .values({
-            ...binding,
-            nativeIssueId: conversation.issueId,
-            id: runId,
-            runtimeMode: "native",
-            status: "running",
-            contextSnapshot: context,
-          });
+        await db.insert(heartbeatRuns).values({
+          ...binding,
+          nativeIssueId: conversation.issueId,
+          id: runId,
+          runtimeMode: "native",
+          status: "running",
+          contextSnapshot: context,
+        });
         await db
           .update(issues)
           .set({ executionRunId: runId, status: "in_progress" })
@@ -38976,19 +38996,66 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await service.replaceResources(endpoint.id, [
           { id: conversation.resourceId!, enabled: false },
         ]);
-        await callbacks.onMessageDeleted!({
-          endpointId: endpoint.id,
-          provider: "slack",
-          event: {
-            adapter: {} as never,
-            channelId: channel.thread.channelId,
-            deletedAt: new Date(),
-            messageId: original.id,
-            platform: "slack",
-            raw: {},
-            threadId: channel.thread.id,
-          },
-        });
+        const providerSentAt = new Date();
+        const replacementFetch = vi.fn(async () => body);
+        if (kind === "deletion") {
+          await callbacks.onMessageDeleted!({
+            endpointId: endpoint.id,
+            provider: "slack",
+            event: {
+              adapter: {} as never,
+              channelId: channel.thread.channelId,
+              deletedAt: providerSentAt,
+              messageId: original.id,
+              platform: "slack",
+              raw: {},
+              threadId: channel.thread.id,
+            },
+          });
+        } else {
+          await callbacks.onMessageUpdated!({
+            endpointId: endpoint.id,
+            provider: "slack",
+            thread: channel.thread,
+            previousMessage: original,
+            message: {
+              ...original,
+              text:
+                kind === "edit"
+                  ? "PRIVATE_DISABLED_EDIT_MUST_NOT_PERSIST"
+                  : original.text,
+              metadata: {
+                ...original.metadata,
+                edited: true,
+                editedAt: providerSentAt,
+              },
+              attachments:
+                kind === "edit"
+                  ? [
+                      {
+                        ...original.attachments[0],
+                        fetchData: replacementFetch,
+                      },
+                    ]
+                  : [],
+              raw: {
+                files:
+                  kind === "edit"
+                    ? [
+                        {
+                          id: "F-REPLACEMENT",
+                          name: "replacement",
+                          mimetype: contentType,
+                          size: body.length,
+                          url_private:
+                            "https://files.slack.com/PRIVATE_DISABLED_ATTACHMENT_URL",
+                        },
+                      ]
+                    : [],
+              },
+            },
+          });
+        }
         await service.replaceResources(endpoint.id, [
           { id: conversation.resourceId!, enabled: true },
         ]);
@@ -39027,6 +39094,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           readsBefore,
         );
         expect(storage.putFile).toHaveBeenCalledTimes(1);
+        expect(replacementFetch).not.toHaveBeenCalled();
         await expect(
           db
             .select({ id: issueComments.id })
@@ -39044,16 +39112,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(
             and(
               eq(chatDeliveries.endpointId, endpoint.id),
-              eq(chatDeliveries.eventKind, "message_deleted"),
+              eq(
+                chatDeliveries.eventKind,
+                kind === "deletion" ? "message_deleted" : "message_updated",
+              ),
             ),
           );
         expect(tombstone).toMatchObject({
           state: "processed",
           conversationId: conversation.id,
-          principalId: null,
-          normalizedEvent: { filtering: { contentRetained: false } },
+          principalId: kind === "deletion" ? null : expect.any(String),
+          normalizedEvent: {
+            filtering: { contentRetained: false },
+            message: { providerSentAt: providerSentAt.toISOString() },
+          },
         });
         expect(tombstone.normalizedEvent.message).not.toHaveProperty("text");
+        expect(JSON.stringify(tombstone.normalizedEvent)).not.toContain(
+          "PRIVATE_DISABLED_",
+        );
       } finally {
         await reader?.close();
         // Global milestone scans include paused endpoints. Retire this exact
@@ -39073,82 +39150,104 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     },
   );
 
-  it("refuses an otherwise eligible exact Slack retry after deletion while channel reach was disabled", async () => {
-    const context = await failedChatRetryFixture("slack");
-    try {
-      const input = {
-        companyId: context.fixture.companyId,
-        issueId: context.issue.id,
-        agentId: context.fixture.assignedAgentId,
-        failedRunId: context.runId,
-        initiatedByUserId: "owner-user",
-      };
-      const rollbackProbe = new Error(
-        "rollback authorized pre-deletion retry probe",
-      );
-      await expect(
-        db.transaction(async (tx) => {
-          await expect(
-            context.service.prepareFailedChatRunRetry(tx, input),
-          ).resolves.toMatchObject({ issueId: context.issue.id });
-          throw rollbackProbe;
-        }),
-      ).rejects.toBe(rollbackProbe);
-      const before = await db
-        .select({ id: chatActions.id })
-        .from(chatActions)
-        .where(eq(chatActions.endpointId, context.endpoint.id));
-      await context.service.replaceResources(context.endpoint.id, [
-        { id: context.conversation.resourceId!, enabled: false },
-      ]);
-      const callbacks = context.runtime.configurations.get(
-        context.endpoint.id,
-      )!.callbacks;
-      await callbacks.onMessageDeleted!({
-        endpointId: context.endpoint.id,
-        provider: "slack",
-        event: {
-          adapter: {} as never,
-          channelId: context.thread.thread.channelId,
-          deletedAt: new Date(),
-          messageId: context.messageId,
-          platform: "slack",
-          raw: {},
-          threadId: context.thread.thread.id,
-        },
-      });
-      await context.service.replaceResources(context.endpoint.id, [
-        { id: context.conversation.resourceId!, enabled: true },
-      ]);
-      await expect(
-        db.transaction((tx) =>
-          context.service.prepareFailedChatRunRetry(tx, input),
-        ),
-      ).rejects.toMatchObject({
-        details: { code: "chat_failed_run_retry_not_authorized" },
-      });
-      await expect(
-        db
+  it.each(["deletion", "edit"] as const)(
+    "refuses an otherwise eligible exact Slack retry after %s while channel reach was disabled",
+    async (kind) => {
+      const context = await failedChatRetryFixture("slack");
+      try {
+        const input = {
+          companyId: context.fixture.companyId,
+          issueId: context.issue.id,
+          agentId: context.fixture.assignedAgentId,
+          failedRunId: context.runId,
+          initiatedByUserId: "owner-user",
+        };
+        const rollbackProbe = new Error(
+          "rollback authorized pre-deletion retry probe",
+        );
+        await expect(
+          db.transaction(async (tx) => {
+            await expect(
+              context.service.prepareFailedChatRunRetry(tx, input),
+            ).resolves.toMatchObject({ issueId: context.issue.id });
+            throw rollbackProbe;
+          }),
+        ).rejects.toBe(rollbackProbe);
+        const before = await db
           .select({ id: chatActions.id })
           .from(chatActions)
-          .where(eq(chatActions.endpointId, context.endpoint.id)),
-      ).resolves.toEqual(before);
-    } finally {
-      await db
-        .update(chatConversations)
-        .set({ state: "completed" })
-        .where(
-          and(
-            eq(chatConversations.companyId, context.fixture.companyId),
-            eq(chatConversations.id, context.conversation.id),
+          .where(eq(chatActions.endpointId, context.endpoint.id));
+        await context.service.replaceResources(context.endpoint.id, [
+          { id: context.conversation.resourceId!, enabled: false },
+        ]);
+        const callbacks = context.runtime.configurations.get(
+          context.endpoint.id,
+        )!.callbacks;
+        if (kind === "deletion") {
+          await callbacks.onMessageDeleted!({
+            endpointId: context.endpoint.id,
+            provider: "slack",
+            event: {
+              adapter: {} as never,
+              channelId: context.thread.thread.channelId,
+              deletedAt: new Date(),
+              messageId: context.messageId,
+              platform: "slack",
+              raw: {},
+              threadId: context.thread.thread.id,
+            },
+          });
+        } else {
+          await callbacks.onMessageUpdated!({
+            endpointId: context.endpoint.id,
+            provider: "slack",
+            thread: context.thread.thread,
+            message: makeMessage({
+              id: context.messageId,
+              text: "PRIVATE_DISABLED_RETRY_EDIT",
+              userId: "U-SAFE-PROGRESS",
+            }),
+          });
+        }
+        await context.service.replaceResources(context.endpoint.id, [
+          { id: context.conversation.resourceId!, enabled: true },
+        ]);
+        await expect(
+          db.transaction((tx) =>
+            context.service.prepareFailedChatRunRetry(tx, input),
           ),
-        );
-      await retirePublicationFixture(context.service, context.endpoint.id);
-    }
-  });
+        ).rejects.toMatchObject({
+          details: { code: "chat_failed_run_retry_not_authorized" },
+        });
+        await expect(
+          db
+            .select({ id: chatActions.id })
+            .from(chatActions)
+            .where(eq(chatActions.endpointId, context.endpoint.id)),
+        ).resolves.toEqual(before);
+      } finally {
+        await db
+          .update(chatConversations)
+          .set({ state: "completed" })
+          .where(
+            and(
+              eq(chatConversations.companyId, context.fixture.companyId),
+              eq(chatConversations.id, context.conversation.id),
+            ),
+          );
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    },
+  );
 
-  it.each(["unknown_target", "stale_runtime", "edit"] as const)(
-    "does not turn disabled-channel Slack %s into an authorized deletion tombstone",
+  it.each([
+    "unknown_target",
+    "stale_runtime",
+    "unauthorized_edit",
+    "unknown_edit",
+    "stale_edit",
+  ] as const)(
+    "does not turn disabled-channel Slack %s into an authorized source invalidation",
     async (mutation) => {
       const context = await safeNativeProgressFixture("slack", "97");
       try {
@@ -39163,16 +39262,24 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await context.service.replaceResources(context.endpoint.id, [
           { id: context.conversation.resourceId!, enabled: false },
         ]);
-        if (mutation === "stale_runtime")
+        if (mutation === "stale_runtime" || mutation === "stale_edit")
           await db
             .update(chatEndpoints)
             .set({
               setup: sql`jsonb_set(${chatEndpoints.setup}, '{runtimeGeneration}', to_jsonb(coalesce((${chatEndpoints.setup}->>'runtimeGeneration')::int, 0) + 1))`,
             })
             .where(eq(chatEndpoints.id, context.endpoint.id));
-        if (mutation === "edit") {
+        if (mutation === "unauthorized_edit")
+          await db
+            .update(chatEndpoints)
+            .set({ allowUnlinkedPeople: false })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        if (mutation.endsWith("edit")) {
           const original = makeMessage({
-            id: context.messageId,
+            id:
+              mutation === "unknown_edit"
+                ? "unknown-message"
+                : context.messageId,
             text: "@maya original",
             userId: "U-SAFE-PROGRESS",
           });
@@ -39216,14 +39323,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               ]),
             ),
           );
-        expect(lifecycle).toHaveLength(mutation === "stale_runtime" ? 0 : 1);
+        expect(lifecycle).toHaveLength(
+          mutation === "stale_runtime" || mutation === "stale_edit" ? 0 : 1,
+        );
         expect(lifecycle.some((row) => row.state === "processed")).toBe(false);
         expect(lifecycle.every((row) => row.conversationId === null)).toBe(
           true,
         );
-        expect(JSON.stringify(lifecycle)).not.toContain(
-          "PRIVATE_DISABLED_EDIT_MUST_NOT_PERSIST",
-        );
+        if (mutation === "unknown_edit") {
+          // An unresolved source retains the existing bounded orphan-grace
+          // receipt, but never becomes an authorized invalidation or task input.
+          expect(lifecycle[0]).toMatchObject({
+            state: "retry",
+            redactedError: "Waiting briefly for the original message",
+          });
+        } else {
+          expect(JSON.stringify(lifecycle)).not.toContain(
+            "PRIVATE_DISABLED_EDIT_MUST_NOT_PERSIST",
+          );
+        }
         await expect(
           db
             .select({ id: issueComments.id })
@@ -39245,6 +39363,114 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
     },
   );
+
+  it("deduplicates Slack file-only revisions by consumed metadata without retaining private locators", async () => {
+    const context = await safeNativeProgressFixture("slack", "98");
+    try {
+      const callbacks = context.runtime.configurations.get(
+        context.endpoint.id,
+      )!.callbacks;
+      await context.service.replaceResources(context.endpoint.id, [
+        { id: context.conversation.resourceId!, enabled: false },
+      ]);
+      const providerSentAt = new Date();
+      const original = makeMessage({
+        id: context.messageId,
+        text: "Unchanged caption",
+        userId: "U-SAFE-PROGRESS",
+      });
+      const file = (id: string) => ({
+        id,
+        name: "source.png",
+        mimetype: "image/png",
+        size: 10,
+        original_w: 1,
+        original_h: 1,
+        url_private: "https://files.slack.com/PRIVATE_LOCATOR_ONE",
+      });
+      const revisions = [
+        [file("F-FIRST")],
+        [file("F-SECOND")],
+        [
+          {
+            ...file("F-SECOND"),
+            url_private: "https://files.slack.com/PRIVATE_LOCATOR_TWO",
+            title: "unused title",
+          },
+        ],
+        [],
+        [],
+      ];
+      const beforeComments = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, context.conversation.issueId));
+      const beforeWakes = context.wakeup.mock.calls.length;
+      for (const files of revisions) {
+        await callbacks.onMessageUpdated!({
+          endpointId: context.endpoint.id,
+          provider: "slack",
+          thread: context.thread.thread,
+          previousMessage: original,
+          message: {
+            ...original,
+            metadata: {
+              ...original.metadata,
+              edited: true,
+              editedAt: providerSentAt,
+            },
+            raw: { files },
+          },
+        });
+      }
+      const deliveries = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, context.endpoint.id),
+            eq(chatDeliveries.eventKind, "message_updated"),
+          ),
+        );
+      expect(deliveries).toHaveLength(3);
+      expect(new Set(deliveries.map((row) => row.providerEventId)).size).toBe(
+        3,
+      );
+      expect(
+        deliveries.every(
+          (row) =>
+            row.state === "processed" &&
+            row.conversationId === context.conversation.id,
+        ),
+      ).toBe(true);
+      expect(
+        JSON.stringify(deliveries.map((row) => row.normalizedEvent)),
+      ).not.toContain("PRIVATE_LOCATOR");
+      expect(
+        deliveries.every(
+          (row) => !Object.hasOwn(row.normalizedEvent.message!, "text"),
+        ),
+      ).toBe(true);
+      await expect(
+        db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, context.conversation.issueId)),
+      ).resolves.toEqual(beforeComments);
+      expect(context.wakeup.mock.calls.length).toBe(beforeWakes);
+    } finally {
+      await db
+        .update(chatConversations)
+        .set({ state: "completed" })
+        .where(
+          and(
+            eq(chatConversations.companyId, context.fixture.companyId),
+            eq(chatConversations.id, context.conversation.id),
+          ),
+        );
+      await retirePublicationFixture(context.service, context.endpoint.id);
+    }
+  });
 
   it("retries lifecycle mutation atomically and reclaims it after restart", async () => {
     const fixture = await seedCompany();

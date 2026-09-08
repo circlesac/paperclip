@@ -49,6 +49,26 @@ index b80888b6d87e8ad429d18cc955c4c5048a55722a..6ed9ad56712e09558d0ba26ad8a32499
        });
        if (response.ok) {
          this.logger.debug("Socket event forwarded successfully", {
+@@ -2895,7 +2899,18 @@ var SlackAdapter = class _SlackAdapter {
+     }
+     const previousMessage = event.previous_message;
++    // File edits can retain both text and edited.ts. Compare only attachment
++    // identity and consumed metadata, not expiring URLs or unfurl metadata.
++    const fileRevision = (files) => JSON.stringify(
++      (Array.isArray(files) ? files : []).map((value) => {
++        const file = value && typeof value === "object" && !Array.isArray(value) ? value : {};
++        return [
++          ...[file.id, file.name, file.mimetype].map((field) => typeof field === "string" ? field : null),
++          ...[file.size, file.original_w, file.original_h].map((field) => typeof field === "number" && Number.isFinite(field) ? field : null)
++        ];
++      })
++    );
+     const isHiddenMessageEdit = Boolean(
+-      previousMessage && (inner.edited?.ts !== previousMessage.edited?.ts || inner.text !== previousMessage.text)
++      previousMessage && (inner.edited?.ts !== previousMessage.edited?.ts || inner.text !== previousMessage.text || fileRevision(inner.files) !== fileRevision(previousMessage.files))
+     );
+     if (event.hidden === true && !isHiddenMessageEdit) {
+       return;
 @@ -3900,17 +3904,22 @@ var SlackAdapter = class _SlackAdapter {
      const { channel, threadTs: rawThreadTs } = this.decodeThreadId(threadId);
      const threadTs = rawThreadTs || void 0;

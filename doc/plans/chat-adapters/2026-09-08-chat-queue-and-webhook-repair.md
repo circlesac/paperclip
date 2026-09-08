@@ -2432,3 +2432,56 @@ retired after assertions; their run/audit records and the existing ownership
 expectation are unchanged. The final complete fresh-database integration suite
 passed **542/542**, and server typecheck passed again. This clears the scoped
 deployment gate, not the still-missing original-request browser retests.
+
+### Server 60: admitted maintenance exposed a missing launch environment
+
+Checkpoint `9ef354692` was pushed and deployed on the normal server entry point.
+Server 59 drained with zero interrupted runs and exited before server 60
+(PID 11488) completed startup at 22:52:40 UTC. The staged runner digest and
+strict code signature remain unchanged from the verified release artifact.
+
+The original Telegram cleanup was admitted at 22:52:39.684 UTC under request
+`native-cleanup:8065a025-239b-4f83-8589-57d58e75819e`. It persisted 91
+content-free receipts—90 retained events and `runner.reconciled` sequence 341—
+then ended `operator_required`, not settled. Its preserved staging copy is
+`1c080549b2c4f48602d28768e62c56bbc50d48c4479e8abd8fc054a498f4b391.cleanup-A2FMbq`.
+The pending stop/suspend commands failed with supervised `codex` spawn `ENOENT`.
+The maintenance caller omitted the host launch environment that normal native
+execution supplies, so the sanitized child had neither `PATH` nor source login
+home. This is an implementation defect, not a user login request.
+
+No provider identity or generation advance occurred; the copied provider file
+is byte-identical to the original, with generation 21 and 128 pending events.
+The copied runner is suspended with no outbox entries. The canonical directory
+is still empty; all three original quarantine hashes remain unchanged. Database
+inspection shows zero new heartbeat runs and unchanged original failed B
+requests. Recovery must preserve the attempted copy and its failed commands,
+prove its exact no-launch history, and continue from it rather than replaying
+the older original snapshot. The browser remains locked, so no new UI retry or
+live message-success claim is made.
+
+### Slack file-only changes and disabled-reach edit invalidation
+
+The actual pinned Slack adapter returned HTTP 200 but no lifecycle callback for
+11 signed file-change cases when text and edit timestamp were unchanged. Its
+content-change predicate now compares ordered stable file identity/metadata;
+private URL rotation and unfurl-only changes are excluded. The real-adapter
+suite passed **74/74**, including 19 new signed cases, no provider downloads,
+no ordinary-message callbacks, and invalid-signature denial. Reverse/forward
+patch application reproduced the tested installed bytes without a lockfile
+or dependency-install change.
+
+Real-service tests separately reproduced six failures: PNG/text edits and file
+removals allowed stale reuse after reach was re-enabled, exact retry still
+staged, and distinct same-text/time file edits collapsed into one revision.
+Authorized edits now retain only their exact-source invalidation while reach
+is disabled, never new text/files or agent wakes. Slack revisions include the
+matching stable-file digest. The focused service cohort passed **26/26** and
+the complete fresh suite **550/550** (107.22s); server typecheck passed.
+
+This is not a complete source-revocation sign-off. A follow-up audit found that
+an edit received while its actor is revoked is filtered, then ignored by old
+file authorization after relink/regrant. Verified provider source invalidation
+must be distinguished from permission to admit new edited content. That next
+slice remains in progress. No new live Slack file-edit journey was performed
+while the Mac is locked, and server 60 still runs the preceding checkpoint.

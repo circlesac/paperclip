@@ -1919,6 +1919,34 @@ function lifecycleActorFromAuthor(
   };
 }
 
+function slackLifecycleFilesDigest(raw: unknown): string {
+  const files =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).files
+      : undefined;
+  // Match the pinned Slack adapter's content-change projection. Transport
+  // locators/unfurls are not content identity and must never enter durable keys.
+  const projection = Array.isArray(files)
+    ? files.map((file) => {
+        const row =
+          file && typeof file === "object" && !Array.isArray(file)
+            ? (file as Record<string, unknown>)
+            : {};
+        return [
+          ...["id", "name", "mimetype"].map((key) =>
+            typeof row[key] === "string" ? row[key] : null,
+          ),
+          ...["size", "original_w", "original_h"].map((key) =>
+            typeof row[key] === "number" && Number.isFinite(row[key])
+              ? row[key]
+              : null,
+          ),
+        ];
+      })
+    : [];
+  return createHash("sha256").update(JSON.stringify(projection)).digest("hex");
+}
+
 function telegramLifecycleActor(message: {
   from?: unknown;
   sender_chat?: unknown;
@@ -15401,68 +15429,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 .for("update")
                 .then((rows) => rows[0] ?? null)
             : null;
-        const destinationAllowed =
-          currentConversation !== null &&
-          ["active", "waiting"].includes(currentConversation.state) &&
-          (currentConversation.isDirectMessage
-            ? currentEndpoint.allowDirectMessages
-            : nonDirectDestinationAllowed(currentEndpoint, currentResource));
-        if (!destinationAllowed) {
-          const filteredAt = new Date();
-          // A verified deletion of an exactly linked message still revokes its
-          // source lineage while reach is disabled. Otherwise re-enabling the
-          // channel would silently make a known-deleted file reusable again.
-          // Keep only the tombstone; no task comment, content or wake is allowed.
-          const retainDeletion =
-            currentConversation !== null &&
-            activeDelivery.eventKind === "message_deleted";
-          await tx
-            .update(chatDeliveries)
-            .set({
-              state: retainDeletion ? "processed" : "filtered",
-              ...(retainDeletion
-                ? { conversationId: currentConversation.id }
-                : {}),
-              normalizedEvent: {
-                providerEventId:
-                  activeDelivery.normalizedEvent.providerEventId ??
-                  activeDelivery.providerEventId,
-                kind: activeDelivery.eventKind,
-                ...(retainDeletion
-                  ? {
-                      runtimeContext: {
-                        generation: admittedRuntimeContext.generation,
-                        credentialFingerprint:
-                          admittedRuntimeContext.credentialFingerprint,
-                      },
-                    }
-                  : {}),
-                conversation: { externalThreadId: lifecycle.threadId },
-                message: {
-                  providerMessageId: lifecycle.messageId,
-                  targetProviderEventId: lifecycle.targetProviderEventId,
-                  ...(retainDeletion
-                    ? { providerSentAt: lifecycle.providerSentAt }
-                    : {}),
-                },
-                filtering: { contentRetained: false },
-              },
-              nextAttemptAt: null,
-              processedAt: filteredAt,
-              redactedError: retainDeletion
-                ? "Provider deletion retained without task content while destination access is disabled"
-                : "Destination is no longer enabled for message lifecycle events",
-              updatedAt: filteredAt,
-            })
-            .where(
-              and(
-                eq(chatDeliveries.id, activeDelivery.id),
-                eq(chatDeliveries.state, "processing"),
-              ),
-            );
-          return;
-        }
-
         let lifecyclePrincipalId: string | null = null;
         const requiresLifecycleActorAuthorization =
           (activeDelivery.eventKind === "message_updated" ||
@@ -15552,6 +15518,75 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           lifecyclePrincipalId = authorizedPrincipalId;
         }
 
+        const destinationAllowed =
+          currentConversation !== null &&
+          ["active", "waiting"].includes(currentConversation.state) &&
+          (currentConversation.isDirectMessage
+            ? currentEndpoint.allowDirectMessages
+            : nonDirectDestinationAllowed(currentEndpoint, currentResource));
+        if (!destinationAllowed) {
+          const filteredAt = new Date();
+          // A verified deletion or authorized edit still revokes the exactly
+          // linked source while reach is disabled. Re-enabling access must not
+          // revive stale files. Keep only the invalidation, never the new
+          // content: no task comment, attachment import or wake is allowed.
+          const retainInvalidation =
+            currentConversation !== null &&
+            (activeDelivery.eventKind === "message_deleted" ||
+              (activeDelivery.eventKind === "message_updated" &&
+                lifecyclePrincipalId !== null));
+          await tx
+            .update(chatDeliveries)
+            .set({
+              state: retainInvalidation ? "processed" : "filtered",
+              ...(retainInvalidation
+                ? {
+                    conversationId: currentConversation.id,
+                    principalId: lifecyclePrincipalId,
+                  }
+                : {}),
+              normalizedEvent: {
+                providerEventId:
+                  activeDelivery.normalizedEvent.providerEventId ??
+                  activeDelivery.providerEventId,
+                kind: activeDelivery.eventKind,
+                ...(retainInvalidation
+                  ? {
+                      runtimeContext: {
+                        generation: admittedRuntimeContext.generation,
+                        credentialFingerprint:
+                          admittedRuntimeContext.credentialFingerprint,
+                      },
+                    }
+                  : {}),
+                conversation: { externalThreadId: lifecycle.threadId },
+                message: {
+                  providerMessageId: lifecycle.messageId,
+                  targetProviderEventId: lifecycle.targetProviderEventId,
+                  ...(retainInvalidation
+                    ? { providerSentAt: lifecycle.providerSentAt }
+                    : {}),
+                },
+                filtering: { contentRetained: false },
+              },
+              nextAttemptAt: null,
+              processedAt: filteredAt,
+              redactedError: retainInvalidation
+                ? activeDelivery.eventKind === "message_deleted"
+                  ? "Provider deletion retained without task content while destination access is disabled"
+                  : "Provider edit invalidation retained without task content while destination access is disabled"
+                : "Destination is no longer enabled for message lifecycle events",
+              updatedAt: filteredAt,
+            })
+            .where(
+              and(
+                eq(chatDeliveries.id, activeDelivery.id),
+                eq(chatDeliveries.state, "processing"),
+              ),
+            );
+          return;
+        }
+
         await issuesSvc.addComment(
           linkedTarget.issueId,
           lifecycle.text,
@@ -15636,7 +15671,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             event.message.metadata.editedAt ?? event.message.metadata.dateSent
           )?.toISOString() ?? null,
         raw: event.message.raw,
-        revision: `${event.message.metadata.editedAt?.toISOString() ?? "unknown"}:${createHash("sha256").update(event.message.text).digest("hex")}`,
+        revision: `${event.message.metadata.editedAt?.toISOString() ?? "unknown"}:${createHash("sha256").update(event.message.text).digest("hex")}${event.provider === "slack" ? `:${slackLifecycleFilesDigest(event.message.raw)}` : ""}`,
       },
       runtimeContext,
     );
