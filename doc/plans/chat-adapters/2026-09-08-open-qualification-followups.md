@@ -18,6 +18,18 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   then incorporated master `db85bf4b7` (simpler production GitHub repository
   controls) cleanly. The six-file UI compatibility cohort passed **221/221**,
   and all four token gates passed. Final-head gates remain required.
+- The first-close failure passed in isolated release/debug repeats. A pair of
+  concurrent debug stress fixtures exposed a separate fake-provider state race:
+  one first close succeeded, then a truncated state file reset its counter and
+  successor turn identity was correctly rejected. The fixture now uses atomic
+  writes, persists before terminal output and rejects malformed existing state.
+  Three deterministic cases went red to green; all **seven fake-provider unit
+  tests**, a concurrent **2/2** stress repeat and final **3/3** staged transport
+  cases pass. Runner TypeScript/Rust formatting and merged UI TypeScript pass.
+  Closed failure diagnostics
+  retain the original and successor epochs without raw payloads. No production
+  runner guard or deadline changes. This does not explain the original CI
+  first-close failure; preserve that qualification and renew final-head checks.
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
@@ -240,6 +252,14 @@ switch to Terra. The signed/staged runner SHA-256 is
   proxy. Its destination exactly matched the App configuration and adjacent
   successful deliveries; its cause remains unproven. Do not call it a safely
   filtered self-event or a fixed transport defect.
+- Explicit `reuse_chat_attachment` now has separate live proof in Slack and
+  Telegram: one applied action receipt and matching reused-source work-product
+  metadata per run, original inbound source and current conversation authority,
+  and one-attempt file publication. Root downloaded both new provider files;
+  both match the original 152-byte hash. File delivery took **24.163 / 27.865
+  seconds**, including **20.647 / 24.747 seconds** native Luna execution.
+  This is an explicitly requested action test, not a universal natural-language
+  routing or all-permutation claim.
 
 ## Remaining work
 

@@ -1837,6 +1837,109 @@ it.each([48, 1024])(
     const stateDirectory = await mkdtemp(
       join(tmpdir(), "runnerd-local-close-backlog-"),
     );
+    let closePhase = "before-first-close";
+    let closeStartedAt = 0;
+    let preserveFailedState = false;
+    const readClosedState = async (relativePath: string) => {
+      try {
+        const value: unknown = JSON.parse(
+          await readFile(join(stateDirectory, relativePath), "utf8"),
+        );
+        return value !== null &&
+          typeof value === "object" &&
+          !Array.isArray(value)
+          ? (value as Record<string, unknown>)
+          : {};
+      } catch {
+        return {};
+      }
+    };
+    const readCloseDiagnostic = async () => {
+      const runner = await readClosedState("runner/runner-state.json");
+      const provider = await readClosedState(
+        "runner/codex-provider-state.json",
+      );
+      const control = await readClosedState(
+        "control-plane/control-plane-state.json",
+      );
+      const commands: Record<string, unknown>[] = Array.isArray(
+        control.commands,
+      )
+        ? control.commands.filter(
+            (command): command is Record<string, unknown> =>
+              command !== null &&
+              typeof command === "object" &&
+              !Array.isArray(command),
+          )
+        : [];
+      const closedNumber = (value: unknown) =>
+        typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+      const closedValue = (value: unknown, allowed: string[]) =>
+        typeof value === "string" && allowed.includes(value)
+          ? value
+          : "unknown";
+      return {
+        runnerLifecycle: closedValue(runner.lifecycle, [
+          "ready",
+          "suspended",
+          "closed",
+          "recoverable_failure",
+        ]),
+        runnerAckedSourceSeq: closedNumber(runner.ackedSourceSeq),
+        runnerNextSourceSeq: closedNumber(runner.nextSourceSeq),
+        runnerOutboxCount: Array.isArray(runner.outbox)
+          ? runner.outbox.length
+          : null,
+        providerLifecycle: closedValue(provider.lifecycle, [
+          "prepared",
+          "session_open",
+          "turn_active",
+          "closed",
+          "provider_exited",
+        ]),
+        providerHasActiveTurn:
+          typeof provider.activeProviderTurnId === "string",
+        providerPendingCount: Array.isArray(provider.pendingEvents)
+          ? provider.pendingEvents.length
+          : null,
+        providerQueuedCount: Array.isArray(provider.queuedEvents)
+          ? provider.queuedEvents.length
+          : null,
+        committedEventCount: Array.isArray(control.committedEvents)
+          ? control.committedEvents.length
+          : null,
+        commandsShape: Array.isArray(control.commands)
+          ? "array"
+          : "unavailable",
+        commandCount: commands.length,
+        closeCommands: commands
+          .filter(
+            (command) =>
+              typeof command.type === "string" &&
+              ["turn.stop", "runner.drain", "runner.suspend"].includes(
+                command.type,
+              ),
+          )
+          .slice(-12)
+          .map((command) => ({
+            type: closedValue(command.type, [
+              "turn.stop",
+              "runner.drain",
+              "runner.suspend",
+            ]),
+            status: closedValue(command.status, [
+              "pending",
+              "completed",
+              "failed",
+              "rejected",
+              "indeterminate",
+            ]),
+          })),
+      };
+    };
+    let firstCloseCompletedState: Awaited<
+      ReturnType<typeof readCloseDiagnostic>
+    > | null = null;
     const identity = {
       runnerInstanceId: "runner-close-backlog",
       environmentLeaseId: "lease-close-backlog",
@@ -1920,7 +2023,11 @@ it.each([48, 1024])(
         ).filter((event) => event.eventType === "item.delta");
         expect(unacknowledgedDeltas.length).toBeLessThanOrEqual(128);
       }
+      closePhase = "first-close";
+      closeStartedAt = Date.now();
       await first.transport.close();
+      closePhase = "after-first-close";
+      firstCloseCompletedState = await readCloseDiagnostic().catch(() => null);
       // Local transports have no remote checkpoint callback. They must still
       // verify suspension rather than treating process termination as proof.
       expect(readRunnerState).toHaveBeenCalled();
@@ -1964,6 +2071,7 @@ it.each([48, 1024])(
       expect(provider.pendingEvents).toEqual([]);
       expect(provider.queuedEvents).toEqual([]);
       expect(provider.activeProviderTurnId).toBeNull();
+      closePhase = "successor-attach";
       second = createCapabilityRunnerdCodexTransport({
         ...options,
         readRunnerState: undefined,
@@ -1987,6 +2095,7 @@ it.each([48, 1024])(
         "runnerd attached the durable provider session to a fresh PRP run authority",
       );
       if (suffixCount > 48) {
+        closePhase = "successor-start";
         const secondTurn = await second.transport.request("turn/start", {
           input: [
             {
@@ -2005,19 +2114,42 @@ it.each([48, 1024])(
         }
         expect(secondDeltas).toBe(97);
         expect(secondSemanticResult).toHaveBeenCalledTimes(1);
+        closePhase = "second-close";
+        closeStartedAt = Date.now();
         await second.transport.close();
+        closePhase = "after-second-close";
         expect(await readRunnerState()).toMatchObject({
           lifecycle: "suspended",
           runId: "run-close-second",
           turnId: "turn-close-second",
         });
       }
+    } catch (error) {
+      preserveFailedState = true;
+      try {
+        console.error(
+          "[backlog-close-state]",
+          JSON.stringify({
+            suffixCount,
+            stateDirectory,
+            closePhase,
+            closeElapsedMs:
+              closeStartedAt === 0 ? null : Date.now() - closeStartedAt,
+            firstCloseCompletedState,
+            failureState: await readCloseDiagnostic(),
+          }),
+        );
+      } catch {
+        // Diagnostics must never replace the original transport failure.
+      }
+      throw error;
     } finally {
       await Promise.allSettled([
         first.transport.close(),
         second?.transport.close(),
       ]);
-      await rm(stateDirectory, { recursive: true, force: true });
+      if (!preserveFailedState)
+        await rm(stateDirectory, { recursive: true, force: true });
     }
   },
   60_000,

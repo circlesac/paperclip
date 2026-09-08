@@ -1368,3 +1368,66 @@ process stayed on server 50. Root inspected the rendered setup and chooser.
 The flow was understandable and showed no error banner or unexpected sign-in
 redirect. This is entry-point proof, not live permission-list population: that
 upstream rendering has the separate automated coverage above.
+
+### Explicit original-file reuse in Slack and Telegram
+
+At **17:52:39.008 UTC**, root submitted `REUSE-ORIGINAL-LANDING-0908` once in
+each existing Slack thread and Telegram bot conversation. Unlike the earlier
+ordinary file handoffs, this request explicitly required `reuse_chat_attachment`
+for the original `native-file-roundtrip-landing-0908.txt`, with no local copy,
+regeneration or substitution. This is a focused action qualification, not a
+claim that every natural-language resend request selects this action.
+
+Both runs persisted an **applied reuse action receipt** and matching
+`reusedFromAttachmentId`, `reusedFromCommentId` and `reusedFromSha256` work-product
+metadata. The selected sources were the original inbound attachments on the
+same tasks, not the previous generated copies. Current conversation authority
+and generation matched. Native Luna used **20.647 seconds** in Slack and
+**24.747 seconds** in Telegram; the downloadable files arrived **24.163 /
+27.865 seconds** after submission. Each file publication used one attempt.
+
+Root inspected the final response and native file, then downloaded each new
+provider-returned copy through its UI, once. Both actual OS downloads are
+**152 bytes**, SHA-256
+`e5ea1c89ad69c0ae9dffea0599c730e5d284816dbcd9dae44746c7a29f790293`,
+matching the source and independently rehashed originating-run output blobs.
+The one-sentence final and file were useful, and no lingering working indicator
+or duplicate final was observed. Scoped output checks found no internal UUID
+or private URL leakage. This closes the explicit-reuse gap for these two live
+journeys, not every permission-revocation, restart or provider permutation.
+
+### Fake-provider restart state and shutdown diagnostics
+
+The CI first-close failure above did not reproduce in an isolated 1,024-suffix
+case using either the staged release runner or the existing debug runner.
+Two concurrent debug fixtures then exposed a **different**, concrete failure:
+one first close succeeded, but its successor correctly rejected a reused
+provider-turn identity. The fake provider's state writer truncated its canonical
+JSON in place, published terminal output before the final save, and silently
+defaulted malformed state to a fresh turn counter. A legitimate process stop
+could interrupt the write and make the next fake process reuse an old turn ID.
+
+The fixture-only repair atomically replaces the state using a unique sibling
+file, persists settled state before emitting terminal output, and defaults only
+when the state file is absent. Existing malformed state fails instead of
+resetting its counter. Three deterministic persistence cases failed on the old
+semantics; all **seven fake-provider unit tests** pass after the fix. A repeated
+pair of concurrent 1,024-suffix debug fixtures passed **2/2** in about 30 seconds
+each. This proves the reproduced fake-state defect, not the original CI close
+failure or machine-power-loss durability.
+
+The transport fixture also retains bounded failure-only lifecycle, cursor,
+count and stop/drain/suspend-command diagnostics, including a first-close
+snapshot captured before successor archival. It preserves synthetic failed
+fixture state for diagnosis without printing raw provider or control-plane
+payloads. Strict suspension, identity, pending-event, uniqueness and successor
+checks remain unchanged, as do their deadlines. Production runner source and
+the staged/signed binary are unchanged; only the fake provider was rebuilt.
+Final staged verification passed **3/3** (48- and 1,024-suffix shutdown/rebind,
+plus unexpected-active resume), with the default binary resolver restored.
+Final fake-provider units passed **7/7**; runner TypeScript, Rust formatting and
+diff checks passed. Independent review's malformed-diagnostic concern was
+addressed: non-record command entries are excluded, emitted values are closed,
+and diagnostic failures cannot replace the original exception. The merged UI
+also passed its incremental TypeScript check.
+The original CI failure remains unproven and requires renewed exact-head gates.
