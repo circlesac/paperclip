@@ -1033,3 +1033,89 @@ A retired conversation must yield actionable guidance and no queued run.
 Concurrent restart/newer input, duplicate retries, cross-company references
 and operator-required native faults need negative tests. This is not fixed
 by restoring stale chat credentials or bypassing corrupt-session guards.
+
+### Early semantic input versus turn admission
+
+The subsequent broad local run stopped in general-server after **8,208
+passed, 30 skipped and one failed** test. The composed real-runner recovery
+fixture saw its event stream close before a terminal fact. Five focused
+stable-environment repetitions and six whole-file repetitions (**35/35** each,
+zero skips) did not reproduce it. Bounded failure-only runner and canonical
+event diagnostics were added; none of the ownership, archive or result
+assertions was relaxed. The exact historical failure cause remains unproven.
+
+Independent investigation did produce a deterministic related failure: an
+authenticated `paperclip_finish` can arrive on the semantic callback path
+before the turn-start response establishes the driver’s active provider turn.
+The driver rejected that valid call as `tool_binding_mismatch`. Waiting only
+in the driver is insufficient because the transport had already copied its
+temporary turn identifier into the callback parameters.
+
+The fix adds two admission barriers. The transport waits for the exact
+captured start to settle, then checks its epoch, controller, thread and durable
+correlation again before constructing provider parameters. Failed startup,
+close, detach, a newer start or a typed integrity failure cannot release an
+old call into a different turn. The driver separately waits for admission
+and then applies its unchanged exact thread/turn guard. Durable semantic
+dispatch does not block command-result ingestion or cumulative ACK, so the
+barriers do not deadlock that connection. No arbitrary delay, retry loop or
+alternate identity was added.
+
+Evidence for the final source:
+
+- Deterministic driver repro went red to green; foreign-turn rejection remains.
+- Authenticated controller → transport → driver → backend → runtime tests
+  passed **16/16**, including withheld start response, a mismatched provider
+  start, failed startup, typed faults, superseded epoch, close and detach.
+  Valid early input waits and produces one accepted result. These tests use
+  a synthetic launcher and persistence port, not a real provider or database.
+- Full controller/staged-transport/Codex-driver/backend cohort passed
+  **326/326** with the then-current 12 composed cases; the expanded 16-case
+  cohort passed separately. Runtime passed **85/85**. Do not claim a combined
+  330-test invocation that was not run.
+- The real runnerd/PostgreSQL recovery file passed **35/35**, zero skips,
+  after the production fix. Source hashes remained unchanged across that run.
+- Full workspace typecheck/build and another fresh chat integration
+  **390/390** passed. The integration database was created separately on the
+  existing isolated PostgreSQL server and migrated through all 255 entries.
+
+The remaining broad groups exposed separate local test-environment failures:
+Workspace B passed **2,996** with 60 skipped; Workspace A passed **6,083**
+with one skipped and three embedded-PostgreSQL bootstrap failures. The entire
+affected CLI worktree suite then passed **63/63** unchanged with exclusive
+database-test access. One serialized server suite hit the same startup error;
+a later serialized run passed that suite but stopped on a `socket hang up` in
+the unchanged company-import transfer suite. Its full isolated repeat passed
+**24/24**. The local machine had 29–30 shared-memory segments against a limit
+of 32. Contention is a supported inference, not captured historical stderr.
+No global IPC state, unrelated PostgreSQL process or system limit was changed.
+
+A new complete `pnpm test:run` was started after the final build with no other
+agent starting an embedded database. Previous failed invocations remain
+recorded; focused repeats do not turn them into broad-suite passes.
+
+The admission fix was deployed to isolated server **47** at **16:57:20.764
+UTC**, after the full build. No queued or running heartbeat existed. Server
+46 drained zero interrupted runs and closed remaining idle HTTP connections
+after its normal five-second deadline. The signed native binary hash is
+unchanged. Root then sent the same `ADMISSION-LANDING-0908` request through
+all three signed-in provider browsers at **16:57:53.655 UTC**, requesting
+exactly `ADMITTED-NATIVE-LUNA` on the existing tasks.
+
+| Provider | Run                                    | Native Luna duration | Submit to publication |
+| -------- | -------------------------------------- | -------------------- | --------------------- |
+| Slack    | `1edcefd6-00aa-41bf-8c82-d89ab2ba3fa6` | 11.743 s             | 14.741 s              |
+| GitHub   | `ea8a948f-841e-4932-a29a-eff45118a048` | 13.354 s             | 18.018 s              |
+| Telegram | `7a4e76f1-1a97-4ee3-b004-8bba06ff5426` | 13.267 s             | 15.940 s              |
+
+All three runs succeeded and their persisted profiles specify native
+`gpt-5.6-luna`. Root saw each exact final reply and the working indicator
+clear. Each working/final operation used one attempt and updated one provider
+message: Slack `1788886677.466519`, GitHub `5588819297`, Telegram
+`417200359:134`. No duplicate final was observed. This is a continuation smoke,
+not fresh coverage of every file/interaction permutation or old-task recovery.
+Discord still requires renewed browser login; Teams still requires a tenant.
+
+Before this admission fix, PR head `5aa2ac46c` passed all CI lanes in
+`34252696878` and Greptile at **5/5**. Those gates must run again for the new
+patch and latest master `be6bb768b`, which arrived during final qualification.

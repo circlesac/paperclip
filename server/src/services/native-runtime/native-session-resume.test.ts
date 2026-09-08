@@ -442,6 +442,11 @@ const recoveryFakeCodex = resolve(
     const previousStateBase = process.env.PAPERCLIP_RUNNER_STATE_DIR;
     const server = createServer();
     let firstSession: NativeSession | undefined;
+    const runnerDiagnostics: string[] = [];
+    const onRunnerLog = async (_stream: "stdout" | "stderr", chunk: string) => {
+      runnerDiagnostics.push(chunk.slice(-4_096));
+      if (runnerDiagnostics.length > 32) runnerDiagnostics.shift();
+    };
     process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
     try {
       await Promise.all(
@@ -562,6 +567,7 @@ const recoveryFakeCodex = resolve(
         execution: firstExecution,
         runnerInstanceId,
         runnerEnvironment: environment,
+        onLog: onRunnerLog,
       });
       firstSession = await firstBackend.openSession({
         identity: {
@@ -710,6 +716,7 @@ const recoveryFakeCodex = resolve(
         execution: currentExecution,
         runnerInstanceId,
         runnerEnvironment: environment,
+        onLog: onRunnerLog,
       });
       let continuity: Record<string, unknown> | undefined;
       const controlPlaneInstanceId = randomUUID();
@@ -736,6 +743,26 @@ const recoveryFakeCodex = resolve(
           async onContinuityBreak(value) {
             continuity = value;
           },
+        }).catch(async (error: unknown) => {
+          const eventRows = await db
+            .select({
+              eventType: heartbeatRunEvents.eventType,
+              payload: heartbeatRunEvents.payload,
+            })
+            .from(heartbeatRunEvents)
+            .where(eq(heartbeatRunEvents.runId, currentRunId));
+          const eventCodes = eventRows.slice(-32).map((event) => ({
+            eventType: event.eventType,
+            code: event.payload?.code ?? null,
+          }));
+          const fakeProvider = await readFile(
+            join(root, "codex-home", "fake-state.json"),
+            "utf8",
+          ).then(JSON.parse, () => null);
+          throw new Error(
+            `${error instanceof Error ? error.message : String(error)}\nDisposable recovery fixture runner diagnostics:\n${runnerDiagnostics.join("").slice(-12_000)}\nPersisted event codes: ${JSON.stringify(eventCodes)}\nFake provider state: ${JSON.stringify(fakeProvider)}`,
+            { cause: error },
+          );
         }),
       ).resolves.toMatchObject({
         result: {

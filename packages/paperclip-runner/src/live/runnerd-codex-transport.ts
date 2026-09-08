@@ -47,6 +47,7 @@ import {
   type RunnerProcessHandle,
   type RunnerProcessConnection,
   type RunnerProcessLaunchSpec,
+  type DurablePrpControlPlaneOptions,
 } from "../control-plane/durable-prp-control-plane.js";
 import {
   resolveQualifiedAcpxProfile,
@@ -2117,6 +2118,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #turnStartResponseEpoch = 0;
   #observedTurnStartEpoch = 0;
   #expectedProviderTurnId: string | null = null;
+  #turnStartAdmission: {
+    settled: Promise<boolean>;
+    resolve: (accepted: boolean) => void;
+  } | null = null;
   #durableTurnId = "";
   #authorizedTools: Record<string, unknown> | null = null;
   #runAttachTemplate: Record<string, unknown> | null = null;
@@ -2789,6 +2794,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async detachControllerForRestart(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#turnStartAdmission?.resolve(false);
     if (this.#pump !== null) clearInterval(this.#pump);
     this.#pump = null;
     if (this.#adoptedRunnerMonitor !== null)
@@ -2816,6 +2822,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   async #closeOnce(): Promise<void> {
     this.#closed = true;
+    this.#turnStartAdmission?.resolve(false);
     const adoptedRunner = this.options.adoptExistingRunner;
     // `settled` is a durable-state assertion, not merely the absence of a
     // process handle. Registration can install a remote checkpoint callback
@@ -2986,28 +2993,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
       onProtocolIntegrityError: (error) => this.#failTransport(error),
-      onSemanticToolInput: async (call) =>
-        unwrapToolResponse(
-          await this.#handler({
-            id: call.callId,
-            method: "item/tool/call",
-            params: {
-              threadId: this.#threadId,
-              turnId: this.#turnId,
-              callId: call.callId,
-              tool: call.operationId,
-              arguments: call.input,
-            },
-            ...(call.sourceEventId && call.sourceEventType
-              ? {
-                  paperclipTrace: {
-                    sourceEventId: call.sourceEventId,
-                    sourceEventType: call.sourceEventType,
-                  },
-                }
-              : {}),
-          }),
-        ),
+      onSemanticToolInput: (call) => this.#handleSemanticToolInput(call),
       connectionLeaseTtlMs: 60 * 60 * 1_000,
     });
     this.#core = core;
@@ -3638,28 +3624,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
       onProtocolIntegrityError: (error) => this.#failTransport(error),
-      onSemanticToolInput: async (call) =>
-        unwrapToolResponse(
-          await this.#handler({
-            id: call.callId,
-            method: "item/tool/call",
-            params: {
-              threadId: this.#threadId,
-              turnId: this.#turnId,
-              callId: call.callId,
-              tool: call.operationId,
-              arguments: call.input,
-            },
-            ...(call.sourceEventId && call.sourceEventType
-              ? {
-                  paperclipTrace: {
-                    sourceEventId: call.sourceEventId,
-                    sourceEventType: call.sourceEventType,
-                  },
-                }
-              : {}),
-          }),
-        ),
+      onSemanticToolInput: (call) => this.#handleSemanticToolInput(call),
       connectionLeaseTtlMs: 60 * 60 * 1_000,
     });
     this.#core = core;
@@ -3863,6 +3828,63 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     );
   }
 
+  async #handleSemanticToolInput(
+    call: Parameters<
+      NonNullable<DurablePrpControlPlaneOptions["onSemanticToolInput"]>
+    >[0],
+  ) {
+    this.#throwIfFailed();
+    const core = this.#core;
+    const threadId = this.#threadId;
+    const epoch = this.#turnStartResponseEpoch;
+    const admission = this.#turnStartAdmission;
+    // This callback runs independently of the notification pump. Do not copy
+    // its provisional turn_lab identity into a provider request before the
+    // exact durable command result and matching turn/started bind that turn.
+    const accepted =
+      admission === null
+        ? true
+        : await Promise.race([admission.settled, this.#failureSignal]);
+    this.#throwIfFailed();
+    if (
+      !accepted ||
+      this.#closed ||
+      epoch !== this.#turnStartResponseEpoch ||
+      threadId !== this.#threadId ||
+      core === null ||
+      core !== this.#core ||
+      call.correlation.runId !== core.store.state.identity.runId ||
+      call.correlation.normalizedSessionId !==
+        core.store.state.identity.normalizedSessionId ||
+      call.correlation.turnId !== core.store.state.identity.turnId
+    ) {
+      throw new Error(
+        "PRP semantic tool call no longer belongs to an admitted turn",
+      );
+    }
+    return unwrapToolResponse(
+      await this.#handler({
+        id: call.callId,
+        method: "item/tool/call",
+        params: {
+          threadId,
+          turnId: this.#turnId,
+          callId: call.callId,
+          tool: call.operationId,
+          arguments: call.input,
+        },
+        ...(call.sourceEventId && call.sourceEventType
+          ? {
+              paperclipTrace: {
+                sourceEventId: call.sourceEventId,
+                sourceEventType: call.sourceEventType,
+              },
+            }
+          : {}),
+      }),
+    );
+  }
+
   async #startTurn(
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
@@ -3878,6 +3900,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const pendingTurnId = `turn_lab_${randomUUID().replaceAll("-", "")}`;
     this.#turnId = pendingTurnId;
     const responseEpoch = ++this.#turnStartResponseEpoch;
+    this.#turnStartAdmission?.resolve(false);
+    let resolveAdmission!: (accepted: boolean) => void;
+    this.#turnStartAdmission = {
+      settled: new Promise((resolve) => {
+        resolveAdmission = resolve;
+      }),
+      resolve: (accepted) => resolveAdmission(accepted),
+    };
     this.#turnStartResponsePending = true;
     this.#expectedProviderTurnId = null;
     let responseReady = false;
@@ -3946,6 +3976,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       return { turn: { id: this.#turnId, status: "inProgress" } };
     } finally {
       if (!responseReady) {
+        resolveAdmission(false);
         if (this.#turnStartResponseEpoch === responseEpoch) {
           this.#turnStartResponsePending = false;
           this.#expectedProviderTurnId = null;
@@ -3956,6 +3987,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         // following task so the driver can bind and emit turn.accepted first.
         // The epoch prevents a late release from clearing a newer turn fence.
         const release = setTimeout(() => {
+          resolveAdmission(
+            !this.#closed && this.#turnStartResponseEpoch === responseEpoch,
+          );
           if (this.#turnStartResponseEpoch !== responseEpoch) return;
           this.#turnStartResponsePending = false;
           this.#expectedProviderTurnId = null;

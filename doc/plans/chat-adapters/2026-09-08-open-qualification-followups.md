@@ -10,8 +10,12 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
-  merged. Keep one PR: published head `d886f52c0` is **493 files**, below 500.
-  The verified recovery-label follow-up brings the final diff to **497 files**.
+  merged. Keep one PR: published head `5aa2ac46c` is **497 files**, below 500.
+  CI `34252696878` passed every lane. Greptile reviewed this exact head at
+  **5/5** with no outstanding finding. A subsequently reproduced early-turn
+  semantic-call race has been fixed and verified before the next push; recount
+  and renew final-head gates. New master `be6bb768b` (accessible-company
+  navigation) must also be incorporated before that final push.
 - The default-off **Experimental > Chat connectors** setting is implemented.
   Production GitHub tools remain visible and open directly without the
   chat/tool choice when disabled. Default-off and enabled browser flows passed.
@@ -59,12 +63,13 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current deployed state and evidence
 
-The live server was restarted at **16:26:24 UTC**, log
-`.paperclip-runtime/chat-adapters-live/server-experimental-landing-46.log`.
-It runs merge `48767c1c0` plus the verified integrity production patch. The
-restart had zero active/queued runs, and migration 0256 applied normally.
-Slack/GitHub/Telegram continuation smoke checks returned exact answers in
-**13.146 / 17.148 / 16.602 seconds**, on the same tasks using native Luna.
+The live server was restarted at **16:57:20 UTC**, log
+`.paperclip-runtime/chat-adapters-live/server-experimental-landing-47.log`.
+It runs `5aa2ac46c` plus the verified turn-admission production patch. The
+restart had zero active/queued runs. Slack/GitHub/Telegram continuation smoke
+checks returned exact answers in **14.741 / 18.018 / 15.940 seconds**, on the
+same tasks using native Luna. The earlier server-46 restart applied migration
+0256 normally and its smoke returned in 13.146 / 17.148 / 16.602 seconds.
 Each working/final operation used one attempt and updated one provider message.
 Its private Board is at `http://127.0.0.1:3103`. Keep the public verified
 webhook proxy separate from the private Board.
@@ -111,6 +116,39 @@ switch to Terra. The signed/staged runner SHA-256 is
   passing fixes and the later CI lanes provide broader evidence, but do not
   claim that original full command passed. Do not upload that old log: its
   CLI-guard failure quotes ignored historical runtime prompts.
+- The new broad run also stopped at general-server: **8,208 passed, 30
+  skipped, one failed** in 1,140.14 seconds. The new real-runner damaged-root
+  recovery test failed at `native-session-resume.test.ts:740` because its
+  event stream closed before a terminal fact. An exact isolated repeat passed
+  in 13.39 seconds; that does not resolve the broad failure. The fixture owner
+  is adding bounded failure-only diagnostics and repeating under the stable
+  wrapper's isolated environment. Keep every ownership/archive/result guard.
+  The remaining workspace groups and serialized suites are running separately;
+  the monolithic command did not execute them and must not be called passed.
+- Workspace B finished **2,996 passed / 60 skipped**. Workspace A had **6,083
+  passed / one skipped / three failed**; all three failures were embedded
+  PostgreSQL bootstrap failures in the CLI worktree suite, before assertions.
+  The full affected suite later passed **63/63** unchanged with exclusive
+  database-test access. One serialized server suite had the same bootstrap
+  failure (11 skipped), then the entire serialized group was restarted alone.
+  macOS had 29–30 shared-memory segments against a 32-segment limit; contention
+  is a supported inference, not captured historical PostgreSQL stderr. Do not
+  alter global IPC settings, delete segments, or stop unrelated databases.
+  The UI portion of Workspace A passed **5,608/5,608** across 570 files.
+- The damaged-root test then passed five focused wrapper-environment repeats
+  and six complete **35/35** file repetitions, zero skips. The original broad
+  failure is still not causally proven. Separately, a deterministic driver
+  test proved a valid `paperclip_finish` can arrive before turn-start admission
+  and be rejected as `tool_binding_mismatch`; a wrong-turn negative also ran.
+  The verified fix adds exact turn-admission barriers in transport and driver,
+  with epoch/identity and typed-fault checks. The final authenticated composed
+  cohort is **16/16**; controller/transport/driver/backend **326/326**, runtime
+  **85/85**, and post-fix real-runner recovery **35/35**, zero skips. Full
+  workspace typecheck/build and a fresh chat integration **390/390** pass.
+  Do not substitute a timing delay or weaken the old-owner/archive/result
+  assertions. Failure-only fixture logs remain bounded and contain synthetic
+  fixture state only. A new complete `pnpm test:run` started after the final
+  build in `admission-workspace-tests-final-0908.log`; it is not yet complete.
 
 ## Remaining work
 
