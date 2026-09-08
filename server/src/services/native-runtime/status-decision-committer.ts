@@ -746,20 +746,28 @@ async function materializeDecisionEffect(input: {
       };
     }
     const prior = await input.tx.select({
-      assessmentId: statusDecisions.assessmentId,
+      id: statusDecisions.id,
     }).from(statusDecisions).where(and(
       eq(statusDecisions.id, input.issue.lastStatusDecisionId),
       eq(statusDecisions.companyId, input.companyId),
     )).limit(1).then((rows) => rows[0] ?? null);
     if (!prior) throw new Error("native_superseded_assessment_missing");
-    const [assessment] = await input.tx.update(workAssessments).set({
-      supersedesAssessmentId: prior.assessmentId,
-    }).where(and(
+    const assessment = await input.tx.select({
+      id: workAssessments.id,
+      supersedesAssessmentId: workAssessments.supersedesAssessmentId,
+    }).from(workAssessments).where(and(
       eq(workAssessments.id, lineage.currentAssessmentId),
       eq(workAssessments.companyId, input.companyId),
       eq(workAssessments.issueId, input.issue.id),
-    )).returning({ id: workAssessments.id });
-    if (!assessment) throw new Error("native_superseding_assessment_not_linked");
+      eq(workAssessments.runId, input.runId),
+    )).limit(1).then((rows) => rows[0] ?? null);
+    if (!assessment?.supersedesAssessmentId) {
+      throw new Error("native_superseding_assessment_not_linked");
+    }
+    // Status decisions form one issue-wide sequence and may supersede a
+    // decision from another run. Work-assessment lineage is deliberately
+    // run-local, so retain the parent recorded when this reassessment was
+    // created instead of replacing it with the prior decision's assessment.
     const [decision] = await input.tx.update(statusDecisions).set({
       supersedesDecisionId: input.issue.lastStatusDecisionId,
     }).where(and(
@@ -774,7 +782,7 @@ async function materializeDecisionEffect(input: {
       payload: {
         supersedesDecisionId: input.issue.lastStatusDecisionId,
         assessmentId: assessment.id,
-        supersedesAssessmentId: prior.assessmentId,
+        supersedesAssessmentId: assessment.supersedesAssessmentId,
       },
     };
   }

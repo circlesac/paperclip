@@ -3,7 +3,7 @@
 ## Execution target
 
 The isolated live agent remains Maya E2E, `31f56712-3944-423e-b7c7-404bb8fbb993`,
-using `paperclip_runner` and `gpt-5.6-luna`. The staged runner binary remains
+using `paperclip_runner` and `gpt-5.6-luna`. The initial live runner binary was
 `af19f64dfdf7e2e4efb5b41275e26cd873338315207c36fd4d108bdb69bae3c1`.
 Actual Codex app-server source/continuation evidence and measured Slack,
 Discord, and Telegram timings are recorded in the
@@ -100,8 +100,8 @@ shape, and pass current policy again at commit. Arbitrary verifying states and
 old-generation events remain denied. Positive tests for all five providers
 reach an actual pending answer publication; reconnect and activation overlap
 tests prove the final authorization recheck. The full external-chat wait suite
-passed 106/106 and server typechecking passed. This fix has not yet been
-deployed to the live qualification server.
+passed 106/106 and server typechecking passed. This fix is included in the
+deployment candidate but has not yet passed its fresh live qualification.
 
 ### Slack upstream retry and queue failure are separate findings
 
@@ -150,7 +150,7 @@ missing-suspension failure against the prior staged `af19f64d…` binary. The
 correction gates new provider ingestion while a sent durable prefix is still
 awaiting controller acknowledgements. Authenticated control frames continue
 in order; every individual event save and cumulative ACK save remains intact.
-There is no longer timeout or discarded durable output.
+There is no timeout increase or discarded durable output.
 
 Independent review required two additional safeguards. Backpressure still
 advances bounded, already-pending receipt-limit cleanup without starting a
@@ -173,7 +173,28 @@ Candidate debug verification passed:
 - Runner and server TypeScript checks passed; independent review found no
   remaining production blocker in these changes.
 
-Release/staged-binary verification and fresh live round trips remain pending.
+The release build completed successfully. Its staged, ad-hoc-signed SHA256 is
+`a0fd27895142f333696df720d66c426793c9051f7361288e54f6c2c16cf7ccd8`.
+The full staged transport suite passed **87/87** in 56.31 seconds; its digest
+was unchanged afterward. Actual Codex integration passed **66/66**, plus its
+intentionally ignored subprocess helper invoked by the parent test. Logs use
+the `runner-ack-fairness-` prefix under the ignored live runtime directory.
+
+Fresh live round trips remain pending. Restart of the clean `857bd57c2` server
+failed closed during native finalization recovery: an assessment belonging to
+the failed Slack run already had a valid same-run supersession link, but
+effect materialization tried to replace it with the current issue decision's
+assessment from another run. PostgreSQL correctly rejected that cross-run
+reference. No constraint or data was changed to bypass it; the failed-start
+process was stopped. The scoped fix preserves the already-recorded run-local
+assessment parent and separately links the issue-wide status decision.
+Cross-run, intermediate same-run ancestry, and replay regressions passed;
+independent focused PostgreSQL verification passed **4/4**. Root's full status
+corpus plus finalization recovery passed **12/12** in 9.15 seconds, and the
+server package typecheck (including its runner contract/build prerequisites)
+passed. The staged runner digest remains unchanged. Live restart and fresh
+round trips remain to be verified after this correction.
+
 The failed Slack session is retained in quarantine; an audited task-scoped
 session reset after deployment will create a new provider session, not recover
 or replay the failed accepted answer. Paperclip issue, message, file, and run
@@ -182,4 +203,5 @@ history will remain. No reset has been performed yet.
 The ignored, local webhook-only qualification proxy now has closed timing
 diagnostics, tested **6/6** without a real listener. They record only provider,
 timestamp, duration, status, outcome, and byte count; no bodies, headers,
-credentials, callback IDs, or URLs. The running proxy is not yet restarted.
+credentials, callback IDs, or URLs. The proxy was restarted with this diagnostic
+code, retaining the same webhook-only routing and public/private exposure.
