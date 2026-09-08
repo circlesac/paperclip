@@ -16,7 +16,8 @@ User-requested wireframe cleanup is now pushed separately as `5ed80f70a`:
 all 67 remaining generated images and the gallery are excluded from the PR,
 which now has **432 files**. Written plans and production icons remain; archive
 links preserve the exact historical images. The focused UI contract suite
-passed. The retry changes below remain uncommitted and are not in that cleanup.
+passed. The retry/presentation changes below are pushed separately in
+`b235e87fd`; they are not part of the wireframe cleanup commit.
 
 The exact failed-run retry implementation now uses the selected failed run ID,
 not mutable client task/comment context. It persists a distinct idempotent retry
@@ -116,6 +117,36 @@ existing JSON evidence and telemetry deduplication. Final native coverage passed
 the last diagnostic-capture refinement: 23/23 passed, 475 unrelated cases
 intentionally filtered. The retry/presentation slice is checkpointed separately
 from unfinished session maintenance; no live server restart has deployed it yet.
+
+The next continuation found that settling A alone does not make the old queued
+requests retryable. GitHub B failed before native execution with the exact
+reviewed-attestation diagnostic; a narrow positive legacy retry now requires
+that sole system error and absence of provider/native/output evidence, while
+retaining the original source and current permissions. Boole owns this path.
+Telegram B is an observed native run with zero attempts, not an exhausted
+failure. James must derive its separate pre-provider retry eligibility from A's
+authenticated settled maintenance receipt; never rewrite B's state or attempts
+to manufacture exhaustion. Root's read-only qualification recheck confirmed
+Discord's Eigenjoy browser session currently requires login again.
+
+Maintenance remains uncommitted and unqualified live. James owns exact old-run
+lease/copy/activation and same-session proof. Epicurus owns the real Codex
+already-ended-on-resume shutdown gap: even an already-ended turn must stop its
+restored provider before claiming a prepared, no-launch drain state. Root added
+a per-database joined, bounded, keyset-advancing discovery lane after accepted
+finalization in startup and periodic recovery, tracked for shutdown. It does
+not create wakes, alter task state, or treat discovery as physical authority.
+The discovery/finalization test file passed 18/18 after correcting its fixture
+teardown method; the first run passed all assertions but failed teardown.
+The real heartbeat lifecycle/adjacent cohort passed 11/11 and server typecheck
+passed. GitHub's exact pre-provider retry cohort passed 28/28. Fresh full chat
+runs were 512/513 and 511/513: one one-second lock observation failed initially
+and passed unchanged later; the second run proved a Discord renewal consumed
+Slack's globally mocked transaction fault, then an un-restored spy cascaded
+into the `/close` fixture. Boole owns the scoped fault/finally repair. Preserve
+these failed-run records and rerun the complete suite after fixture isolation.
+Do not deploy the partially finished physical recovery or mark the live A/B
+journey passed from these fixture results.
 
 ## Earlier work: Discord restart repair and final landing gates
 

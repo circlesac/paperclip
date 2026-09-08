@@ -40507,7 +40507,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     },
   );
 
-  async function failedChatRetryFixture(provider: "slack" | "telegram") {
+  async function failedChatRetryFixture(provider: "slack" | "telegram" | "github") {
     const context = await safeNativeProgressFixture(provider, "91");
     const [issue] = await db
       .select()
@@ -41595,6 +41595,294 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await context.service.shutdown();
     }
   });
+
+  async function failedReviewedGitHubRetryFixture() {
+    const context = await failedChatRetryFixture("github");
+    await db
+      .update(issues)
+      .set({ status: "in_review" })
+      .where(eq(issues.id, context.issue.id));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        errorCode: "setup_failed",
+        error: "reviewed_chat_execution_binding_not_authorized",
+        startedAt: new Date(Date.now() - 10),
+        finishedAt: new Date(),
+        // Admission captures the prior display/session identity before any
+        // execution starts. It is not evidence of a turn for this new run.
+        sessionIdBefore: "prior-provider-session",
+      })
+      .where(eq(heartbeatRuns.id, context.runId));
+    await db.insert(heartbeatRunEvents).values({
+      companyId: context.fixture.companyId,
+      agentId: context.fixture.assignedAgentId,
+      runId: context.runId,
+      seq: 1,
+      eventType: "error",
+      stream: "system",
+      level: "error",
+      message: "reviewed_chat_execution_binding_not_authorized",
+    });
+    return context;
+  }
+
+  it("retries an exact GitHub source denied by pre-provider reviewed attestation without rewriting its failure", async () => {
+    const context = await failedReviewedGitHubRetryFixture();
+    try {
+      const [original] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, context.runId));
+      const [originalSource] = await db
+        .select()
+        .from(chatActions)
+        .where(eq(chatActions.id, context.action.id));
+      const stage = () =>
+        db.transaction((tx) =>
+          context.service.prepareFailedChatRunRetry(tx, {
+            companyId: context.fixture.companyId,
+            issueId: context.issue.id,
+            agentId: context.fixture.assignedAgentId,
+            failedRunId: context.runId,
+            initiatedByUserId: "owner-user",
+          }),
+        );
+      const first = await stage();
+      expect(await stage()).toEqual(first);
+      await expect(
+        context.service.processFailedChatRunRetry(first.actionId),
+      ).resolves.toMatchObject({ status: "queued" });
+      await context.service.processFailedChatRunRetry(first.actionId);
+      const receipts = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, first.actionId));
+      expect(receipts).toEqual([
+        expect.objectContaining({
+          companyId: context.fixture.companyId,
+          agentId: context.fixture.assignedAgentId,
+          requestedByActorType: context.receipt.requestedByActorType,
+          requestedByActorId: context.receipt.requestedByActorId,
+          payload: expect.objectContaining({
+            issueId: context.issue.id,
+            taskKey: context.issue.identifier,
+            wakeCommentIds: [context.action.payload.commentId],
+            retryOfRunId: context.runId,
+          }),
+        }),
+      ]);
+      expect(
+        await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, context.runId)),
+      ).toEqual([original]);
+      expect(
+        await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, context.action.id)),
+      ).toEqual([originalSource]);
+      expect(
+        await db
+          .select()
+          .from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.runId, context.runId)),
+      ).toEqual([]);
+      expect(
+        await db
+          .select()
+          .from(nativeRunResults)
+          .where(eq(nativeRunResults.runId, context.runId)),
+      ).toEqual([]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it("rechecks pre-provider retry evidence after staging and refuses a late execution event", async () => {
+    const context = await failedReviewedGitHubRetryFixture();
+    try {
+      const staged = await db.transaction((tx) =>
+        context.service.prepareFailedChatRunRetry(tx, {
+          companyId: context.fixture.companyId,
+          issueId: context.issue.id,
+          agentId: context.fixture.assignedAgentId,
+          failedRunId: context.runId,
+          initiatedByUserId: "owner-user",
+        }),
+      );
+      const wakeCount = context.wakeup.mock.calls.length;
+      await db.insert(heartbeatRunEvents).values({
+        companyId: context.fixture.companyId,
+        agentId: context.fixture.assignedAgentId,
+        runId: context.runId,
+        seq: 2,
+        eventType: "prp",
+        sourceInstanceId: "late-provider",
+        payload: { type: "turn.started" },
+      });
+      await expect(
+        context.service.processFailedChatRunRetry(staged.actionId),
+      ).resolves.toMatchObject({ status: "failed", runId: null });
+      expect(context.wakeup.mock.calls.length).toBe(wakeCount);
+      expect(
+        await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, staged.actionId)),
+      ).toEqual([]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it.each([
+    "other_setup_error",
+    "missing_error_event",
+    "provider_event",
+    "native_profile",
+    "native_identity",
+    "process_identity",
+    "provider_output",
+    "environment_lease",
+    "uncertain_publication",
+    "selected_reply",
+    "revoked_resource",
+    "retired_conversation",
+    "edited_source",
+  ] as const)(
+    "denies a pre-provider reviewed retry with %s",
+    async (change) => {
+      const context = await failedReviewedGitHubRetryFixture();
+      try {
+        if (change === "other_setup_error")
+          await db
+            .update(heartbeatRuns)
+            .set({ error: "Some other setup failure" })
+            .where(eq(heartbeatRuns.id, context.runId));
+        if (change === "missing_error_event")
+          await db
+            .delete(heartbeatRunEvents)
+            .where(eq(heartbeatRunEvents.runId, context.runId));
+        if (change === "provider_event")
+          await db.insert(heartbeatRunEvents).values({
+            companyId: context.fixture.companyId,
+            agentId: context.fixture.assignedAgentId,
+            runId: context.runId,
+            seq: 2,
+            eventType: "prp",
+            sourceInstanceId: "provider-source",
+            payload: { type: "turn.started" },
+          });
+        if (change === "native_profile")
+          await db
+            .update(heartbeatRuns)
+            .set({ runnerProfileJson: { nativeExecutionInput: {} } })
+            .where(eq(heartbeatRuns.id, context.runId));
+        if (change === "native_identity")
+          await db
+            .update(heartbeatRuns)
+            .set({ nativeSessionId: randomUUID() })
+            .where(eq(heartbeatRuns.id, context.runId));
+        if (change === "process_identity")
+          await db
+            .update(heartbeatRuns)
+            .set({ processPid: 987654 })
+            .where(eq(heartbeatRuns.id, context.runId));
+        if (change === "provider_output")
+          await db
+            .update(heartbeatRuns)
+            .set({ lastOutputSeq: 1 })
+            .where(eq(heartbeatRuns.id, context.runId));
+        if (change === "environment_lease")
+          await db.insert(environmentLeases).values({
+            companyId: context.fixture.companyId,
+            heartbeatRunId: context.runId,
+            status: "released",
+          });
+        if (change === "uncertain_publication")
+          await db.insert(chatPublications).values({
+            companyId: context.fixture.companyId,
+            endpointId: context.endpoint.id,
+            conversationId: context.conversation.id,
+            issueId: context.issue.id,
+            state: "delivery_unknown",
+            idempotencyKey: `run:${context.runId}:working:uncertain`,
+            payload: { text: "Possibly sent" },
+          });
+        if (change === "selected_reply") {
+          const [comment] = await db
+            .insert(issueComments)
+            .values({
+              companyId: context.fixture.companyId,
+              issueId: context.issue.id,
+              authorAgentId: context.fixture.assignedAgentId,
+              authorType: "agent",
+              createdByRunId: context.runId,
+              body: "Already selected response",
+            })
+            .returning();
+          await db.insert(chatPublications).values({
+            companyId: context.fixture.companyId,
+            endpointId: context.endpoint.id,
+            conversationId: context.conversation.id,
+            issueId: context.issue.id,
+            commentId: comment.id,
+            state: "pending",
+            idempotencyKey: `selected:${context.runId}`,
+            payload: { text: comment.body },
+          });
+        }
+        if (change === "revoked_resource")
+          await db
+            .update(chatEndpointResources)
+            .set({ enabled: false })
+            .where(
+              eq(chatEndpointResources.id, context.conversation.resourceId!),
+            );
+        if (change === "retired_conversation")
+          await db
+            .update(chatConversations)
+            .set({ state: "completed" })
+            .where(eq(chatConversations.id, context.conversation.id));
+        if (change === "edited_source")
+          await db
+            .update(issueComments)
+            .set({ updatedAt: new Date(Date.now() + 1000) })
+            .where(
+              eq(issueComments.id, String(context.action.payload.commentId)),
+            );
+        await expect(
+          db.transaction((tx) =>
+            context.service.prepareFailedChatRunRetry(tx, {
+              companyId: context.fixture.companyId,
+              issueId: context.issue.id,
+              agentId: context.fixture.assignedAgentId,
+              failedRunId: context.runId,
+              initiatedByUserId: "owner-user",
+            }),
+          ),
+        ).rejects.toMatchObject({
+          details: { code: "chat_failed_run_retry_not_authorized" },
+        });
+        expect(
+          await db
+            .select()
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.companyId, context.fixture.companyId),
+                eq(chatActions.kind, "failed_run_retry"),
+              ),
+            ),
+        ).toEqual([]);
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
 
   it.each(["adapter_failed", "adapter_exit_code", "process_exit", "timeout"])(
     "admits the exact chat source for ordinary %s failure",

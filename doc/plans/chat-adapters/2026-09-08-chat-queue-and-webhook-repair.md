@@ -2152,3 +2152,66 @@ delivered through the new recovery path. Its old session must be settled using
 the separate exact-authority maintenance operation before retrying the original
 queued document or GitHub B. No live quarantine or source data was rewritten to
 produce a passing fixture result.
+
+### Pre-provider retry and bounded cleanup discovery
+
+Read-only revalidation proved Telegram A's accepted canonical digest and server
+fingerprint against its actual authenticated control-plane source. Its original
+photo/source and conversation generation remain current, with no selected
+answer, owned interaction, source invalidation or uncertain publication. Only
+the earlier progress/failure message exists. This is eligibility evidence, not
+proof that the user received the answer; presentation repair has not run live.
+
+The saved GitHub B failure happens before runtime resolution, but the original
+retry allowlist rejected every `setup_failed` run. A positive regression
+reproduced that refusal. The narrow repair recognizes only the exact reviewed
+attestation diagnostic, its sole unauthenticated system-error row, and absence
+of native/provider/process/output/result evidence. It preserves the original
+source, current authorization and idempotency checks. A later provider event
+invalidates an already-staged retry before any wake or receipt is created.
+The final focused cohort passed **28/28**; broader verification follows below.
+
+Two fresh full runs were not clean: first **512/513**, with the existing locked
+progress issue fixture exceeding its one-second observation deadline; both
+lock variants passed unchanged in isolation. The second run was **511/513**,
+with that lock fixture passing but two different failures. Its log directly
+shows a previous Discord Gateway renewal consuming the database transaction
+failure intended for Slack's durable ingress. The subsequent failed assertion
+skipped spy restoration and caused recursion in a later `/close` test. The
+fault must target the intended delivery insert, and spy cleanup must execute
+even when assertions fail. This is active fixture-isolation work, not evidence
+of a production fix or a passed full suite. The positive GitHub retry slice is
+checkpointed independently; do not relabel either failed full run as passed.
+
+Telegram B remains a separate recovery case: an observed native coordinator
+with zero attempts must not be disguised as an exhausted failure. Its retry
+needs authenticated settlement of the exact inherited old session, plus proof
+that B itself never started provider work. That positive path is unfinished.
+
+Automatic cleanup discovery is joined per database, defaults to one candidate
+per sweep, and advances a keyset cursor past refusals rather than repeatedly
+blocking behind the first damaged checkpoint. It selects only exact committed
+accepted results with the retained close diagnostic, skips any prior maintenance
+attempt, and leaves lease/physical authority to the separate cleanup operation.
+Startup and periodic recovery schedule this as independent tracked work, so
+unrelated ingress is not held behind maintenance and shutdown still waits for
+the actual operation. Discovery does not create a wake or rewrite a task/run.
+The existing finalization/discovery test file passed **18/18**; its first run
+passed all assertions but failed the new fixture's incorrect teardown method,
+which was corrected. Physical maintenance and the live journey are not yet
+qualified, and server 58 has not been restarted.
+
+Two real heartbeat lifecycle fixture cases additionally prove that startup and
+orphan reaping share one pending physical cleanup, unrelated orphan recovery
+can finish, and shutdown waits for either cleanup success or rejection without
+creating a provider execution, run or wake. Only the physical cleanup boundary
+is deferred; accepted-result/finalizer/discovery/startup/reap/drain paths are
+real. The adjacent cohort passed **11/11** and plain server typecheck passed.
+
+The signed-in-browser recheck also confirmed Eigenjoy currently shows “Please
+log in again” in Discord. No new Discord message or account switch was made.
+GitHub's recently released CLI media upload was checked as a potential native
+file-delivery improvement, but its official implementation explicitly accepts
+OAuth/PAT credentials, not App installation tokens. It is not a supported
+substitute for the bot's existing authenticated Paperclip download links:
+[GitHub CLI upload implementation](https://github.com/cli/cli/blob/v2.99.0/internal/attachments/client.go).

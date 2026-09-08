@@ -59,6 +59,7 @@ import {
   companies,
   companyMemberships,
   companySecretBindings,
+  heartbeatRunEvents,
   heartbeatRuns,
   nativeRunFinalizations,
   nativeRunResults,
@@ -9662,6 +9663,90 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
+  /** The reviewed-chat ownership check runs before runtime/profile resolution
+   * or provider startup. Recognize only that exact persisted failure together
+   * with its sole system diagnostic and absence of execution evidence. A
+   * generic setup error (or a prior-session display hint) is not this proof. */
+  async function isPreProviderReviewedChatFailure(
+    tx: DbOrTransaction,
+    run: typeof heartbeatRuns.$inferSelect,
+  ): Promise<boolean> {
+    const diagnostic = "reviewed_chat_execution_binding_not_authorized";
+    if (
+      run.runtimeMode !== "legacy" ||
+      run.errorCode !== "setup_failed" ||
+      run.error !== diagnostic ||
+      [
+        run.runtimeModeResolverVersion,
+        run.runtimeModeReason,
+        run.runtimeModeResolvedAt,
+        run.runnerProfileJson,
+        run.runnerInstanceId,
+        run.nativeSessionId,
+        run.nativeIssueId,
+        run.nativePhase,
+        run.driverKind,
+        run.driverVersion,
+        run.completionContractId,
+        run.completionContractSha256,
+        run.sessionIdAfter,
+        run.externalRunId,
+        run.processPid,
+        run.processGroupId,
+        run.processStartedAt,
+        run.logStore,
+        run.logRef,
+        run.logBytes,
+        run.logSha256,
+        run.stdoutExcerpt,
+        run.stderrExcerpt,
+        run.lastOutputAt,
+        run.lastOutputStream,
+        run.lastOutputBytes,
+        run.usageJson,
+        run.exitCode,
+        run.signal,
+      ].some((value) => value !== null) ||
+      run.lastOutputSeq !== 0 ||
+      run.logCompressed
+    )
+      return false;
+    const events = await tx
+      .select()
+      .from(heartbeatRunEvents)
+      .where(
+        and(
+          eq(heartbeatRunEvents.companyId, run.companyId),
+          eq(heartbeatRunEvents.runId, run.id),
+        ),
+      )
+      .limit(2)
+      .for("share", { noWait: true });
+    const event = events[0];
+    if (
+      events.length !== 1 ||
+      !event ||
+      event.agentId !== run.agentId ||
+      event.seq !== 1 ||
+      event.eventType !== "error" ||
+      event.stream !== "system" ||
+      event.level !== "error" ||
+      event.message !== diagnostic ||
+      event.payload !== null ||
+      event.sourceInstanceId !== null ||
+      event.sourceEventId !== null ||
+      event.sourceSeq !== null ||
+      event.sourcePayloadSha256 !== null ||
+      event.protocolSchemaVersion !== null
+    )
+      return false;
+    const evidence = await tx.execute(sql`select 1 where
+      exists (select 1 from native_run_finalizations where company_id = ${run.companyId}::uuid and run_id = ${run.id}::uuid)
+      or exists (select 1 from native_run_results where company_id = ${run.companyId}::uuid and run_id = ${run.id}::uuid)
+      or exists (select 1 from environment_leases where company_id = ${run.companyId}::uuid and heartbeat_run_id = ${run.id}::uuid)`);
+    return evidence.length === 0;
+  }
+
   async function failedNativeRetryCoordinator(
     tx: DbOrTransaction,
     run: typeof heartbeatRuns.$inferSelect,
@@ -9882,12 +9967,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           !failedRun.finishedAt)) ||
       (!input.committedResponse &&
         failedRun.runtimeMode !== "native" &&
-        ![
-          "adapter_failed",
-          "adapter_exit_code",
-          "process_exit",
-          "timeout",
-        ].includes(failedRun.errorCode ?? "")) ||
+        !(
+          [
+            "adapter_failed",
+            "adapter_exit_code",
+            "process_exit",
+            "timeout",
+          ].includes(failedRun.errorCode ?? "") ||
+          (await isPreProviderReviewedChatFailure(tx, failedRun))
+        )) ||
       (!input.publication &&
         ["backlog", "done", "cancelled"].includes(issue.status))
     )
