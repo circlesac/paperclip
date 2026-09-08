@@ -275,3 +275,146 @@ publication was created by this restart. Fresh post-deployment provider
 qualification and the Slack task-scoped reset remain pending the browser
 confirmation/input problem above. The server is available locally on 3103;
 the private/public Tailscale routing boundary is unchanged.
+
+## Fresh native Luna qualification after browser recovery
+
+Browser input became responsive again. The earlier prepared drafts were not
+counted; the following are newly submitted, provider-visible requests on the
+`84a601459` server and staged `a0fd2789…` runner. All four active endpoints
+(Slack, Discord, GitHub, Telegram) still bind to Maya E2E with adapter
+`paperclip_runner` and configured model `gpt-5.6-luna`. Each run below also
+independently records `driver_kind=codex_app_server` and the same model in its
+native execution profile. No Terra substitution or legacy adapter was used.
+
+- **Discord long answer and queue:** source message `1546864944140787752`
+  submitted at 12:49:01.858 UTC, received at 12:49:02.057. Run
+  `e9b877f2-4087-413e-bc3d-4f1edd313420` succeeded in 59.769 seconds.
+  Working feedback appeared at 12:49:03.800; a safe native progress update
+  reused the same message `1546864951203864586`. The complete long answer
+  was delivered as `paperclip-response.md` in message `1546865203755614239`
+  at 12:50:04.135, **62.277 seconds** after submission. The attachment was
+  opened in Discord's whole-file preview, not inferred from an outbox flag.
+  Two follow-ups submitted at 12:49:19.640/.670 shared one queued notice,
+  message `1546865026105606204`. Successor run
+  `04bd1506-2f5d-41a4-b65e-e4377b420a70` succeeded in 15.608 seconds and
+  reused that exact notice for working then `GARNET-QUEUE-A` / `GARNET-QUEUE-B`
+  at 12:50:18.813. All publications used one attempt. The prior native
+  suspension/acknowledgement failure did not recur.
+- **Slack scoped recovery and queue:** the audited Board API reset only
+  task `4268eb34-b15a-4ab6-91e7-6c184021690d` at 12:54:12.360. This was an
+  authorized recovery-fixture API action, not a claim that the previously
+  blocked browser confirmation passed. Failed history remains intact.
+  Fresh message `1788872101.219689` was submitted at 12:55:01.100; proxy
+  ingress followed at 12:55:01.986 and returned 200 in 44.052 ms. Run
+  `593ad9cc-f81d-4008-8308-7e1c71082f1b` succeeded in 37.060 seconds; its
+  600-word answer replaced the working/progress message `1788872104.327139`
+  at 12:55:40.299, **39.199 seconds** after submission. The two new queued
+  follow-ups used one notice `1788872120.702299`, then successor run
+  `5e81a966-fc00-4bff-8455-4a8b4ae4d2c1` reused it for working and the exact
+  ordered `AMETHYST-QUEUE-A` / `AMETHYST-QUEUE-B` answer at 12:55:58.289.
+  Both outcomes were read in Slack. All publications used one attempt.
+- **Telegram ingress localization:** the first fresh request was submitted
+  at 12:49:02.157 but first reached the local webhook proxy at 12:52:56.592:
+  **234.435 seconds before local ingress**, not time spent queued in Luna.
+  The proxy returned 200 in 703.024 ms; run
+  `584dc938-5d8c-4752-8042-aff378da4a9d` then succeeded in 13.433 seconds.
+  `TELEGRAM-NATIVE-LUNA-READY` was visibly delivered on the same working
+  message `417200359:115`. A second independent request at 12:55:01.547
+  reached the proxy in 0.583 seconds without a reconnect/configuration change.
+  Run `a2207faa-ff35-4bac-9e1a-fbc0270f5d96` succeeded in 13.603 seconds,
+  and `TG-FAST-READY` replaced `417200359:117` at 12:55:17.775:
+  **16.228 seconds end to end**. Both final outbox rows used two attempts;
+  neither duplicated the provider message. The earlier pre-ingress delay is
+  localized, not yet explained or declared permanently fixed.
+- **GitHub native question:** new PR comment `5585485583`, submitted at
+  12:56:45.673, started run `1ac82077-478b-444a-a459-efa52aaf9d4d` at
+  12:56:49.409. It succeeded in 12.884 seconds and visibly published
+  “Choose Quartz or Jade” with its normal Paperclip link. Opening that link
+  reached the actual pending Board question. Its answer is intentionally
+  pending deployment of the separately reproduced native Board-answer
+  continuation correction; question creation is not a completed round trip.
+
+These are individual live samples, not latency percentiles. Private reasoning
+and raw tool/diagnostic events stay in Paperclip; external progress uses the
+closed, safe phase projection. Teams still lacks a qualified Microsoft 365
+tenant and is not counted among these four active live endpoints.
+
+The whole-file inspection found two remaining quality defects: the old
+Discord placeholder still said “preparing” after its attachment arrived, and
+the runner over-redacted ordinary game-token prose. The attachment handoff
+now uses a timeless message-limit explanation, which does not claim delivery
+before the attachment's own outbox row succeeds. Both existing Discord and
+Telegram long-document tests pass (**2/2**, fresh PostgreSQL), including
+retry, rejected attachment, ambiguous delivery, and lossless safe-text bytes.
+The runner prose-redaction correction is being tested separately with secret
+canaries; no broad redaction bypass is authorized.
+
+## Authored-answer preservation and native GitHub answer authority
+
+The parallel audit reproduced an actual progress-lane collision: a run can
+legitimately yield an authorized selected answer and later fail, but the
+failure milestone reused the old working-message ID after that ID held the
+answer. The reverse order could erase the truthful failure notice. The fix
+checks the current exact outbound message link, scoped to company, endpoint,
+conversation and issue, before either the run lane or older queued-wake lane
+can be reused. Authored answers and failure notices consume their lane;
+ordinary working→failure and interleaved task-status updates retain their
+existing single-message behavior. Twenty Slack/Telegram order/status and
+deferred-admission cases failed before the fix and pass afterward; the final
+compatibility subset passed **29/29**. No run status or review decision is
+rewritten to make the presentation pass.
+
+GitHub's link-only question fallback exposed a separate native-authority gap:
+answering in the authenticated Board creates no provider callback action,
+while the native continuation attestor required one. A real PostgreSQL native
+fixture reproduced the denial. The correction recognizes a distinct Board
+answer receipt for GitHub only, bound to the server-created response delivery,
+exact original linked user, published question, source/run/wake chain and
+current runtime generation. Existing membership, reach and review checks
+remain; it does not invent a chat action or make an answer grant governance
+authority. The native question suite passed **130/130**, including wrong
+responder, revoked identity/membership/reach, stale generation/receipt and
+forged-marker denials, plus native file registration/reuse and idempotence.
+
+Root's full chat-channel integration run passed **390/390** on fresh
+PostgreSQL in 74.10 seconds (68.98 seconds in tests); source server TypeScript
+checking passed. A new Discord pre-link reaction test also covers durable
+replay across service reconstruction without additional task work. These
+focused results do not remove the separately documented frozen-install/
+lockfile release limitation or qualify the missing Teams tenant.
+
+The first and second Telegram final attempts above were authorization-lock
+deferrals: the log explicitly records that no provider send was attempted
+on the first claim. The retry count is not evidence of a duplicate Bot API
+request.
+
+## Live Discord lease expiry
+
+With no active Maya run, root paused the actual server PID for 30 seconds
+using an independent automatic-resume timer: 13:00:05.357–13:00:35.358 UTC,
+past the 15-second Discord Gateway lease. New message
+`1546867734644662432` and an added reaction on the long-answer attachment
+`1546865203755614239` were sent while paused. On resume they became exactly
+one processed message and one processed reaction delivery, both in the
+original CHA-4 conversation. Only one run started:
+`1ca2ec88-9c7e-489b-8b1b-bf6f1a85faf5`, actual native Luna, succeeded in
+15.982 seconds. Its working notice was edited into `DC-LEASE-RESUMED` on
+message `1546867860427644999`, one attempt each, visibly verified.
+
+The reaction removal was performed **after** resume, at 13:00:52.774, and
+was durably processed once at 13:00:52.992 without starting another run.
+It is not counted as an in-pause removal. A second independent follow-up was
+submitted at 13:01:16.676 to verify continued Gateway operation. Run
+`9a05c338-4e43-4bb2-ac99-bed85d2c7c6d` succeeded on native Luna in 14.476
+seconds; `DC-CONTINUITY-OK` visibly replaced its own working message
+`1546868033899986944` at 13:01:32.493, **15.817 seconds end to end**,
+one attempt per publication. This proves expired-owner recovery,
+not live takeover by a second server process; stale-owner takeover remains
+covered by the deterministic integration tests.
+
+Independent review of the GitHub Board fallback found no additional blocker
+and reran **24/24** authorization cases successfully. The Discord reconstruction
+test was strengthened to assert one exact Activity row plus its original
+thread/message/reaction target across a repeated drain; that final focused
+case also passed. The server corrections are ready for deployment; the Rust
+prose-redaction change remains a separate test/build/deployment batch.

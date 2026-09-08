@@ -24596,6 +24596,49 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       : null;
   }
 
+  async function providerProgressLaneConsumed(
+    publication: typeof chatPublications.$inferSelect,
+    providerMessageId: string,
+  ): Promise<boolean> {
+    // Published progress rows retain their old provider ID after an edit.
+    // Consult that exact message's current outbound link, not the conversation
+    // tail: an authored answer or failure has consumed the lane, while an
+    // interleaved task-status update may still be replaced normally.
+    const [consumed] = await db
+      .select({ id: chatPublications.id })
+      .from(chatMessageLinks)
+      .innerJoin(
+        chatPublications,
+        and(
+          eq(chatPublications.id, chatMessageLinks.publicationId),
+          eq(chatPublications.companyId, publication.companyId),
+          eq(chatPublications.endpointId, publication.endpointId),
+          eq(chatPublications.conversationId, publication.conversationId),
+          eq(chatPublications.issueId, publication.issueId),
+          eq(chatPublications.providerMessageId, providerMessageId),
+          eq(chatPublications.state, "published"),
+        ),
+      )
+      .where(
+        and(
+          eq(chatMessageLinks.companyId, publication.companyId),
+          eq(chatMessageLinks.endpointId, publication.endpointId),
+          eq(chatMessageLinks.conversationId, publication.conversationId),
+          eq(chatMessageLinks.direction, "outbound"),
+          eq(chatMessageLinks.providerMessageId, providerMessageId),
+          or(
+            and(
+              isNotNull(chatPublications.commentId),
+              sql`${chatPublications.payload}->>'progressState' is null`,
+            ),
+            sql`${chatPublications.payload}->>'progressState' = 'failed'`,
+          ),
+        ),
+      )
+      .limit(1);
+    return Boolean(consumed);
+  }
+
   async function runPublicationToReplace(
     publication: typeof chatPublications.$inferSelect,
     payload: SafeChatPublicationPayload,
@@ -24634,7 +24677,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ),
       )
       .orderBy(desc(chatPublications.createdAt), desc(chatPublications.id))
-      .then((rows) => {
+      .then(async (rows) => {
         // Progress updates are one replaceable provider-message lane per run.
         // The first durable agent comment may turn that placeholder into the
         // terminal response, but later comments from the same run are distinct
@@ -24654,6 +24697,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             row.payload.progressState !== undefined,
         );
         if (!replacement?.providerMessageId) return null;
+        if (
+          await providerProgressLaneConsumed(
+            publication,
+            replacement.providerMessageId,
+          )
+        )
+          return null;
         // Replacement identity belongs to the run, not to the provider-visible
         // tail. A status/control reply may legitimately interleave while the run
         // is active; making the tail the edit candidate would strand this run's
@@ -24832,7 +24882,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ),
         ),
       );
-    if (!queued?.commentId) return null;
+    if (!queued?.commentId || !queued.providerMessageId) return null;
+    // The run helper may have rejected this same provider ID because its
+    // queued/working placeholder is already an answer or terminal failure.
+    // Falling back to the older wake row must not erase that newer output.
+    if (
+      await providerProgressLaneConsumed(publication, queued.providerMessageId)
+    )
+      return null;
     if (notice && notice.state !== "queued")
       return queued.commentId === publication.commentId
         ? queued.providerMessageId
@@ -25638,7 +25695,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
         const handoffPayload: SafeChatPublicationPayload = {
           ...currentPayload,
-          text: "Paperclip is preparing the complete response as an attachment.",
+          text: "This response needs a separate attachment because it exceeds the message limit.",
           transportPart: transportPart(0, 2, "inline"),
         };
         delete handoffPayload.attachmentIds;
@@ -25735,7 +25792,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
         const handoffPayload: SafeChatPublicationPayload = {
           ...currentPayload,
-          text: "Paperclip is preparing the complete response as an attachment.",
+          text: "This response needs a separate attachment because it exceeds the message limit.",
           transportPart: transportPart(0, 2, "inline"),
         };
         delete handoffPayload.attachmentIds;

@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, notExists, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -152,7 +152,8 @@ function completedQuestionFormMatchesInteraction(
 }
 
 /**
- * Resolve the durable provider answer, not a caller-supplied wake marker. This
+ * Resolve a durable provider answer or GitHub's authenticated Board fallback,
+ * never a caller-supplied wake marker. This
  * is routing/reading authority only: it never checks out a task or resolves a
  * review. Callers retain their issue/run/actor and current destination checks.
  */
@@ -484,24 +485,111 @@ async function resolveQuestionResponseChain(
     .where(
       and(
         eq(chatActions.companyId, binding.companyId),
-        inArray(chatActions.kind, [
-          "question_answer",
-          "question_form_submit",
-        ]),
+        inArray(chatActions.kind, ["question_answer", "question_form_submit"]),
         eq(chatActions.status, "processed"),
         sql`${chatActions.payload}->>'interactionId' = ${interaction.id}`,
         sql`${chatActions.result}->>'interactionId' = ${interaction.id}`,
       ),
     );
+  // GitHub has no executable question callback. Its published link leads to
+  // the ordinary authenticated Board answer route, whose pending→answered CAS
+  // creates the response delivery above atomically. Do not fabricate a provider
+  // action: bind that distinct receipt to the original linked person instead.
+  const boardQuery = tx
+    .select({
+      action: sql<null>`null`,
+      publication: chatPublications,
+      link: chatMessageLinks,
+      inbound: chatDeliveries,
+      comment: issueComments,
+      conversation: chatConversations,
+      endpoint: chatEndpoints,
+      identity: chatIdentityLinks,
+    })
+    .from(chatPublications)
+    .innerJoin(
+      chatMessageLinks,
+      and(
+        eq(chatMessageLinks.companyId, chatPublications.companyId),
+        eq(chatMessageLinks.endpointId, chatPublications.endpointId),
+        eq(chatMessageLinks.conversationId, chatPublications.conversationId),
+        eq(chatMessageLinks.commentId, context.sourceCommentId),
+        eq(chatMessageLinks.direction, "inbound"),
+      ),
+    )
+    .innerJoin(
+      chatDeliveries,
+      and(
+        eq(chatDeliveries.id, chatMessageLinks.deliveryId),
+        eq(chatDeliveries.companyId, chatMessageLinks.companyId),
+        eq(chatDeliveries.endpointId, chatMessageLinks.endpointId),
+        eq(chatDeliveries.conversationId, chatMessageLinks.conversationId),
+      ),
+    )
+    .innerJoin(
+      issueComments,
+      and(
+        eq(issueComments.id, chatMessageLinks.commentId),
+        eq(issueComments.companyId, chatMessageLinks.companyId),
+        eq(issueComments.issueId, binding.issueId),
+      ),
+    )
+    .innerJoin(
+      chatConversations,
+      and(
+        eq(chatConversations.id, chatPublications.conversationId),
+        eq(chatConversations.companyId, chatPublications.companyId),
+        eq(chatConversations.endpointId, chatPublications.endpointId),
+      ),
+    )
+    .innerJoin(
+      chatEndpoints,
+      and(
+        eq(chatEndpoints.id, chatPublications.endpointId),
+        eq(chatEndpoints.companyId, chatPublications.companyId),
+        eq(chatEndpoints.provider, "github"),
+      ),
+    )
+    .innerJoin(
+      chatIdentityLinks,
+      and(
+        eq(chatIdentityLinks.companyId, chatDeliveries.companyId),
+        eq(chatIdentityLinks.endpointId, chatDeliveries.endpointId),
+        eq(chatIdentityLinks.principalId, chatDeliveries.principalId),
+      ),
+    )
+    .where(
+      and(
+        eq(chatPublications.companyId, binding.companyId),
+        eq(chatPublications.issueId, binding.issueId),
+        sql`${chatPublications.idempotencyKey} = 'interaction:' || ${interaction.id} || ':' || ${chatEndpoints.id}::text`,
+        notExists(
+          tx
+            .select({ id: chatActions.id })
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.companyId, binding.companyId),
+                sql`${chatActions.payload}->>'interactionId' = ${interaction.id}`,
+                inArray(chatActions.kind, [
+                  "question_answer",
+                  "question_form_submit",
+                ]),
+              ),
+            ),
+        ),
+      ),
+    );
+  const evidenceQuery = provider === "github" ? boardQuery : actionQuery;
   let expectedPrincipalId: string | null = null;
   if (lockMode !== "read") {
     // Identity changes take this advisory lock before their row lock. Resolve
     // the candidate without row locks, acquire that same policy fence, then
     // reread everything under locks. A changed candidate is never adopted.
-    const candidates = await actionQuery;
-    if (candidates.length !== 1 || !candidates[0]!.action.principalId)
+    const candidates = await evidenceQuery;
+    if (candidates.length !== 1 || !candidates[0]!.inbound.principalId)
       return null;
-    expectedPrincipalId = candidates[0]!.action.principalId;
+    expectedPrincipalId = candidates[0]!.inbound.principalId;
     const key = `chat-identity:${binding.companyId}:${expectedPrincipalId}`;
     if (lockMode === "blocking") {
       await tx.execute(
@@ -519,15 +607,15 @@ async function resolveQuestionResponseChain(
     }
   }
   const actions = await (lockMode === "read"
-    ? actionQuery
+    ? evidenceQuery
     : lockMode === "nonblocking"
-      ? actionQuery.for("update", { noWait: true })
-      : actionQuery.for("update"));
+      ? evidenceQuery.for("update", { noWait: true })
+      : evidenceQuery.for("update"));
   // One exact provider response, never whichever responder happened to be last.
   if (
     actions.length !== 1 ||
     (expectedPrincipalId !== null &&
-      actions[0]!.action.principalId !== expectedPrincipalId)
+      actions[0]!.inbound.principalId !== expectedPrincipalId)
   )
     return null;
   const {
@@ -540,15 +628,39 @@ async function resolveQuestionResponseChain(
     endpoint,
     identity,
   } = actions[0]!;
-  if (chain.actionIds.has(action.id)) return null;
-  chain.actionIds.add(action.id);
+  if (action) {
+    if (chain.actionIds.has(action.id)) return null;
+    chain.actionIds.add(action.id);
+  }
   if (
     parent &&
     (parent.marker.endpointId !== endpoint.id ||
       parent.marker.conversationId !== conversation.id)
   )
     return null;
-  if (action.kind === "question_answer") {
+  const boardRuntime = record(record(inbound.normalizedEvent).runtimeContext);
+  const boardGeneration = record(endpoint.setup).runtimeGeneration;
+  if (!action) {
+    const card = record(record(publication.payload).card);
+    const links = Array.isArray(card.actions) ? card.actions.map(record) : [];
+    if (
+      provider !== "github" ||
+      interaction.resolvedByRunId !== null ||
+      publication.payload.progressState !== "waiting_for_input" ||
+      card.kind !== "question" ||
+      (card.actions !== undefined && !Array.isArray(card.actions)) ||
+      links.some((link) => link.type !== "link") ||
+      !publication.publishedAt ||
+      publication.publishedAt > interaction.resolvedAt ||
+      typeof boardGeneration !== "number" ||
+      !Number.isSafeInteger(boardGeneration) ||
+      boardGeneration < 0 ||
+      boardRuntime.generation !== boardGeneration ||
+      typeof boardRuntime.credentialFingerprint !== "string" ||
+      !/^[a-f0-9]{64}$/.test(boardRuntime.credentialFingerprint)
+    )
+      return null;
+  } else if (action.kind === "question_answer") {
     const answers = record(interaction.result).answers;
     const selectedAnswer = Array.isArray(answers)
       ? answers
@@ -637,12 +749,23 @@ async function resolveQuestionResponseChain(
         actor: wake.requestedByActorId,
         payload: wake.payload,
       },
-      action: {
-        id: action.id,
-        principalId: action.principalId,
-        payload: action.payload,
-        result: action.result,
-      },
+      ...(action
+        ? {
+            action: {
+              id: action.id,
+              principalId: action.principalId,
+              payload: action.payload,
+              result: action.result,
+            },
+          }
+        : {
+            boardResponse: {
+              schema: "paperclip.github_board_question_response.v1",
+              principalId: inbound.principalId,
+              runtimeGeneration: boardGeneration,
+              credentialFingerprint: boardRuntime.credentialFingerprint,
+            },
+          }),
       publication: {
         id: publication.id,
         providerMessageId: publication.providerMessageId,

@@ -24417,7 +24417,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     ]);
     expect(providerRuntime.edits[0]?.text).toBe(
-      "Paperclip is preparing the complete response as an attachment.",
+      "This response needs a separate attachment because it exceeds the message limit.",
     );
     expect(providerRuntime.posts).toHaveLength(1);
     expect(providerRuntime.posts[0]?.text).toBe("Complete response attached.");
@@ -24513,7 +24513,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     ]);
     expect(providerRuntime.edits[0]?.text).toBe(
-      "Paperclip is preparing the complete response as an attachment.",
+      "This response needs a separate attachment because it exceeds the message limit.",
     );
     expect(providerRuntime.posts).toEqual([
       {
@@ -25092,7 +25092,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     ]);
     expect(providerRuntime.edits[0]?.text).toBe(
-      "Paperclip is preparing the complete response as an attachment.",
+      "This response needs a separate attachment because it exceeds the message limit.",
     );
     expect(providerRuntime.posts).toHaveLength(1);
     expect(providerRuntime.posts[0]?.text).toBe("Complete response attached.");
@@ -39680,6 +39680,149 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     },
   );
 
+  it.each(
+    (["slack", "telegram"] as const).flatMap((provider) =>
+      (["failed", "cancelled", "timed_out"] as const).flatMap((status) =>
+        (["published_final", "pending_final", "failure_first"] as const).map(
+          (order) => ({ provider, status, order }),
+        ),
+      ),
+    ),
+  )(
+    "preserves selected answer and failure lanes on $provider after $status ($order)",
+    async ({ provider, status, order }) => {
+      const context = await safeNativeProgressFixture(provider, "81");
+      try {
+        const original = await context.createRun("the original request");
+        const successor = await context.createRun("the successor request");
+        const [originalWorking] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            eq(
+              chatPublications.idempotencyKey,
+              `run:${original.runId}:working:${context.endpoint.id}`,
+            ),
+          );
+        const [successorWorking] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            eq(
+              chatPublications.idempotencyKey,
+              `run:${successor.runId}:working:${context.endpoint.id}`,
+            ),
+          );
+        const addFinal = () =>
+          addSelectedChatFinal({
+            agentId: context.fixture.assignedAgentId,
+            body: "The original selected answer remains available",
+            companyId: context.fixture.companyId,
+            issueId: context.conversation.issueId,
+            runId: original.runId,
+          });
+        let final = order === "failure_first" ? null : await addFinal();
+        if (order === "published_final")
+          await context.service.processPendingPublications(100);
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status,
+            errorCode: "adapter_failed",
+            error: "PRIVATE internal error token=do-not-publish",
+            finishedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, original.runId));
+        await enqueueChatRunMilestones(db);
+        if (order === "failure_first") {
+          await context.service.processPendingPublications(100);
+          final = await addFinal();
+        }
+        await context.service.processPendingPublications(100);
+        const [answerPublication] = await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, final!.id));
+        const [failurePublication] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            eq(
+              chatPublications.idempotencyKey,
+              `run:${original.runId}:failed:${context.endpoint.id}`,
+            ),
+          );
+        expect(answerPublication?.state).toBe("published");
+        expect(failurePublication?.state).toBe("published");
+        expect(answerPublication?.providerMessageId).not.toBe(
+          failurePublication?.providerMessageId,
+        );
+        expect(
+          order === "failure_first"
+            ? failurePublication?.providerMessageId
+            : answerPublication?.providerMessageId,
+        ).toBe(originalWorking!.providerMessageId);
+        expect(context.providerRuntime.posts).toHaveLength(3);
+        expect(context.providerRuntime.edits).toHaveLength(1);
+        expect(context.providerRuntime.edits[0]?.messageId).toBe(
+          originalWorking!.providerMessageId,
+        );
+        expect(context.providerRuntime.edits[0]?.messageId).not.toBe(
+          successorWorking!.providerMessageId,
+        );
+        const links = await db
+          .select({
+            providerMessageId: chatMessageLinks.providerMessageId,
+            publicationId: chatMessageLinks.publicationId,
+            commentId: chatMessageLinks.commentId,
+          })
+          .from(chatMessageLinks)
+          .where(
+            and(
+              eq(chatMessageLinks.conversationId, context.conversation.id),
+              eq(chatMessageLinks.direction, "outbound"),
+            ),
+          );
+        expect(links).toHaveLength(3);
+        expect(links).toEqual(
+          expect.arrayContaining([
+            {
+              providerMessageId: answerPublication!.providerMessageId,
+              publicationId: answerPublication!.id,
+              commentId: final!.id,
+            },
+            {
+              providerMessageId: failurePublication!.providerMessageId,
+              publicationId: failurePublication!.id,
+              commentId: null,
+            },
+            {
+              providerMessageId: successorWorking!.providerMessageId,
+              publicationId: successorWorking!.id,
+              commentId: null,
+            },
+          ]),
+        );
+        expect(JSON.stringify(context.providerRuntime.posts)).not.toMatch(
+          /PRIVATE|adapter_failed|do-not-publish/,
+        );
+        await enqueueChatRunMilestones(db);
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.posts).toHaveLength(3);
+        expect(context.providerRuntime.edits).toHaveLength(1);
+        await expect(
+          db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, original.runId)),
+        ).resolves.toEqual([{ status }]);
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
+
   it.each([
     ["slack", "1", "channel"],
     ["github", "2", "channel"],
@@ -40845,6 +40988,195 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
     expect(restarted.wakeup).not.toHaveBeenCalled();
     await restarted.service.shutdown();
+  });
+
+  it("replays one pre-link Discord reaction after service reconstruction without waking the task", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredDiscordEndpoint(fixture);
+    const guildId = "1457808928258658549";
+    const channelId = "333333333333333391";
+    const rootMessageId = "555555555555555691";
+    const channel = makeThread({
+      channelId,
+      id: `discord:${guildId}:${channelId}:${rootMessageId}`,
+      name: "discord-reaction-restart",
+    });
+    const rootMessage = makeMessage({
+      id: rootMessageId,
+      mentioned: true,
+      text: "@maya prepare a Discord reply before service reconstruction",
+      userId: "444444444444444491",
+    });
+    await deliverMessage({
+      callbacks,
+      endpointId: endpoint.id,
+      provider: "discord",
+      thread: channel.thread,
+      message: rootMessage,
+      trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id, rootMessage.author.userId);
+    await service.test(endpoint.id, "owner-user");
+    if (!callbacks.onReaction)
+      throw new Error("Discord reaction callback was not registered");
+    const [conversation] = await service.listConversations(endpoint.id);
+    const providerRuntime = runtime.endpoints.get(endpoint.id);
+    if (!conversation || !providerRuntime)
+      throw new Error("Expected an active Discord conversation");
+
+    const targetMessageId = "555555555555555692";
+    const targetMessage = makeMessage({
+      id: targetMessageId,
+      text: "",
+      userId: rootMessage.author.userId,
+    });
+    const reaction = {
+      endpointId: endpoint.id,
+      provider: "discord" as const,
+      event: {
+        adapter: {} as never,
+        added: true,
+        emoji: {
+          name: "thumbsup",
+          toJSON: () => "👍",
+          toString: () => "👍",
+        },
+        message: targetMessage,
+        messageId: targetMessageId,
+        raw: {
+          channel_id: channelId,
+          emoji: { id: null, name: "👍" },
+          gateway_dispatch: {
+            eventType: "MESSAGE_REACTION_ADD",
+            sequence: 891,
+            sessionFingerprint: "f".repeat(24),
+            shardId: 0,
+          },
+          guild_id: guildId,
+          message_id: targetMessageId,
+          user_id: targetMessage.author.userId,
+        },
+        rawEmoji: "👍",
+        thread: channel.thread,
+        threadId: channel.thread.id,
+        user: targetMessage.author,
+      },
+    };
+    let stagedId: string | null = null;
+    providerRuntime.postResultIds.push(targetMessageId);
+    providerRuntime.postHook = async () => {
+      if (stagedId) return;
+      await callbacks.onReaction!(reaction);
+      await callbacks.onReaction!(reaction);
+      const staged = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.eventKind, "reaction_added"),
+          ),
+        );
+      expect(staged).toHaveLength(1);
+      expect(staged[0]).toMatchObject({
+        conversationId: null,
+        state: "received",
+        attempts: 0,
+        normalizedEvent: expect.objectContaining({
+          conversation: { externalThreadId: channel.thread.id },
+          message: { providerMessageId: targetMessageId },
+          runtimeContext: {
+            generation: expect.any(Number),
+            credentialFingerprint: expect.any(String),
+          },
+        }),
+      });
+      stagedId = staged[0]!.id;
+    };
+    await service.publishBoardMessage(
+      endpoint.id,
+      conversation.id,
+      "A Discord reply whose reaction must survive reconstruction",
+      "discord-reaction-before-restart",
+      "owner-user",
+    );
+    providerRuntime.postHook = undefined;
+    if (!stagedId) throw new Error("Expected a staged Discord reaction");
+
+    const commentCount = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, conversation.issueId))
+      .then((rows) => rows.length);
+    const runCount = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, fixture.companyId))
+      .then((rows) => rows.length);
+    const wakeupCount = wakeup.mock.calls.length;
+    await service.shutdown();
+    await db
+      .update(chatDeliveries)
+      .set({ nextAttemptAt: new Date(0) })
+      .where(eq(chatDeliveries.id, stagedId));
+
+    const restarted = createService();
+    try {
+      await restarted.service.processPendingDeliveries(1, stagedId);
+      await expect(
+        db.select().from(chatDeliveries).where(eq(chatDeliveries.id, stagedId)),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          conversationId: conversation.id,
+          state: "processed",
+          attempts: 1,
+          nextAttemptAt: null,
+          redactedError: null,
+          normalizedEvent: expect.objectContaining({
+            conversation: { externalThreadId: channel.thread.id },
+            message: { providerMessageId: targetMessageId },
+            reaction: {
+              added: true,
+              emoji: "thumbsup",
+              rawEmoji: "👍",
+            },
+          }),
+        }),
+      ]);
+      const reactionActivity = () =>
+        restarted.service
+          .listActivity(endpoint.id)
+          .then((items) => items.filter((item) => item.id === stagedId));
+      await expect(reactionActivity()).resolves.toEqual([
+        expect.objectContaining({
+          kind: "delivery",
+          status: "processed",
+          summary: "reaction added processed",
+        }),
+      ]);
+
+      await restarted.service.processPendingDeliveries(1, stagedId);
+      await expect(reactionActivity()).resolves.toHaveLength(1);
+      await expect(
+        db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation.issueId))
+          .then((rows) => rows.length),
+      ).resolves.toBe(commentCount);
+      await expect(
+        db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.companyId, fixture.companyId))
+          .then((rows) => rows.length),
+      ).resolves.toBe(runCount);
+      expect(wakeup).toHaveBeenCalledTimes(wakeupCount);
+      expect(restarted.wakeup).not.toHaveBeenCalled();
+    } finally {
+      await restarted.service.shutdown();
+    }
   });
 
   it.each(["action_first", "reaction_first"] as const)(
@@ -44588,6 +44920,100 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await context.service.shutdown();
     }
   });
+
+  it.each(["answer_first", "failure_first"] as const)(
+    "preserves selected answer and failure lanes after deferred admission (%s)",
+    async (order) => {
+      const context = await deferredChatQueueFixture();
+      try {
+        await context.service.processPendingPublications();
+        const [queued] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              like(chatPublications.idempotencyKey, "wake:%:queued:%"),
+            ),
+          );
+        expect(queued?.providerMessageId).toBeTruthy();
+        const runId = await context.promote();
+        const addFinal = () =>
+          addSelectedChatFinal({
+            agentId: context.fixture.assignedAgentId,
+            body: "The deferred selected answer remains available",
+            companyId: context.fixture.companyId,
+            issueId: context.conversation.issueId,
+            runId,
+          });
+        let final = order === "answer_first" ? await addFinal() : null;
+        if (order === "answer_first")
+          await context.service.processPendingPublications();
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "failed",
+            errorCode: "adapter_failed",
+            finishedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, runId));
+        await enqueueChatRunMilestones(db);
+        await context.service.processPendingPublications();
+        if (order === "failure_first") {
+          final = await addFinal();
+          await context.service.processPendingPublications();
+        }
+        const [answer] = await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, final!.id));
+        const [failure] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            eq(
+              chatPublications.idempotencyKey,
+              `run:${runId}:failed:${context.endpoint.id}`,
+            ),
+          );
+        expect(answer?.state).toBe("published");
+        expect(failure?.state).toBe("published");
+        expect(answer?.providerMessageId).not.toBe(failure?.providerMessageId);
+        expect(
+          order === "answer_first"
+            ? answer?.providerMessageId
+            : failure?.providerMessageId,
+        ).toBe(queued!.providerMessageId);
+        const runtime = context.runtime.endpoints.get(context.endpoint.id)!;
+        expect(runtime.posts).toHaveLength(2);
+        expect(runtime.edits).toHaveLength(1);
+        expect(runtime.edits[0]?.messageId).toBe(queued!.providerMessageId);
+        const links = await db
+          .select({ publicationId: chatMessageLinks.publicationId })
+          .from(chatMessageLinks)
+          .where(
+            and(
+              eq(chatMessageLinks.conversationId, context.conversation.id),
+              eq(chatMessageLinks.direction, "outbound"),
+            ),
+          );
+        expect(links).toHaveLength(2);
+        expect(links).toEqual(
+          expect.arrayContaining([
+            { publicationId: answer!.id },
+            { publicationId: failure!.id },
+          ]),
+        );
+        await enqueueChatRunMilestones(db);
+        await context.service.processPendingPublications();
+        expect(runtime.posts).toHaveLength(2);
+        expect(runtime.edits).toHaveLength(1);
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
 
   it("reuses a pre-run FIFO notice when the successor asks before its working milestone", async () => {
     const context = await deferredChatQueueFixture();

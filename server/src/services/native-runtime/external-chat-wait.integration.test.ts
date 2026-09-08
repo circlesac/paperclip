@@ -52,6 +52,7 @@ import * as nativeChatReviewPresentation from "./native-chat-review-presentation
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import { issueService } from "../issues.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
 import {
   authorizeChatConversationForBoundRun,
@@ -677,8 +678,436 @@ describe("native external-chat response wait", () => {
     };
   }
 
+  async function seedGitHubBoardAnsweredTurn(withLink = true) {
+    const fixture = await seedWaitTurn("github");
+    const gate = await seedPriorCompletionReview(fixture);
+    const [current] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    const sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      status: "succeeded",
+      runtimeMode: "native",
+      nativeIssueId: fixture.issueId,
+      contextSnapshot: current!.contextSnapshot,
+    });
+    await db
+      .update(chatEndpoints)
+      .set({
+        setup: {
+          step: "complete",
+          runtimeGeneration: 1,
+        } as typeof chatEndpoints.$inferInsert.setup,
+      })
+      .where(eq(chatEndpoints.id, fixture.endpointId));
+    await db
+      .update(chatDeliveries)
+      .set({
+        normalizedEvent: {
+          runtimeContext: {
+            generation: 1,
+            credentialFingerprint: "a".repeat(64),
+          },
+        },
+      })
+      .where(eq(chatDeliveries.id, fixture.deliveryId));
+    const interactionSvc = issueThreadInteractionService(db);
+    const previousPublicUrl = process.env.PAPERCLIP_PUBLIC_URL;
+    process.env.PAPERCLIP_PUBLIC_URL = withLink
+      ? "https://board.paperclip.example"
+      : "http://127.0.0.1:3103";
+    let interaction: Awaited<ReturnType<typeof interactionSvc.create>>;
+    try {
+      interaction = await interactionSvc.create(
+        { id: fixture.issueId, companyId: fixture.companyId },
+        {
+          kind: "ask_user_questions",
+          sourceRunId,
+          continuationPolicy: "wake_assignee",
+          payload: {
+            version: 1,
+            questions: [
+              {
+                id: "color",
+                prompt: "Choose a color",
+                selectionMode: "single",
+                required: true,
+                allowOther: false,
+                options: [
+                  { id: "cobalt", label: "Cobalt" },
+                  { id: "amber", label: "Amber" },
+                ],
+              },
+            ],
+          },
+        },
+        { agentId: fixture.agentId, runId: sourceRunId },
+      );
+    } finally {
+      if (previousPublicUrl === undefined)
+        delete process.env.PAPERCLIP_PUBLIC_URL;
+      else process.env.PAPERCLIP_PUBLIC_URL = previousPublicUrl;
+    }
+    const publicationKey = `interaction:${interaction.id}:${fixture.endpointId}`;
+    const [publication] = await db
+      .update(chatPublications)
+      .set({
+        state: "published",
+        providerMessageId: "github-question",
+        publishedAt: new Date(),
+      })
+      .where(eq(chatPublications.idempotencyKey, publicationKey))
+      .returning();
+    expect(publication).toBeTruthy();
+    await interactionSvc.answerQuestions(
+      { id: fixture.issueId, companyId: fixture.companyId },
+      interaction.id,
+      { answers: [{ questionId: "color", optionIds: ["cobalt"] }] },
+      { userId: fixture.userId },
+    );
+    const [delivery] = await db
+      .update(issueQuestionResponseDeliveries)
+      .set({
+        status: "fallback_queued",
+        deliveryMode: "wake_fallback",
+        targetRunId: fixture.runId,
+        attemptCount: 1,
+        acknowledgedAt: new Date(),
+      })
+      .where(eq(issueQuestionResponseDeliveries.interactionId, interaction.id))
+      .returning();
+    const wakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      requestedByActorType: "user",
+      requestedByActorId: fixture.userId,
+      idempotencyKey: `question-response:${interaction.id}`,
+      status: "claimed",
+      runId: fixture.runId,
+      payload: {
+        issueId: fixture.issueId,
+        interactionId: interaction.id,
+        sourceRunId,
+        sourceCommentId: fixture.commentId,
+        mutation: "interaction",
+        externalChatContinuation: true,
+      },
+    });
+    const context: Record<string, unknown> = {
+      issueId: fixture.issueId,
+      taskId: fixture.issueId,
+      source: "issue.interaction.respond",
+      wakeReason: "issue_commented",
+      interactionId: interaction.id,
+      interactionKind: "ask_user_questions",
+      interactionStatus: "answered",
+      sourceRunId,
+      sourceCommentId: fixture.commentId,
+      wakeCommentId: fixture.commentId,
+      wakeCommentIds: [fixture.commentId],
+      externalChatContinuation: true,
+    };
+    await db
+      .update(heartbeatRuns)
+      .set({
+        wakeupRequestId: wakeId,
+        contextSnapshot: context,
+        status: "running",
+      })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    return {
+      ...fixture,
+      gate,
+      context,
+      sourceRunId,
+      interactionId: interaction.id,
+      publicationId: publication!.id,
+      responseDeliveryId: delivery!.id,
+      wakeId,
+    };
+  }
+
+  it.each([true, false])(
+    "attests a native GitHub question answered in Board without inventing a provider action (link: %s)",
+    async (withLink) => {
+      const fixture = await seedGitHubBoardAnsweredTurn(withLink);
+      await expect(
+        db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.companyId, fixture.companyId)),
+      ).resolves.toEqual([]);
+      expect(
+        await resolveExternalChatQuestionResponse(
+          db,
+          fixture,
+          fixture.context,
+          "read",
+          true,
+        ),
+      ).not.toBeNull();
+      await attestAnswer(fixture);
+      expect(fixture.context.paperclipWake).toMatchObject({
+        externalChatProvider: "github",
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: fixture.context })
+        .where(eq(heartbeatRuns.id, fixture.runId));
+      const responses = await materializeExternalChatQuestionResponseInput({
+        db,
+        binding: fixture,
+        contextSnapshot: fixture.context,
+      });
+      expect(responses).toHaveLength(1);
+      expect(JSON.stringify(responses)).toContain("cobalt");
+      expect(responses[0]!.interactionId).toBe(fixture.interactionId);
+      const resultJson = await finishReviewResponse(fixture);
+      expect(resultJson.externalChatReviewPresentation).toMatchObject({
+        gateId: fixture.gate.id,
+      });
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          resultJson,
+        }),
+      ).toBe(true);
+      const publications = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.issueId, fixture.issueId));
+      await finishReviewResponse(fixture);
+      await expect(
+        db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.issueId, fixture.issueId)),
+      ).resolves.toEqual(publications);
+      await expect(
+        db
+          .select({ status: issueThreadInteractions.status })
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, fixture.gate.id)),
+      ).resolves.toEqual([{ status: "pending" }]);
+    },
+  );
+
+  it.each([
+    "different_user",
+    "viewer",
+    "membership_revoked",
+    "identity_revoked",
+    "generation",
+    "missing_runtime",
+    "wrong_target",
+    "wrong_wake",
+    "unpublished",
+    "provider_action",
+    "deleted_source",
+    "endpoint_paused",
+    "resource_revoked",
+    "answer_hash",
+  ] as const)(
+    "rejects GitHub Board answer authority after %s",
+    async (change) => {
+      const fixture = await seedGitHubBoardAnsweredTurn();
+      if (change === "different_user") {
+        const otherUser = `other-${randomUUID()}`;
+        await db
+          .insert(companyMemberships)
+          .values({
+            companyId: fixture.companyId,
+            principalType: "user",
+            principalId: otherUser,
+            status: "active",
+            membershipRole: "member",
+          });
+        await db
+          .update(issueThreadInteractions)
+          .set({ resolvedByUserId: otherUser })
+          .where(eq(issueThreadInteractions.id, fixture.interactionId));
+        await db
+          .update(agentWakeupRequests)
+          .set({ requestedByActorId: otherUser })
+          .where(eq(agentWakeupRequests.id, fixture.wakeId));
+        const [interaction] = await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, fixture.interactionId));
+        const receipt = questionResponseDeliveryValues(
+          interaction! as unknown as AskUserQuestionsInteraction,
+        );
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({ payloadSha256: receipt.payloadSha256 })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+          );
+      }
+      if (change === "viewer" || change === "membership_revoked")
+        await db
+          .update(companyMemberships)
+          .set(
+            change === "viewer"
+              ? { membershipRole: "viewer" }
+              : { status: "suspended" },
+          )
+          .where(eq(companyMemberships.companyId, fixture.companyId));
+      if (change === "identity_revoked")
+        await db
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.endpointId, fixture.endpointId));
+      if (change === "generation")
+        await db
+          .update(chatEndpoints)
+          .set({
+            setup: {
+              step: "complete",
+              runtimeGeneration: 2,
+            } as typeof chatEndpoints.$inferInsert.setup,
+          })
+          .where(eq(chatEndpoints.id, fixture.endpointId));
+      if (change === "missing_runtime")
+        await db
+          .update(chatDeliveries)
+          .set({ normalizedEvent: {} })
+          .where(eq(chatDeliveries.id, fixture.deliveryId));
+      if (change === "wrong_target")
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({ targetRunId: fixture.sourceRunId })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+          );
+      if (change === "wrong_wake")
+        await db
+          .update(agentWakeupRequests)
+          .set({ runId: fixture.sourceRunId })
+          .where(eq(agentWakeupRequests.id, fixture.wakeId));
+      if (change === "unpublished")
+        await db
+          .update(chatPublications)
+          .set({ state: "pending", publishedAt: null, providerMessageId: null })
+          .where(eq(chatPublications.id, fixture.publicationId));
+      if (change === "provider_action")
+        await db
+          .insert(chatActions)
+          .values({
+            companyId: fixture.companyId,
+            endpointId: fixture.endpointId,
+            conversationId: fixture.conversationId,
+            principalId: fixture.principalId,
+            kind: "question_answer",
+            status: "processed",
+            providerActionId: randomUUID(),
+            payload: {
+              version: 1,
+              interactionId: fixture.interactionId,
+              publicationId: fixture.publicationId,
+            },
+            result: {},
+          });
+      if (change === "deleted_source")
+        await db
+          .update(issueComments)
+          .set({ deletedAt: new Date() })
+          .where(eq(issueComments.id, fixture.commentId));
+      if (change === "endpoint_paused")
+        await db
+          .update(chatEndpoints)
+          .set({ status: "paused" })
+          .where(eq(chatEndpoints.id, fixture.endpointId));
+      if (change === "resource_revoked")
+        await db
+          .update(chatEndpointResources)
+          .set({ enabled: false })
+          .where(eq(chatEndpointResources.id, fixture.resourceId));
+      if (change === "answer_hash")
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({ payloadSha256: "b".repeat(64) })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+          );
+      expect(
+        await attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: fixture.context,
+        }),
+      ).toBe(false);
+      expect(
+        fixture.context.paperclipExternalChatQuestionResponse,
+      ).toBeUndefined();
+      await expect(
+        db
+          .select({ status: issueThreadInteractions.status })
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, fixture.gate.id)),
+      ).resolves.toEqual([{ status: "pending" }]);
+    },
+  );
+
+  it.each(["generation", "identity", "membership", "reach"] as const)(
+    "rechecks GitHub Board answer %s at publication after native completion",
+    async (change) => {
+      const fixture = await seedGitHubBoardAnsweredTurn();
+      await attestAnswer(fixture);
+      const resultJson = await finishReviewResponse(fixture);
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          resultJson,
+        }),
+      ).toBe(true);
+      if (change === "generation")
+        await db
+          .update(chatEndpoints)
+          .set({
+            setup: {
+              step: "complete",
+              runtimeGeneration: 2,
+            } as typeof chatEndpoints.$inferInsert.setup,
+          })
+          .where(eq(chatEndpoints.id, fixture.endpointId));
+      if (change === "identity")
+        await db
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.endpointId, fixture.endpointId));
+      if (change === "membership")
+        await db
+          .update(companyMemberships)
+          .set({ membershipRole: "viewer" })
+          .where(eq(companyMemberships.companyId, fixture.companyId));
+      if (change === "reach")
+        await db
+          .update(chatEndpointResources)
+          .set({ enabled: false })
+          .where(eq(chatEndpointResources.id, fixture.resourceId));
+      expect(
+        await authorizeNativeChatReviewPresentation(db, {
+          ...fixture,
+          resultJson,
+        }),
+      ).toBe(false);
+    },
+  );
+
   async function attestAnswer(
-    fixture: Awaited<ReturnType<typeof seedAnsweredChatTurn>>,
+    fixture:
+      | Awaited<ReturnType<typeof seedAnsweredChatTurn>>
+      | Awaited<ReturnType<typeof seedGitHubBoardAnsweredTurn>>,
   ) {
     expect(
       await attestReviewedExternalChatRun({
@@ -710,14 +1139,19 @@ describe("native external-chat response wait", () => {
   }
 
   async function withAnsweredFileTool(
-    provider: "telegram" | "discord",
+    provider: "telegram" | "discord" | "github",
     tool: "register_deliverable" | "reuse_chat_attachment",
     check: (input: {
-      fixture: Awaited<ReturnType<typeof seedAnsweredChatTurn>>;
+      fixture:
+        | Awaited<ReturnType<typeof seedAnsweredChatTurn>>
+        | Awaited<ReturnType<typeof seedGitHubBoardAnsweredTurn>>;
       invoke: () => Promise<unknown>;
     }) => Promise<void>,
   ) {
-    const fixture = await seedAnsweredChatTurn(provider);
+    const fixture =
+      provider === "github"
+        ? await seedGitHubBoardAnsweredTurn()
+        : await seedAnsweredChatTurn(provider);
     await attestAnswer(fixture);
     const root = await mkdtemp(path.join(tmpdir(), "answered-chat-file-"));
     try {
@@ -918,6 +1352,8 @@ describe("native external-chat response wait", () => {
     ["discord", "register_deliverable"],
     ["telegram", "reuse_chat_attachment"],
     ["discord", "reuse_chat_attachment"],
+    ["github", "register_deliverable"],
+    ["github", "reuse_chat_attachment"],
   ] as const)(
     "describes %s answered-question %s delivery from current authority without duplicate effects",
     async (provider, tool) => {
@@ -935,7 +1371,10 @@ describe("native external-chat response wait", () => {
             disposition: "applied",
             fileDelivery: {
               provider,
-              mode: "provider_attachment",
+              mode:
+                provider === "github"
+                  ? "paperclip_task_only"
+                  : "provider_attachment",
               preparationState: "prepared",
               providerDeliveryConfirmed: false,
             },
@@ -962,10 +1401,17 @@ describe("native external-chat response wait", () => {
 
           // Receipt replay still rechecks the real destination; a prior mode
           // does not survive current reach revocation or repeat the file effect.
-          await db
-            .update(chatEndpoints)
-            .set({ allowDirectMessages: false })
-            .where(eq(chatEndpoints.id, fixture.endpointId));
+          if (provider === "github") {
+            await db
+              .update(chatEndpointResources)
+              .set({ enabled: false })
+              .where(eq(chatEndpointResources.id, fixture.resourceId));
+          } else {
+            await db
+              .update(chatEndpoints)
+              .set({ allowDirectMessages: false })
+              .where(eq(chatEndpoints.id, fixture.endpointId));
+          }
           await expect(invoke()).rejects.toThrow(
             "paperclip_runner_chat_attachment_destination_denied",
           );
@@ -975,6 +1421,42 @@ describe("native external-chat response wait", () => {
               .from(issueAttachments)
               .where(eq(issueAttachments.issueId, fixture.issueId)),
           ).toEqual(attachments);
+        },
+      );
+    },
+  );
+
+  it.each(["register_deliverable", "reuse_chat_attachment"] as const)(
+    "rejects a forged GitHub Board answer marker before %s effects",
+    async (tool) => {
+      await withAnsweredFileTool(
+        "github",
+        tool,
+        async ({ fixture, invoke }) => {
+          const attachments = await db
+            .select()
+            .from(issueAttachments)
+            .where(eq(issueAttachments.issueId, fixture.issueId));
+          const context = structuredClone(fixture.context);
+          (
+            context.paperclipExternalChatQuestionResponse as Record<
+              string,
+              unknown
+            >
+          ).bindingSha256 = "0".repeat(64);
+          await db
+            .update(heartbeatRuns)
+            .set({ contextSnapshot: context })
+            .where(eq(heartbeatRuns.id, fixture.runId));
+          await expect(invoke()).rejects.toThrow(
+            "paperclip_runner_chat_attachment_binding_denied",
+          );
+          await expect(
+            db
+              .select()
+              .from(issueAttachments)
+              .where(eq(issueAttachments.issueId, fixture.issueId)),
+          ).resolves.toEqual(attachments);
         },
       );
     },
