@@ -22,7 +22,7 @@ continues. This supersedes the earlier instruction not to tend pull requests.
    obtain reviews before claiming the work ready to merge.
 
 PR [#13038](https://github.com/paperclipai/paperclip/pull/13038) is open as
-one 468-file review against master. It is mergeable; CI and review must still
+one 473-file review against master. It is mergeable; CI and review must still
 pass before landing. Master is incorporated through `b97101893` by
 `1a442f5a0`, including the new project repository selection flow. Independent
 compatibility checks passed 138 UI and 19 server tests. Full workspace
@@ -38,8 +38,26 @@ running. Its CLI guidance failure was caused by ignored historical runtime
 recordings, not current source guidance. Commit `9beee1d14` excludes only the
 root recordings directory; all 38 focused guard tests pass without changing
 the command allowlist. Do not upload the earlier failure log, which quotes
-captured prompts. The final ten-test browser suite is running from root's
-unrestricted environment on isolated port 3199; subagent execution hit EPERM.
+captured prompts. The first browser run passed all six catalog/provider
+journeys, then found that the four Board-send fixtures still needed to opt
+into the new experiment. After correcting those mocks, the full browser suite
+passed **10/10** on isolated port 3199 and a fresh external PostgreSQL database. Local
+embedded PostgreSQL exhausted macOS IPC slots during concurrent test work;
+one orphan from this task's own completed browser run was cleared without
+deleting database files or touching another worktree's processes.
+
+CI on the initial PR head is **not green**. Follow-up work covers the clipboard
+fallback guard, a uniform cross-company identity-preview response, legacy
+migration and route fixture compatibility, a buffered-tool diagnostic test
+race, and a bundled ACPX patch applicability failure. Native recovery now
+passes **9/9**, the migration rollback test **1/1**, and the corrected durable
+diagnostic assertion's full staged transport suite **87/87**. Greptile's
+automatic review refused the 100-file soft limit; the requested explicit
+`@greptile-apps` override is posted, but no review-start acknowledgment or
+completed review is visible yet. Do not report the review as accepted.
+The issue route fixtures also pass **92/92** after adding the missing left-join
+mock and the fifth database argument to comment assertions. The clipboard and
+identity-preview cohort passes **37/37**, with both server and UI typechecks.
 
 ## Current tested/deployed state
 
@@ -60,6 +78,11 @@ unrestricted environment on isolated port 3199; subagent execution hit EPERM.
   fresh Slack reply now preserves all three exact regression sentences.
   A full Discord document inspection still found other ordinary token phrases
   redacted, so broader prose quality remains open.
+- Follow-up `7e4960695` narrowly preserves “a/the transparent token system”
+  and sentence-final punctuation without weakening credential canaries.
+  Root independently passed **225/225** core and **87/87** rebuilt/staged
+  transport tests. The new signed binary SHA-256 starts `dfb434e487ac`.
+  This newer binary has not yet received fresh live qualification.
 
 ## Immediate unfinished tests/fixes
 
@@ -85,7 +108,21 @@ unrestricted environment on isolated port 3199; subagent execution hit EPERM.
   live long response after deployment. Discord's fresh sapphire plan now
   passed: the timeless handoff and real whole-file preview were verified;
   final attachment arrived once in 61.372 seconds end to end. Native Luna
-  used 58.630 seconds. Telegram's equivalent fresh wording remains untested.
+  used 58.630 seconds. Telegram's equivalent fresh attempt failed at native
+  shutdown, so neither its handoff wording nor delivery passed that attempt.
+- **Telegram/native shutdown:** the fresh long-answer run
+  `f262ca93-3c29-4338-a625-0d2239757e38` accepted a successful native result,
+  but failed to durably suspend before checkpoint. Its transport quarantined
+  on provider-event teardown timeout, then repeatedly failed cleanup.
+  Telegram correctly showed failure rather than a fabricated success, but
+  the authored answer was not delivered. Investigate the event drain and
+  shutdown sequence; do not treat accepted result metadata as delivery proof.
+  Durable inspection found 128 delta events committed by the controller but
+  not yet ACK-persisted by the runner; stop and suspend commands were delayed
+  behind that traffic. A subsequent Slack run also failed on incomplete
+  prior-session cleanup, so further live sends are paused while the runner
+  fairness/cleanup regression is fixed. Do not clear safety state to force
+  a green result or increase deadlines in place of fixing command progress.
 - **Telegram latency:** one message took 234.435 seconds _before reaching the
   local webhook proxy_, then Luna ran for 13.433 seconds. The next independent
   message reached the proxy in 0.583 seconds and answered in 16.228 seconds
