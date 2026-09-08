@@ -10,13 +10,15 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
-  merged. Keep one PR: published head `aaa74597f` is **497 files**, below 500.
-  CI `34255076310` passed every lane. Greptile reviewed this exact head at
+  merged. Keep one PR: code/test checkpoint `dcc931d8d` is **497 files**, below 500. At its preceding production head `aaa74597f`, CI `34255076310` passed
+  every lane. Greptile reviewed that exact production head at
   **5/5** with no outstanding finding. A reproduced early-turn
   semantic-call race is fixed in `46a946aae`. Master `be6bb768b`
   (accessible-company navigation) is incorporated in `49de75691`; the diff
   remains **497 files** with no lockfile delta. Renew final-head gates after
-  pushing the pending test-fixture cleanup and qualification record.
+  the test-fixture cleanup and documentation follow-ups. The cleanup and live
+  file/image record are pushed in `dcc931d8d`; final branch-head gates must
+  include the subsequent reasoning-effort evidence correction below.
   A final direct-driver malformed-response edge is also fixed: clear the
   optimistic turn before rejecting a response without `turn.id`. Its
   deterministic repro went red to green; **178/178** focused driver tests
@@ -90,7 +92,11 @@ Its private Board is at `http://127.0.0.1:3103`. Keep the public verified
 webhook proxy separate from the private Board.
 
 All four active connections use immutable Maya E2E with **Paperclip Runner →
-Codex app-server → `gpt-5.6-luna`**, low reasoning. Verify the persisted
+Codex app-server → `gpt-5.6-luna`**. The agent configuration retains a legacy
+`modelReasoningEffort: "low"`, but the native execution path does **not**
+forward that field. Effective reasoning effort is unverified; do not describe
+these as proven low-reasoning runs. This is pre-existing on master and is
+documented in the permanent record's reasoning-effort correction. Verify the persisted
 execution profile for new runs; do not substitute a legacy adapter or silently
 switch to Terra. The signed/staged runner SHA-256 is
 `e758b7cdb6ba7c9f176d89cbd17b98dc4c42975326012582d6a7cdf230fb0373`.
@@ -287,11 +293,16 @@ switch to Terra. The signed/staged runner SHA-256 is
 7. **Teams external gate.** There is no qualified Microsoft 365 tenant/admin
    setup. Deterministic tests are not live Teams qualification. Continue other
    providers while this real external gate remains.
-8. **Discord browser login renewed.** The current Eigenjoy browser session
+8. **Discord browser login required.** The current Eigenjoy browser session
    expired when reopening the conversation. Its login page is open and the
    user was notified. The bot endpoint remains active; Slack/GitHub/Telegram
    browsers are signed in. Do not claim a new Discord live retest until login
    and a visible conversation result are verified.
+9. **Native reasoning selection.** The legacy configured-low field is ignored
+   by the current native path. Luna is verified, effective effort is not.
+   This behavior also exists on master. Keep the recorded qualification honest;
+   a future closed-contract reasoning setting needs its own native new/resume
+   tests and live provider proof, not a silent legacy-field passthrough.
 
 ## Working guardrails
 

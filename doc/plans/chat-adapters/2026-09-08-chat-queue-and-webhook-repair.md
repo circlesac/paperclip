@@ -573,7 +573,8 @@ is an operator-recovery UX gap, not a reason to bypass identity checks.
 After verifying that retention and the absence of the old processes, root
 submitted `TG-AFTER-RETIRED-CHECKPOINT-0908` at 14:00:46.314. Run
 `a4938fcc-dc2c-4146-a776-12512cf4b613` started at 14:00:47.771 using
-Paperclip Runner, Codex app-server, and Luna with low reasoning effort.
+Paperclip Runner, Codex app-server, and Luna. The configured low-effort field
+was later found not to reach this native path; effective effort is unverified.
 The provider produced `paperclip_finish` at 14:01:26.348, but the run stayed
 active without delivering its answer. Working/progress publications each
 used one attempt against Telegram message `417200359:123`.
@@ -1185,7 +1186,7 @@ error banner appeared. This covers the final company-navigation merge, not
 every viewport or transition timing.
 
 New signed-in browser file checks on server 48 used native Codex app-server
-with persisted **`gpt-5.6-luna`**, low reasoning:
+with persisted **`gpt-5.6-luna`** (effective reasoning effort unverified):
 
 | Journey                                            | Native execution | Submission to useful result |
 | -------------------------------------------------- | ---------------- | --------------------------- |
@@ -1283,3 +1284,28 @@ CLI pass. Host usage remained 30 of 32 shared-memory segments. No positively
 identified database from these completed test roots remained to clean up.
 Global IPC limits, unknown segments and unrelated databases were untouched.
 The documented serialized group is continuing once separately.
+
+### Reasoning-effort evidence correction
+
+The live runs demonstrably use native Paperclip Runner, Codex app-server and
+`gpt-5.6-luna`. Earlier notes also called them low reasoning because Maya's
+agent configuration contains `modelReasoningEffort: "low"`. A final audit
+found that this legacy field is **not projected by the native execution path**.
+The measured timing, provider identity, bytes and delivery results remain valid;
+verified low reasoning was an unsupported inference and is corrected above.
+
+The provider resolver produces identical closed profiles for synthetic low and
+high inputs: Codex, Luna and the configured approval policy. The native input
+contract has no reasoning-effort field. The native Codex transport and Rust
+provider omit it from thread start/resume and turn start, and the generated
+isolated configuration and launch arguments add no override. Actual effort
+may depend on provider defaults or resumed state; it was not measured here.
+The decisive resolver, native contract, Rust provider, context materializer and
+security-argument files are byte-identical to master `be6bb768b`, so this is
+a pre-existing runner limitation rather than a chat transport regression.
+
+Follow-up: if native reasoning selection is exposed, carry a validated value
+through the closed provider contract, persisted execution identity and provider
+request, test new and resumed sessions, and verify it with the live provider.
+Do not silently inject legacy configuration into the closed native boundary
+or expand the chat landing patch into an unreviewed runner protocol change.
