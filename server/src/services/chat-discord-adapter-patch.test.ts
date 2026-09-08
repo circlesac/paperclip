@@ -112,6 +112,32 @@ describe("Paperclip Discord adapter patch", () => {
     vi.unstubAllGlobals();
   });
 
+  it("explicitly clears Discord buttons when editing a terminal card", () => {
+    const { adapter } = harness();
+    const buildMessagePayload = (
+      adapter as unknown as {
+        buildMessagePayload(
+          message: unknown,
+          options?: { clearContentForCard?: boolean },
+        ): { payload: Record<string, unknown> };
+      }
+    ).buildMessagePayload.bind(adapter);
+    const terminalCard = {
+      card: {
+        children: [],
+        title: "Choose a color",
+        type: "card",
+      },
+    };
+
+    expect(buildMessagePayload(terminalCard).payload).not.toHaveProperty(
+      "components",
+    );
+    expect(
+      buildMessagePayload(terminalCard, { clearContentForCard: true }).payload,
+    ).toMatchObject({ components: [] });
+  });
+
   it("names root-mention threads from the request without the bot mention", () => {
     const { adapter } = harness();
     const gatewayThreadName = (

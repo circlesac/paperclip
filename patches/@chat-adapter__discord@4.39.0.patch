@@ -522,6 +522,15 @@ index a42b61d58aa05c553cad8544090284070973cf0a..47ec7caee95cce5fa949a6dfd4e988c3
        return;
      }
      const reactionEvent = {
+@@ -1622,7 +1748,7 @@ var DiscordAdapter = class _DiscordAdapter {
+       if (cardPayload.embeds.length > 0) {
+         payload.embeds = cardPayload.embeds;
+       }
+-      if (cardPayload.components.length > 0) {
++      if (cardPayload.components.length > 0 || options.clearContentForCard) {
+         payload.components = cardPayload.components;
+       }
+       if (cardPayload.flags !== void 0) {
 @@ -1794,12 +1912,12 @@ var DiscordAdapter = class _DiscordAdapter {
    /**
     * Create a Discord thread from a message.
