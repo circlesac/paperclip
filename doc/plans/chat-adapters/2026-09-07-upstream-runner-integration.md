@@ -1449,3 +1449,55 @@ it currently redirects to a fresh Microsoft sign-in page. An eligible
 work/school tenant and its app-upload policy are still required, as described
 in [Microsoft's prerequisites](https://learn.microsoft.com/en-us/microsoftteams/platform/toolkit/tools-prerequisites).
 No Teams bot event or successful live Teams qualification is claimed.
+
+### Verified hardening and live restart — 2026-09-08
+
+Commits `230ebb1ce` and `f5066ecac` add current-authority-fenced private
+GitHub image resolution, suppress terminal runs' stale queued/working/native
+progress, and preserve provider-specific file preparation guidance after a
+durable external question answer. File effects and receipt replays revalidate
+the actual answer chain and current endpoint/principal; a wake marker alone
+does not grant file authority. Independent reviews covered both authority
+changes. The GitHub resolver's supported boundary is documented separately in
+`2026-09-08-github-private-attachment-authority.md`.
+
+Verification after the combined changes: **316/316** chat integration tests,
+**85/85** native external-wait tests, **180/180** focused GitHub SDK/egress/input
+tests, **9/9** deterministic browser tests, shared/server/UI typechecks, and
+token gates. The first combined runs were not clean: four legacy progress
+fixtures assumed working messages could still be sent after terminalization,
+one global wake spy observed another company's valid retry, and a fixed-delay
+contention assertion sampled a legitimate short retry transaction. Fixtures
+now publish initial progress while their runs are active, the wake assertion
+checks its own company, and the contention test observes the actual rollback
+boundary and verifies issue/coordinator/interaction locks are available there.
+No production authorization was weakened to satisfy these tests. Broad
+workspace tests/build and frozen-install validation are not claimed here.
+
+The live server was gracefully restarted with no running/queued company runs.
+Health reports clean commit `f5066ecac`, private exposure, and ready recovery.
+The seven historic recovery holds were not changed. Telegram question run
+`7191fb31-7802-42f5-8fae-bb0d56b452e6` had already displayed an actual
+Original photo / Small note choice before restart. Its existing provider card
+`417200359:101` survived. Clicking Original photo at 09:50:52.325Z started
+one continuation, `533fb22b-0a68-451d-803e-cf0252e53bf6`, on the same CHA-24.
+The old card changed to “Answered: Original photo.” The new working message
+`417200359:102` displayed safe progress and became the concise final
+**Original cat photo**. A real photo then arrived as `417200359:103` at
+09:51:32.734Z: **40.409 seconds after the click**, including file delivery.
+Every publication attempted delivery once. Attachment
+`f638d678-2d7f-46b8-ab27-4ee0faa85282` is the exact original JPEG:
+221,327 bytes, SHA256
+`1d22f8c026abf16ff0dde087d6c46a3b4a41978cfb4cee62c62e159e5550ce8a`.
+The response no longer adds a routine “prepared” caveat to an ordinary
+successful native image reply.
+
+The first live private-image attempt on `f5066ecac` still failed intake.
+GitHub review comment `3956584966` supplied only a newly uploaded image;
+run `f43884bd-fbd7-47d8-88f6-355cbf5d6b44` correctly reported it unavailable,
+did not inspect an older image, and created no image attachment. The actual
+provider reply is `3956585653`. This is an explicit failing live sample, not
+a passing private-image qualification. The signed-in browser renders a
+signed image anchor, but that does not establish the installation App's
+canonical response format; follow-up diagnosis must use the genuine product
+path without copying browser credentials or signed links into the connector.
