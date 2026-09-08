@@ -568,27 +568,38 @@ fn codex_completion_survives_failed_pending_request_cancellation() {
         .start_turn("Complete and exit with a tool call pending.", &config.cwd)
         .expect("start provider turn");
 
-    let call = (0..32)
-        .find_map(|_| match provider.poll().expect("poll pending tool call") {
-            Some(CodexProviderEvent::ToolCall {
-                call_id,
-                operation_id,
-                ..
-            }) => Some((call_id, operation_id)),
-            _ => None,
-        })
-        .expect("observe the pending semantic tool call");
+    let call_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut call = None;
+    while std::time::Instant::now() < call_deadline {
+        if let Some(CodexProviderEvent::ToolCall {
+            call_id,
+            operation_id,
+            ..
+        }) = provider.poll().expect("poll pending tool call")
+        {
+            call = Some((call_id, operation_id));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let call = call.expect("observe the pending semantic tool call");
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let completed = (0..32).any(|_| {
-        matches!(
+    let completed_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut completed = false;
+    while std::time::Instant::now() < completed_deadline {
+        completed = matches!(
             provider
                 .poll()
                 .expect("the received completion survives closed provider stdin"),
             Some(CodexProviderEvent::Notification { method, .. })
                 if method == "turn/completed"
-        )
-    });
+        );
+        if completed {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert!(completed, "the terminal notification remains authoritative");
     assert!(provider
         .deliver_tool_result(&ToolResult {
@@ -2629,19 +2640,7 @@ fn durable_backend_routes_a_semantic_tool_result_back_to_codex() {
         ))
         .expect("start the Codex turn");
 
-    let mut semantic_input = None;
-    for _ in 0..32 {
-        let events = poll_and_ack(&mut executor).expect("poll semantic input");
-        semantic_input = events
-            .iter()
-            .find(|event| event.event_type == "semantic_tool.input")
-            .cloned()
-            .or(semantic_input);
-        if semantic_input.is_some() {
-            break;
-        }
-    }
-    let semantic_input = semantic_input.expect("durable semantic input is emitted");
+    let semantic_input = wait_for_executor_event(&mut executor, "semantic_tool.input");
     assert_eq!(
         semantic_input.payload["semantic_tool"]["correlation"]["runId"],
         "run-1"
@@ -2668,7 +2667,8 @@ fn durable_backend_routes_a_semantic_tool_result_back_to_codex() {
 
     let mut result_seen = false;
     let mut terminal_seen = false;
-    for _ in 0..32 {
+    let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < completion_deadline {
         let events = poll_and_ack(&mut executor).expect("poll result and completion");
         result_seen |= events
             .iter()
@@ -2679,6 +2679,7 @@ fn durable_backend_routes_a_semantic_tool_result_back_to_codex() {
         if result_seen && terminal_seen {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(result_seen);
     assert!(terminal_seen);
@@ -3527,6 +3528,230 @@ fn durable_backend_settles_tools_before_a_natural_terminal_event() {
 
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn durable_stop_does_not_reopen_an_unprepared_or_closed_executor() {
+    let directory = temporary_directory("stop-no-checkpoint-authority");
+    let runner_config = durable_config(&directory);
+    let mut executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let unprepared = executor
+        .execute(&command("unprepared-stop", 1, "turn.stop", json!({})))
+        .expect("unprepared stop remains a no-op");
+    assert_eq!(unprepared.result["status"], "already_settled");
+    assert!(unprepared.result["providerExitConfirmed"].is_null());
+    assert!(!directory.join("codex-provider-state.json").exists());
+    executor
+        .execute(&command(
+            "prepare",
+            2,
+            "run.prepare",
+            json!({"provider": provider_config(&directory, &[])}),
+        ))
+        .unwrap();
+    executor
+        .execute(&command("close", 3, "session.close", json!({})))
+        .unwrap();
+    let closed = fs::read(directory.join("codex-provider-state.json")).unwrap();
+    let stopped = executor
+        .execute(&command("closed-stop", 4, "turn.stop", json!({})))
+        .expect("closed stop cannot create a successor checkpoint");
+    assert_eq!(stopped.result["status"], "already_settled");
+    assert!(stopped.result["providerExitConfirmed"].is_null());
+    assert_eq!(
+        fs::read(directory.join("codex-provider-state.json")).unwrap(),
+        closed
+    );
+    assert_eq!(call_count(&directory, "thread/start"), 0);
+    assert_eq!(call_count(&directory, "thread/resume"), 0);
+    assert_eq!(call_count(&directory, "turn/start"), 0);
+    fs::remove_dir_all(directory).expect("remove exact no-authority stop fixture");
+}
+
+#[test]
+#[cfg(unix)]
+fn durable_stop_prepares_a_turn_that_ended_before_provider_resume() {
+    assert_durable_stop_prepares_resumed_provider(true);
+}
+
+#[test]
+#[cfg(unix)]
+fn durable_stop_prepares_an_active_resumed_turn() {
+    assert_durable_stop_prepares_resumed_provider(false);
+}
+
+#[cfg(unix)]
+fn assert_durable_stop_prepares_resumed_provider(ended_before_resume: bool) {
+    let directory = temporary_directory(if ended_before_resume {
+        "stop-ended-resumed-turn"
+    } else {
+        "stop-active-resumed-turn"
+    });
+    let config = provider_config(
+        &directory,
+        if ended_before_resume {
+            &[]
+        } else {
+            &["--hold-turn"]
+        },
+    );
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare exact provider authority");
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open original provider thread");
+    first
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Settle only this turn."}),
+        ))
+        .expect("start original provider turn");
+    if ended_before_resume {
+        // The real provider persists completion, but runnerd never polls its
+        // terminal notification before losing the process. Do not manufacture
+        // or clear the runner's durable active-turn identity in this fixture.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state: Value = serde_json::from_slice(
+                &fs::read(directory.join("fake-state.json")).expect("read provider-owned state"),
+            )
+            .expect("parse provider-owned state");
+            if state["activeTurnId"].is_null() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider did not settle its turn"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    first.shutdown().expect("reap original provider process");
+    drop(first);
+    let state_path = directory.join("codex-provider-state.json");
+    let original: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(original["lifecycle"], "turn_active");
+    assert_eq!(original["activeProviderTurnId"], "provider-turn-1");
+
+    let mut resumed = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let snapshot = resumed
+        .execute(&command("snapshot", 4, "session.snapshot", json!({})))
+        .expect("restore only the existing thread");
+    assert_eq!(snapshot.result["driverSessionId"], "codex-thread-1");
+    assert_eq!(
+        snapshot.result["status"],
+        if ended_before_resume {
+            "session_open"
+        } else {
+            "turn_active"
+        }
+    );
+    let before_stop: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let resumed_event = before_stop["pendingEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["eventType"] == "session.resumed")
+        .expect("durably record renewed provider ownership");
+    let resumed_pid = resumed_event["payload"]["processId"].as_u64().unwrap();
+    let process_exists = |group: bool| {
+        std::process::Command::new("/bin/kill")
+            .arg("-0")
+            .arg("--")
+            .arg(if group {
+                format!("-{resumed_pid}")
+            } else {
+                resumed_pid.to_string()
+            })
+            .output()
+            .expect("check exact test provider process")
+            .status
+            .success()
+    };
+    assert!(process_exists(false));
+
+    let stopped = resumed
+        .execute(&command("stop", 5, "turn.stop", json!({})))
+        .expect("stop and checkpoint exact resumed provider");
+    assert_eq!(
+        stopped.result["status"],
+        if ended_before_resume {
+            "already_settled"
+        } else {
+            "stopped"
+        }
+    );
+    assert_eq!(stopped.result["providerExitConfirmed"], true);
+    assert!(
+        !process_exists(false),
+        "stop must reap the exact resumed provider PID"
+    );
+    assert!(
+        !process_exists(true),
+        "stop must reap the exact resumed provider group"
+    );
+    let prepared: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(prepared["lifecycle"], "prepared");
+    assert_eq!(prepared["threadId"], "codex-thread-1");
+    assert!(prepared["activeProviderTurnId"].is_null());
+    assert_eq!(prepared["ambiguousTurnStartPending"], false);
+    assert_eq!(
+        prepared["providerProcessGeneration"],
+        before_stop["providerProcessGeneration"]
+    );
+    assert_eq!(
+        prepared["pendingEvents"], before_stop["pendingEvents"],
+        "stop preserves the exact retained event suffix"
+    );
+    assert_eq!(
+        call_count(&directory, "turn/interrupt"),
+        usize::from(!ended_before_resume)
+    );
+    resumed
+        .execute(&command("drain", 6, "runner.drain", json!({})))
+        .unwrap();
+    resumed
+        .execute(&command("suspend", 7, "runner.suspend", json!({})))
+        .unwrap();
+    resumed
+        .shutdown()
+        .expect("prepared provider shutdown is a no-op");
+    drop(resumed);
+
+    let mut drain_only = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let retained = drain_only
+        .poll_events()
+        .expect("replay retained events without launching a provider");
+    assert_eq!(
+        retained.len(),
+        prepared["pendingEvents"].as_array().unwrap().len()
+    );
+    drain_only.acknowledge_events(retained.len()).unwrap();
+    drain_only
+        .execute(&command("repeat-stop", 8, "turn.stop", json!({})))
+        .unwrap();
+    drain_only.shutdown().unwrap();
+    assert_eq!(call_count(&directory, "thread/start"), 1);
+    assert_eq!(call_count(&directory, "thread/resume"), 1);
+    assert_eq!(call_count(&directory, "turn/start"), 1);
+    let final_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(final_state["lifecycle"], "prepared");
+    assert_eq!(
+        final_state["providerProcessGeneration"],
+        prepared["providerProcessGeneration"]
+    );
+    assert!(final_state["pendingEvents"].as_array().unwrap().is_empty());
+    fs::remove_dir_all(directory).expect("remove exact provider-stop fixture");
 }
 
 #[test]
@@ -4609,7 +4834,7 @@ fn structured_question_round_trips_through_the_normalized_backend() {
             json!({"provider": config}),
         ))
         .expect("prepare provider");
-    executor
+    let _opened = executor
         .execute(&command("open", 2, "session.open", json!({})))
         .expect("open provider session");
     let started = executor
@@ -4626,7 +4851,8 @@ fn structured_question_round_trips_through_the_normalized_backend() {
     let mut question_set = None;
     let mut request_id = None;
     let mut provider_started_events = 0;
-    for _ in 0..16 {
+    let question_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < question_deadline {
         for event in poll_and_ack(&mut executor).expect("poll question") {
             provider_started_events += usize::from(event.event_type == "turn.started");
             if event.event_type == "runtime_request.created" {
@@ -4645,6 +4871,7 @@ fn structured_question_round_trips_through_the_normalized_backend() {
         if question_set.is_some() {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     let question_set = question_set.expect("normalized question set is emitted");
     let request_id = request_id.expect("normalized request id is emitted");
@@ -4654,6 +4881,30 @@ fn structured_question_round_trips_through_the_normalized_backend() {
         question_set["questions"][0]["options"][0]["label"],
         "Staging"
     );
+
+    #[cfg(unix)]
+    struct PausedTestProvider(u64);
+    #[cfg(unix)]
+    impl Drop for PausedTestProvider {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-CONT", "--", &self.0.to_string()])
+                .output();
+        }
+    }
+    // Deterministically put the child behind the consumer's immediate polls.
+    // Resuming this exact fixture PID is also guaranteed on assertion unwind.
+    #[cfg(unix)]
+    let paused_provider = {
+        let pid = _opened.result["processId"].as_u64().unwrap();
+        assert!(std::process::Command::new("/bin/kill")
+            .args(["-STOP", "--", &pid.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        PausedTestProvider(pid)
+    };
 
     executor
         .execute(&command(
@@ -4669,17 +4920,18 @@ fn structured_question_round_trips_through_the_normalized_backend() {
             }),
         ))
         .expect("deliver normalized response");
-    let mut completed = false;
-    for _ in 0..16 {
-        completed |= poll_and_ack(&mut executor)
-            .expect("poll completed question turn")
-            .iter()
-            .any(|event| event.event_type == "turn.completed");
-        if completed {
-            break;
+    #[cfg(unix)]
+    {
+        for _ in 0..16 {
+            assert!(!poll_and_ack(&mut executor)
+                .expect("poll while the exact provider is paused")
+                .iter()
+                .any(|event| event.event_type == "turn.completed"));
         }
+        drop(paused_provider);
     }
-    assert!(completed);
+    let completed = wait_for_executor_event(&mut executor, "turn.completed");
+    assert_eq!(completed.event_type, "turn.completed");
     executor.shutdown().expect("stop provider process");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }

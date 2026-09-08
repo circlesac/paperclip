@@ -2396,23 +2396,25 @@ impl CodexCommandExecutor {
         reason: &str,
     ) -> Result<CommandExecution, DurableRunnerError> {
         self.restore_provider_if_needed()?;
-        let provider_turn_id = self
-            .state
-            .as_ref()
-            .and_then(|state| state.active_provider_turn_id.clone());
-        let Some(provider_turn_id) = provider_turn_id else {
+        let state = self.state.as_ref();
+        // An unprepared or permanently closed executor cannot become a
+        // successor checkpoint merely because the controller asks it to stop.
+        if state.is_none_or(|state| state.lifecycle == "closed") {
             return Ok(CommandExecution::result(json!({
                 "status": "already_settled",
                 "reason": reason,
             })));
-        };
+        }
+        let provider_turn_id = state.and_then(|state| state.active_provider_turn_id.clone());
 
         // The cooperative interrupt is useful to the provider, but its RPC
         // acknowledgement is not proof that an active turn stopped. A
         // controller issues turn.stop only while closing a run whose result is
         // already durable, so terminate the exact process generation before
         // publishing the provider state as attachable by a successor run.
-        let interrupt_accepted = self.interrupt_turn(reason).is_ok();
+        // Resume may discover that the old turn already ended; its newly
+        // resumed process still needs the same exit and prepared-state proof.
+        let interrupt_accepted = provider_turn_id.is_some() && self.interrupt_turn(reason).is_ok();
         let provider_shutdown_failed = self
             .provider
             .as_mut()
@@ -2429,7 +2431,9 @@ impl CodexCommandExecutor {
             .state
             .as_mut()
             .expect("Codex state remains available after provider termination");
-        state.settle_active_provider_turn_identity()?;
+        if provider_turn_id.is_some() {
+            state.settle_active_provider_turn_identity()?;
+        }
         let settled = state
             .tool_bridge
             .settle_turn("provider_turn_stopped_for_suspension")
@@ -2460,7 +2464,7 @@ impl CodexCommandExecutor {
         state.lifecycle = "prepared".to_owned();
         self.save_state()?;
         Ok(CommandExecution::result(json!({
-            "status": "stopped",
+            "status": if provider_turn_id.is_some() { "stopped" } else { "already_settled" },
             "providerTurnId": provider_turn_id,
             "reason": reason,
             "interruptAccepted": interrupt_accepted,

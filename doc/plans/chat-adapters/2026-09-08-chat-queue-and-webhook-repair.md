@@ -2215,3 +2215,42 @@ file-delivery improvement, but its official implementation explicitly accepts
 OAuth/PAT credentials, not App installation tokens. It is not a supported
 substitute for the bot's existing authenticated Paperclip download links:
 [GitHub CLI upload implementation](https://github.com/cli/cli/blob/v2.99.0/internal/attachments/client.go).
+
+### Already-ended provider shutdown and recovery qualification
+
+The retained-session fixture exposed a second shutdown bug: restoring the old
+Codex thread can discover that its turn already ended, but the restored
+provider process still exists. `turn.stop` formerly returned `already_settled`
+without stopping that process or durably preparing its checkpoint. It now
+requires the same exact-generation exit proof even for an already-ended turn;
+an unprepared or permanently closed executor remains a no-op and is not revived.
+Active and already-ended resume tests preserve the original thread, leave the
+queued event suffix intact, and prove no extra `turn/start` across drain/restart.
+
+The complete Rust provider target passed **69/69**, with one existing deliberate
+subprocess helper ignored (145.89 seconds). Earlier full attempts exposed three
+pre-existing finite-immediate-poll fixture races; they passed unchanged in
+isolation. Positive event waits are now deadline-bounded and yield to the fake
+provider, preserving question/schema/choice, run/operation, terminal and
+failed-late-result assertions. This changes no production timeout or latency
+budget. The composed retained 218-event fixture also passed **2/2**, covering
+both active and already-ended old turns with no new provider turn. Root's
+executor/discovery cohort passed **205/205**; shared/server/UI typechecks passed.
+
+The ingress fixture now injects its failure only into the transaction holding
+the exact target delivery, explicitly exercises an unrelated competing
+transaction, and restores the spy in `finally`. Its post-ack processing wait
+uses a bounded five-second condition check rather than assuming completion is
+observable within one second; one previous observation missed a receipt that
+completed once in 985.874ms. The final ingress plus three `/close` cases passed
+**4/4**. No production admission/dedupe assertion was weakened. A fresh complete
+chat integration run is still required.
+
+The server maintenance slice is not yet deployed: review identified a
+crash-after-commit activation-marker retry edge and late database callbacks
+that need explicit shutdown ownership after a bounded attempt expires. Both
+are being repaired with regressions before the live server is restarted.
+Live Telegram still shows the original A/B failure messages. Root opened B's
+exact run through the task UI and verified the Retry control without invoking
+it. The photo answer has not been redelivered, and the original queued file
+request has not been retried; these fixture results are not live success.

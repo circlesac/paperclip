@@ -7,6 +7,22 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+Latest checkpoint: the Codex already-ended-on-resume shutdown repair passed
+the full provider target (69 passed, one deliberate subprocess helper ignored).
+Its active/ended/no-authority regressions retain exact process-exit and
+same-thread/no-new-turn assertions. Three pre-existing immediate-poll fixtures
+now wait for their positive event with bounded deadlines; their original
+semantic assertions remain. Root's executor/discovery cohort passed 205/205,
+and shared/server/UI typechecks passed. The scoped ingress fault and adjacent
+`/close` cohort passed 4/4. The complete combined chat suite still needs rerun.
+The composed 218-event maintenance fixture passes for both active and already
+ended turns, but two final integration edges are being repaired before live
+deployment: read-only recognition of a committed activation marker after a
+crash, and shutdown ownership of database callbacks that outlive the bounded
+maintenance attempt. Server 58 remains unchanged. Root reopened the actual
+Telegram conversation and followed its task link to the exact failed B run;
+both old failure messages are still visible, and no Retry was submitted.
+
 Base `63c8b5d8d` is pushed. All 24 CI jobs, quality, and Greptile's explicit
 500-file review passed; PR #13038 still requires CODEOWNER approval and is not
 merged. Do not spend the next qualification turn polling those unchanged gates.
