@@ -150,16 +150,18 @@ export class CodexAppServerDriver implements HarnessDriver {
     const supplied = this.#options.dynamicTools ?? [];
     if (this.#direct()) {
       // Direct chat deliberately excludes the general semantic/governance
-      // catalog. Keep only the server-authorized file handoff and current-wake
-      // reader plus the server-bound same-conversation resend tools, so
-      // requested files and complete message batches can feed the harness's
-      // final response without reopening general task authority.
+      // catalog. Keep only the server-authorized question, file handoff, and
+      // current-wake tools so the harness can ask a structured provider
+      // question or return requested files without reopening general task
+      // authority.
       return supplied.filter(
         (tool) =>
           text(tool.name) === "register_deliverable" ||
+          text(tool.name) === "request_human_input" ||
           text(tool.name) === "read_current_wake_comments" ||
           text(tool.name) === "list_chat_attachments" ||
-          text(tool.name) === "reuse_chat_attachment",
+          text(tool.name) === "reuse_chat_attachment" ||
+          text(tool.name) === "read_chat_attachment",
       );
     }
     return [...supplied, ...codexSemanticToolSpecs()];

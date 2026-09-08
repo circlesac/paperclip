@@ -648,11 +648,14 @@ async function writeStagedAttachment(input: {
     );
   }
   let keepOpen = false;
+  let safeToClear = false;
   try {
     const descriptorPath = await openedFilePath(handle.fd);
     const before = await handle.stat();
     const pathBefore = await lstat(input.destination);
     if (
+      !before.isFile() ||
+      before.nlink !== 1 ||
       !isWithin(input.workspaceRoot, descriptorPath) ||
       descriptorPath !== (await realpath(input.destination)) ||
       pathBefore.isSymbolicLink() ||
@@ -660,6 +663,7 @@ async function writeStagedAttachment(input: {
     ) {
       throw new Error("paperclip_runner_attachment_staging_path_denied");
     }
+    safeToClear = true;
     await handle.truncate(0);
     await handle.write(input.body, 0, input.body.length, 0);
     await handle.sync();
@@ -671,6 +675,7 @@ async function writeStagedAttachment(input: {
     );
     if (
       after.size !== input.body.length ||
+      after.nlink !== 1 ||
       pathAfter.isSymbolicLink() ||
       !sameFileIdentity(after, pathAfter) ||
       descriptorPath !== (await realpath(input.destination))
@@ -703,12 +708,72 @@ async function writeStagedAttachment(input: {
         // A validation failure after writing must not leave admitted bytes in
         // the shared workspace. The held descriptor, not the mutable path,
         // identifies the inode that is safe to clear.
-        await handle.truncate(0);
-        await handle.sync();
+        if (safeToClear) {
+          await handle.truncate(0);
+          await handle.sync();
+        }
       } finally {
         await handle.close();
       }
     }
+  }
+}
+
+/** Stage already-authorized bytes using the same confined, scrubbed slots as wake files. */
+export async function stageNativeRunnerAttachmentBytes(input: {
+  workspaceRoot: string;
+  body: Buffer;
+}): Promise<{ workspaceRelativePath: string; cleanup(): Promise<void> }> {
+  if (input.body.length > MAX_ATTACHMENT_BYTES) {
+    throw new Error("paperclip_runner_attachment_staging_size_denied");
+  }
+  const workspaceRoot = await realpath(input.workspaceRoot);
+  const processDirectoryName = await currentStagingProcessDirectoryName();
+  let destination = "";
+  let release = () => undefined;
+  await withStagingRegistryLock(workspaceRoot, async () => {
+    const directory = await ensurePrivateStagingDirectory(
+      workspaceRoot,
+      processDirectoryName,
+    );
+    const active =
+      activeStagingPathsByWorkspace.get(workspaceRoot) ?? new Set<string>();
+    const reusable = await scrubNativeRunnerStagingResidue(
+      workspaceRoot,
+      active,
+      processDirectoryName,
+    );
+    destination = reusable[0] ?? path.join(directory, randomUUID());
+    active.add(destination);
+    activeStagingPathsByWorkspace.set(workspaceRoot, active);
+    release = () => {
+      active.delete(destination);
+      if (active.size === 0)
+        activeStagingPathsByWorkspace.delete(workspaceRoot);
+    };
+  });
+  try {
+    const written = await writeStagedAttachment({
+      workspaceRoot,
+      destination,
+      body: input.body,
+    });
+    let cleaned = false;
+    return {
+      workspaceRelativePath: written.relativePath,
+      cleanup: async () => {
+        if (cleaned) return;
+        cleaned = true;
+        try {
+          await written.cleanup();
+        } finally {
+          release();
+        }
+      },
+    };
+  } catch (error) {
+    release();
+    throw error;
   }
 }
 

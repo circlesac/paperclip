@@ -31,6 +31,7 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
 import { nativeSha256 } from "./canonical.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -552,6 +553,19 @@ export async function finalizeNativeRun(input: {
       runId: run.id,
       executionState: record(authoritativeIssue.executionState),
     });
+    const externalChatResponseWaitAuthorization =
+      assessment.reportedDisposition === "yielded" &&
+      assessment.continuation?.kind === "response_wake"
+        ? await resolveExternalChatResponseWaitAuthorization({
+            db: input.db,
+            binding: {
+              companyId: run.companyId,
+              issueId: authoritativeIssue.id,
+              runId: run.id,
+              agentId: run.agentId,
+            },
+          })
+        : "not_applicable";
     const [dependencyReadiness, resolvedInteraction] = await Promise.all([
       issueService(input.db).getDependencyReadiness(authoritativeIssue.id, input.db),
       acceptedInteractionFromRun({
@@ -570,6 +584,7 @@ export async function finalizeNativeRun(input: {
         contractRow.risk === "low" && contractRow.completionAuthority === "agent_claim_policy",
       hasUnresolvedIssueBlockers: dependencyReadiness.unresolvedBlockerCount > 0,
       governanceResolvedForRun: resolvedInteraction !== null,
+      externalChatResponseWaitAuthorization,
       reviewOwnerUserId: authoritativeIssue.responsibleUserId ?? authoritativeIssue.createdByUserId ?? null,
       agentId: run.agentId,
       priorIssueStatus: authoritativeStatus(authoritativeIssue.status),
@@ -610,6 +625,10 @@ export async function finalizeNativeRun(input: {
         priorStatusVersion: Number(authoritativeIssue.statusVersion),
         priorDecisionId: authoritativeIssue.lastStatusDecisionId,
         decision,
+        requireExternalChatResponseWaitAuthorization:
+          decision.reasonCode === "external_chat_response_waiting"
+            ? { agentId: run.agentId }
+            : undefined,
         failpoint: input.failpoint,
       });
       const now = new Date();
@@ -654,6 +673,9 @@ export async function finalizeNativeRun(input: {
     } catch (error) {
       if (error instanceof NativeStatusRaceError && attempt < 2) {
         supersedesAssessmentId = assessmentRow.id;
+        await new Promise((resolve) =>
+          setTimeout(resolve, 25 * (attempt + 1)),
+        );
         continue;
       }
       return recordRetryableFailure({

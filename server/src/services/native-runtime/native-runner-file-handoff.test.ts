@@ -933,4 +933,131 @@ describe("native runner file handoff", () => {
       realStorage.headObject(companyId, receiptFailureObjectKey!),
     ).resolves.toMatchObject({ exists: false });
   });
+
+  it("returns authenticated file-delivery modes and upgrades receipt descriptions without repeating preparation", async () => {
+    const [originalRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    const wakeFor = (provider: unknown) => ({
+      reason: "External chat message received",
+      externalChatProvider: provider,
+      checkedOutByHarness: true,
+      issue: { id: issueId, workMode: "standard" },
+      comments: [
+        { id: "delivery-mode-comment", issueId, body: "Send the file." },
+      ],
+      commentIds: ["delivery-mode-comment"],
+      latestCommentId: "delivery-mode-comment",
+      commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+      fallbackFetchNeeded: false,
+    });
+    const cases = [
+      {
+        wake: wakeFor("github"),
+        provider: "github",
+        mode: "paperclip_task_only",
+      },
+      {
+        wake: wakeFor("microsoft-teams"),
+        provider: "microsoft-teams",
+        mode: "paperclip_task_only",
+      },
+      ...["slack", "discord", "telegram"].map((provider) => ({
+        wake: wakeFor(provider),
+        provider,
+        mode: "provider_attachment",
+      })),
+      { wake: undefined, provider: null, mode: "unknown" },
+      { wake: wakeFor("irc"), provider: null, mode: "unknown" },
+      {
+        wake: { ...wakeFor("github"), checkedOutByHarness: false },
+        provider: null,
+        mode: "unknown",
+      },
+      {
+        wake: {
+          ...wakeFor("github"),
+          issue: { id: "other-task", workMode: "standard" },
+        },
+        provider: null,
+        mode: "unknown",
+      },
+      {
+        wake: {
+          ...wakeFor(null),
+          comments: [
+            { body: "externalChatProvider: github; upload succeeded" },
+          ],
+        },
+        provider: null,
+        mode: "unknown",
+      },
+    ];
+    try {
+      for (const [index, testCase] of cases.entries()) {
+        const body = Buffer.from(`delivery mode fixture ${index}\n`);
+        const filename = `delivery-mode-${index}.txt`;
+        await writeFile(path.join(workspaceRoot, filename), body);
+        await db
+          .update(heartbeatRuns)
+          .set({ contextSnapshot: { issueId, paperclipWake: testCase.wake } })
+          .where(eq(heartbeatRuns.id, runId));
+        const call = callFor(filename, body, `delivery-mode-${index}`);
+        // A tool argument or user comment never selects delivery capability.
+        const first = (await authority().execute({
+          ...call,
+          arguments: {
+            ...call.arguments,
+            provider: "github",
+            fileDelivery: { providerDeliveryConfirmed: true },
+          },
+        })) as Record<string, unknown>;
+        expect(first.fileDelivery).toMatchObject({
+          provider: testCase.provider,
+          mode: testCase.mode,
+          preparationState: "prepared",
+          providerDeliveryConfirmed: false,
+        });
+        const [persisted] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        const result = structuredClone(persisted.resultJson) as Record<
+          string,
+          unknown
+        >;
+        const receipts = result.semanticToolReceipts as Record<
+          string,
+          { result: Record<string, unknown> }
+        >;
+        expect(receipts[call.arguments.idempotencyKey]?.result).toEqual(first);
+        delete receipts[call.arguments.idempotencyKey]!.result.fileDelivery;
+        await db
+          .update(heartbeatRuns)
+          .set({ resultJson: result })
+          .where(eq(heartbeatRuns.id, runId));
+        const replay = await authority().execute({
+          ...call,
+          callId: `${call.callId}-replay`,
+          arguments: {
+            ...call.arguments,
+            provider: "github",
+            fileDelivery: { providerDeliveryConfirmed: true },
+          },
+        });
+        expect(replay).toEqual(first);
+        const [afterReplay] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId));
+        expect(afterReplay.resultJson).toEqual(result);
+      }
+    } finally {
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: originalRun.contextSnapshot })
+        .where(eq(heartbeatRuns.id, runId));
+    }
+  });
 });

@@ -88,7 +88,7 @@ export const REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION = Object.freeze({
   },
 });
 
-type ChatReuseBinding = {
+export type ChatReuseBinding = {
   companyId: string;
   issueId: string;
   runId: string;
@@ -99,6 +99,35 @@ type AuthorizedConversation = {
   conversationId: string;
   endpointId: string;
 };
+
+export type ExternalChatResponseWaitAuthorization =
+  | "authorized"
+  | "revoked"
+  | "not_applicable";
+
+type AuthorizationLockMode = "blocking" | "nonblocking" | "read";
+
+class ExternalChatWaitAuthorizationContentionError extends Error {
+  constructor() {
+    super("paperclip_external_chat_wait_authorization_contended");
+    this.name = "ExternalChatWaitAuthorizationContentionError";
+  }
+}
+
+export function isExternalChatWaitAuthorizationContention(
+  error: unknown,
+): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    if (current instanceof ExternalChatWaitAuthorizationContentionError) {
+      return true;
+    }
+    const value = record(current);
+    if (value.code === "55P03") return true;
+    current = value.cause;
+  }
+  return false;
+}
 
 export type ChatAttachmentReuseSource = {
   sourceCommentId: string;
@@ -250,11 +279,21 @@ async function principalAuthorized(
   tx: Db,
   endpoint: typeof chatEndpoints.$inferSelect,
   principalId: string,
+  lockMode: AuthorizationLockMode = "blocking",
 ): Promise<boolean> {
-  await tx.execute(
-    sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${endpoint.companyId}:${principalId}`}, 0))`,
-  );
-  const [principal] = await tx
+  if (lockMode === "blocking") {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${endpoint.companyId}:${principalId}`}, 0))`,
+    );
+  } else if (lockMode === "nonblocking") {
+    const [lock] = (await tx.execute(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${`chat-identity:${endpoint.companyId}:${principalId}`}, 0)) as acquired`,
+    )) as unknown as Array<{ acquired: boolean }>;
+    if (!lock?.acquired) {
+      throw new ExternalChatWaitAuthorizationContentionError();
+    }
+  }
+  const principalQuery = tx
     .select({ id: chatExternalPrincipals.id })
     .from(chatExternalPrincipals)
     .where(
@@ -267,11 +306,14 @@ async function principalAuthorized(
           endpoint.providerAccountId ?? "",
         ),
       ),
-    )
-    .for("update")
-    .limit(1);
+    );
+  const [principal] = await (lockMode === "read"
+    ? principalQuery.limit(1)
+    : lockMode === "nonblocking"
+      ? principalQuery.for("update", { noWait: true }).limit(1)
+      : principalQuery.for("update").limit(1));
   if (!principal) return false;
-  const [link] = await tx
+  const linkQuery = tx
     .select({
       status: chatIdentityLinks.status,
       userId: chatIdentityLinks.paperclipUserId,
@@ -283,11 +325,14 @@ async function principalAuthorized(
         eq(chatIdentityLinks.endpointId, endpoint.id),
         eq(chatIdentityLinks.principalId, principalId),
       ),
-    )
-    .for("update")
-    .limit(1);
+    );
+  const [link] = await (lockMode === "read"
+    ? linkQuery.limit(1)
+    : lockMode === "nonblocking"
+      ? linkQuery.for("update", { noWait: true }).limit(1)
+      : linkQuery.for("update").limit(1));
   const activeMember = async (userId: string) => {
-    const [membership] = await tx
+    const membershipQuery = tx
       .select({
         status: companyMemberships.status,
         role: companyMemberships.membershipRole,
@@ -299,9 +344,12 @@ async function principalAuthorized(
           eq(companyMemberships.principalType, "user"),
           eq(companyMemberships.principalId, userId),
         ),
-      )
-      .for("update")
-      .limit(1);
+      );
+    const [membership] = await (lockMode === "read"
+      ? membershipQuery.limit(1)
+      : lockMode === "nonblocking"
+        ? membershipQuery.for("update", { noWait: true }).limit(1)
+        : membershipQuery.for("update").limit(1));
     return membership?.status === "active" && membership.role !== "viewer";
   };
   if (link?.status === "linked") {
@@ -315,6 +363,7 @@ async function authorizedConversation(
   tx: Db,
   binding: ChatReuseBinding,
   contextSnapshot: unknown,
+  lockMode: AuthorizationLockMode = "blocking",
 ): Promise<AuthorizedConversation> {
   const context = record(contextSnapshot);
   const source = typeof context.source === "string" ? context.source : "";
@@ -336,7 +385,7 @@ async function authorizedConversation(
   ) {
     throw new Error("paperclip_runner_chat_attachment_binding_denied");
   }
-  const links = await tx
+  const linksQuery = tx
     .select({
       commentId: chatMessageLinks.commentId,
       conversation: chatConversations,
@@ -383,8 +432,12 @@ async function authorizedConversation(
         eq(chatEndpoints.assignedAgentId, binding.agentId),
         eq(chatEndpoints.status, "active"),
       ),
-    )
-    .for("update");
+    );
+  const links = await (lockMode === "read"
+    ? linksQuery
+    : lockMode === "nonblocking"
+      ? linksQuery.for("update", { noWait: true })
+      : linksQuery.for("update"));
   const linkedCommentIds = new Set(links.map((row) => row.commentId));
   const conversationIds = new Set(links.map((row) => row.conversation.id));
   const endpointIds = new Set(links.map((row) => row.endpoint.id));
@@ -400,28 +453,243 @@ async function authorizedConversation(
   const conversation = links[0]!.conversation;
   const endpoint = links[0]!.endpoint;
   const resource = conversation.resourceId
-    ? await tx
-        .select()
-        .from(chatEndpointResources)
-        .where(
-          and(
-            eq(chatEndpointResources.id, conversation.resourceId),
-            eq(chatEndpointResources.companyId, binding.companyId),
-            eq(chatEndpointResources.endpointId, endpoint.id),
-          ),
-        )
-        .for("update")
-        .then((rows) => rows[0] ?? null)
+    ? await (() => {
+        const query = tx
+          .select()
+          .from(chatEndpointResources)
+          .where(
+            and(
+              eq(chatEndpointResources.id, conversation.resourceId!),
+              eq(chatEndpointResources.companyId, binding.companyId),
+              eq(chatEndpointResources.endpointId, endpoint.id),
+            ),
+          );
+        return lockMode === "read"
+          ? query.then((rows) => rows[0] ?? null)
+          : lockMode === "nonblocking"
+            ? query
+                .for("update", { noWait: true })
+                .then((rows) => rows[0] ?? null)
+            : query.for("update").then((rows) => rows[0] ?? null);
+      })()
     : null;
   if (!destinationAllowed(endpoint, conversation, resource)) {
     throw new Error("paperclip_runner_chat_attachment_destination_denied");
   }
   for (const principalId of new Set(links.map((row) => row.principalId!))) {
-    if (!(await principalAuthorized(tx, endpoint, principalId))) {
+    if (!(await principalAuthorized(tx, endpoint, principalId, lockMode))) {
       throw new Error("paperclip_runner_chat_attachment_principal_denied");
     }
   }
   return { conversationId: conversation.id, endpointId: endpoint.id };
+}
+
+function externalChatWaitCandidate(
+  contextSnapshot: unknown,
+  binding: ChatReuseBinding,
+): { provider: string; commentIds: string[] } | null {
+  const context = record(contextSnapshot);
+  const source = typeof context.source === "string" ? context.source : "";
+  const provider = [
+    "slack",
+    "github",
+    "discord",
+    "microsoft-teams",
+    "telegram",
+  ].find(
+    (candidate) =>
+      source === `chat:${candidate}` || source === `chat:${candidate}:recovery`,
+  );
+  const commentIds = wakeCommentIds(context);
+  const wake = record(context.paperclipWake);
+  const wakeIssue = record(wake.issue);
+  const payloadCommentIds = Array.isArray(wake.commentIds)
+    ? wake.commentIds.filter(
+        (value): value is string =>
+          typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
+  if (
+    !provider ||
+    context.paperclipHarnessCheckedOut !== true ||
+    commentIds.length === 0 ||
+    wake.externalChatProvider !== provider ||
+    wake.checkedOutByHarness !== true ||
+    wakeIssue.id !== binding.issueId ||
+    payloadCommentIds.length !== commentIds.length ||
+    payloadCommentIds.some((id, index) => id !== commentIds[index])
+  ) {
+    return null;
+  }
+  return { provider, commentIds };
+}
+
+/**
+ * Authorize a no-work external-chat wait from the same durable boundary used
+ * by historical file reuse. The nested wake payload proves that this was a
+ * server-built chat turn; current destination and principal policy remain
+ * authoritative at the instant the status decision commits.
+ */
+export async function resolveExternalChatResponseWaitAuthorizationInTransaction(
+  tx: Db,
+  binding: ChatReuseBinding,
+  lockMode: AuthorizationLockMode = "blocking",
+): Promise<ExternalChatResponseWaitAuthorization> {
+  // Preserve the native mutation lock order (issue -> run -> actor). The
+  // status committer already holds the issue lock; PostgreSQL treats this
+  // repeated lock as a no-op.
+  const issueQuery = tx
+    .select({
+      assigneeAgentId: issues.assigneeAgentId,
+      executionRunId: issues.executionRunId,
+    })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.id, binding.issueId),
+        eq(issues.companyId, binding.companyId),
+      ),
+    );
+  const [issue] = await (lockMode === "read"
+    ? issueQuery.limit(1)
+    : lockMode === "nonblocking"
+      ? issueQuery.for("update", { noWait: true }).limit(1)
+      : issueQuery.for("update").limit(1));
+
+  const runQuery = tx
+    .select()
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.id, binding.runId),
+        eq(heartbeatRuns.companyId, binding.companyId),
+        eq(heartbeatRuns.agentId, binding.agentId),
+        eq(heartbeatRuns.nativeIssueId, binding.issueId),
+        eq(heartbeatRuns.runtimeMode, "native"),
+      ),
+    );
+  const [run] = await (lockMode === "read"
+    ? runQuery.limit(1)
+    : lockMode === "nonblocking"
+      ? runQuery.for("update", { noWait: true }).limit(1)
+      : runQuery.for("update").limit(1));
+  const candidate = run
+    ? externalChatWaitCandidate(run.contextSnapshot, binding)
+    : null;
+  if (!candidate) return "not_applicable";
+
+  const actorQuery = tx
+    .select({ status: agents.status })
+    .from(agents)
+    .where(
+      and(
+        eq(agents.id, binding.agentId),
+        eq(agents.companyId, binding.companyId),
+      ),
+    );
+  const [actor] = await (lockMode === "read"
+    ? actorQuery.limit(1)
+    : lockMode === "nonblocking"
+      ? actorQuery.for("update", { noWait: true }).limit(1)
+      : actorQuery.for("update").limit(1));
+  if (
+    !issue ||
+    !actor ||
+    run.status !== "running" ||
+    issue.assigneeAgentId !== binding.agentId ||
+    issue.executionRunId !== binding.runId ||
+    ["paused", "terminated", "pending_approval", "error"].includes(
+      actor.status,
+    )
+  ) {
+    return "revoked";
+  }
+
+  const links = await tx
+    .select({
+      commentId: chatMessageLinks.commentId,
+      conversationId: chatConversations.id,
+      endpointId: chatEndpoints.id,
+      principalId: chatDeliveries.principalId,
+    })
+    .from(chatMessageLinks)
+    .innerJoin(
+      chatDeliveries,
+      and(
+        eq(chatDeliveries.id, chatMessageLinks.deliveryId),
+        eq(chatDeliveries.companyId, chatMessageLinks.companyId),
+        eq(chatDeliveries.endpointId, chatMessageLinks.endpointId),
+        eq(chatDeliveries.conversationId, chatMessageLinks.conversationId),
+      ),
+    )
+    .innerJoin(
+      chatConversations,
+      and(
+        eq(chatConversations.id, chatMessageLinks.conversationId),
+        eq(chatConversations.companyId, chatMessageLinks.companyId),
+        eq(chatConversations.endpointId, chatMessageLinks.endpointId),
+      ),
+    )
+    .innerJoin(
+      chatEndpoints,
+      and(
+        eq(chatEndpoints.id, chatConversations.endpointId),
+        eq(chatEndpoints.companyId, chatConversations.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(chatMessageLinks.companyId, binding.companyId),
+        eq(chatMessageLinks.direction, "inbound"),
+        inArray(chatMessageLinks.commentId, candidate.commentIds),
+        eq(chatDeliveries.state, "processed"),
+        eq(chatConversations.issueId, binding.issueId),
+        eq(
+          chatEndpoints.provider,
+          candidate.provider as typeof chatEndpoints.$inferSelect.provider,
+        ),
+        eq(chatEndpoints.assignedAgentId, binding.agentId),
+      ),
+    );
+  const linkedCommentIds = new Set(links.map((row) => row.commentId));
+  if (
+    links.length === 0 ||
+    new Set(links.map((row) => row.conversationId)).size !== 1 ||
+    new Set(links.map((row) => row.endpointId)).size !== 1 ||
+    links.some((row) => !row.principalId) ||
+    !candidate.commentIds.every((id) => linkedCommentIds.has(id))
+  ) {
+    return "revoked";
+  }
+  try {
+    await authorizedConversation(tx, binding, run.contextSnapshot, lockMode);
+    return "authorized";
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      [
+        "paperclip_runner_chat_attachment_binding_denied",
+        "paperclip_runner_chat_attachment_destination_denied",
+        "paperclip_runner_chat_attachment_principal_denied",
+      ].includes(error.message)
+    ) {
+      return "revoked";
+    }
+    throw error;
+  }
+}
+
+export async function resolveExternalChatResponseWaitAuthorization(input: {
+  db: Db;
+  binding: ChatReuseBinding;
+}): Promise<ExternalChatResponseWaitAuthorization> {
+  return input.db.transaction((tx) =>
+    resolveExternalChatResponseWaitAuthorizationInTransaction(
+      tx as unknown as Db,
+      input.binding,
+      "read",
+    ),
+  );
 }
 
 async function sourceLineageExists(
@@ -536,6 +804,7 @@ async function loadSource(
   conversation: AuthorizedConversation,
   sourceCommentId: string,
   attachmentId: string,
+  allowEmpty = false,
 ): Promise<ChatAttachmentReuseSource> {
   const [sourceComment] = await tx
     .select({ id: issueComments.id })
@@ -593,7 +862,7 @@ async function loadSource(
   if (
     !row ||
     !row.filename ||
-    row.byteSize <= 0 ||
+    row.byteSize < (allowEmpty ? 0 : 1) ||
     row.byteSize > MAX_ATTACHMENT_BYTES ||
     !isAllowedContentType(normalizeContentType(row.contentType)) ||
     !/^[a-f0-9]{64}$/iu.test(row.sha256)
@@ -803,6 +1072,7 @@ export async function listAuthorizedChatAttachments(input: {
           conversation,
           candidate.sourceCommentId,
           candidate.attachmentId,
+          true,
         );
         listed.push({
           sourceCommentId: source.sourceCommentId,
@@ -850,6 +1120,8 @@ export async function authorizeChatAttachmentReuse(input: {
   contextSnapshot: unknown;
   sourceCommentId: string;
   attachmentId: string;
+  /** Inspection may open empty files; publication retains its nonempty bound. */
+  allowEmpty?: boolean;
 }): Promise<ChatAttachmentReuseSource> {
   const conversation = await authorizedConversation(
     input.db,
@@ -862,6 +1134,7 @@ export async function authorizeChatAttachmentReuse(input: {
     conversation,
     input.sourceCommentId,
     input.attachmentId,
+    input.allowEmpty,
   );
 }
 

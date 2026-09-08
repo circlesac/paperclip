@@ -396,3 +396,31 @@ lock; the corrected guard rejects late settlement without replaying the send.
 The frozen full integration rerun passes **288/288** in 100.13 s
 (`chat-channels-full-root-hardening-02.log`), with app lifecycle checks **8/8**.
 These changes are not yet deployed.
+
+### Frozen native tool and continuity verification
+
+The native historical reader now admits one exact same-conversation attachment
+under current run, agent, source-lineage, membership and destination policy.
+After bounded storage retrieval and size/hash verification it revalidates
+authority, commits that transaction, then stages bytes in the confined temporary
+workspace. Reading never selects a file for outbound delivery. Empty files are
+inspectable, cancellation cannot return a path, and run completion clears the
+staged inode. Review caught both filesystem work holding policy locks and a
+pre-validation cleanup path that could truncate an unauthorized inode; focused
+regressions cover both corrections. Remote staging is explicitly unsupported,
+not silently replaced by a public URL.
+
+Direct Codex chat also advertises the existing run-bound `request_human_input`
+tool. No general task/governance tool was added. Fingerprint v5 rotates older
+provider catalogs, including the intermediate reader-only catalog. Independent
+review found no remaining authority/privacy defect in this narrow exposure.
+
+Combined native-runtime, prompt/file guidance and provider arbitration coverage
+passes **1,350/1,350 across 34 files** in 164.80 s
+(`native-combined-root-hardening-01.log`). The Codex driver suite passes **65/65**,
+including fresh and resumed direct-tool dispatch. The full server/runner build,
+shared/adapter-utils/UI typechecks and whitespace checks pass. New files are
+Prettier-formatted; whole-file Prettier reports existing mixed-style formatting
+in several touched modules (also reproduced against the pre-change
+`server-utils.ts`), so that broader check is not claimed as a pass. The lockfile
+remains unchanged. Live verification of these combined changes is still pending.

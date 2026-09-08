@@ -108,6 +108,56 @@ describe("native status authority", () => {
       toStatus: "in_progress",
       effects: [expect.objectContaining({ kind: "enqueue_continuation", continuationKind: "retry" })],
     }));
+    const externalChatWait = assessment({
+      reportedDisposition: "yielded",
+      continuation: {
+        kind: "response_wake",
+        summary: "Wait for the next authorized provider message",
+        idempotencyKey: "external-chat-wait",
+      },
+    });
+    expect(
+      arbitrate({
+        assessment: externalChatWait,
+        externalChatResponseWaitAuthorization: "authorized",
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "in_progress",
+        toStatus: "in_progress",
+        reasonCode: "external_chat_response_waiting",
+        effects: [],
+      }),
+    );
+    expect(
+      arbitrate({
+        assessment: externalChatWait,
+        externalChatResponseWaitAuthorization: "revoked",
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        statusAction: "preserve",
+        toStatus: "in_progress",
+        reasonCode: "external_chat_response_wait_authorization_lost",
+        effects: [],
+      }),
+    );
+    expect(
+      arbitrate({
+        assessment: externalChatWait,
+        externalChatResponseWaitAuthorization: "not_applicable",
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        reasonCode: "live_continuation_registered",
+        effects: [
+          expect.objectContaining({
+            kind: "enqueue_continuation",
+            continuationKind: "response_wake",
+          }),
+        ],
+      }),
+    );
     expect(arbitrate({ terminalState: "cancelled" })).toEqual(expect.objectContaining({
       toStatus: "in_progress",
       effects: [expect.objectContaining({ kind: "release_run_resources" })],

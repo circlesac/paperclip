@@ -11,6 +11,7 @@ import {
 } from "./local-process-sandbox.js";
 import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
+import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   resolvePaperclipRunnerModel,
@@ -2114,6 +2115,8 @@ export function renderPaperclipWakePrompt(
             ]),
         "The harness owns task state and persists your final assistant response. If the runtime offers a semantic completion operation, emit exactly one semantic completion and do not duplicate that response in a Paperclip comment or status update.",
         "The semantic completion summary is the user-visible final answer. Include every requested answer, exact value, description, and file-delivery limitation there; a statement that you read, checked, or prepared something is not a substitute. Private progress commentary is not delivered as the final answer.",
+        "If the user explicitly asks to keep this current chat task open and wait for their next provider message without scheduling more work, report `yielded` with continuation kind `response_wake`; do not report `done`. Use that wait only after completing this turn's requested response, and never use it to defer unfinished work or for an ordinary completed request. Paperclip independently verifies the current chat binding before preserving the task.",
+        `File-delivery contract: ${paperclipChatFilePreparationDelivery(normalized.externalChatProvider).guidance}`,
         "When the request genuinely requires files, investigation, external access, or mutations, use the appropriate tools and complete every required permission, approval, execution-policy, containment, budget, pause/cancel, and company-boundary check. This response shortcut grants no new authority.",
         "Keep the final response concise and provider-facing. Do not narrate Paperclip workflow, checkout, status, or completion bookkeeping.",
         "",

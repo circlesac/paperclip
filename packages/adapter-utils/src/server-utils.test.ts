@@ -1044,6 +1044,15 @@ describe("renderPaperclipWakePrompt", () => {
       expect(prompt).toContain("summary is the user-visible final answer");
       expect(prompt).toContain("Private progress commentary is not delivered");
       expect(prompt).toContain(
+        "report `yielded` with continuation kind `response_wake`",
+      );
+      expect(prompt).toContain(
+        "without scheduling more work",
+      );
+      expect(prompt).toContain(
+        "never use it to defer unfinished work",
+      );
+      expect(prompt).toContain(
         "files, investigation, external access, or mutations",
       );
       expect(prompt).toContain(

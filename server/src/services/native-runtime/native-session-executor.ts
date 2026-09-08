@@ -69,6 +69,7 @@ import {
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
+import { NativeChatAttachmentReadScope } from "./chat-attachment-read.js";
 import {
   assertCurrentWakeCommentsRead,
   resolveCurrentWakeCommentsBinding,
@@ -3697,6 +3698,8 @@ export async function executePaperclipNativeSession(input: {
   /** Test seam at the provider boundary; production uses a qualified package backend. */
   backend?: NativeSessionBackend;
   useRunnerd?: boolean;
+  /** Internal, run-owned file inspection lifetime; never supplied by tool arguments. */
+  chatAttachmentReadScope?: NativeChatAttachmentReadScope;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
   preparationSpans?: NativeRunHistoricalSpan[];
@@ -3748,6 +3751,14 @@ export async function executePaperclipNativeSession(input: {
     ownsSessionScope = true;
 
     const targetKind = input.runnerExecutionTarget?.kind ?? "local";
+    const chatAttachmentReadScope = new NativeChatAttachmentReadScope({
+      db: input.db,
+      binding: input.execution.binding,
+      workspaceRoot: input.execution.workspace.cwd,
+      executionTargetKind: targetKind,
+    });
+    preparedInput = { ...input, chatAttachmentReadScope };
+    cleanupStagedAttachments = () => chatAttachmentReadScope.close();
     const attachmentStage = await stageNativeRunnerWakeAttachments({
       db: input.db,
       binding: {
@@ -3759,13 +3770,21 @@ export async function executePaperclipNativeSession(input: {
         executionTargetKind: targetKind,
       },
     });
-    cleanupStagedAttachments = attachmentStage.cleanup;
+    cleanupStagedAttachments = async () => {
+      const cleanupResults = await Promise.allSettled([
+        chatAttachmentReadScope.close(),
+        attachmentStage.cleanup(),
+      ]);
+      if (cleanupResults.some((result) => result.status === "rejected")) {
+        throw new Error("paperclip_runner_attachment_staging_cleanup_failed");
+      }
+    };
     const stagedPrompt = renderNativeRunnerStagedAttachmentPrompt(
       attachmentStage.attachments,
     );
     if (stagedPrompt) {
       preparedInput = {
-        ...input,
+        ...preparedInput,
         execution: parseNativeExecutionInput({
           ...input.execution,
           task: {
@@ -6268,6 +6287,7 @@ export async function createRunnerdBackend(input: {
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
+  chatAttachmentReadScope?: NativeChatAttachmentReadScope;
   restartRecovery?: NativeRestartRecoveryClaim;
   durableEnvironmentLeaseId?: string;
   onSpawn?: (meta: {
@@ -6351,6 +6371,7 @@ async function createRunnerdBackendWithinSessionClaim(
     workspaceRoot: input.execution.workspace.cwd,
     executionTargetKind: target.kind,
     currentWakeComments: currentWakeComments ?? undefined,
+    chatAttachmentReadScope: input.chatAttachmentReadScope,
     enqueueWakeup: input.enqueueWakeup,
   });
   const authorityEpoch = new SessionToolAuthorityEpoch(

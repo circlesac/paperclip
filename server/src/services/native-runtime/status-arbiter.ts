@@ -83,6 +83,10 @@ export function arbitrateNativeStatus(input: {
   hasUnresolvedIssueBlockers?: boolean;
   /** A governance interaction created by this run was accepted before the run settled. */
   governanceResolvedForRun?: boolean;
+  externalChatResponseWaitAuthorization?:
+    | "authorized"
+    | "revoked"
+    | "not_applicable";
   reviewOwnerUserId?: string | null;
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
@@ -318,6 +322,37 @@ export function arbitrateNativeStatus(input: {
         idempotencyKey: `native-track-blocked:${input.assessment.blocker.unblockAction}`,
         agentId: input.agentId,
       }],
+    };
+  }
+  if (
+    input.assessment.reportedDisposition === "yielded" &&
+    input.assessment.continuation?.kind === "response_wake" &&
+    input.externalChatResponseWaitAuthorization === "authorized"
+  ) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "in_progress",
+      toStatus: "in_progress",
+      reasonCode: "external_chat_response_waiting",
+      unblockDescriptor: null,
+      // The active, authorized provider conversation is the durable liveness
+      // path. Only its next admitted message may enqueue the response wake.
+      effects: [],
+    };
+  }
+  if (
+    input.assessment.reportedDisposition === "yielded" &&
+    input.assessment.continuation?.kind === "response_wake" &&
+    input.externalChatResponseWaitAuthorization === "revoked"
+  ) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve",
+      toStatus: input.priorIssueStatus,
+      reasonCode: "external_chat_response_wait_authorization_lost",
+      unblockDescriptor: null,
+      // Revocation cannot be converted into an unrequested background run.
+      effects: [],
     };
   }
   if (input.assessment.reportedDisposition === "yielded" && input.assessment.continuation) {

@@ -2311,7 +2311,7 @@ describe("Codex app-server Codex driver", () => {
     await session.close({ reason: "test complete" });
   });
 
-  it("exposes only explicit file handoff across fresh and resumed direct chat", async () => {
+  it("exposes and dispatches only explicit chat tools across fresh and resumed direct chat", async () => {
     const first = new FakeCodexTransport();
     const second = new FakeCodexTransport();
     const registerDeliverable = {
@@ -2324,6 +2324,11 @@ describe("Codex app-server Codex driver", () => {
       description: "Read only comments bound into the current wake.",
       inputSchema: { type: "object", properties: {} },
     };
+    const requestHumanInput = {
+      name: "request_human_input",
+      description: "Ask one structured question through Paperclip.",
+      inputSchema: { type: "object", properties: {} },
+    };
     const listChatAttachments = {
       name: "list_chat_attachments",
       description: "List same-conversation attachment metadata.",
@@ -2334,19 +2339,31 @@ describe("Codex app-server Codex driver", () => {
       description: "Prepare one same-conversation attachment again.",
       inputSchema: { type: "object", properties: {} },
     };
+    const readChatAttachment = {
+      name: "read_chat_attachment",
+      description: "Read one same-conversation file without resending it.",
+      inputSchema: { type: "object", properties: {} },
+    };
+    const handler = vi.fn(async (call) => ({
+      interaction: { id: "interaction-direct-question", status: "pending" },
+      callId: call.callId,
+    }));
     const driver = makeDriver([first, second], {
       conversationMode: "direct",
       dynamicTools: [
         registerDeliverable,
         readCurrentWakeComments,
+        requestHumanInput,
         listChatAttachments,
         reuseChatAttachment,
+        readChatAttachment,
         {
           name: "report_progress",
           description: "Must remain unavailable in direct chat.",
           inputSchema: { type: "object", properties: {} },
         },
       ],
+      dynamicToolHandler: handler,
     });
     const original = await driver.openSession({
       runId: "run-direct-file",
@@ -2365,9 +2382,31 @@ describe("Codex app-server Codex driver", () => {
     ).toEqual([
       registerDeliverable,
       readCurrentWakeComments,
+      requestHumanInput,
       listChatAttachments,
       reuseChatAttachment,
+      readChatAttachment,
     ]);
+
+    const freshQuestion = await first.invoke({
+      id: "rpc-direct-question-fresh",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-direct-question-fresh",
+        tool: "request_human_input",
+        arguments: { interactionKind: "questions" },
+      },
+    });
+    expect(freshQuestion).toMatchObject({ success: true });
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool: "request_human_input",
+        callId: "call-direct-question-fresh",
+        arguments: { interactionKind: "questions" },
+      }),
+    );
 
     const recovery = await driver.recoverSession?.(snapshot);
     expect(recovery).toMatchObject({ recovered: true });
@@ -2377,9 +2416,30 @@ describe("Codex app-server Codex driver", () => {
     ).toEqual([
       registerDeliverable,
       readCurrentWakeComments,
+      requestHumanInput,
       listChatAttachments,
       reuseChatAttachment,
+      readChatAttachment,
     ]);
+    const resumedQuestion = await second.invoke({
+      id: "rpc-direct-question-resumed",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-direct-question-resumed",
+        tool: "request_human_input",
+        arguments: { interactionKind: "confirmation" },
+      },
+    });
+    expect(resumedQuestion).toMatchObject({ success: true });
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool: "request_human_input",
+        callId: "call-direct-question-resumed",
+        arguments: { interactionKind: "confirmation" },
+      }),
+    );
     await recovery?.session?.close({ reason: "test complete" });
   });
 

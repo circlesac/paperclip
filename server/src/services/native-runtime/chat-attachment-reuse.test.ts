@@ -37,6 +37,7 @@ import { issueService } from "../issues.js";
 import { mergeHeartbeatRunResultJson } from "../heartbeat-run-summary.js";
 import {
   prepareReusedChatAttachment,
+  resolveExternalChatResponseWaitAuthorization,
   type ChatAttachmentReuseSource,
 } from "./chat-attachment-reuse.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
@@ -278,6 +279,13 @@ describe("native same-conversation chat attachment reuse", () => {
           paperclipHarnessCheckedOut: true,
           wakeCommentIds: [currentCommentId],
           commentId: currentCommentId,
+          paperclipWake: {
+            reason: "External chat message received",
+            externalChatProvider: "discord",
+            checkedOutByHarness: true,
+            issue: { id: issueId, workMode: "standard" },
+            commentIds: [currentCommentId],
+          },
         },
       })
       .where(eq(heartbeatRuns.id, runId));
@@ -297,6 +305,108 @@ describe("native same-conversation chat attachment reuse", () => {
       storage,
     });
   }
+
+  it("authorizes an external-chat response wait only from current durable policy", async () => {
+    const binding = { companyId, agentId, issueId, runId };
+    const alternateRunId = randomUUID();
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRuns).values({
+      id: alternateRunId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      runtimeMode: "native",
+      nativeIssueId: issueId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      contextSnapshot: {},
+    });
+    try {
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({ db, binding }),
+      ).resolves.toBe("authorized");
+
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: null })
+        .where(eq(issues.id, issueId));
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({ db, binding }),
+      ).resolves.toBe("revoked");
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: agentId, executionRunId: alternateRunId })
+        .where(eq(issues.id, issueId));
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({ db, binding }),
+      ).resolves.toBe("revoked");
+      await db
+        .update(issues)
+        .set({ executionRunId: runId })
+        .where(eq(issues.id, issueId));
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({ db, binding }),
+      ).resolves.toBe("revoked");
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "running", updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+
+      await db
+        .update(companyMemberships)
+        .set({ status: "suspended", updatedAt: new Date() })
+        .where(eq(companyMemberships.principalId, userId));
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({ db, binding }),
+      ).resolves.toBe("revoked");
+      await db
+        .update(companyMemberships)
+        .set({ status: "active", updatedAt: new Date() })
+        .where(eq(companyMemberships.principalId, userId));
+
+      const spoofedContext = {
+        ...((run?.contextSnapshot as Record<string, unknown> | null) ?? {}),
+      };
+      delete spoofedContext.paperclipWake;
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: spoofedContext,
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({ db, binding }),
+      ).resolves.toBe("not_applicable");
+    } finally {
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: agentId, executionRunId: runId })
+        .where(eq(issues.id, issueId));
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          contextSnapshot: run?.contextSnapshot ?? {},
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      await db
+        .update(companyMemberships)
+        .set({ status: "active", updatedAt: new Date() })
+        .where(eq(companyMemberships.principalId, userId));
+      await db
+        .delete(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, alternateRunId));
+    }
+  });
 
   it("lists metadata only and clones exact bytes once into current-run provenance", async () => {
     const runner = authority();

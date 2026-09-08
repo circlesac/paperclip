@@ -24,6 +24,10 @@ import {
   type NativeStatusEffect,
 } from "./status-arbiter.js";
 import { nativeSha256 } from "./canonical.js";
+import {
+  isExternalChatWaitAuthorizationContention,
+  resolveExternalChatResponseWaitAuthorizationInTransaction,
+} from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -1032,6 +1036,7 @@ export async function commitNativeStatusDecision(input: {
   failpoint?: NativeStatusCommitFailpoint;
   preMaterializedEffects?: NativeMaterializedStatusEffect[];
   supersedesCommittedDecisionId?: string;
+  requireExternalChatResponseWaitAuthorization?: { agentId: string };
 }) {
   if (input.decision.reasonCode === null) {
     throw new Error("native_status_reason_code_required");
@@ -1075,6 +1080,31 @@ export async function commitNativeStatusDecision(input: {
       || issue.lastStatusDecisionId !== input.priorDecisionId
     ) {
       throw new NativeStatusRaceError();
+    }
+    if (input.requireExternalChatResponseWaitAuthorization) {
+      let authorization;
+      try {
+        authorization =
+          await resolveExternalChatResponseWaitAuthorizationInTransaction(
+            tx as unknown as Db,
+            {
+              companyId: input.companyId,
+              issueId: input.issueId,
+              runId: input.runId,
+              agentId:
+                input.requireExternalChatResponseWaitAuthorization.agentId,
+            },
+            "nonblocking",
+          );
+      } catch (error) {
+        if (isExternalChatWaitAuthorizationContention(error)) {
+          throw new NativeStatusRaceError();
+        }
+        throw error;
+      }
+      if (authorization !== "authorized") {
+        throw new NativeStatusRaceError();
+      }
     }
     const decisionJson = {
       statusAction: input.decision.statusAction,

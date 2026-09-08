@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import { paperclipChatFilePreparationDelivery } from "@paperclipai/adapter-utils/chat-file-delivery";
+import {
+  isPaperclipExternalChatContractTurn,
+  normalizePaperclipWakePayload,
+} from "@paperclipai/adapter-utils/server-utils";
 import { runnerApiToolsEnabled } from "./runner-api-rollout.js";
 import { openRunnerApiWorkspaceFile } from "./runner-api-files.js";
 import { basename } from "node:path";
@@ -48,6 +53,11 @@ import {
   REUSE_CHAT_ATTACHMENT_TOOL_NAME,
   type ChatAttachmentReuseSource,
 } from "./chat-attachment-reuse.js";
+import {
+  READ_CHAT_ATTACHMENT_TOOL_DEFINITION,
+  READ_CHAT_ATTACHMENT_TOOL_NAME,
+  type NativeChatAttachmentReadScope,
+} from "./chat-attachment-read.js";
 
 const IMPLEMENTED_OPERATIONS = new Set([
   "search_api", "call_api",
@@ -73,6 +83,7 @@ type Binding = {
   workspaceRoot?: string;
   executionTargetKind?: "local" | "remote";
   currentWakeComments?: CurrentWakeCommentsBinding;
+  chatAttachmentReadScope?: NativeChatAttachmentReadScope;
   enqueueWakeup?: (agentId: string, options: {
     source: "assignment";
     triggerDetail: "system";
@@ -161,6 +172,7 @@ export class PaperclipRunnerToolAuthority {
     definitions.push(READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION);
     definitions.push(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION);
     definitions.push(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION);
+    definitions.push(READ_CHAT_ATTACHMENT_TOOL_DEFINITION);
     return definitions;
   }
 
@@ -173,7 +185,8 @@ export class PaperclipRunnerToolAuthority {
       !IMPLEMENTED_OPERATIONS.has(call.tool) &&
       call.tool !== READ_CURRENT_WAKE_COMMENTS_TOOL_NAME &&
       call.tool !== LIST_CHAT_ATTACHMENTS_TOOL_NAME &&
-      call.tool !== REUSE_CHAT_ATTACHMENT_TOOL_NAME
+      call.tool !== REUSE_CHAT_ATTACHMENT_TOOL_NAME &&
+      call.tool !== READ_CHAT_ATTACHMENT_TOOL_NAME
     ) {
       throw new Error("paperclip_runner_tool_not_advertised");
     }
@@ -188,6 +201,20 @@ export class PaperclipRunnerToolAuthority {
     }
     const context = await this.#boundContext();
     const input = record(call.arguments);
+    if (call.tool === READ_CHAT_ATTACHMENT_TOOL_NAME) {
+      const scope = this.binding.chatAttachmentReadScope;
+      const identityKeys = ["companyId", "issueId", "runId", "agentId"] as const;
+      if (!scope || identityKeys.some((key) => scope.options.binding[key] !== this.binding[key])) {
+        throw new Error("paperclip_runner_chat_attachment_read_scope_unavailable");
+      }
+      if (Object.keys(input).some((key) => key !== "sourceCommentId" && key !== "attachmentId")) {
+        throw new Error("paperclip_runner_chat_attachment_read_arguments_invalid");
+      }
+      return scope.read({
+        sourceCommentId: requiredUuid(input.sourceCommentId),
+        attachmentId: requiredUuid(input.attachmentId),
+      });
+    }
     if (call.tool === READ_CURRENT_WAKE_COMMENTS_TOOL_NAME) {
       if (!this.binding.currentWakeComments) {
         throw new Error("paperclip_runner_tool_not_advertised");
@@ -974,6 +1001,26 @@ export class PaperclipRunnerToolAuthority {
         const context = await this.#lockAuthorizedMutationContext(
           tx as unknown as Db,
         );
+        // Describe file preparation from the locked, server-built wake, never
+        // from file/tool arguments. Replays of older receipts gain the same
+        // honest delivery guidance without repeating their committed effect.
+        const describeResult = (result: unknown): unknown => {
+          if (
+            operationId !== "register_deliverable" &&
+            operationId !== REUSE_CHAT_ATTACHMENT_TOOL_NAME
+          ) return result;
+          const wake = record(context.run.contextSnapshot).paperclipWake;
+          const normalized = normalizePaperclipWakePayload(wake);
+          const provider =
+            normalized?.issue?.id === this.binding.issueId &&
+            isPaperclipExternalChatContractTurn(wake)
+              ? normalized.externalChatProvider
+              : null;
+          return {
+            ...record(result),
+            fileDelivery: paperclipChatFilePreparationDelivery(provider),
+          };
+        };
         const resultJson = record(context.run.resultJson);
         const receipts = record(resultJson.semanticToolReceipts);
         const prior = receipts[idempotencyKey] as ToolReceipt | undefined;
@@ -985,10 +1032,12 @@ export class PaperclipRunnerToolAuthority {
             throw new Error("paperclip_runner_tool_idempotency_conflict");
           }
           await options.beforeReceiptReplay?.(tx as unknown as Db, context);
-          return prior.result;
+          return describeResult(prior.result);
         }
         const result = JSON.parse(
-          JSON.stringify(await effect(tx as unknown as Db, context)),
+          JSON.stringify(
+            describeResult(await effect(tx as unknown as Db, context)),
+          ),
         ) as unknown;
         receipts[idempotencyKey] = {
           operationId,

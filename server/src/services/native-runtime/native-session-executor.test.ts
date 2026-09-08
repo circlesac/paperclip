@@ -4187,6 +4187,13 @@ describe("runnerd provider runtime wiring", () => {
       }),
     );
     expect(cleanup).toHaveBeenCalledTimes(1);
+    const definitionsCall = state.toolAuthorityDefinitions.mock.calls.find(
+      ([binding]) => binding.runId === stagedExecution.binding.runId,
+    );
+    const inspectionScope = definitionsCall?.[0].chatAttachmentReadScope as
+      import("./chat-attachment-read.js").NativeChatAttachmentReadScope | undefined;
+    expect(inspectionScope?.options.binding).toEqual(stagedExecution.binding);
+    expect(() => inspectionScope!.read({ sourceCommentId: "unused", attachmentId: "unused" })).toThrow("scope_closed");
   });
 
   it("passes the run checkpoint active turn into restart recovery", async () => {
