@@ -1,15 +1,21 @@
 import { and, eq, exists, inArray, or, sql } from "drizzle-orm";
 
 import type { Db } from "@paperclipai/db";
-import { chatPublications, issueThreadInteractions } from "@paperclipai/db";
+import {
+  chatPublications,
+  heartbeatRuns,
+  issueThreadInteractions,
+} from "@paperclipai/db";
 
 type ChatInteractionArbitrationDb = Pick<Db, "select">;
 
 /**
  * Returns whether a run has yielded its provider-visible response slot to a
- * native question or confirmation. A pending interaction is authoritative
- * even before its publication row is inserted; once resolved, the durable
- * provider prompt proves that the source run's prose remains internal.
+ * native question or confirmation. A pending interaction authored by this
+ * run's agent is authoritative even before its publication row is inserted.
+ * System-authored completion reviews cannot be projected to a provider and
+ * must not strand its working placeholder. Once resolved, the durable provider
+ * prompt proves that the source run's prose remains internal.
  */
 export async function hasChatRunOwnedProviderInteraction(
   db: ChatInteractionArbitrationDb,
@@ -46,7 +52,24 @@ export async function hasChatRunOwnedProviderInteraction(
           "request_confirmation",
         ]),
         or(
-          eq(issueThreadInteractions.status, "pending"),
+          and(
+            eq(issueThreadInteractions.status, "pending"),
+            exists(
+              db
+                .select({ id: heartbeatRuns.id })
+                .from(heartbeatRuns)
+                .where(
+                  and(
+                    eq(heartbeatRuns.id, input.runId),
+                    eq(heartbeatRuns.companyId, input.companyId),
+                    eq(
+                      heartbeatRuns.agentId,
+                      issueThreadInteractions.createdByAgentId,
+                    ),
+                  ),
+                ),
+            ),
+          ),
           exists(promptPublication),
         ),
       ),

@@ -303,3 +303,68 @@ while the transport correctly explained that GitHub App comments cannot upload
 file bytes and saved the file on the private Paperclip task. This is not signed
 off as native GitHub attachment delivery; capability/result guidance needs to
 prevent the conflicting claim.
+
+### Deployed native recovery proof
+
+Commit `062cfcacc` is pushed and deployed on the isolated live instance. Health
+reports that exact revision, startup recovery ready, and the agent remains
+`paperclip_runner` / `codex` / `gpt-5.6-luna`. No credentials were regenerated.
+The new follow-up in the original Discord conversation succeeded as run
+`b9fc4be1-3a22-44c8-9198-4527fc8b90c4`: native execution took **12.85 s** and
+the final publication followed **0.75 s** later. Its new normalized session is
+`74083a50-8e04-4732-baed-5b5180267a56`; the old incompatible durable directory
+and task/conversation history remain intact. `session.started` is recorded,
+and the browser shows `DISCORD-LUNA-RECOVERED` on the same provider thread.
+[Discord recovery proof](https://discord.com/channels/1457808928258658549/1546513811672932372/1546734998126854244).
+This closes the exercised stale-checkpoint bootstrap failure, not every
+possible interrupted native-session recovery scenario.
+
+Ten subsequent real Discord messages were admitted once each to that same task.
+Runs `68814d68-1913-4f03-9199-8cd707121372` and
+`427bd446-88e1-461d-9fb6-bfdba64f9cda` resumed the same new native session and
+acknowledged markers 01 and 02–10 respectively, once each and in order. The
+queued second run started **63 ms** after the first finished; its 46.5 s duration
+was native/provider work (six tool calls), not a multi-minute delivery poll.
+Both final responses were inspected in Discord. The Board run page also showed
+the native Luna identity, 13 s recovery turn, session change, transcript controls,
+tool/terminal events and detailed timing spans.
+
+The GitHub inline-file artifact was independently checked in private storage:
+19 bytes, exact `INLINE-LUNA-FILE-OK` content with no trailing newline,
+SHA-256 `73bf300550546d6a389e7c0791266a3a1e5e3466ff7e9f74f2f2aff11dffdaf1`.
+This proves file creation/storage, while the conflicting provider-facing wording
+remains a separate fix and live-retest requirement.
+
+### Fresh Slack native media round-trip
+
+The signed-in Slack thread received a real PNG and text file via its upload UI.
+Native Luna run `5041afe7-27b1-4d99-8e29-7f560f889680` correctly described the
+orange tabby and read `cobalt otter 47` from the file, then returned both original
+files. The browser screenshot confirmed the image and readable text attachment.
+Inbound/outbound asset hashes match for each file: PNG
+`005f8dabdb19ef786c0e2e76695596d22c1d0bb53de374e0be209cc6d89851c9` and text
+`fd40030afb62b83181a2a46dde8220e8defecfa0b4328e380c30b1899ccdce24`.
+Native execution took 57.6 s; the final text published 0.93 s after completion,
+with both native files delivered within another 5.8 s. This verifies actual
+current-message file/image handling on Luna, not just an attachment label.
+[Slack media proof](https://papercliplabs.slack.com/archives/C0BUT55N9RV/p1788841046075929).
+
+### Historical file follow-up and private-review arbitration
+
+Discord historical-file run `db32efde-61d5-45fa-9763-e2676e666600` exposed two
+distinct gaps. Existing reuse could prepare old same-conversation files but
+listing intentionally exposed metadata only, so Luna could not inspect the
+historical image or quote the text. Native completion correctly required review.
+However, its system-authored private review interaction incorrectly suppressed
+the provider final despite being ineligible for chat projection, leaving the
+visible working placeholder stranded.
+
+Interaction arbitration now reserves the pending response slot only for an
+interaction authored by the source run's agent. A durable actual provider prompt
+still suppresses duplicate source prose after resolution. System/Board-created
+reviews cannot silently consume that slot. Real PostgreSQL coverage plus the
+existing safe-milestone suite pass **17/17**, and server TypeScript checking
+passes (`native-chat-arbitration-root-02.log`). The first test attempt exposed
+duplicate company prefixes in the new isolated fixtures; that seed defect was
+corrected before the successful rerun. This correction is not yet deployed;
+historical content inspection and live retry remain separate work.
