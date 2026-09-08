@@ -98,6 +98,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { resolvePaperclipRunnerBinary } from "./native-codex-runner.js";
 import {
   createNativeRunTrace,
+  isNativeRunRootHistoricalSpan,
   nativeRunPreparationStarts,
   type NativeRunHistoricalSpan,
   type NativeRunSpanScope,
@@ -3911,8 +3912,7 @@ async function executePaperclipNativeSessionWithinScope(
         })
       : null;
   for (const span of preparationSpans) {
-    const rootMilestone =
-      span.name === "heartbeat.queue" || span.name === "comment.to_run_created";
+    const rootMilestone = isNativeRunRootHistoricalSpan(span.name);
     await trace.record({
       ...span,
       parentName: rootMilestone

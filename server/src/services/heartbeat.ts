@@ -184,6 +184,7 @@ import {
 } from "./native-runtime/provider-profile.js";
 import {
   buildNativeHeartbeatPreparationSpans,
+  buildNativeWakeIngressSpan,
   type NativeRunHistoricalSpan,
 } from "./native-runtime/native-run-trace.js";
 import {
@@ -7171,10 +7172,14 @@ export async function attestReviewedExternalChatRun(input: {
   issueId: string;
   runId: string;
   contextSnapshot: Record<string, unknown>;
+  /** Diagnostic-only value from the committed, authorized answer; never a wake field. */
+  onQuestionResponseAttested?: (answeredAtMs: number) => void;
 }): Promise<boolean> {
   const attempt = () =>
     input.db.transaction(
-      async (transaction): Promise<boolean | "pending_delivery"> => {
+      async (
+        transaction,
+      ): Promise<boolean | "pending_delivery" | { answeredAtMs: number }> => {
         const tx = transaction as unknown as Db;
         const [issue] = await tx
           .select()
@@ -7266,7 +7271,7 @@ export async function attestReviewedExternalChatRun(input: {
           );
           if (answer)
             input.contextSnapshot[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY] = answer.marker;
-          return true;
+          return answer ? { answeredAtMs: answer.answeredAtMs } : true;
         } catch (error) {
           if (
             error instanceof Error &&
@@ -7332,6 +7337,12 @@ export async function attestReviewedExternalChatRun(input: {
   for (let attemptNumber = 0; attemptNumber < 51; attemptNumber += 1) {
     try {
       const result = await attempt();
+      if (typeof result === "object") {
+        // The transaction (including COMMIT) must succeed before any attempt-
+        // local timing is accepted. A retry/rollback cannot publish this value.
+        input.onQuestionResponseAttested?.(result.answeredAtMs);
+        return true;
+      }
       if (result !== "pending_delivery") return result;
     } catch (error) {
       if (!isExternalChatWaitAuthorizationContention(error)) throw error;
@@ -18750,6 +18761,7 @@ export function heartbeatService(
     } = {},
   ) {
     const attemptStartedAtMs = Date.now();
+    let attestedQuestionResponseAtMs: number | null = null;
     if ((await getSchedulingSuppression()).suppressed) {
       try {
         await releaseRunClaimedJustBeforeSuppression(runId);
@@ -19036,6 +19048,9 @@ export function heartbeatService(
           issueId,
           runId: run.id,
           contextSnapshot: context,
+          onQuestionResponseAttested: (answeredAtMs) => {
+            attestedQuestionResponseAtMs = answeredAtMs;
+          },
         });
         if (!attested)
           throw new Error("reviewed_chat_execution_binding_not_authorized");
@@ -22395,22 +22410,13 @@ export function heartbeatService(
             )
               ? (parseObject(context.paperclipWake).comments as unknown[])
               : [];
-            const wakeCommentCreatedAtMs = wakeComments
-              .map((value) =>
-                Date.parse(
-                  readNonEmptyString(parseObject(value).createdAt) ?? "",
-                ),
-              )
-              .filter(Number.isFinite)
-              .sort((a, b) => a - b)[0];
-            if (wakeCommentCreatedAtMs !== undefined) {
-              nativeRunnerPreparationSpans.unshift({
-                name: "comment.to_run_created",
-                parentName: "task.run",
-                startedAtMs: wakeCommentCreatedAtMs,
-                endedAtMs: Math.max(wakeCommentCreatedAtMs, runCreatedAtMs),
-              });
-            }
+            const wakeIngressSpan = buildNativeWakeIngressSpan({
+              runCreatedAtMs,
+              wakeComments,
+              attestedQuestionResponseAtMs,
+            });
+            if (wakeIngressSpan)
+              nativeRunnerPreparationSpans.unshift(wakeIngressSpan);
             nativeRunnerPreparationSpans.push(
               ...buildNativeHeartbeatPreparationSpans({
                 runCreatedAtMs,

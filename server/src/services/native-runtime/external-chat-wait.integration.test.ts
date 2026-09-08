@@ -581,6 +581,130 @@ describe("native external-chat response wait", () => {
     return { fixture, parents };
   }
 
+  it.each([1, 3])(
+    "reports only the latest durable answer time for a %i-question chain after a long wait",
+    async (depth) => {
+      const { fixture, parents } = await seedSequentialQuestionChain(depth);
+      const answeredAt = new Date(Date.now() + 7_200_000);
+      const originalCreatedAt = new Date(answeredAt.getTime() - 14_400_000);
+      for (const parent of parents) {
+        const [earlier] = await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, parent.interactionId));
+        expect(answeredAt.getTime()).toBeGreaterThan(
+          earlier!.resolvedAt!.getTime(),
+        );
+      }
+      await db
+        .update(issueComments)
+        .set({ createdAt: originalCreatedAt })
+        .where(eq(issueComments.id, fixture.commentId));
+      const [interaction] = await db
+        .update(issueThreadInteractions)
+        .set({ resolvedAt: answeredAt })
+        .where(eq(issueThreadInteractions.id, fixture.interactionId))
+        .returning();
+      const delivery = questionResponseDeliveryValues(
+        interaction as unknown as AskUserQuestionsInteraction,
+      );
+      await db
+        .update(issueQuestionResponseDeliveries)
+        .set({ payloadSha256: delivery.payloadSha256 })
+        .where(
+          eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+        );
+      // Neither a caller timestamp nor an untrusted marker field is the source.
+      fixture.context.answeredAtMs = 1;
+      fixture.context.paperclipExternalChatQuestionResponse = {
+        answeredAtMs: 2,
+      };
+      const onQuestionResponseAttested = vi.fn();
+      expect(
+        await attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: fixture.context,
+          onQuestionResponseAttested,
+        }),
+      ).toBe(true);
+      expect(onQuestionResponseAttested).toHaveBeenCalledExactlyOnceWith(
+        answeredAt.getTime(),
+      );
+      expect(fixture.context.sourceCommentId).toBe(fixture.commentId);
+      expect(fixture.context.wakeCommentIds).toEqual([fixture.commentId]);
+      expect(
+        fixture.context.paperclipExternalChatQuestionResponse,
+      ).not.toHaveProperty("answeredAtMs");
+      const [comment] = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.id, fixture.commentId));
+      expect(comment!.createdAt).toEqual(originalCreatedAt);
+    },
+  );
+
+  it.each(["forged_source", "stale_answer", "unattested_principal"] as const)(
+    "does not expose an answered-question timestamp for %s",
+    async (kind) => {
+      const fixture = await seedAnsweredChatTurn();
+      if (kind === "forged_source") {
+        fixture.context.sourceRunId = randomUUID();
+        await db
+          .update(heartbeatRuns)
+          .set({ contextSnapshot: fixture.context })
+          .where(eq(heartbeatRuns.id, fixture.runId));
+      }
+      if (kind === "stale_answer")
+        await db
+          .update(issueQuestionResponseDeliveries)
+          .set({ payloadSha256: "0".repeat(64) })
+          .where(
+            eq(issueQuestionResponseDeliveries.id, fixture.responseDeliveryId),
+          );
+      if (kind === "unattested_principal")
+        await db
+          .update(chatIdentityLinks)
+          .set({ status: "revoked" })
+          .where(eq(chatIdentityLinks.principalId, fixture.principalId));
+      fixture.context.answeredAtMs = 1;
+      const onQuestionResponseAttested = vi.fn();
+      expect(
+        await attestReviewedExternalChatRun({
+          db,
+          ...fixture,
+          contextSnapshot: fixture.context,
+          onQuestionResponseAttested,
+        }),
+      ).toBe(false);
+      expect(onQuestionResponseAttested).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not expose an answered-question timestamp before its attestation transaction commits", async () => {
+    const fixture = await seedAnsweredChatTurn();
+    const onQuestionResponseAttested = vi.fn();
+    let validatedInsideTransaction = false;
+    const rolledBackDb = {
+      transaction: async (operation: (tx: typeof db) => Promise<unknown>) =>
+        db.transaction(async (tx) => {
+          await operation(tx as unknown as typeof db);
+          validatedInsideTransaction = true;
+          throw new Error("timing_attestation_test_rollback");
+        }),
+    } as unknown as typeof db;
+    await expect(
+      attestReviewedExternalChatRun({
+        db: rolledBackDb,
+        ...fixture,
+        contextSnapshot: fixture.context,
+        onQuestionResponseAttested,
+      }),
+    ).rejects.toThrow("timing_attestation_test_rollback");
+    expect(validatedInsideTransaction).toBe(true);
+    expect(onQuestionResponseAttested).not.toHaveBeenCalled();
+  });
+
   it("authorizes sequential chat questions through exact durable parents and preserves the original request", async () => {
     const { fixture, parents } = await seedSequentialQuestionChain(3);
     await attestAnswer(fixture);

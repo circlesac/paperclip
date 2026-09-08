@@ -22,6 +22,50 @@ export interface NativeRunHistoricalSpan {
   attributes?: Record<string, string | number | boolean>;
 }
 
+export function isNativeRunRootHistoricalSpan(name: string): boolean {
+  return (
+    name === "heartbeat.queue" ||
+    name === "comment.to_run_created" ||
+    name === "question_response.to_run_created"
+  );
+}
+
+/** Current causal ingress, not the older source comment kept for provenance. */
+export function buildNativeWakeIngressSpan(input: {
+  runCreatedAtMs: number;
+  wakeComments: readonly unknown[];
+  /** Attempt-local output of committed server authorization, never a wake marker. */
+  attestedQuestionResponseAtMs: number | null;
+}): NativeRunHistoricalSpan | null {
+  const answeredAt = input.attestedQuestionResponseAtMs;
+  if (answeredAt !== null && Number.isFinite(answeredAt) && answeredAt >= 0) {
+    return {
+      name: "question_response.to_run_created",
+      parentName: "task.run",
+      startedAtMs: answeredAt,
+      endedAtMs: Math.max(answeredAt, input.runCreatedAtMs),
+    };
+  }
+  const createdAt = input.wakeComments
+    .map((comment) => {
+      const value =
+        comment && typeof comment === "object" && !Array.isArray(comment)
+          ? (comment as Record<string, unknown>).createdAt
+          : null;
+      return typeof value === "string" ? Date.parse(value) : Number.NaN;
+    })
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b)[0];
+  return createdAt === undefined
+    ? null
+    : {
+        name: "comment.to_run_created",
+        parentName: "task.run",
+        startedAtMs: createdAt,
+        endedAtMs: Math.max(createdAt, input.runCreatedAtMs),
+      };
+}
+
 export function buildNativeHeartbeatPreparationSpans(input: {
   runCreatedAtMs: number;
   runStartedAtMs: number;
@@ -72,11 +116,7 @@ export function nativeRunPreparationStarts(
   // them in task.prepare would charge previous attempts and recovery delays
   // to every resumed attempt, even if its actual startup took milliseconds.
   const preparationStartedAtMs = spans
-    .filter(
-      (span) =>
-        span.name !== "heartbeat.queue" &&
-        span.name !== "comment.to_run_created",
-    )
+    .filter((span) => !isNativeRunRootHistoricalSpan(span.name))
     .reduce((earliest, span) => Math.min(earliest, span.startedAtMs), nowMs);
   return { runStartedAtMs, preparationStartedAtMs };
 }

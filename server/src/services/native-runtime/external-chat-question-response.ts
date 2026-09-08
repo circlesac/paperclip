@@ -40,6 +40,8 @@ type Marker = {
 type ResolvedQuestionResponse = {
   marker: Marker;
   provider: typeof chatEndpoints.$inferSelect.provider;
+  /** Server-recorded current answer time, already bound into the marker hash. */
+  answeredAtMs: number;
   authorizationContext: Record<string, unknown>;
   /** Authoritative answered interactions, oldest first; not persisted answer text. */
   interactionIds: string[];
@@ -566,6 +568,7 @@ async function resolveQuestionResponseChain(
   return {
     marker,
     provider,
+    answeredAtMs: interaction.resolvedAt.getTime(),
     interactionIds: [...(parent?.interactionIds ?? []), interaction.id],
     authorizationContext: {
       ...context,

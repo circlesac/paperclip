@@ -2531,6 +2531,62 @@ function cancellationDb(options?: {
 }
 
 describe("native resumed preparation timing", () => {
+  it("keeps answered-question ingress at the run root rather than charging it to preparation", async () => {
+    const answeredAtMs = Date.now();
+    const events: AdapterRuntimeEvent[] = [];
+    state.execute.mockReset().mockResolvedValueOnce({
+      result: { summary: "cancelled" },
+      terminal: { runTerminalState: "cancelled" },
+      turnId: "turn",
+      normalizedSessionId: "session",
+      providerSessionId: null,
+      driverKind: "test",
+      driverVersion: "1",
+      nativeEventCount: 1,
+      highestContiguousSourceSeq: 1,
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(answeredAtMs + 100);
+    try {
+      await executePaperclipNativeSession({
+        db: leaseDb(),
+        execution,
+        runnerInstanceId: "runner",
+        preparationSpans: [
+          {
+            name: "question_response.to_run_created",
+            startedAtMs: answeredAtMs,
+            endedAtMs: answeredAtMs + 50,
+          },
+          ...buildNativeHeartbeatPreparationSpans({
+            runCreatedAtMs: answeredAtMs + 50,
+            runStartedAtMs: answeredAtMs + 60,
+            attemptStartedAtMs: answeredAtMs + 70,
+            environmentAcquireStartedAtMs: answeredAtMs + 80,
+            environmentRealizeEndedAtMs: answeredAtMs + 90,
+            nativeDispatchAtMs: answeredAtMs + 95,
+          }),
+        ],
+        onEvent: async (event) => {
+          events.push(event);
+        },
+      });
+    } finally {
+      clock.mockRestore();
+    }
+    const payloadFor = (span: string) =>
+      events.find((event) => event.payload?.span === span)?.payload;
+    expect(payloadFor("question_response.to_run_created")).toMatchObject({
+      parentSpan: "task.run",
+      durationMs: 50,
+      startOffsetMs: 0,
+    });
+    expect(payloadFor("task.prepare")).toMatchObject({
+      durationMs: 30,
+      startOffsetMs: 70,
+    });
+    expect(payloadFor("task.run.measured")).toMatchObject({ durationMs: 100 });
+  });
+
   it("uses attempt-local preparation in the executor without truncating run elapsed time", async () => {
     const attemptStartedAtMs = Date.now();
     const runStartedAtMs = attemptStartedAtMs - 983_000;

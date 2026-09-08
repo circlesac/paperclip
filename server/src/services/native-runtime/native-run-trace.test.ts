@@ -5,6 +5,7 @@ import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/sta
 import type { StartupTraceContextHandle } from "../../instrumentation.js";
 import {
   buildNativeHeartbeatPreparationSpans,
+  buildNativeWakeIngressSpan,
   createNativeRunTrace,
   nativeRunPreparationStarts,
   NATIVE_RUN_SPAN_EVENT_TYPE,
@@ -64,6 +65,97 @@ function createRecordingTraceContext(): {
 }
 
 describe("native runner performance trace", () => {
+  it.each([7_200_000, 10_800_000])(
+    "times the current answer after %i ms without charging prior questions or human wait",
+    async (answeredAtMs) => {
+      const original = {
+        id: "original-comment",
+        createdAt: new Date(1_000).toISOString(),
+      };
+      const ingress = buildNativeWakeIngressSpan({
+        runCreatedAtMs: answeredAtMs + 10,
+        wakeComments: [original],
+        attestedQuestionResponseAtMs: answeredAtMs,
+      });
+      expect(ingress).toEqual({
+        name: "question_response.to_run_created",
+        parentName: "task.run",
+        startedAtMs: answeredAtMs,
+        endedAtMs: answeredAtMs + 10,
+      });
+      const starts = nativeRunPreparationStarts(
+        [
+          ingress!,
+          ...buildNativeHeartbeatPreparationSpans({
+            runCreatedAtMs: answeredAtMs + 10,
+            runStartedAtMs: answeredAtMs + 20,
+            attemptStartedAtMs: answeredAtMs + 30,
+            environmentAcquireStartedAtMs: answeredAtMs + 40,
+            environmentRealizeEndedAtMs: answeredAtMs + 50,
+            nativeDispatchAtMs: answeredAtMs + 60,
+          }),
+        ],
+        answeredAtMs + 60,
+      );
+      expect(starts).toEqual({
+        runStartedAtMs: answeredAtMs,
+        preparationStartedAtMs: answeredAtMs + 30,
+      });
+      const events: AdapterRuntimeEvent[] = [];
+      const trace = createNativeRunTrace({
+        runId: "answer-run",
+        startedAtMs: starts.runStartedAtMs,
+        traceContext: createRecordingTraceContext().traceContext,
+        onEvent: async (event) => {
+          events.push(event);
+        },
+      });
+      const clock = vi
+        .spyOn(Date, "now")
+        .mockReturnValue(answeredAtMs + 19_000);
+      try {
+        await trace.finish("ok");
+      } finally {
+        clock.mockRestore();
+      }
+      expect(
+        events.find((event) => event.payload?.span === "task.run.measured")
+          ?.payload,
+      ).toMatchObject({ durationMs: 19_000 });
+      expect(original.createdAt).toBe(new Date(1_000).toISOString());
+    },
+  );
+
+  it("preserves ordinary and retry comment ingress and ignores caller answer timestamps", () => {
+    const wakeComments = [
+      { createdAt: new Date(2_000).toISOString(), answeredAtMs: 50_000 },
+      { createdAt: "invalid", answeredAtMs: 60_000 },
+      {
+        createdAt: new Date(1_000).toISOString(),
+        externalChatQuestionResponse: { answeredAtMs: 70_000 },
+      },
+    ];
+    expect(
+      buildNativeWakeIngressSpan({
+        runCreatedAtMs: 3_000,
+        wakeComments,
+        attestedQuestionResponseAtMs: null,
+      }),
+    ).toEqual({
+      name: "comment.to_run_created",
+      parentName: "task.run",
+      startedAtMs: 1_000,
+      endedAtMs: 3_000,
+    });
+    expect(
+      buildNativeWakeIngressSpan({
+        runCreatedAtMs: 3_000,
+        wakeComments: [{ answeredAtMs: 1 }],
+        attestedQuestionResponseAtMs: null,
+      }),
+    ).toBeNull();
+  });
+
   it.each([
     { label: "initial", attemptStartedAtMs: 2_000 },
     { label: "same-run resume after host sleep", attemptStartedAtMs: 985_000 },
