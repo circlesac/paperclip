@@ -10,9 +10,8 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 - The user asked to prepare the PR while testing continues. This supersedes
   the earlier instruction not to tend PRs.
 - [PR #13038](https://github.com/paperclipai/paperclip/pull/13038) is open, not
-  merged. Keep one PR: published head `2ded499ed` is **483 files**, below 500.
-  The next integrity patch adds several shared runtime files; recount before
-  pushing (currently 493 including the new driver test).
+  merged. Keep one PR: published head `d886f52c0` is **493 files**, below 500.
+  The verified recovery-label follow-up brings the final diff to **497 files**.
 - The default-off **Experimental > Chat connectors** setting is implemented.
   Production GitHub tools remain visible and open directly without the
   chat/tool choice when disabled. Default-off and enabled browser flows passed.
@@ -48,8 +47,15 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   client/snapshot/safety cohort **48/48**, and DB build/typecheck passed.
   Independent code review found no issue. Greptile subsequently reviewed
   `2ded499ed` at **5/5**, with the P2 resolved. CI run `34248557216` passed
-  **all lanes** at that exact head. These results do not cover the new,
-  currently uncommitted integrity patch; obtain review and CI again after push.
+  **all lanes** at that exact head. Greptile also reviewed integrity head
+  `d886f52c0` at **5/5**, with no outstanding findings. CI `34251447214`
+  encountered fourteen pre-install artifact-restore failures: HTTP 403 from
+  an intermediary when listing the policy-generated lockfile artifact. The
+  artifact exists and sibling jobs restored it successfully. The recovery-copy
+  follow-up will start fresh final-head CI; do not rerun superseded jobs merely
+  to make the older head green. If the new head has the same transient failure,
+  let its jobs finish, inspect outcomes, and retry only failed jobs. Do not
+  count unexecuted tests as passed or rewrite the lockfile.
 
 ## Current deployed state and evidence
 
@@ -114,7 +120,7 @@ switch to Terra. The signed/staged runner SHA-256 is
    Leave checklist items unchecked while their evidence is missing.
 2. **Finish and deploy permanent protocol-fault feedback.** The original
    authenticated digest mismatch can leave “using tools” visible until the
-   900-second deadline. Current uncommitted code adds the typed, latched fault
+   900-second deadline. Commit `d886f52c0` adds the typed, latched fault
    after exact authentication/correlation/sequence checks; bad events cannot
    ACK or dispatch, and ordinary persistence failures remain retryable.
    Controller/staged transport **130/130**, middle-layer **238/238**, runtime
@@ -129,8 +135,8 @@ switch to Terra. The signed/staged runner SHA-256 is
    controller-to-driver/runtime negative-path composition passed; its combined
    cohort is **132/132**, using a synthetic process launcher and persistence
    port. Full workspace typecheck/build and **10/10** deterministic browser
-   tests pass. The production patch is deployed; broad local tests and final
-   PR review/CI remain pending.
+   tests pass. The production patch is deployed and reviewed at 5/5; broad
+   local tests and final CI remain pending.
    Safe external copy directs users to an admin without exposing protocol
    details. No fabricated corruption may be injected into a live provider root.
 3. **Damaged-session recovery.** Telegram `CHA-24` run
@@ -150,6 +156,27 @@ switch to Terra. The signed/staged runner SHA-256 is
    runner bytes and the invalid pending event are preserved. Only the provider
    and historical corruption seed are synthetic. This uses persisted execution
    v2 and is not actual live `CHA-24` recovery or external publication proof.
+   A normal Board **Try again** at 16:35:06 UTC produced a 24-second native
+   Luna run on CHA-24, but resumed its older UUID-keyed session and retried the
+   original photo request instead of the latest failed chat request. Therefore
+   this does not qualify the damaged identifier-keyed root. Both archived
+   state-file hashes stayed unchanged. The old conversation is completed
+   generation 9; current CHA-26 is generation 10. No message was published to
+   Telegram and attachment access stayed denied, correctly preserving that
+   boundary. Investigate truthful retry context and explicit retired-chat
+   feedback; do not restore obsolete access to make this check pass.
+   The task-list label **Observing active run** also misrepresented a
+   Board-owned terminal recovery action. The shared badge and expanded card
+   now require a human decision for Board-owned watchdog recovery. **125/125**
+   UI tests, UI typecheck and all four styling/token gates pass. Root reloaded
+   the live UI and verified **Recovery needed** on existing CHA-6 in Tasks and
+   Inbox. The expanded card has component coverage, not a live visual retest.
+   The generic retry routes that lose the failed request already exist on
+   master. Follow up with an explicit server-authorized failed-run retry:
+   preserve exact task key/comment lineage, recheck active chat generation
+   and current permissions, reject retired context before mutation, dedupe
+   retries, and retain operator-required integrity recovery. Do not silently
+   choose a different session or restore completed-generation access.
 4. **Conservative prose redaction.** All observed game-token phrases now pass
    live, but unfamiliar token-noun phrases can still be over-redacted. Preserve
    low-entropy credential coverage; no arbitrary-word/entropy heuristic.

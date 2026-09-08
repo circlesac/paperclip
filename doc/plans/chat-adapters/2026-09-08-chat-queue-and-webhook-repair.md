@@ -951,11 +951,11 @@ Fresh ordinary continuation `INTEGRITY-LANDING-0908` requested exactly
 `NATIVE-LUNA-READY` on existing tasks. Root submitted through the signed-in
 provider browsers and saw each final reply with its working state cleared:
 
-| Provider | Run | Native Luna duration | Submit to publication |
-| --- | --- | --- | --- |
-| Slack | `a0f1d707-c6e3-4fd5-90b0-f5d4ba05c48c` | 11.237 s | 13.146 s |
-| GitHub | `73ce21b7-9cd8-4380-9bd7-69c9f6992dfb` | 12.686 s | 17.148 s |
-| Telegram | `823d811f-daad-4bd3-91c0-c1dbdf587e3f` | 14.046 s | 16.602 s |
+| Provider | Run                                    | Native Luna duration | Submit to publication |
+| -------- | -------------------------------------- | -------------------- | --------------------- |
+| Slack    | `a0f1d707-c6e3-4fd5-90b0-f5d4ba05c48c` | 11.237 s             | 13.146 s              |
+| GitHub   | `73ce21b7-9cd8-4380-9bd7-69c9f6992dfb` | 12.686 s             | 17.148 s              |
+| Telegram | `823d811f-daad-4bd3-91c0-c1dbdf587e3f` | 14.046 s             | 16.602 s              |
 
 Persisted execution profiles confirm `gpt-5.6-luna` for all three. Each
 working/final operation used one attempt and the same provider message:
@@ -969,3 +969,67 @@ Discord's Eigenjoy browser login had expired, so no new Discord live send is
 claimed. Its login tab was left open and the user notified; the bot connection
 itself is active. Teams still lacks a qualified tenant. No corruption was
 introduced into live state and the old damaged Telegram task was not reset.
+
+### Final-head review and normal old-task retry
+
+The integrity work was committed and pushed as `d886f52c0`, with **493** PR
+files and master `5752d6bd9` incorporated. Greptile reviewed that exact head
+at **5/5**, with no outstanding finding. CI `34251447214` hit fourteen
+pre-install failures in the lockfile-artifact restore step; sampled job logs
+all report `ListArtifacts` HTTP 403 from an intermediary. The policy artifact
+exists and five sibling jobs restored it successfully. Running jobs and the
+broad local test command are not yet complete. This is not a green CI claim.
+
+Root navigated through Board Tasks to the old Telegram **CHA-24** and clicked
+its ordinary **Try again** at **16:35:06.919 UTC**. The UI immediately showed
+working state; native Luna run `91a2e169-9674-4853-87ef-22b0d924321e` started
+at 16:35:06.982 and succeeded at 16:35:31.003, with one accepted result.
+However, this is **not** successful damaged-session recovery:
+
+- The new run used the task UUID as its session key and resumed older provider
+  session `01a0802c-06af-7671-b96d-d63d2f5e9b8f`. The damaged run used key
+  `CHA-24` and provider session `01a08152-4af9-75a0-bbcb-f40b2f67115d`.
+- The new wake reason was `issue_status_changed`, with no `retry_of_run_id`.
+  The model acted on the original photo-resend description, not the latest
+  failed 900-word request. It reported attachment-binding denial and did not
+  resend the photo. A successful run status does not mean the user goal was
+  achieved.
+- The old Telegram generation 9 remains completed; generation 10 still maps
+  to CHA-26. Zero publications were created for the retry. The newer chat did
+  not receive an old-task response, and obsolete attachment access was not
+  restored. This is the correct safety boundary, not a delivery failure.
+- Both damaged root files remained byte-identical: runner state SHA-256
+  `b8eedccd5fddbda3f8d099f96ea2e4658360815a133830cfc94a39ecfa011399` and
+  provider state `b98888368bfe175e826f6709f34f42b5a1a10c16a6664850b2e24fa6d5a2b09b`.
+
+Experience quality still needs improvement. The task list called the
+Board-owned terminal recovery **Observing active run**, the retry's intent
+did not match the failed request, and a **Native completion review** remained
+visible during execution. No completion was approved. The label is being
+corrected below; retry-context and retired-conversation feedback remain a
+follow-up. No direct database or saved-runner-state repair was used.
+
+The shared recovery badge now displays **Recovery needed** for a Board-owned
+watchdog, including terminal native faults. The expanded card says that a
+human decision is needed instead of claiming a silent active run. Existing
+agent observation, resolved/cancelled/escalated precedence and authorized
+controls remain intact. Four cases demonstrated the old error before the
+fix; the final four-suite UI cohort passed **125/125**. UI TypeScript and all
+four mandatory `check:token-gates` checks passed. A separate forbidden-name
+`check:tokens` command still reports unrelated existing fixture/Storybook
+content; no broad cleanup was performed.
+
+Root reloaded the live UI, navigated through Tasks and Inbox, and visually
+verified the corrected badge on existing failed **CHA-6**. No run or recovery
+action was changed during that check. The expanded card has component-test
+coverage but was not visible in this live chat-interface journey. The final
+PR diff remains below the review cap at **497 files**.
+
+Read-only comparison with master `5752d6bd9` confirmed the generic retry
+context loss predates this PR. The follow-up must bind an explicit failed run
+on the server, preserve exact request/comment and task-key lineage, and
+revalidate current chat generation, identity and reach before any mutation.
+A retired conversation must yield actionable guidance and no queued run.
+Concurrent restart/newer input, duplicate retries, cross-company references
+and operator-required native faults need negative tests. This is not fixed
+by restoring stale chat credentials or bypassing corrupt-session guards.
