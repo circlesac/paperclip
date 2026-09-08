@@ -235,8 +235,8 @@ pub trait CommandExecutor {
         Ok(Vec::new())
     }
 
-    /// Removes the prefix returned by `poll_events` after each event is
-    /// durably committed to the PRP outbox. Implementations that retain
+    /// Removes the prefix returned by `poll_events` after every event in that
+    /// prefix is durably committed to the PRP outbox. Implementations that retain
     /// provider events must not remove them before this acknowledgement.
     fn acknowledge_events(&mut self, _count: usize) -> Result<(), DurableRunnerError> {
         Ok(())
@@ -887,32 +887,43 @@ fn poll_executor_events<E: CommandExecutor>(
     config: &DurableRunnerConfig,
     executor: &mut E,
 ) -> Result<(), DurableRunnerError> {
-    let events = executor.poll_events()?;
-    if events.is_empty() {
-        return Ok(());
-    }
-    for event in events {
-        // Commit and acknowledge one event at a time. If a later event is
-        // oversized or the outbox is full, the accepted prefix is already
-        // durable and the unacknowledged suffix remains with the executor.
-        if state.has_executor_event_receipt(
-            &event.executor_event_id,
-            &event.event_type,
-            event.priority,
-            &event.payload,
-        )? {
-            executor.acknowledge_events(1)?;
-            continue;
-        }
-        state.enqueue_executor_event(
-            config,
-            event.executor_event_id,
-            event.event_type,
-            event.priority,
-            event.payload,
-        )?;
-        store.save(state)?;
-        executor.acknowledge_events(1)?;
+    let mut events = executor.poll_events()?.into_iter().peekable();
+    while events.peek().is_some() {
+        let mut durable_prefix = 0;
+        let committed = (|| -> Result<(), DurableRunnerError> {
+            // Keep each PRP event's durable save. Only coalesce provider queue
+            // acknowledgements, bounded below the retained receipt window so
+            // a crash before the prefix ACK can replay every event exactly.
+            for event in events.by_ref().take(128) {
+                if !state.has_executor_event_receipt(
+                    &event.executor_event_id,
+                    &event.event_type,
+                    event.priority,
+                    &event.payload,
+                )? {
+                    state.enqueue_executor_event(
+                        config,
+                        event.executor_event_id,
+                        event.event_type,
+                        event.priority,
+                        event.payload,
+                    )?;
+                    store.save(state)?;
+                }
+                durable_prefix += 1;
+            }
+            Ok(())
+        })();
+        // Even when a later save/validation fails, remove only the already
+        // durable prefix. A failed provider ACK leaves that prefix replayable;
+        // it must not hide the original commit/identity error, if any.
+        let acknowledged = if durable_prefix > 0 {
+            executor.acknowledge_events(durable_prefix)
+        } else {
+            Ok(())
+        };
+        committed?;
+        acknowledged?;
     }
     Ok(())
 }
@@ -1052,6 +1063,7 @@ mod tests {
     struct RetainingEventExecutor {
         events: VecDeque<PolledEvent>,
         fail_acknowledgement: bool,
+        acknowledgements: Vec<usize>,
     }
 
     impl CommandExecutor for CountingExecutor {
@@ -1103,6 +1115,7 @@ mod tests {
         }
 
         fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+            self.acknowledgements.push(count);
             if self.fail_acknowledgement {
                 return Err(DurableRunnerError::invalid(
                     "simulated crash before provider acknowledgement",
@@ -1379,6 +1392,154 @@ mod tests {
     }
 
     #[test]
+    fn event_batch_acknowledges_only_bounded_durable_prefixes() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-bounded-event-prefix-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = config(directory.clone());
+        config.max_outbox_bytes = 1024 * 1024;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = RetainingEventExecutor {
+            events: (1..=131)
+                .map(|index| PolledEvent {
+                    executor_event_id: format!("provider-event-{index}"),
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"index": index}),
+                })
+                .collect(),
+            fail_acknowledgement: false,
+            acknowledgements: Vec::new(),
+        };
+
+        poll_executor_events(&mut state, &store, &config, &mut executor).unwrap();
+
+        assert_eq!(executor.acknowledgements, vec![128, 3]);
+        assert!(executor.events.is_empty());
+        let (reloaded, recovered) = store.load_or_create(&config).unwrap();
+        assert!(recovered);
+        assert_eq!(reloaded.highest_source_seq(), 131);
+        for index in 1..=131 {
+            assert!(reloaded
+                .has_executor_event_receipt(
+                    &format!("provider-event-{index}"),
+                    "provider.notice.recorded",
+                    EventPriority::P1,
+                    &json!({"index": index}),
+                )
+                .unwrap());
+        }
+        assert_eq!(reloaded.outbox.len(), 131);
+        assert_eq!(
+            reloaded
+                .outbox
+                .iter()
+                .map(|event| event.source_seq)
+                .collect::<Vec<_>>(),
+            (1..=131).collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn event_batch_never_acknowledges_a_failed_durable_save() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-event-save-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        // Force atomic replacement to fail without a production store hook.
+        let original = directory.join("saved-runner-state.json");
+        fs::rename(store.path(), &original).unwrap();
+        fs::create_dir(store.path()).unwrap();
+        let mut executor = RetainingEventExecutor {
+            events: VecDeque::from([PolledEvent {
+                executor_event_id: "provider-unsaved-event".to_owned(),
+                event_type: "provider.notice.recorded".to_owned(),
+                priority: EventPriority::P1,
+                payload: json!({"message": "must remain with provider"}),
+            }]),
+            fail_acknowledgement: false,
+            acknowledgements: Vec::new(),
+        };
+
+        let error = poll_executor_events(&mut state, &store, &config, &mut executor)
+            .expect_err("failed persistence cannot authorize a provider ACK");
+        assert!(error
+            .to_string()
+            .contains("atomically replace durable state"));
+        assert!(executor.acknowledgements.is_empty());
+        assert_eq!(executor.events.len(), 1);
+        fs::remove_dir(store.path()).unwrap();
+        fs::rename(original, store.path()).unwrap();
+        let (reloaded, _) = store.load_or_create(&config).unwrap();
+        assert!(reloaded.outbox.is_empty());
+        assert!(!reloaded
+            .has_executor_event_receipt(
+                "provider-unsaved-event",
+                "provider.notice.recorded",
+                EventPriority::P1,
+                &json!({"message": "must remain with provider"}),
+            )
+            .unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn event_batch_preserves_original_error_when_prefix_ack_also_fails() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-event-prefix-double-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = config(directory.clone());
+        config.max_frame_bytes = 1024;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = RetainingEventExecutor {
+            events: VecDeque::from([
+                PolledEvent {
+                    executor_event_id: "provider-prefix".to_owned(),
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"message": "saved prefix"}),
+                },
+                PolledEvent {
+                    executor_event_id: "provider-oversized-suffix".to_owned(),
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"message": "x".repeat(2048)}),
+                },
+            ]),
+            fail_acknowledgement: true,
+            acknowledgements: Vec::new(),
+        };
+
+        let error = poll_executor_events(&mut state, &store, &config, &mut executor)
+            .expect_err("the rejected suffix remains the primary failure");
+        assert!(error.to_string().contains("transport frame limit"));
+        assert_eq!(executor.acknowledgements, vec![1]);
+        assert_eq!(executor.events.len(), 2);
+        let (mut recovered, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(recovered.outbox.len(), 1);
+        executor.fail_acknowledgement = false;
+        let error = poll_executor_events(&mut recovered, &store, &config, &mut executor)
+            .expect_err("retry deduplicates only the durable prefix");
+        assert!(error.to_string().contains("transport frame limit"));
+        assert_eq!(executor.acknowledgements, vec![1, 1]);
+        assert_eq!(executor.events.len(), 1);
+        assert_eq!(recovered.highest_source_seq(), 1);
+        assert_eq!(recovered.outbox.len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn event_batch_keeps_accepted_prefix_and_unacknowledged_suffix() {
         let directory = std::env::temp_dir().join(format!(
             "paperclip-runner-event-batch-failure-{}",
@@ -1401,16 +1562,24 @@ mod tests {
                     executor_event_id: "provider-event-2".to_owned(),
                     event_type: "provider.notice.recorded".to_owned(),
                     priority: EventPriority::P1,
+                    payload: json!({"message": "second durable prefix event"}),
+                },
+                PolledEvent {
+                    executor_event_id: "provider-event-3".to_owned(),
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
                     payload: json!({"message": "x".repeat(2048)}),
                 },
             ]),
             fail_acknowledgement: false,
+            acknowledgements: Vec::new(),
         };
 
         let error = poll_executor_events(&mut state, &store, &config, &mut executor)
             .expect_err("the oversized suffix must fail closed");
         assert!(error.to_string().contains("transport frame limit"));
-        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(state.outbox.len(), 2);
+        assert_eq!(executor.acknowledgements, vec![2]);
         assert_eq!(state.outbox[0].event_type, "provider.notice.recorded");
         assert_eq!(executor.events.len(), 1);
         assert_eq!(
@@ -1420,7 +1589,7 @@ mod tests {
 
         let (reloaded, recovered) = store.load_or_create(&config).unwrap();
         assert!(recovered);
-        assert_eq!(reloaded.outbox.len(), 1);
+        assert_eq!(reloaded.outbox.len(), 2);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1435,13 +1604,16 @@ mod tests {
         let store = DurableStateStore::new(&directory).unwrap();
         let (mut state, _) = store.load_or_create(&config).unwrap();
         let mut executor = RetainingEventExecutor {
-            events: VecDeque::from([PolledEvent {
-                executor_event_id: "provider-event-before-ack-crash".to_owned(),
-                event_type: "provider.notice.recorded".to_owned(),
-                priority: EventPriority::P1,
-                payload: json!({"message": "deliver exactly once"}),
-            }]),
+            events: (1..=3)
+                .map(|index| PolledEvent {
+                    executor_event_id: format!("provider-event-before-ack-crash-{index}"),
+                    event_type: "provider.notice.recorded".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"message": "deliver exactly once"}),
+                })
+                .collect(),
             fail_acknowledgement: true,
+            acknowledgements: Vec::new(),
         };
 
         let error = poll_executor_events(&mut state, &store, &config, &mut executor)
@@ -1449,10 +1621,11 @@ mod tests {
         assert!(error
             .to_string()
             .contains("before provider acknowledgement"));
-        assert_eq!(state.outbox.len(), 1);
-        assert_eq!(executor.events.len(), 1);
+        assert_eq!(state.outbox.len(), 3);
+        assert_eq!(executor.acknowledgements, vec![3]);
+        assert_eq!(executor.events.len(), 3);
         state
-            .apply_ack(1)
+            .apply_ack(3)
             .expect("controller ACK removes the durable outbox copy");
         store.save(&state).unwrap();
 
@@ -1460,16 +1633,19 @@ mod tests {
         assert!(recovered);
         assert!(recovered_state.outbox.is_empty());
         executor.fail_acknowledgement = false;
-        executor.events[0].payload = json!({"message": "different data"});
+        executor.events[1].payload = json!({"message": "different data"});
         let mismatch = poll_executor_events(&mut recovered_state, &store, &config, &mut executor)
             .expect_err("a retained identity cannot name different event data");
         assert!(mismatch.to_string().contains("reused with different"));
+        assert_eq!(executor.acknowledgements, vec![3, 1]);
+        assert_eq!(executor.events.len(), 2);
         executor.events[0].payload = json!({"message": "deliver exactly once"});
         poll_executor_events(&mut recovered_state, &store, &config, &mut executor)
             .expect("recovery acknowledges the retained provider copy");
         assert!(executor.events.is_empty());
         assert!(recovered_state.outbox.is_empty());
-        assert_eq!(recovered_state.highest_source_seq(), 1);
+        assert_eq!(executor.acknowledgements, vec![3, 1, 2]);
+        assert_eq!(recovered_state.highest_source_seq(), 3);
         fs::remove_dir_all(directory).unwrap();
     }
 
