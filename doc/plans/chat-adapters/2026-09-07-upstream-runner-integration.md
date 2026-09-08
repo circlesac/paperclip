@@ -1964,3 +1964,67 @@ six fixed progress phases use a 20-second cadence; a short Luna turn may
 correctly show working followed directly by its final answer. Pre-run FIFO
 waiting still has a receipt reaction rather than a separate queued-next
 message. Teams progress remains without tenant-backed live qualification.
+
+### Live answered-form repair on the committed build — 2026-09-08
+
+The server restarted at 11:22:32.606Z on clean `4391c9dff`, with the staged
+`af19f64d…` runner binary. The existing pending Slack interaction
+`535d8574-9916-4d96-8e84-d5c30ae48142` survived the restart and opened normally.
+Its first submit at 11:22:57.197Z showed Slack's "We had some trouble
+connecting" error; the interaction was still pending with no committed answer.
+One explicit provider "Try again?" click at 11:23:31.822Z resolved it at
+32.272Z, without duplicate continuation. This transient failure is retained,
+not counted as a clean first-attempt pass or attributed to an unproven cause.
+Run `83b46ee3-6571-4993-91ef-88e5dcfec824` reused the actual Luna provider
+session `01a080b1-7be1-7711-9a15-e36e0c017bc9` and returned exactly
+`Cedar / silver beacon 64`. Final publication `068cf7c5-5fec-420d-986b-a0cc051e2b55`
+edited its working message `1788866614.101909` at 11:23:54.006Z (22.184s after
+the successful retry), attempt one. The actual provider input contains the
+new outer resolved-question constraint and current answers; no repeat form
+was generated.
+
+A fresh first-attempt journey then started at 11:24:09.464Z. Source run
+`6dd8eb9a-88b2-4d44-804f-857dbd3c273e` created a new Birch/Pine-plus-label
+form, interaction `fd637f6f-e664-4109-8c8d-c2c5f5aacfa9`, published at
+11:24:22.430Z (**12.966s**). Respond opened on the first click. Pine plus
+`violet harbor 27` was submitted once at 11:24:56.732Z, committed at 57.115Z,
+and started continuation `f088a043-ed2c-4620-a768-905f7f52a6a8` at 57.157Z.
+It returned exactly `Pine / violet harbor 27`, with no re-ask. Final publication
+`3c9f8d9c-3dd7-4a07-b7d8-6f62fa976ad7` edited the same working message
+`1788866698.368079` at 11:25:14.202Z: **17.470s** after Submit and 386ms
+after publication creation. Every associated outbound publication was attempt
+one. Actual rollout turn contexts verify `gpt-5.6-luna` for source and
+continuation, both using `codex_app_server`; Terra was not substituted.
+
+The same-build Discord 220-word text request was sent at 11:25:38.522Z.
+Run `bc31b671-0574-4490-b441-a8dbb5506801` started at 39.526Z and completed
+at 11:26:17.028Z, reusing provider session
+`01a0808d-fe51-7e00-b6c5-e032a49f4e3d`; its actual rollout records Luna.
+Working message `1546843965431484556` appeared at 11:25:40.444Z, became the
+fixed "making progress" phase at 11:26:05.402Z, then the complete answer at
+11:26:17.599Z: **39.077s** request-to-final. The final publication took 522ms;
+the native progress publication took 249ms. All three publications were
+attempt one and reused one message. The response was complete and coherent,
+and ordinary prose such as "emerald token" was not spuriously redacted.
+This is live qualification of the optimized build, not a controlled before/
+after model benchmark: its different-content predecessor took 49.349s, so
+the difference must not be represented as an isolated causal speedup.
+
+Telegram's same-build native button check started at 11:27:23.682Z. Source
+run `21fdb7fb-197c-41f3-a95f-7abb14f2f28f` generated the new Orbit/Harbor
+interaction `359ebf93-7557-4d71-affc-9f621e338b8a`, published as
+`417200359:112` at 11:27:34.692Z (**11.010s**). Harbor was clicked once at
+11:27:48.674Z; the answer committed at 48.879Z. Continuation
+`4f49883e-469e-45c2-87aa-1fbdf40ecf7e` reused its native provider session and
+returned exactly `Harbor`, without another question. Its working message
+`417200359:113` became the final answer at 11:28:07.940Z (**19.266s** after
+the click). The final publication's own interval was 1.521s, so universal
+sub-second transport delivery is not claimed. All related publications were
+attempt one; actual source/continuation rollout contexts verify Luna.
+
+A final fetch still resolves `origin/master` to `297d8741f`; its code-only
+reconciliation and deliberately excluded lockfile refresh remain as described
+above. No claim of reconciled master ancestry or frozen-install success is
+made. The live test server stays available on loopback 3103, with no active
+or queued Maya run after these checks. GitHub's pending callback investigation
+still needs App Confirm access; Teams still needs its work/school tenant.
