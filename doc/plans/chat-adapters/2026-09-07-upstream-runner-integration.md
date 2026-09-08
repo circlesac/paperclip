@@ -74,7 +74,8 @@ Two independent PostgreSQL upgrade checks passed:
 Generation inputs, the original SQL, hashes, baseline, proof script and results
 are retained locally under
 `.paperclip-runtime/chat-adapters-live/migration-reconcile-20260907/`.
-The live database has not been migrated by these checks.
+Those fixture checks did not mutate the live database. The later backed-up live
+upgrade is recorded below.
 
 ## Verification recorded so far
 
@@ -93,6 +94,7 @@ and transport races in deterministic tests are simulated, not live-provider proo
   **891/891**, with no skips. A child rerun could not bind loopback sockets;
   the root rerun exercised the real HTTP suites successfully. These counts
   overlap and must not be summed as unique coverage.
+- Final current-wake comment reader: **5/5** against fresh embedded PostgreSQL.
 - Final combined heartbeat, issue routes, execution identity, GitHub broker and
   trust cohort: **208/208**. A narrower broker/identity/trust run passed **24/24**,
   including fourteen policy-source/personal-or-dedicated denial combinations,
@@ -113,17 +115,60 @@ and transport races in deterministic tests are simulated, not live-provider proo
 Detailed command logs are under
 `.paperclip-runtime/chat-adapters-live/upstream-*.log`.
 
+## Deployed checkpoint
+
+Code checkpoint `26b6df7c1` was committed and pushed to `codex/chat-adapters`.
+The isolated live server was gracefully paused with no queued or running runs.
+Before migration:
+
+- Created a portable JavaScript-engine SQL backup in the ignored runtime
+  directory. Restoring it into a new fixture preserved row counts, but did not
+  reproduce every row digest. The inspected agent row differed in its
+  sub-millisecond `created_at` precision; this backup is not recorded as exact.
+- Created native PostgreSQL snapshot database
+  `chat_adapters_live_pre_identity_20260907_01` while the application was stopped.
+  All **198** table counts/full-row digests and all **248** original migration
+  history rows matched the live database exactly. No existing database was
+  overwritten. Both backup forms and the restore fixture are retained.
+- Applied exactly the six identity migrations to the live database. All nine
+  captured chat/attachment/outbox table digests stayed unchanged, the original
+  history remained unchanged, the journal grew to **254**, and repeating the
+  migration was a no-op.
+
+Backup, baseline and verification artifacts are in
+`.paperclip-runtime/chat-adapters-live/upstream-live-backup-20260907/`.
+The guarded local `upstream-live-upgrade.ts` helper and its logs remain alongside
+that directory. The portable-backup precision discrepancy was not patched as
+part of this chat integration.
+
+`pnpm --filter @paperclipai/server build` passed, including the full native runner
+build, protocol/contract checks and binary staging. The package and vendored
+runner binaries share SHA256
+`f7c1273cce29e521e820ad947d657e500da28477f563053148e764cdfb3730cd`.
+The restarted server reports `2026.831.0+413.git.26b6df7c1` at
+`http://127.0.0.1:3103`; its log is `server-native-checkpoint-16.log`.
+Maya remains `paperclip_runner`, provider `codex`, model `gpt-5.6-luna`.
+
+The staged Rust-backed Codex transport suite passed **71/71** in
+`upstream-runner-staged-driver-03.log`, including cold restoration with a changed
+run binding. Two earlier full attempts each timed out in different tests while
+macOS slept: the host power log records thermal/maintenance sleep overlapping
+both runs, including a two-minute sleep during the second. A targeted rerun of
+cold restoration and prompt process-exit handling also passed **2/2**. No timeout
+was increased and no power/thermal protection was changed.
+
+During that host sleep Discord's lease expired, its local listener stopped, and
+a fresh listener connected after wake. A later read-only check found a valid
+gateway lease, all four configured endpoints active and no queued/running runs.
+The old detached Board tab could not attach; a fresh in-app catalog tab loaded
+and showed Maya's Slack, GitHub, Discord and Telegram connections active. This
+was a catalog-state check, not an interactive journey or visual-polish sign-off.
+
 ## Remaining qualification
 
-The loaded live server is still checkpoint `9277e0dc5`; these integration changes
-must be built, staged and deployed coherently with a live database backup first.
-The locked Rust build alone does not stage or qualify a replacement live binary.
-Do not use old staged runner artifacts as evidence for the newly built revision.
-
-The Rust-backed driver cohort passed 86/87 against the old staged runner, with
-the cold-restore launch-binding regression failing against that old artifact.
-Rerun it after staging the matching rebuilt runner. The whole-workspace build
-and test suite have not been claimed green.
+The earlier 86/87 cohort against the old staged binary was not new-runtime
+qualification; the rebuilt transport suite above closes its cold-restore gap.
+The whole-workspace build and test suite have not been claimed green.
 
 Live model qualification remains limited by the observed Codex capacity gate.
 The in-app browser input outage also needs recovery, and Teams still requires a
