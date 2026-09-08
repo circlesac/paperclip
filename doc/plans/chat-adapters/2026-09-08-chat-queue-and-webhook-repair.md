@@ -1480,4 +1480,52 @@ negative absence, receipt-limit, replay-retention or production deadline is
 relaxed. The final full debug Codex target passed **66 tests / one ignored**
 in **88.40 seconds**. The ignored test is its existing subprocess helper, not
 a skipped qualification case. Workspace formatting now passes the exact CI
-command. Adjacent native-backend and full release-workspace checks are pending.
+command. The adjacent debug native-backend target passed **10/10**. The exact
+CI release-workspace command then passed **480 tests / zero failed / one
+ignored** across 26 top-level test summaries (nested subprocess output is not
+double-counted). This includes all 66 Codex cases and seven fake-provider unit
+tests. The signed/staged runner hash remains unchanged. Fixture checkpoint:
+`9668530e1`. The earlier failed invocations remain failed; these are separate
+post-repair results.
+
+### Run-dispatch master integration
+
+The next master update, `f65991a5f`, includes managed GitHub sandbox PATH
+preservation and extraction of scheduled retries and queued-run dispatch into
+a shared module. The merge retains chat attachment omissions, exact coalesced
+wake identity, current-principal validation and native ownership guards.
+Cancelled interaction continuations move into the new shared classifier rather
+than leaving a divergent private copy in heartbeat. Two new classifier cases
+failed before this resolution; the resulting classifier file passed **16/16**.
+
+The initial merged server typecheck also caught a missing `contextSnapshot`
+bridge for run-status events. The module now carries only nullable
+`contextSource` from the committed run row. The heartbeat bridge reconstructs
+only that safe field; it does not reload a later row or expose the private wake
+payload. Eight PostgreSQL regression cases cover chat/native sources and
+absent, null, blank or malformed values. The full new adapter target passed
+**19/19**, including existing lock and compare-and-swap assertions.
+
+The pure merge cohort passed **298/298**, status/coalescing consumers **12/12**,
+and module-boundary tests **3/3**. The actual module-boundary check and server /
+adapter-utils no-emit TypeScript checks pass. PostgreSQL capacity had changed
+from the prior exhausted host: root observed 29 of 32 segments. The new DB
+target used normal harness setup and cleanup, without changing global settings
+or stopping unrelated databases. Three subsequent database files ran one at a
+time: retry scheduling **28/28**, stale-queue invalidation **22/22** and
+task-drain admission release **2/2**, all with zero skips and normal cleanup.
+They retain injected-write rollback, revalidation, adapter-handoff lock release
+and deferred-wake admission checks. No startup failure or retry occurred.
+
+The upstream dispatch transaction deliberately releases its validation locks
+at adapter handoff, before the provider process starts. This preserves the new
+module contract and avoids run-log self-deadlock; it does not promise that every
+later permission change prevents provider startup. Tool and external-publication
+authorization remain separate current checks. Independent review found no
+additional lost guard.
+
+The combined review is **500 files**. Only the superseded v3/v4 design notes
+were removed from the working tree; their exact contents are linked from
+`wireframes-archive.md` at checkpoint `9668530e1`. Current designs, generator
+inputs and all live qualification evidence remain present. Server 50 still
+runs the earlier production code until a deliberate post-merge restart.

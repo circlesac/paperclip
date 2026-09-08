@@ -7,7 +7,28 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Landing status
 
-- Latest pushed head `a756325e0` received Greptile **5/5**, with all 497
+- Fixture follow-up `9668530e1` passed the exact CI Rust release-workspace
+  command: **480 passed / zero failed / one ignored**. Debug Codex and native
+  backend targets also passed **66 + 10**, with the existing Codex subprocess
+  helper ignored. The signed/staged binary hash is unchanged. The current
+  master merge incorporates `f65991a5f`: managed GitHub sandbox PATH and the
+  extracted run-dispatch module. Preserve cancelled interaction continuation
+  in the new shared classifier and source-only status-event projection from
+  the committed run. Two classifier cases went red to green; the final
+  classifier suite is **16/16**. The initial merged server typecheck identified
+  the missing source bridge; its final check passes after repair. Pure merge
+  compatibility is **298/298**, status/context consumers **12/12**, module
+  boundary tests **3/3**, and the new PostgreSQL adapter **19/19**, including
+  eight source-projection cases. Three serialized database suites then passed
+  **52/52**: retry scheduling, stale-queue invalidation and task-drain admission,
+  including rollback and handoff-lock checks. All fixtures cleaned up normally.
+  Server and adapter-utils TypeScript and the
+  actual module-boundary check pass. The combined PR is **500 files** after
+  archiving only the superseded v3/v4 design notes in Git history. Current
+  designs, generators and qualification evidence remain available. Final
+  merged-head CI/review and deployment are still required; the running server
+  is still server 50 below.
+- Preceding pushed head `a756325e0` received Greptile **5/5**, with all 497
   files reviewed and no unresolved finding. Its CI `34260240654` exposed a
   Rust import-order mismatch in the fake provider: standalone formatting had
   used a different convention from the workspace's edition-2021 check. Both
@@ -27,8 +48,8 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
   went red to green with a controlled asynchronous terminal. The final debug
   Codex target passed **66 tests / one ignored**, with eight positive waits
   corrected and all safety assertions retained. The adjacent native backend
-  and full release-workspace gates are still in progress.
-- Current continuation: documentation head `179fb5a53` received Greptile
+  and full release-workspace gates subsequently passed as recorded above.
+- Earlier continuation: documentation head `179fb5a53` received Greptile
   **5/5**, with no open finding. Its CI `34257833081` failed the runner Build
   lane: the real-transport 1,024-event suffix test rejected its first close
   with `NativeSessionCloseUnrecoverableError`. This is a test failure, not a
