@@ -136,7 +136,8 @@ function milestoneForStatus(
     return "waiting_for_input";
   if (status === "running") return "working";
   if (status === "succeeded") return "completed";
-  if (["failed", "timed_out", "cancelled"].includes(status)) return "failed";
+  if (["interrupted", "failed", "timed_out", "cancelled"].includes(status))
+    return "failed";
   return null;
 }
 
@@ -682,6 +683,7 @@ export async function enqueueChatRunMilestones(
             "queued",
             "running",
             "succeeded",
+            "interrupted",
             "failed",
             "timed_out",
             "cancelled",
@@ -714,11 +716,14 @@ export async function enqueueChatRunMilestones(
             ${heartbeatRuns.status} <> 'succeeded'
             or ${heartbeatRuns.resultJson} -> 'presentationDecision' is not null
           )`,
-          // Exclude successful runs that already produced an explicit external
-          // reply before applying the batch limit. Otherwise a page of settled
-          // runs could permanently starve later milestones.
+          // A successful or interrupted run's selected final remains its
+          // authoritative response. Filter it before LIMIT so a page of settled
+          // runs cannot starve later milestones.
           or(
-            ne(heartbeatRuns.status, "succeeded"),
+            and(
+              ne(heartbeatRuns.status, "succeeded"),
+              ne(heartbeatRuns.status, "interrupted"),
+            ),
             notExists(
               db
                 .select({ id: chatPublications.id })
@@ -856,7 +861,7 @@ export async function enqueueChatRunMilestones(
         }
         if (hasProviderInteraction) continue;
       }
-      if (milestone === "completed") {
+      if (milestone === "completed" || row.runStatus === "interrupted") {
         const explicitlyAuthoredPublication = await db
           .select({ id: chatPublications.id })
           .from(chatPublications)

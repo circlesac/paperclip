@@ -38684,6 +38684,182 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     };
   }
 
+  it("settles an interrupted native run once without overwriting its successor", async () => {
+    const context = await safeNativeProgressFixture("telegram", "61");
+    try {
+      const interrupted = await context.createRun("the original request");
+      const [originalWorking] = await db
+        .select()
+        .from(chatPublications)
+        .where(
+          eq(
+            chatPublications.idempotencyKey,
+            `run:${interrupted.runId}:working:${context.endpoint.id}`,
+          ),
+        );
+      expect(originalWorking?.providerMessageId).toBeTruthy();
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "interrupted",
+          finishedAt: new Date(),
+          errorCode: "server_shutdown_interrupted",
+          error:
+            "PRIVATE stdout tool arguments token=PRIVATE-INTERRUPTION-TOKEN",
+          resultJson: { summary: "PRIVATE internal interruption summary" },
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, interrupted.runId));
+
+      // Model delayed milestone reconciliation after a successor has already
+      // published its own working placeholder in the same conversation.
+      const successor = await context.createRun("the successor request");
+      const [successorWorking] = await db
+        .select()
+        .from(chatPublications)
+        .where(
+          eq(
+            chatPublications.idempotencyKey,
+            `run:${successor.runId}:working:${context.endpoint.id}`,
+          ),
+        );
+      expect(successorWorking?.providerMessageId).toBeTruthy();
+      expect(successorWorking?.providerMessageId).not.toBe(
+        originalWorking?.providerMessageId,
+      );
+
+      await expect(enqueueChatRunMilestones(db)).resolves.toBe(1);
+      await context.service.processPendingPublications(100);
+      await expect(enqueueChatRunMilestones(db)).resolves.toBe(0);
+      await expect(
+        context.service.processPendingPublications(100),
+      ).resolves.toBe(0);
+      expect(context.providerRuntime.posts).toHaveLength(2);
+      expect(context.providerRuntime.edits).toEqual([
+        {
+          threadId: context.thread.thread.id,
+          messageId: originalWorking!.providerMessageId,
+          text: "Maya stopped before completing this turn. Open the task in Paperclip for details.",
+        },
+      ]);
+
+      await addSelectedChatFinal({
+        agentId: context.fixture.assignedAgentId,
+        body: "The successor's authoritative answer",
+        companyId: context.fixture.companyId,
+        issueId: context.conversation.issueId,
+        runId: successor.runId,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "succeeded",
+          resultJson: {
+            presentationDecision: {
+              chosenSource: "existing_issue_comment",
+              commentAction: "none",
+            },
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, successor.runId));
+      await context.service.processPendingPublications(100);
+      await expect(enqueueChatRunMilestones(db)).resolves.toBe(0);
+      expect(context.providerRuntime.edits).toHaveLength(2);
+      expect(context.providerRuntime.edits[1]).toEqual({
+        threadId: context.thread.thread.id,
+        messageId: successorWorking!.providerMessageId,
+        text: "The successor's authoritative answer",
+      });
+      expect(
+        JSON.stringify({
+          posts: context.providerRuntime.posts,
+          edits: context.providerRuntime.edits,
+        }),
+      ).not.toMatch(
+        /PRIVATE|stdout|tool arguments|server_shutdown_interrupted/,
+      );
+      await expect(
+        db
+          .select()
+          .from(chatPublications)
+          .where(
+            eq(
+              chatPublications.idempotencyKey,
+              `run:${interrupted.runId}:failed:${context.endpoint.id}`,
+            ),
+          ),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          state: "published",
+          providerMessageId: originalWorking!.providerMessageId,
+          payload: {
+            progressState: "failed",
+            text: "Maya stopped before completing this turn. Open the task in Paperclip for details.",
+          },
+        }),
+      ]);
+      await expect(
+        db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, interrupted.runId)),
+      ).resolves.toEqual([{ status: "interrupted" }]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it.each(["pending", "published"] as const)(
+    "preserves an interrupted run's selected final when its publication is %s",
+    async (publicationState) => {
+      const context = await safeNativeProgressFixture(
+        "telegram",
+        publicationState === "pending" ? "62" : "63",
+      );
+      try {
+        const run = await context.createRun("an already answered request");
+        const final = await addSelectedChatFinal({
+          agentId: context.fixture.assignedAgentId,
+          body: "The selected final remains authoritative",
+          companyId: context.fixture.companyId,
+          issueId: context.conversation.issueId,
+          runId: run.runId,
+        });
+        if (publicationState === "published")
+          await context.service.processPendingPublications(100);
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "interrupted",
+            errorCode: "lease_released_before_terminal",
+            finishedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, run.runId));
+        await expect(enqueueChatRunMilestones(db, { limit: 1 })).resolves.toBe(
+          0,
+        );
+        await context.service.processPendingPublications(100);
+        await expect(enqueueChatRunMilestones(db)).resolves.toBe(0);
+        expect(context.providerRuntime.posts).toHaveLength(1);
+        expect(context.providerRuntime.edits).toEqual([
+          expect.objectContaining({
+            text: "The selected final remains authoritative",
+          }),
+        ]);
+        await expect(
+          db
+            .select({ state: chatPublications.state })
+            .from(chatPublications)
+            .where(eq(chatPublications.commentId, final.id)),
+        ).resolves.toEqual([{ state: "published" }]);
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
+
   it.each(["slack", "github", "discord", "telegram"] as const)(
     "coalesces closed native progress on %s without projecting event content",
     async (provider, index) => {

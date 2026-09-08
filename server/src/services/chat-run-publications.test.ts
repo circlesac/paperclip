@@ -76,6 +76,22 @@ describe("chat run milestone projection", () => {
     );
   });
 
+  it.each(["server_shutdown_interrupted", "lease_released_before_terminal"])(
+    "keeps interruption bookkeeping for %s inside Paperclip",
+    (errorCode) => {
+      expect(
+        safeMilestoneText({
+          agentName: "Maya",
+          errorCode,
+          milestone: "failed",
+          issueId: "issue-1",
+        }),
+      ).toBe(
+        "Maya stopped before completing this turn. Open the task in Paperclip for details.",
+      );
+    },
+  );
+
   it("explains an allowlisted native provider capacity failure without exposing provider details", () => {
     expect(
       safeMilestoneText({
