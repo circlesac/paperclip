@@ -93,8 +93,15 @@ remains in its legitimate reconnect test state; it was not manually activated.
 The bound-conversation authorization helper required endpoint status `active`,
 although normal setup admits test traffic while `verifying`. This creates a
 setup/finalization cycle. A narrowly scoped current-generation test-window
-exception is being implemented; it must retain current actor/reach checks and
-reject stale deliveries across reconnect.
+exception now retains the existing actor/reach/ownership checks. Every exact
+bound delivery must have been received and processed within the current test
+window, carry the current runtime generation and canonical credential-fence
+shape, and pass current policy again at commit. Arbitrary verifying states and
+old-generation events remain denied. Positive tests for all five providers
+reach an actual pending answer publication; reconnect and activation overlap
+tests prove the final authorization recheck. The full external-chat wait suite
+passed 106/106 and server typechecking passed. This fix has not yet been
+deployed to the live qualification server.
 
 ### Slack upstream retry and queue failure are separate findings
 

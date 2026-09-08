@@ -276,6 +276,48 @@ function destinationAllowed(
   return resource.enabled;
 }
 
+function currentSetupTestAcceptsBoundDeliveries(
+  endpoint: typeof chatEndpoints.$inferSelect,
+  deliveries: Array<{
+    normalizedEvent: unknown;
+    processedAt: Date | null;
+    receivedAt: Date;
+  }>,
+): boolean {
+  if (endpoint.status === "active") return true;
+  if (endpoint.status !== "verifying" || deliveries.length === 0) return false;
+  const setup = record(endpoint.setup);
+  const testStartedAt =
+    typeof setup.testStartedAt === "string"
+      ? new Date(setup.testStartedAt)
+      : null;
+  const generation = setup.runtimeGeneration;
+  if (
+    setup.step !== "test" ||
+    !testStartedAt ||
+    Number.isNaN(testStartedAt.getTime()) ||
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation < 0
+  ) {
+    return false;
+  }
+  return deliveries.every((delivery) => {
+    const runtimeContext = record(
+      record(delivery.normalizedEvent).runtimeContext,
+    );
+    return (
+      delivery.receivedAt >= testStartedAt &&
+      delivery.processedAt !== null &&
+      delivery.processedAt >= testStartedAt &&
+      delivery.processedAt >= delivery.receivedAt &&
+      runtimeContext.generation === generation &&
+      typeof runtimeContext.credentialFingerprint === "string" &&
+      /^[a-f0-9]{64}$/u.test(runtimeContext.credentialFingerprint)
+    );
+  });
+}
+
 async function principalAuthorized(
   tx: Db,
   endpoint: typeof chatEndpoints.$inferSelect,
@@ -399,6 +441,9 @@ export async function authorizeChatConversationForBoundRun(
       conversation: chatConversations,
       endpoint: chatEndpoints,
       principalId: chatDeliveries.principalId,
+      normalizedEvent: chatDeliveries.normalizedEvent,
+      processedAt: chatDeliveries.processedAt,
+      receivedAt: chatDeliveries.receivedAt,
     })
     .from(chatMessageLinks)
     .innerJoin(
@@ -438,7 +483,7 @@ export async function authorizeChatConversationForBoundRun(
           provider as typeof chatEndpoints.$inferSelect.provider,
         ),
         eq(chatEndpoints.assignedAgentId, binding.agentId),
-        eq(chatEndpoints.status, "active"),
+        inArray(chatEndpoints.status, ["active", "verifying"]),
       ),
     );
   const links = await (lockMode === "read"
@@ -460,6 +505,9 @@ export async function authorizeChatConversationForBoundRun(
   }
   const conversation = links[0]!.conversation;
   const endpoint = links[0]!.endpoint;
+  if (!currentSetupTestAcceptsBoundDeliveries(endpoint, links)) {
+    throw new Error("paperclip_runner_chat_attachment_binding_denied");
+  }
   const resource = conversation.resourceId
     ? await (() => {
         const query = tx

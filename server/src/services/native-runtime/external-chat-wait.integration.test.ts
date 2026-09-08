@@ -53,7 +53,11 @@ import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publi
 import { resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import { issueService } from "../issues.js";
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
-import { authorizeChatConversationForBoundRun, isExternalChatWaitAuthorizationContention } from "./chat-attachment-reuse.js";
+import {
+  authorizeChatConversationForBoundRun,
+  isExternalChatWaitAuthorizationContention,
+  resolveExternalChatResponseWaitAuthorization,
+} from "./chat-attachment-reuse.js";
 import { attestReviewedExternalChatRun, buildPaperclipWakePayload } from "../heartbeat.js";
 import { questionResponseDeliveryValues } from "../question-response-delivery.js";
 import { resolveExternalChatQuestionResponse } from "./external-chat-question-response.js";
@@ -83,7 +87,12 @@ describe("native external-chat response wait", () => {
   });
 
   async function seedWaitTurn(
-    provider: "telegram" | "discord" | "slack" = "telegram",
+    provider:
+      | "telegram"
+      | "discord"
+      | "github"
+      | "microsoft-teams"
+      | "slack" = "telegram",
     attentionRequests: PrpStructuredRunResult["attentionRequests"] = [],
   ) {
     const companyId = randomUUID();
@@ -203,9 +212,13 @@ describe("native external-chat response wait", () => {
       id: resourceId,
       companyId,
       endpointId,
-      type: "direct_message",
-      providerResourceId: "telegram-user",
-      label: "Telegram direct message",
+      type: provider === "github" ? "repository" : "direct_message",
+      providerResourceId:
+        provider === "github" ? "paperclip/test-repository" : "telegram-user",
+      label:
+        provider === "github"
+          ? "Paperclip test repository"
+          : "Telegram direct message",
       availability: "available",
       enabled: true,
     });
@@ -219,7 +232,7 @@ describe("native external-chat response wait", () => {
       externalThreadId: "telegram:telegram-user",
       sessionGeneration: 1,
       externalLabel: "Telegram direct message",
-      isDirectMessage: true,
+      isDirectMessage: provider !== "github",
       state: "active",
     });
     await db.insert(chatExternalPrincipals).values({
@@ -367,12 +380,62 @@ describe("native external-chat response wait", () => {
       companyId,
       conversationId,
       endpointId,
+      deliveryId,
       issueId,
+      resourceId,
       runId,
       userId,
       commentId,
       principalId,
     };
+  }
+
+  async function placeWaitTurnInSetupTest(
+    fixture: Awaited<ReturnType<typeof seedWaitTurn>>,
+    options: {
+      credentialFingerprint?: string;
+      generation?: number;
+      processedAt?: Date;
+      receivedAt?: Date;
+      setupStep?: "provider_setup" | "test";
+      testStartedAt?: Date;
+    } = {},
+  ) {
+    const testStartedAt =
+      options.testStartedAt ?? new Date(Date.now() - 5_000);
+    const receivedAt = options.receivedAt ?? new Date(Date.now() - 4_000);
+    const processedAt = options.processedAt ?? new Date(Date.now() - 3_000);
+    const generation = options.generation ?? 1;
+    await db
+      .update(chatEndpoints)
+      .set({
+        status: "verifying",
+        setup: {
+          step: options.setupStep ?? "test",
+          testStartedAt: testStartedAt.toISOString(),
+          runtimeGeneration: generation,
+        } as (typeof chatEndpoints.$inferSelect)["setup"] & {
+          runtimeGeneration: number;
+        },
+        updatedAt: new Date(),
+      })
+      .where(eq(chatEndpoints.id, fixture.endpointId));
+    await db
+      .update(chatDeliveries)
+      .set({
+        normalizedEvent: {
+          runtimeContext: {
+            generation,
+            credentialFingerprint:
+              options.credentialFingerprint ?? "a".repeat(64),
+          },
+        },
+        processedAt,
+        receivedAt,
+        updatedAt: new Date(),
+      })
+      .where(eq(chatDeliveries.id, fixture.deliveryId));
+    return { processedAt, receivedAt, testStartedAt };
   }
 
   async function seedAnsweredChatTurn(
@@ -3108,6 +3171,354 @@ describe("native external-chat response wait", () => {
         .from(chatPublications)
         .where(eq(chatPublications.issueId, fixture.issueId)),
     ).toHaveLength(1);
+  });
+
+  it.each([
+    ["Slack fresh setup", "slack", 1],
+    ["GitHub fresh setup", "github", 1],
+    ["Discord fresh setup", "discord", 1],
+    ["Teams fresh setup", "microsoft-teams", 1],
+    ["Telegram fresh setup", "telegram", 1],
+    ["GitHub reconnect setup", "github", 8],
+  ])(
+    "authorizes an exact response wait during the current %s test window",
+    async (_label, provider, generation) => {
+      const fixture = await seedWaitTurn(
+        provider as Parameters<typeof seedWaitTurn>[0],
+      );
+      await placeWaitTurnInSetupTest(fixture, { generation });
+
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({
+          db,
+          binding: fixture,
+        }),
+      ).resolves.toBe("authorized");
+      await finalizeNativeRun({
+        db,
+        runId: fixture.runId,
+        workspaceFinalizeStatus: "succeeded",
+        projectRunStatus: true,
+      });
+      await expect(
+        db
+          .select()
+          .from(statusDecisions)
+          .where(eq(statusDecisions.issueId, fixture.issueId)),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          reasonCode: "external_chat_response_waiting",
+          decisionJson: expect.objectContaining({ effects: [] }),
+        }),
+      ]);
+      const [finalizedRun] = await db
+        .select({ resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId));
+      await expect(
+        resolveChatRunPresentationAuthorizationReason(db, fixture),
+      ).resolves.toBe("allow_chat_run_presentation");
+      const response = resolveHeartbeatRunResponse({
+        resultJson: finalizedRun!.resultJson,
+        preferFinalResponseOverExistingComment: true,
+        externalChatResponseWakeSummaryAuthorized: true,
+      });
+      expect(response).toEqual(
+        expect.objectContaining({
+          text: "The requested photo is prepared. I will wait for your next message.",
+          decision: expect.objectContaining({ commentAction: "create" }),
+        }),
+      );
+      const comment = await issueService(db).addComment(
+        fixture.issueId,
+        response.text!,
+        { agentId: fixture.agentId, runId: fixture.runId },
+        { authorizationReason: "allow_chat_run_presentation" },
+      );
+      await expect(
+        db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, comment.id)),
+      ).resolves.toEqual([
+        expect.objectContaining({
+          conversationId: fixture.conversationId,
+          endpointId: fixture.endpointId,
+          state: "pending",
+        }),
+      ]);
+    },
+  );
+
+  it("rejects stale or revoked setup-test provenance without weakening active policy", async () => {
+    type Fixture = Awaited<ReturnType<typeof seedWaitTurn>>;
+    type Times = Awaited<ReturnType<typeof placeWaitTurnInSetupTest>>;
+    const expectRevoked = async (
+      label: string,
+      mutate: (fixture: Fixture, times: Times) => Promise<void>,
+    ) => {
+      const fixture = await seedWaitTurn("github");
+      const times = await placeWaitTurnInSetupTest(fixture, { generation: 4 });
+      await mutate(fixture, times);
+      await expect(
+        resolveExternalChatResponseWaitAuthorization({
+          db,
+          binding: fixture,
+        }),
+        label,
+      ).resolves.toBe("revoked");
+    };
+
+    await expectRevoked("received before the current test", async (fixture, times) => {
+      await db
+        .update(chatDeliveries)
+        .set({ receivedAt: new Date(times.testStartedAt.getTime() - 1) })
+        .where(eq(chatDeliveries.id, fixture.deliveryId));
+    });
+    await expectRevoked("processed before the current test", async (fixture, times) => {
+      await db
+        .update(chatDeliveries)
+        .set({ processedAt: new Date(times.testStartedAt.getTime() - 1) })
+        .where(eq(chatDeliveries.id, fixture.deliveryId));
+    });
+    await expectRevoked("prior runtime generation", async (fixture) => {
+      await db
+        .update(chatDeliveries)
+        .set({
+          normalizedEvent: {
+            runtimeContext: {
+              generation: 3,
+              credentialFingerprint: "a".repeat(64),
+            },
+          },
+        })
+        .where(eq(chatDeliveries.id, fixture.deliveryId));
+    });
+    await expectRevoked("malformed runtime generation", async (fixture) => {
+      await db.execute(sql`
+        update chat_endpoints
+        set setup = jsonb_set(setup, '{runtimeGeneration}', '"4"'::jsonb)
+        where id = ${fixture.endpointId}
+      `);
+    });
+    await expectRevoked("invalid runtime fingerprint", async (fixture) => {
+      await db
+        .update(chatDeliveries)
+        .set({
+          normalizedEvent: {
+            runtimeContext: {
+              generation: 4,
+              credentialFingerprint: "not-a-runtime-fingerprint",
+            },
+          },
+        })
+        .where(eq(chatDeliveries.id, fixture.deliveryId));
+    });
+    await expectRevoked("missing runtime fence", async (fixture) => {
+      await db
+        .update(chatDeliveries)
+        .set({ normalizedEvent: {} })
+        .where(eq(chatDeliveries.id, fixture.deliveryId));
+    });
+    await expectRevoked("invalid test timestamp", async (fixture) => {
+      await db
+        .update(chatEndpoints)
+        .set({
+          setup: {
+            step: "test",
+            testStartedAt: "not-a-timestamp",
+            runtimeGeneration: 4,
+          } as (typeof chatEndpoints.$inferSelect)["setup"] & {
+            runtimeGeneration: number;
+          },
+        })
+        .where(eq(chatEndpoints.id, fixture.endpointId));
+    });
+    await expectRevoked("wrong setup step", async (fixture, times) => {
+      await db
+        .update(chatEndpoints)
+        .set({
+          setup: {
+            step: "provider_setup",
+            testStartedAt: times.testStartedAt.toISOString(),
+            runtimeGeneration: 4,
+          } as (typeof chatEndpoints.$inferSelect)["setup"] & {
+            runtimeGeneration: number;
+          },
+        })
+        .where(eq(chatEndpoints.id, fixture.endpointId));
+    });
+    for (const status of ["paused", "revoked"] as const) {
+      await expectRevoked(`${status} endpoint`, async (fixture) => {
+        await db
+          .update(chatEndpoints)
+          .set({ status })
+          .where(eq(chatEndpoints.id, fixture.endpointId));
+      });
+    }
+    await expectRevoked("expired principal link", async (fixture) => {
+      await db
+        .update(chatIdentityLinks)
+        .set({ status: "expired", updatedAt: new Date() })
+        .where(eq(chatIdentityLinks.principalId, fixture.principalId));
+    });
+    await expectRevoked("disabled current resource", async (fixture) => {
+      await db
+        .update(chatEndpointResources)
+        .set({ enabled: false, updatedAt: new Date() })
+        .where(eq(chatEndpointResources.id, fixture.resourceId));
+    });
+  });
+
+  it("loses setup-test response authority when reconnect rotates the window before commit", async () => {
+    const fixture = await seedWaitTurn("github");
+    await placeWaitTurnInSetupTest(fixture, { generation: 4 });
+    let releaseEndpoint!: () => void;
+    let endpointLocked!: () => void;
+    const endpointRelease = new Promise<void>((resolve) => {
+      releaseEndpoint = resolve;
+    });
+    const endpointLockObserved = new Promise<void>((resolve) => {
+      endpointLocked = resolve;
+    });
+    const endpointHolder = db.transaction(async (tx) => {
+      await tx
+        .select({ id: chatEndpoints.id })
+        .from(chatEndpoints)
+        .where(eq(chatEndpoints.id, fixture.endpointId))
+        .for("update");
+      await tx
+        .update(chatEndpoints)
+        .set({
+          setup: {
+            step: "test",
+            testStartedAt: new Date().toISOString(),
+            runtimeGeneration: 5,
+          } as (typeof chatEndpoints.$inferSelect)["setup"] & {
+            runtimeGeneration: number;
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(chatEndpoints.id, fixture.endpointId));
+      endpointLocked();
+      await endpointRelease;
+    });
+    await endpointLockObserved;
+    const finalization = finalizeNativeRun({
+      db,
+      runId: fixture.runId,
+      workspaceFinalizeStatus: "succeeded",
+      projectRunStatus: true,
+    });
+    const joined = Promise.allSettled([endpointHolder, finalization]);
+    let waitError: unknown = null;
+    try {
+      await vi.waitFor(
+        async () => {
+          const [coordinator] = await db
+            .select({ phase: nativeRunFinalizations.phase })
+            .from(nativeRunFinalizations)
+            .where(eq(nativeRunFinalizations.runId, fixture.runId));
+          expect(coordinator?.phase).toBe("arbitrating");
+        },
+        { timeout: 1_000, interval: 5 },
+      );
+    } catch (error) {
+      waitError = error;
+    } finally {
+      releaseEndpoint();
+    }
+    const [holderOutcome, finalizationOutcome] = await joined;
+    if (waitError) throw waitError;
+    if (holderOutcome.status === "rejected") throw holderOutcome.reason;
+    if (finalizationOutcome.status === "rejected") {
+      throw finalizationOutcome.reason;
+    }
+
+    await expect(
+      db
+        .select()
+        .from(statusDecisions)
+        .where(eq(statusDecisions.issueId, fixture.issueId)),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        reasonCode: "external_chat_response_wait_authorization_lost",
+        decisionJson: expect.objectContaining({ effects: [] }),
+      }),
+    ]);
+  });
+
+  it("retains setup-test response authority when the endpoint activates before commit", async () => {
+    const fixture = await seedWaitTurn("github");
+    await placeWaitTurnInSetupTest(fixture, { generation: 4 });
+    let releaseEndpoint!: () => void;
+    let endpointLocked!: () => void;
+    const endpointRelease = new Promise<void>((resolve) => {
+      releaseEndpoint = resolve;
+    });
+    const endpointLockObserved = new Promise<void>((resolve) => {
+      endpointLocked = resolve;
+    });
+    const endpointHolder = db.transaction(async (tx) => {
+      await tx
+        .select({ id: chatEndpoints.id })
+        .from(chatEndpoints)
+        .where(eq(chatEndpoints.id, fixture.endpointId))
+        .for("update");
+      await tx
+        .update(chatEndpoints)
+        .set({
+          status: "active",
+          setup: { step: "complete", testStartedAt: null },
+          updatedAt: new Date(),
+        })
+        .where(eq(chatEndpoints.id, fixture.endpointId));
+      endpointLocked();
+      await endpointRelease;
+    });
+    await endpointLockObserved;
+    const finalization = finalizeNativeRun({
+      db,
+      runId: fixture.runId,
+      workspaceFinalizeStatus: "succeeded",
+      projectRunStatus: true,
+    });
+    const joined = Promise.allSettled([endpointHolder, finalization]);
+    let waitError: unknown = null;
+    try {
+      await vi.waitFor(
+        async () => {
+          const [coordinator] = await db
+            .select({ phase: nativeRunFinalizations.phase })
+            .from(nativeRunFinalizations)
+            .where(eq(nativeRunFinalizations.runId, fixture.runId));
+          expect(coordinator?.phase).toBe("arbitrating");
+        },
+        { timeout: 1_000, interval: 5 },
+      );
+    } catch (error) {
+      waitError = error;
+    } finally {
+      releaseEndpoint();
+    }
+    const [holderOutcome, finalizationOutcome] = await joined;
+    if (waitError) throw waitError;
+    if (holderOutcome.status === "rejected") throw holderOutcome.reason;
+    if (finalizationOutcome.status === "rejected") {
+      throw finalizationOutcome.reason;
+    }
+
+    await expect(
+      db
+        .select()
+        .from(statusDecisions)
+        .where(eq(statusDecisions.issueId, fixture.issueId)),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        reasonCode: "external_chat_response_waiting",
+        decisionJson: expect.objectContaining({ effects: [] }),
+      }),
+    ]);
   });
 
   it("parks a verified external-chat response wait without scheduling work", async () => {
