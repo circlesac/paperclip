@@ -218,6 +218,12 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(markdown).toContain(
       "do not ask for another chat connection",
     );
+    expect(markdown).toContain(
+      "attach the file directly to this Paperclip task or paste the needed text",
+    );
+    expect(markdown).toContain(
+      "Never borrow browser cookies or forward credentials to an attachment URL",
+    );
   });
 
   it("adds planning directives for assignment and comment task context", () => {
