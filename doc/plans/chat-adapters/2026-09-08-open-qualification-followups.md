@@ -204,7 +204,8 @@ file delivery. The final UI cohort passes **101/101**, types/token gates pass,
 and the two consent-specific browser cases pass **2/2** (13.9 seconds) on fresh
 `chat_teams_consent_browser_20260909_03`. Browser publication responses are
 mocked; actual task/file-upload controls and reload behavior are exercised.
-No complete new 660-case server or 31-case browser run has been claimed.
+These targeted runs were followed by the complete current 665-case service
+and 31-case browser runs below.
 
 Next integration boundaries are explicit: preserve a minimal authenticated
 personal-recipient proof on new Teams deliveries, bind it to the current
@@ -240,8 +241,35 @@ Teams transfer as ordinary text, and its 60-second stale sweep quarantined a
 live 90-second Teams intent. Exact company/publication exclusions and a
 publication-lock-before-lane-check fix both. The combined API/worker block now
 passes **21/21** on fresh `chat_teams_worker_exclusion_20260909_green01`.
-The full 665-case service run and 31-case deterministic browser run are in
-progress; do not treat these targeted results as either complete run.
+The full service run now passes **665/665**, zero skips, on fresh
+`chat_teams_integration_20260909_root01` in **125.77 seconds**; the full
+deterministic browser run passes **31/31**, zero retries, on fresh
+`chat_teams_browser_20260909_root01` in **2.8 minutes**. Logs:
+`teams-full-integration-root-0909.log` and `teams-browser-full-root-0909.log`.
+The browser loaded the current UI/API work before the later generic-worker
+exclusion fix; that worker fix is covered by the final 665-case service run.
+Provider transport and model execution remain mocked. New Teams file delivery
+is still not activated or live-qualified.
+
+Final service-run source SHA256:
+`dbb146cd5cc5494a0cd9026f102ba55f399556caca81d51204e75679e6e845c3`;
+integration test SHA256:
+`1907518eabc63e73a43489270642404ce7368eb379a9682f5050cdc28a4fa4d0`;
+browser spec SHA256:
+`d286a6daa1feacde14423044a8a8b0a2324fe217a13ff262313e5eb1648508d4`.
+Root additionally passes **44/44** OpenAPI/batch contract tests and **95/95**
+selected UI tests; the earlier owner's 101-case UI selection is a different
+cohort. Plain server TypeScript and diff checks pass. The dedicated transfer
+worker still needs current causal-source/recipient authority, stage resolver,
+expiry-recovery scheduling and per-row sweep failure isolation. Do not expose
+stage actions with the generic resolver or treat an expired send lease as proof
+that no file/card was delivered.
+
+Standalone projection/recipient helpers are committed and pushed as
+`e9099b5c4`. The shared service/API/UI activation work remains uncommitted and
+preserved. No server restart, live database migration, runner staging or live
+provider message occurred during this pass. Lockfile and runner SHA remain
+unchanged.
 
 The September 9 browser inventory still reports the Mac lock screen,
 not a Discord login failure. Loopback/private health is ready on server 72; the
