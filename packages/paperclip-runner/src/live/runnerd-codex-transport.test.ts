@@ -73,6 +73,7 @@ import {
   resolveSourceCodexHome,
   settleRetainedRunnerdSession,
   retainedRunnerdCleanupProofIsCurrent,
+  retainedRunnerdMaintenanceIsIdle,
   trustedRuntimeReadOnlyRoots,
   unwrapRunnerdProviderNotification,
   unwrapRunnerdProviderNotifications,
@@ -84,9 +85,26 @@ it.each([
   { alreadyEnded: true, appendFailure: false },
   { alreadyEnded: true, appendFailure: true },
   { alreadyEnded: true, appendFailure: false, bareCodex: true },
+  { alreadyEnded: true, appendFailure: false, epochFailure: "launch_intent" },
+  { alreadyEnded: true, appendFailure: false, epochFailure: "spawned" },
+  { alreadyEnded: true, appendFailure: false, epochFailure: "retired" },
+  { alreadyEnded: true, appendFailure: false, holdSpawned: true },
+  {
+    alreadyEnded: true,
+    appendFailure: false,
+    bareCodex: true,
+    terminalReplay: true,
+  },
 ])(
-  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex)",
-  async ({ alreadyEnded, appendFailure, bareCodex }) => {
+  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned)",
+  async ({
+    alreadyEnded,
+    appendFailure,
+    bareCodex,
+    epochFailure,
+    terminalReplay,
+    holdSpawned,
+  }) => {
     const fixtureRunner = defaultCapabilityRunnerdBinary();
     const directory = await mkdtemp(join(tmpdir(), "runnerd-maintenance-"));
     const original = join(directory, "original");
@@ -260,7 +278,11 @@ it.each([
         .digest("hex");
       const appendEvent = vi.fn(async (_event: PrpEvent) => {});
       const authorize = vi.fn(async () => {});
+      const recordEpoch = vi.fn(
+        async (_receipt: Record<string, unknown>) => {},
+      );
       const input = {
+        requestId: "maintenance-fixture-request",
         binding: {
           companyId: "company-maintenance",
           issueId: "issue-maintenance",
@@ -270,7 +292,11 @@ it.each([
         },
         backend: {
           kind: "codex",
-          name: appendFailure ? "maintenance-test-failure" : "maintenance-test",
+          name: epochFailure
+            ? `maintenance-test-${epochFailure}`
+            : appendFailure
+              ? "maintenance-test-failure"
+              : "maintenance-test",
         },
         identity,
         stateDirectory: copy,
@@ -284,6 +310,7 @@ it.each([
         environment,
         authorize,
         appendEvent,
+        recordEpoch,
       };
       const close = vi.fn(async () => {
         throw new NativeSessionCloseUnrecoverableError();
@@ -458,6 +485,7 @@ it.each([
           expect(await observed).toMatchObject({
             message: "native_cleanup_maintenance_unproven",
           });
+          expect(retainedRunnerdMaintenanceIsIdle(copy)).toBe(false);
           await expect(settleRetainedRunnerdSession(input)).rejects.toThrow(
             "native_cleanup_maintenance_unproven",
           );
@@ -473,6 +501,7 @@ it.each([
           releaseAuthorization();
           await drain;
           expect(drained).toBe(true);
+          expect(retainedRunnerdMaintenanceIsIdle(copy)).toBe(true);
         } finally {
           releaseAuthorization();
           await drain;
@@ -515,6 +544,115 @@ it.each([
           methods.filter((method) => method === "thread/resume"),
         ).toHaveLength(1);
         return;
+      }
+      const assertNoProviderBeforeSpawnedReceipt = async () => {
+        const callsBefore = await readFile(calls, "utf8");
+        const providerBefore = await readFile(copyProvider);
+        const controlBefore = JSON.parse(
+          await readFile(
+            join(copy, "control-plane/control-plane-state.json"), "utf8",
+          ),
+        );
+        // Give the actual runner time to authenticate while its durable spawn
+        // receipt is held. Authentication must not release even the old stop.
+        await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+        expect(await readFile(calls, "utf8")).toBe(callsBefore);
+        expect(await readFile(copyProvider)).toEqual(providerBefore);
+        const controlAfter = JSON.parse(
+          await readFile(
+            join(copy, "control-plane/control-plane-state.json"), "utf8",
+          ),
+        );
+        expect(controlAfter.connectionCount).toBe(
+          controlBefore.connectionCount,
+        );
+        expect(controlAfter.commandDeliveryCounts).toEqual(
+          controlBefore.commandDeliveryCounts,
+        );
+        expect(controlAfter.commands).toEqual(controlBefore.commands);
+      };
+      if (holdSpawned) {
+        recordEpoch.mockImplementation(async (receipt) => {
+          if (receipt.phase === "spawned")
+            await assertNoProviderBeforeSpawnedReceipt();
+        });
+      }
+      if (epochFailure) {
+        const failure = new Error("injected epoch receipt persistence failure");
+        const callsBefore = await readFile(calls, "utf8");
+        recordEpoch.mockImplementation(async (receipt) => {
+          if (receipt.phase === "spawned" && epochFailure === "spawned")
+            await assertNoProviderBeforeSpawnedReceipt();
+          if (receipt.phase === epochFailure) throw failure;
+        });
+        await expect(settleRetainedRunnerdSession(input)).rejects.toBe(failure);
+        for (const [receipt] of recordEpoch.mock.calls) {
+          if (receipt.phase !== "spawned") continue;
+          expect(dead(Number(receipt.pid))).toBe(true);
+          expect(dead(-Number(receipt.pid))).toBe(true);
+        }
+        if (epochFailure === "spawned") {
+          expect(await readFile(calls, "utf8")).toBe(callsBefore);
+        }
+        if (epochFailure === "launch_intent") {
+          expect(await readFile(calls, "utf8")).toBe(callsBefore);
+          expect(
+            recordEpoch.mock.calls.map(([receipt]) => receipt.phase),
+          ).toEqual(["launch_intent"]);
+        }
+        expect(
+          await Promise.all(
+            files.map((file) => readFile(join(original, file))),
+          ),
+        ).toEqual(bytes);
+        await expect(
+          readFile(join(activated, "runner/runner-state.json")),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(execute()).rejects.toMatchObject({
+          code: "native_session_cleanup_quarantined",
+        });
+        expect(start).toHaveBeenCalledOnce();
+        return;
+      }
+      let failedAttempt: { directory: string; bytes: Buffer[] } | null = null;
+      if (terminalReplay) {
+        await expect(
+          settleRetainedRunnerdSession({
+            ...input,
+            environment: undefined,
+            sourceCodexHome: null,
+          }),
+        ).rejects.toThrow("native_cleanup_maintenance_unproven");
+        const failedBytes = await Promise.all(
+          files.map((file) => readFile(join(copy, file))),
+        );
+        expect(failedBytes[2]).toEqual(bytes[2]);
+        const failedRunner = JSON.parse(failedBytes[1]!.toString("utf8"));
+        expect(failedRunner.pendingTerminalDelivery).toMatchObject({
+          commandType: "runner.suspend",
+          lifecycle: "suspended",
+        });
+        const failedControl = JSON.parse(failedBytes[0]!.toString("utf8"));
+        expect(
+          failedControl.commands
+            .slice(-2)
+            .map((command: { status: string }) => command.status),
+        ).toEqual(["failed", "failed"]);
+        const directory = join(original, "..", "failed-attempt");
+        await rename(copy, directory);
+        await cp(directory, copy, { recursive: true });
+        failedAttempt = { directory, bytes: failedBytes };
+        input.sourceFingerprint = createHash("sha256")
+          .update(
+            JSON.stringify(
+              failedBytes.map((value) =>
+                createHash("sha256").update(value).digest("hex"),
+              ),
+            ),
+          )
+          .digest("hex");
+        input.requestId = "maintenance-fixture-continuation";
+        recordEpoch.mockClear();
       }
       const proof = await settleRetainedRunnerdSession(input).catch(
         async (error: unknown) => {
@@ -559,10 +697,65 @@ it.each([
           );
         },
       );
-      if (bareCodex) {
+      if (failedAttempt) {
         expect(
-          await readFile(join(copy, "codex-home/auth.json"), "utf8"),
-        ).toBe(await readFile(join(home, "auth.json"), "utf8"));
+          await Promise.all(
+            files.map((file) => readFile(join(failedAttempt!.directory, file))),
+          ),
+        ).toEqual(failedAttempt.bytes);
+        const finalControl = JSON.parse(
+          await readFile(join(copy, files[0]!), "utf8"),
+        );
+        const failedControl = JSON.parse(
+          failedAttempt.bytes[0]!.toString("utf8"),
+        );
+        expect(
+          finalControl.commands.slice(0, failedControl.commands.length),
+        ).toEqual(failedControl.commands);
+        expect(
+          finalControl.commands
+            .slice(failedControl.commands.length)
+            .some(
+              (command: {
+                type: string;
+                status: string;
+                result: { result?: { providerExitConfirmed?: boolean } };
+              }) =>
+                command.type === "turn.stop" &&
+                command.status === "completed" &&
+                command.result.result?.providerExitConfirmed === true,
+            ),
+        ).toBe(true);
+      }
+      const epochReceipts = recordEpoch.mock.calls.map(([receipt]) => receipt);
+      expect(epochReceipts.length).toBeGreaterThanOrEqual(3);
+      for (let index = 0; index < epochReceipts.length; index += 3) {
+        const [intent, spawned, retired] = epochReceipts.slice(
+          index,
+          index + 3,
+        );
+        expect(intent).toMatchObject({
+          phase: "launch_intent",
+          requestId: input.requestId,
+          stateDirectory: copy,
+        });
+        expect(spawned).toMatchObject({
+          phase: "spawned",
+          launchId: intent!.launchId,
+        });
+        expect(retired).toMatchObject({
+          phase: "retired",
+          launchId: intent!.launchId,
+          pid: spawned!.pid,
+          processGroupAbsent: true,
+        });
+        expect(dead(Number(retired!.pid))).toBe(true);
+        expect(dead(-Number(retired!.pid))).toBe(true);
+      }
+      if (bareCodex) {
+        expect(await readFile(join(copy, "codex-home/auth.json"), "utf8")).toBe(
+          await readFile(join(home, "auth.json"), "utf8"),
+        );
       }
       expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(false);
       await rename(copy, activated);

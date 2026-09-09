@@ -335,6 +335,23 @@ describe("retained native cleanup discovery", () => {
   const agentId = randomUUID();
   const closeError =
     "provider_transport_failed: runner did not durably suspend before checkpoint";
+  const legacyMaintenanceHistory = () => [
+    {
+      kind: "native_cleanup_maintenance",
+      version: 1,
+      phase: "started",
+      requestId: "native-cleanup:legacy-request",
+      sourceFingerprint: "a".repeat(64),
+      startedAt: "2026-09-08T12:00:00.000Z",
+    },
+    {
+      kind: "native_cleanup_maintenance",
+      version: 1,
+      phase: "operator_required",
+      requestId: "native-cleanup:legacy-request",
+      code: "native_cleanup_maintenance_unproven",
+    },
+  ];
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase(
@@ -557,6 +574,83 @@ describe("retained native cleanup discovery", () => {
       expect(cleanup).not.toHaveBeenCalled();
     },
   );
+
+  it("discovers a single legacy failed attempt only for independent physical proof", async () => {
+    const runId = await candidate({
+      coordinator: { recoveryHistory: legacyMaintenanceHistory() },
+    });
+    const before = await db
+      .select()
+      .from(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.runId, runId));
+    const cleanup = vi.fn(async (input: { runId: string }) => ({
+      runId: input.runId,
+      status: "not_eligible" as const,
+    }));
+    await reconcileRetainedNativeSessionCleanups(db, { cleanup });
+    expect(cleanup).toHaveBeenCalledExactlyOnceWith({ companyId, runId });
+    expect(
+      await db
+        .select()
+        .from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, runId)),
+    ).toEqual(before);
+  });
+
+  it.each([
+    [
+      "new epoch",
+      (entries: Record<string, unknown>[]) =>
+        entries.push({ kind: "native_cleanup_runner_epoch", phase: "intent" }),
+    ],
+    [
+      "third attempt",
+      (entries: Record<string, unknown>[]) => entries.push({ ...entries[0] }),
+    ],
+    [
+      "reordered phases",
+      (entries: Record<string, unknown>[]) => entries.reverse(),
+    ],
+    [
+      "different request",
+      (entries: Record<string, unknown>[]) => {
+        entries[1]!.requestId = "native-cleanup:other";
+      },
+    ],
+    [
+      "unversioned entry",
+      (entries: Record<string, unknown>[]) => {
+        delete entries[0]!.version;
+      },
+    ],
+    [
+      "settled attempt",
+      (entries: Record<string, unknown>[]) => {
+        entries[1]!.phase = "settled";
+      },
+    ],
+    [
+      "unknown failure",
+      (entries: Record<string, unknown>[]) => {
+        entries[1]!.code = "other_failure";
+      },
+    ],
+    [
+      "missing source",
+      (entries: Record<string, unknown>[]) => {
+        delete entries[0]!.sourceFingerprint;
+      },
+    ],
+  ] as const)("excludes legacy discovery with %s", async (_name, mutate) => {
+    const history: Record<string, unknown>[] = legacyMaintenanceHistory();
+    mutate(history);
+    await candidate({ coordinator: { recoveryHistory: history } });
+    const cleanup = vi.fn();
+    expect(
+      await reconcileRetainedNativeSessionCleanups(db, { cleanup }),
+    ).toEqual([]);
+    expect(cleanup).not.toHaveBeenCalled();
+  });
 
   it("joins overlap and advances beyond a permanently ineligible first candidate", async () => {
     const ids = [await candidate(), await candidate()].sort();

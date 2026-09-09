@@ -96,6 +96,8 @@ export const defaultCapabilityRunnerdBinary =
 export const executeNativeSession = runner.executeNativeSession;
 export const completeRetainedNativeSessionCleanup = runner.completeRetainedNativeSessionCleanup;
 export const settleRetainedRunnerdSession = runner.settleRetainedRunnerdSession;
+export const retainedRunnerdMaintenanceIsIdle =
+  runner.retainedRunnerdMaintenanceIsIdle;
 export const drainRetainedRunnerdMaintenanceOperations =
   runner.drainRetainedRunnerdMaintenanceOperations;
 export const nativeRuntimePromptDigest = runner.nativeRuntimePromptDigest;

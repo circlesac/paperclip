@@ -50,6 +50,7 @@ import {
   parseNativeExecutionInput,
   parsePaperclipQuestionSet,
   resolveSourceCodexHome,
+  retainedRunnerdMaintenanceIsIdle,
   settleRetainedRunnerdSession,
   validatePrpEvent,
   validatePrpStructuredRunResult,
@@ -90,6 +91,7 @@ import {
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
 import { nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
+import { verifyRetainedMaintenanceNoLaunch } from "./native-maintenance-no-launch.js";
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -1560,18 +1562,16 @@ function cleanupStateSnapshot(root: string) {
   const [control, runner, provider] = bytes.map((value) =>
     record(JSON.parse(value.toString("utf8"))),
   );
+  const fileSha256 = bytes.map((value) =>
+    createHash("sha256").update(value).digest("hex"),
+  ) as [string, string, string];
   return {
     control: control!,
     runner: runner!,
     provider: provider!,
+    fileSha256,
     fingerprint: createHash("sha256")
-      .update(
-        JSON.stringify(
-          bytes.map((value) =>
-            createHash("sha256").update(value).digest("hex"),
-          ),
-        ),
-      )
+      .update(JSON.stringify(fileSha256))
       .digest("hex"),
   };
 }
@@ -1927,6 +1927,11 @@ export async function reconcileRetainedNativeSessionCleanup(
     root: string;
     emptyRoot: ReturnType<typeof cleanupCanonicalVacancy>;
     source: ReturnType<typeof cleanupStateSnapshot>;
+    copySource: {
+      directory: string;
+      snapshot: ReturnType<typeof cleanupStateSnapshot>;
+      requestId: string;
+    } | null;
     providerPid: number;
     providerSessionId: string;
     identity: {
@@ -2020,7 +2025,7 @@ export async function reconcileRetainedNativeSessionCleanup(
           coordinator.leaseExpiresAt &&
           coordinator.leaseExpiresAt > new Date()) ||
         coordinator.recoveryHistory.some(
-          (event) => event.kind === "native_cleanup_maintenance",
+          (event) => event.kind === "native_cleanup_runner_epoch",
         )
       )
         return null;
@@ -2146,6 +2151,79 @@ export async function reconcileRetainedNativeSessionCleanup(
         })
       )
         return null;
+      let copySource: {
+        directory: string;
+        snapshot: ReturnType<typeof cleanupStateSnapshot>;
+        requestId: string;
+      } | null = null;
+      const maintenanceHistory = coordinator.recoveryHistory.filter(
+        (event) => event.kind === "native_cleanup_maintenance",
+      );
+      if (maintenanceHistory.length) {
+        if (
+          maintenanceHistory.length !== 2 ||
+          typeof maintenanceHistory[0]?.requestId !== "string"
+        )
+          return null;
+        const priorRequestId = maintenanceHistory[0].requestId;
+        const scopeEntries = readdirSync(runnerdStateBase());
+        if (scopeEntries.length > 4096) return null;
+        const attemptedNames = scopeEntries.filter((name) =>
+          name.startsWith(`${basename(root)}.cleanup-`),
+        );
+        if (attemptedNames.length !== 1) return null;
+        const directory = resolve(runnerdStateBase(), attemptedNames[0]!);
+        if (
+          !retainedRunnerdMaintenanceIsIdle(directory) ||
+          lstatSync(resolve(directory, CLEANUP_ACTIVATION_FILE), {
+            throwIfNoEntry: false,
+          })
+        )
+          return null;
+        const attempted = cleanupStateSnapshot(directory);
+        const receipts = await tx
+          .select()
+          .from(heartbeatRunEvents)
+          .where(
+            and(
+              eq(heartbeatRunEvents.companyId, run.companyId),
+              eq(heartbeatRunEvents.runId, run.id),
+              eq(heartbeatRunEvents.eventType, "native.cleanup.event"),
+              eq(
+                heartbeatRunEvents.sourceInstanceId,
+                `${run.runnerInstanceId}:cleanup:${priorRequestId}`,
+              ),
+            ),
+          )
+          .limit(513);
+        if (
+          receipts.length > 512 ||
+          !verifyRetainedMaintenanceNoLaunch({
+            companyId: run.companyId,
+            agentId: run.agentId,
+            identity: identity as {
+              runnerInstanceId: string;
+              environmentLeaseId: string;
+              runId: string;
+              normalizedSessionId: string;
+              turnId: string;
+              itemId: string;
+            },
+            original: source,
+            attempted,
+            requestId: priorRequestId,
+            requestHistory: coordinator.recoveryHistory,
+            receipts,
+            now: new Date(),
+          })
+        )
+          return null;
+        copySource = {
+          directory,
+          snapshot: attempted,
+          requestId: priorRequestId,
+        };
+      }
       const history = [
         ...coordinator.recoveryHistory,
         {
@@ -2153,7 +2231,15 @@ export async function reconcileRetainedNativeSessionCleanup(
           version: 1,
           phase: "started",
           requestId: leaseOwner,
-          sourceFingerprint: source.fingerprint,
+          sourceFingerprint:
+            copySource?.snapshot.fingerprint ?? source.fingerprint,
+          ...(copySource
+            ? {
+                originalFingerprint: source.fingerprint,
+                copiedFromRequestId: copySource.requestId,
+                copiedFromStagingName: basename(copySource.directory),
+              }
+            : {}),
           startedAt: new Date().toISOString(),
         },
       ];
@@ -2173,6 +2259,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         root,
         emptyRoot,
         source,
+        copySource,
         providerPid: provider.processId,
         providerSessionId: provider.providerSessionId,
         identity: identity as {
@@ -2216,12 +2303,47 @@ export async function reconcileRetainedNativeSessionCleanup(
       executingRunnerdSessionScopes.get(reservedScope) !== leaseOwner ||
       cleanupStateSnapshot(owned.quarantine).fingerprint !==
         owned.source.fingerprint ||
+      (owned.copySource &&
+        (!retainedRunnerdMaintenanceIsIdle(owned.copySource.directory) ||
+          cleanupStateSnapshot(owned.copySource.directory).fingerprint !==
+            owned.copySource.snapshot.fingerprint ||
+          lstatSync(
+            resolve(owned.copySource.directory, CLEANUP_ACTIVATION_FILE),
+            { throwIfNoEntry: false },
+          ))) ||
       canonicalJson(cleanupCanonicalVacancy(owned.root)) !==
         canonicalJson(owned.emptyRoot) ||
       !cleanupProcessAbsent(owned.run.processPid) ||
       !cleanupProcessAbsent(owned.providerPid)
     )
       throw denied();
+  };
+  const appendMaintenanceHistory = async (entry: Record<string, unknown>) => {
+    const history = await db.transaction(async (tx) => {
+      const current = await tx
+        .select()
+        .from(nativeRunFinalizations)
+        .where(
+          and(
+            eq(nativeRunFinalizations.runId, owned.run.id),
+            eq(nativeRunFinalizations.companyId, owned.run.companyId),
+            eq(nativeRunFinalizations.phase, "committed"),
+            eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+            gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
+          ),
+        )
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (!current || current.leaseOwner !== leaseOwner) throw denied();
+      const next = [...current.recoveryHistory, entry];
+      await tx
+        .update(nativeRunFinalizations)
+        .set({ recoveryHistory: next, updatedAt: new Date() })
+        .where(eq(nativeRunFinalizations.runId, owned.run.id));
+      return next;
+    });
+    owned.history = history;
   };
   try {
     await authorize();
@@ -2234,13 +2356,23 @@ export async function reconcileRetainedNativeSessionCleanup(
       mkdirSync(resolve(copy, folder), { mode: 0o700 });
     for (const file of CLEANUP_CANONICAL_FILES) {
       copyFileSync(
-        resolve(owned.quarantine, file),
+        resolve(owned.copySource?.directory ?? owned.quarantine, file),
         resolve(copy, file),
         constants.COPYFILE_EXCL,
       );
       chmodSync(resolve(copy, file), 0o600);
     }
+    await appendMaintenanceHistory({
+      kind: "native_cleanup_maintenance",
+      version: 1,
+      phase: "staged",
+      requestId: leaseOwner,
+      sourceFingerprint:
+        owned.copySource?.snapshot.fingerprint ?? owned.source.fingerprint,
+      stagingName: basename(copy),
+    });
     const proof = await settleRetainedRunnerdSession({
+      requestId: leaseOwner,
       binding: {
         companyId: owned.run.companyId,
         issueId: owned.run.nativeIssueId!,
@@ -2252,7 +2384,8 @@ export async function reconcileRetainedNativeSessionCleanup(
       backend: { kind: "runner", name: "codex_app_server" },
       stateDirectory: copy,
       activationDirectory: owned.root,
-      sourceFingerprint: owned.source.fingerprint,
+      sourceFingerprint:
+        owned.copySource?.snapshot.fingerprint ?? owned.source.fingerprint,
       providerSessionId: owned.providerSessionId,
       originalRunnerPid: owned.run.processPid!,
       originalProviderPid: owned.providerPid,
@@ -2264,6 +2397,15 @@ export async function reconcileRetainedNativeSessionCleanup(
         owned.execution.workspace.cwd,
       ),
       authorize,
+      recordEpoch: async (receipt) => {
+        if (receipt.requestId !== leaseOwner || receipt.stateDirectory !== copy)
+          throw denied();
+        await appendMaintenanceHistory({
+          kind: "native_cleanup_runner_epoch",
+          version: 1,
+          ...receipt,
+        });
+      },
       appendEvent: async (event) => {
         await appendRetainedNativeCleanupEvent(db, {
           companyId: owned.run.companyId,
@@ -2385,29 +2527,46 @@ export async function reconcileRetainedNativeSessionCleanup(
         /* retain fail-closed ownership */
       }
     }
-    await db
-      .update(nativeRunFinalizations)
-      .set({
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        recoveryHistory: [
-          ...owned.history,
-          {
-            kind: "native_cleanup_maintenance",
-            version: 1,
-            phase: "operator_required",
-            requestId: leaseOwner,
-            code: "native_cleanup_maintenance_unproven",
-          },
-        ],
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(nativeRunFinalizations.runId, owned.run.id),
-          eq(nativeRunFinalizations.leaseOwner, leaseOwner),
-        ),
-      );
+    await db.transaction(async (tx) => {
+      const current = await tx
+        .select()
+        .from(nativeRunFinalizations)
+        .where(
+          and(
+            eq(nativeRunFinalizations.runId, owned.run.id),
+            eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+          ),
+        )
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (!current || current.leaseOwner !== leaseOwner) return;
+      await tx
+        .update(nativeRunFinalizations)
+        .set({
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          // A timed-out epoch callback may have committed before this lock.
+          // Preserve its evidence rather than replacing it from a stale copy.
+          recoveryHistory: [
+            ...current.recoveryHistory,
+            {
+              kind: "native_cleanup_maintenance",
+              version: 1,
+              phase: "operator_required",
+              requestId: leaseOwner,
+              code: "native_cleanup_maintenance_unproven",
+            },
+          ],
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(nativeRunFinalizations.runId, owned.run.id),
+            eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+          ),
+        );
+    });
     return { status: "operator_required", runId: input.runId };
   } finally {
     releaseScope();

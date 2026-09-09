@@ -7,6 +7,26 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+Newest release evidence (September 9, 00:04 UTC): the ownership admission gate
+is fixed and independently reviewed. A genuine red test reproduced commands
+starting before the spawned-process receipt committed; a second reproduced a
+pending peer being welcomed after another peer latched an integrity fault.
+Both now fail closed. Controller tests pass 49/49, full transport 97/97, and
+all nine real maintenance cases pass against the normally staged optimized
+runner, SHA-256
+`6a22b20ffd1c32a2866e804dc2b36e984618aaf8065c811533739deb79ec7d95`.
+Strict code-signature verification, normal TypeScript build, package no-emit
+checks and server typechecking pass. Live deployment and the original Telegram
+file retry are the next actions, not yet established outcomes.
+
+Slack's exact active bot `U0C05EDC10R` is still a member of private test channel
+`C0BUT55N9RV`: authenticated provider reads confirmed membership and three
+members. The browser's one-member display and similarly named app suggestion
+are not grounds to change access. Refresh and select the exact current bot.
+Discord's Eigenjoy browser session currently requires login again; the saved
+1Password item is visible, but CLI authorization was dismissed. No bot token
+rotation or provider access changes have been made.
+
 Newest evidence (23:55 UTC): the browser is available again. Root retried the
 original GitHub B run `38dfc3ec-4fa7-4ed4-8563-7650dfce3d47` through its Board
 Retry control, producing run `7c4827a6-705a-4295-8196-f51a821a4af3`. It ran on

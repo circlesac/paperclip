@@ -252,7 +252,32 @@ export function reconcileRetainedNativeSessionCleanups(
             // privately after clearing the visible successful run's stale error.
             sql`coalesce(${heartbeatRuns.errorCode}, ${heartbeatRuns.resultJson}->'recoveredExecutionFailure'->>'errorCode') = 'adapter_failed'`,
             sql`coalesce(${heartbeatRuns.error}, ${heartbeatRuns.resultJson}->'recoveredExecutionFailure'->>'error') = 'provider_transport_failed: runner did not durably suspend before checkpoint'`,
-            sql`not (${nativeRunFinalizations.recoveryHistory} @> '[{"kind":"native_cleanup_maintenance"}]'::jsonb)`,
+            sql`not (${nativeRunFinalizations.recoveryHistory} @> '[{"kind":"native_cleanup_runner_epoch"}]'::jsonb)`,
+            // One legacy pre-ownership attempt may be inspected by the closed,
+            // artifact-pinned no-launch verifier. Discovery grants no authority
+            // to reuse its directory or start a provider. New recorded epochs,
+            // staged attempts and ambiguous histories never enter this lane.
+            sql`(
+              select coalesce(
+                jsonb_array_length(history.entries) = 0 or (
+                  jsonb_array_length(history.entries) = 2
+                  and history.entries->0->>'version' = '1'
+                  and history.entries->1->>'version' = '1'
+                  and history.entries->0->>'phase' = 'started'
+                  and history.entries->1->>'phase' = 'operator_required'
+                  and history.entries->1->>'code' = 'native_cleanup_maintenance_unproven'
+                  and history.entries->0->>'requestId' like 'native-cleanup:%'
+                  and history.entries->0->>'requestId' = history.entries->1->>'requestId'
+                  and history.entries->0->>'sourceFingerprint' ~ '^[a-f0-9]{64}$'
+                ), false
+              )
+              from (
+                select coalesce(jsonb_agg(entry.value order by entry.ordinal), '[]'::jsonb) as entries
+                from jsonb_array_elements(${nativeRunFinalizations.recoveryHistory})
+                  with ordinality as entry(value, ordinal)
+                where entry.value->>'kind' = 'native_cleanup_maintenance'
+              ) history
+            )`,
             ...(cursor ? [gt(heartbeatRuns.id, cursor)] : []),
           ),
         )

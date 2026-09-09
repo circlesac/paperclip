@@ -2564,3 +2564,32 @@ matching 453-second and 186-second sleep intervals. The final run used only a
 process-scoped idle-sleep assertion. No test timeout or safety assertion was
 weakened. Server 60 still runs the preceding source version; live revoked-editor
 qualification after deployment remains outstanding.
+
+### Copy-only legacy recovery and durable spawn admission
+
+The closed legacy verifier now proves the exact reviewed pre-spawn failure
+using both unchanged snapshots, the complete receipt namespace, immutable
+command prefixes and Rust's nullable fingerprint fields. It authorizes only a
+new private copy, never reactivation or deletion of the failed evidence. The
+actual 91-receipt read-only check passes with original files unchanged; pure
+proof and discovery tests pass 60/60. Discovery itself grants no execution
+authority and excludes all newer recorded epochs and ambiguous histories.
+
+New maintenance persists per-epoch launch intent, spawned ownership and joined
+retirement. A real held-write regression initially demonstrated that the
+controller could welcome the runner before its spawned receipt committed.
+Authentication now waits for that durable admission and then rechecks the exact
+credential, connection, expiry and latched integrity status before consuming
+the credential or sending commands. A second genuine red regression covered an
+authenticated peer latching an integrity fault while its successor waited.
+Failure cannot be undone by late completion of the original database promise.
+
+Final verification: 49 controller tests, 97 transport tests, 207 executor tests,
+and the 60 proof/discovery tests passed. All nine composed maintenance cases
+also passed against the normal staged optimized release (no debug runner
+override), including terminal-only continuation and held/failed spawned
+receipts. Its SHA-256 is
+`6a22b20ffd1c32a2866e804dc2b36e984618aaf8065c811533739deb79ec7d95`;
+strict code-signature verification, normal TypeScript build, package no-emit
+checks and server typechecking passed. This section records release evidence,
+not live physical settlement; controlled idle deployment follows.

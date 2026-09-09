@@ -760,6 +760,93 @@ function secureNonce(prefix: "P3C1" | "P3S1", counter: bigint): Buffer {
   return nonce;
 }
 
+it.each([
+  "allow", "reject", "expire", "replace", "stop", "competing_proof",
+] as const)(
+  "holds authenticated command admission until durable ownership settles (%s)",
+  async (outcome) => {
+    const root = mkdtempSync(resolve(tmpdir(), "runner-auth-admission-test-"));
+    let release!: () => void;
+    let reject!: (error: Error) => void;
+    const gate = new Promise<void>((resolveGate, rejectGate) => {
+      release = resolveGate;
+      reject = rejectGate;
+    });
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolveEntered) => {
+      entered = resolveEntered;
+    });
+    let admissions = 0;
+    const core = new DurablePrpControlPlane({
+      stateDirectory: root,
+      identity,
+      expectedRunnerVersion,
+      expectedRunnerDigest,
+      beforeAuthenticatedConnection: () => {
+        admissions++;
+        entered();
+        return gate;
+      },
+    });
+    let authenticating: Promise<AuthenticatedClient | null> | undefined;
+    let competing: Promise<AuthenticatedClient | null> | undefined;
+    let client: AuthenticatedClient | null = null;
+    try {
+      await core.start();
+      const command = core.queueCommand("turn.stop", {});
+      const ticket = core.issueBootstrapTicket();
+      const ticketId = credentialMaterial(ticket).credentialId;
+      authenticating = authenticate(core, ticket);
+      await waiting;
+      if (outcome === "competing_proof") {
+        competing = authenticate(core, ticket);
+        await vi.waitFor(() => expect(admissions).toBe(2));
+      }
+      expect(core.store.state.connectionCount).toBe(0);
+      expect(core.store.state.commandDeliveryCounts).toEqual({});
+      expect(core.store.state.tickets[ticketId]!.usedAt).toBeNull();
+      expect(Object.keys(core.store.state.leases)).toHaveLength(0);
+      if (outcome === "expire")
+        core.store.state.tickets[ticketId]!.expiresAtUnixMs = Date.now() - 1;
+      if (outcome === "replace")
+        core.store.state.tickets[ticketId]!.recordId = "changed-record";
+      if (outcome === "stop") await core.stop();
+      if (outcome === "reject") reject(new Error("durable ownership failed"));
+      else release();
+      client = await authenticating;
+      if (outcome === "allow" || outcome === "competing_proof") {
+        expect(client).not.toBeNull();
+        if (competing) expect(await competing).toBeNull();
+        expect(
+          (client!.welcome.payload as Record<string, unknown>).pendingCommands,
+        ).toEqual([
+          expect.objectContaining({
+            commandId: command.commandId,
+            type: "turn.stop",
+          }),
+        ]);
+        expect(core.store.state.connectionCount).toBe(1);
+        expect(core.store.state.commandDeliveryCounts[command.commandId]).toBe(
+          1,
+        );
+      } else {
+        expect(client).toBeNull();
+        expect(core.store.state.connectionCount).toBe(0);
+        expect(core.store.state.commandDeliveryCounts).toEqual({});
+        expect(core.store.state.tickets[ticketId]!.usedAt).toBeNull();
+        expect(Object.keys(core.store.state.leases)).toHaveLength(0);
+      }
+    } finally {
+      release();
+      client?.socket.destroy();
+      await core.stop();
+      await authenticating?.catch(() => undefined);
+      await competing?.catch(() => undefined);
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
 function secureAad(
   client: AuthenticatedClient,
   direction: "client_to_core" | "core_to_client",
@@ -769,6 +856,67 @@ function secureAad(
     `paperclip.runner.secure-frame.v1\0${client.sessionId}\0${direction}\0${counter}`,
   );
 }
+
+it("denies held admission if the previous authenticated owner latches integrity failure", async () => {
+  const root = mkdtempSync(
+    resolve(tmpdir(), "runner-auth-integrity-gate-test-"),
+  );
+  let hold = false;
+  let release!: () => void;
+  const gate = new Promise<void>((resolveGate) => {
+    release = resolveGate;
+  });
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolveEntered) => {
+    entered = resolveEntered;
+  });
+  const integrity = vi.fn();
+  const core = new DurablePrpControlPlane({
+    stateDirectory: root,
+    identity,
+    expectedRunnerVersion,
+    expectedRunnerDigest,
+    onProtocolIntegrityError: integrity,
+    onSemanticToolInput: async () => ({ result: {} }),
+    beforeAuthenticatedConnection: async () => {
+      if (!hold) return;
+      entered();
+      await gate;
+    },
+  });
+  let old: AuthenticatedClient | null = null;
+  let successor: AuthenticatedClient | null = null;
+  let admission: Promise<AuthenticatedClient | null> | undefined;
+  try {
+    await core.start();
+    old = await authenticate(core, core.issueBootstrapTicket());
+    expect(old).not.toBeNull();
+    const command = core.queueCommand("turn.stop", {});
+    const ticket = core.issueBootstrapTicket();
+    const ticketId = credentialMaterial(ticket).credentialId;
+    hold = true;
+    admission = authenticate(core, ticket);
+    await waiting;
+    sendSecure(old!, corruptSemanticInputDigest());
+    expect(await receiveSecure(old!)).toBeNull();
+    expect(integrity).toHaveBeenCalledOnce();
+    release();
+    successor = await admission;
+    expect(successor).toBeNull();
+    expect(core.store.state.connectionCount).toBe(1);
+    expect(core.store.state.tickets[ticketId]!.usedAt).toBeNull();
+    expect(
+      core.store.state.commandDeliveryCounts[command.commandId],
+    ).toBeUndefined();
+  } finally {
+    release();
+    old?.socket.destroy();
+    successor?.socket.destroy();
+    await core.stop();
+    await admission?.catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function sendSecure(
   client: AuthenticatedClient,

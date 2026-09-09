@@ -1644,8 +1644,48 @@ export interface RetainedRunnerdCleanupProof {
   readonly settledFingerprint: string;
 }
 
+/** Content-free evidence for this controller's exact child handle. A launch
+ * intent without a matching retirement is deliberately not absence proof. */
+export type RetainedRunnerdMaintenanceEpochReceipt = {
+  schema: "paperclip.native_cleanup_runner_epoch.v1";
+  requestId: string;
+  epoch: number;
+  launchId: string;
+  stateDirectory: string;
+  initialFingerprint: string;
+  runnerArtifact: { path: string; version: string; digest: string };
+} & (
+  | { phase: "launch_intent" }
+  | {
+      phase: "spawned";
+      pid: number;
+      processGroupId: number;
+      processStartedAt: string;
+      spawnedAt: string;
+    }
+  | {
+      phase: "retired";
+      pid: number;
+      processGroupId: number;
+      processStartedAt: string;
+      spawnedAt: string;
+      exitCode: number | null;
+      exitSignal: NodeJS.Signals | null;
+      processGroupAbsent: true;
+      retiredAt: string;
+      finalFingerprint: string;
+    }
+);
+
 const retainedRunnerdCleanupProofs = new WeakMap<object, readonly number[]>();
 const retainedMaintenanceOperations = new Map<string, Set<Promise<unknown>>>();
+const activeMaintenanceRoots = new Set<string>();
+
+/** No absence claim about an old child; only this controller's joined work. */
+export function retainedRunnerdMaintenanceIsIdle(directory: string): boolean {
+  const root = resolve(directory);
+  return !activeMaintenanceRoots.has(root) && !retainedMaintenanceOperations.has(root);
+}
 
 /** A timeout revokes cleanup authority, not ownership of an already-started
  * callback. Shutdown must join the original operations, including any that
@@ -1701,6 +1741,7 @@ function readMaintenanceState(root: string) {
     control: control!,
     runner: runner!,
     provider: provider!,
+    providerFingerprint: createHash("sha256").update(bytes[2]!).digest("hex"),
     fingerprint: createHash("sha256")
       .update(
         JSON.stringify(
@@ -1755,7 +1796,9 @@ export function retainedRunnerdCleanupProofIsCurrent(
     assertMaintenanceBinding(state, proof.identity, proof.providerSessionId);
     return (
       state.fingerprint === proof.settledFingerprint &&
-      state.runner.lifecycle === "suspended"
+      state.runner.lifecycle === "suspended" &&
+      state.runner.pendingTerminalDelivery == null &&
+      state.runner.pendingProviderCleanup == null
     );
   } catch {
     return false;
@@ -1766,7 +1809,8 @@ export function retainedRunnerdCleanupProofIsCurrent(
  * deliberately not a NativeSession: it has no turn-start, tool execution,
  * result selection, or authority-rotation API. The embedding server owns the
  * durable recovery lease, original-source proof, and atomic activation. */
-export async function settleRetainedRunnerdSession(input: {
+export interface RetainedRunnerdMaintenanceInput {
+  requestId: string;
   binding: NativeRunIdentity;
   identity: DurableRecoveryIdentity;
   backend: { kind: string; name: string };
@@ -1781,10 +1825,33 @@ export async function settleRetainedRunnerdSession(input: {
   sourceCodexHome?: string | null;
   authorize: () => Promise<void>;
   appendEvent: (event: PrpEvent) => Promise<void>;
+  recordEpoch: (
+    receipt: RetainedRunnerdMaintenanceEpochReceipt,
+  ) => Promise<void>;
   signal?: AbortSignal;
-}): Promise<RetainedRunnerdCleanupProof> {
+}
+
+export async function settleRetainedRunnerdSession(
+  input: RetainedRunnerdMaintenanceInput,
+): Promise<RetainedRunnerdCleanupProof> {
+  const root = resolve(input.stateDirectory);
+  if (!retainedRunnerdMaintenanceIsIdle(root)) throw maintenanceDenied();
+  activeMaintenanceRoots.add(root);
+  try {
+    return await settleRetainedRunnerdSessionOwned(input);
+  } finally {
+    activeMaintenanceRoots.delete(root);
+  }
+}
+
+async function settleRetainedRunnerdSessionOwned(
+  input: RetainedRunnerdMaintenanceInput,
+): Promise<RetainedRunnerdCleanupProof> {
   const root = resolve(input.stateDirectory);
   if (
+    !input.requestId ||
+    input.requestId.length > 160 ||
+    /[\x00-\x1f]/.test(input.requestId) ||
     retainedMaintenanceOperations.has(root) ||
     root === resolve(input.activationDirectory) ||
     input.binding.runId !== input.identity.runId ||
@@ -1919,12 +1986,28 @@ export async function settleRetainedRunnerdSession(input: {
   // A previously journaled suspend must be honored before a later drain.
   // A second exact-authority connection can then drain the retained provider
   // prefix; no old command is removed, reordered, or treated as completed.
-  for (let epoch = 0; epoch < 3; epoch++) {
+  for (let epoch = 0; epoch < 4; epoch++) {
     await authorize();
     if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
     const before = readMaintenanceState(root);
     assertMaintenanceBinding(before, input.identity, input.providerSessionId);
-    const epochRestoresProvider = before.provider.lifecycle === "turn_active";
+    const terminalOnly = before.runner.pendingTerminalDelivery != null;
+    const pendingTerminal = record(before.runner.pendingTerminalDelivery);
+    if (
+      terminalOnly &&
+      !(before.control.commands as Array<Record<string, unknown>>).some(
+        (command) =>
+          command.commandId === pendingTerminal.commandId &&
+          command.controllerSeq === pendingTerminal.controllerSeq &&
+          command.type === "runner.suspend" &&
+          pendingTerminal.commandType === "runner.suspend" &&
+          pendingTerminal.lifecycle === "suspended" &&
+          command.status === "failed",
+      )
+    )
+      throw maintenanceDenied();
+    const epochRestoresProvider =
+      !terminalOnly && before.provider.lifecycle === "turn_active";
     const epochProviderPids = new Set<number>();
     const epochCompletedCommands = new Set(
       (before.control.commands as Array<Record<string, unknown>>)
@@ -1932,6 +2015,7 @@ export async function settleRetainedRunnerdSession(input: {
         .map((command) => command.commandId),
     );
     if (
+      !terminalOnly &&
       !epochRestoresProvider &&
       (before.provider.activeProviderTurnId != null ||
         (before.control.commands as Array<Record<string, unknown>>).some(
@@ -1942,11 +2026,25 @@ export async function settleRetainedRunnerdSession(input: {
     ) {
       throw maintenanceDenied();
     }
+    let releaseSpawnAdmission!: () => void;
+    let rejectSpawnAdmission!: (error: unknown) => void;
+    const spawnAdmission = new Promise<void>(
+      (resolveAdmission, rejectAdmission) => {
+        releaseSpawnAdmission = resolveAdmission;
+        rejectSpawnAdmission = rejectAdmission;
+      },
+    );
+    // A launch failure can reject this before any runner reaches authentication.
+    void spawnAdmission.catch(() => undefined);
     const core = new DurablePrpControlPlane({
       stateDirectory: resolve(root, "control-plane"),
       identity: input.identity,
       expectedRunnerVersion: artifact.version,
       expectedRunnerDigest: artifact.digest,
+      beforeAuthenticatedConnection: async () => {
+        await spawnAdmission;
+        await authorize();
+      },
       onProtocolIntegrityError: (error) => {
         failure = error;
       },
@@ -2014,6 +2112,19 @@ export async function settleRetainedRunnerdSession(input: {
     let handle: RunnerProcessHandle | null = null;
     let exited = false;
     let epochCompleted = false;
+    const epochIdentity = {
+      schema: "paperclip.native_cleanup_runner_epoch.v1" as const,
+      requestId: input.requestId,
+      epoch,
+      launchId: randomUUID(),
+      stateDirectory: root,
+      initialFingerprint: before.fingerprint,
+      runnerArtifact: { path: resolve(runnerBinary), ...artifact },
+    };
+    let spawnedReceipt: Extract<
+      RetainedRunnerdMaintenanceEpochReceipt,
+      { phase: "spawned" }
+    > | null = null;
     try {
       const pending = core.store.state.commands.filter(
         (command) => command.status === "pending",
@@ -2022,6 +2133,7 @@ export async function settleRetainedRunnerdSession(input: {
         (command) => command.type === "runner.suspend",
       );
       if (
+        !terminalOnly &&
         !terminalQueued &&
         before.provider.activeProviderTurnId !== null &&
         before.provider.activeProviderTurnId !== undefined
@@ -2031,6 +2143,11 @@ export async function settleRetainedRunnerdSession(input: {
         });
       }
       await core.start();
+      await authorize();
+      epochIdentity.initialFingerprint = readMaintenanceState(root).fingerprint;
+      await bounded(
+        input.recordEpoch({ ...epochIdentity, phase: "launch_intent" }),
+      );
       await authorize();
       handle = spawnRunner({
         connectUrl: core.connectUrl,
@@ -2065,6 +2182,24 @@ export async function settleRetainedRunnerdSession(input: {
           failure = error;
         },
       );
+      const processStartedAt = readLocalProcessStartedAt(handle.child.pid);
+      if (
+        !processStartedAt ||
+        !handle.startedAt ||
+        handle.processGroupId !== handle.child.pid
+      )
+        throw maintenanceDenied();
+      spawnedReceipt = {
+        ...epochIdentity,
+        phase: "spawned",
+        pid: handle.child.pid,
+        processGroupId: handle.processGroupId,
+        processStartedAt,
+        spawnedAt: handle.startedAt,
+      };
+      await bounded(input.recordEpoch(spawnedReceipt));
+      await authorize();
+      releaseSpawnAdmission();
       let drainQueued = false;
       while (!exited) {
         await authorize();
@@ -2076,7 +2211,7 @@ export async function settleRetainedRunnerdSession(input: {
           epochRestoresProvider,
         );
         const provider = providerDrainStateFromSnapshot(state.provider);
-        if (!terminalQueued && provider.providerSettled) {
+        if (!terminalOnly && !terminalQueued && provider.providerSettled) {
           if (!drainQueued) {
             core.queueCommand("runner.drain", {}, undefined, true);
             drainQueued = true;
@@ -2097,9 +2232,36 @@ export async function settleRetainedRunnerdSession(input: {
       await authorize();
       epochCompleted = true;
     } finally {
+      rejectSpawnAdmission(failure ?? maintenanceDenied());
       if (handle && !exited)
         await waitForProcess(handle, 250).catch(() => undefined);
       await core.stop();
+      // Do not mistake a bounded wait/kill attempt for retirement. Only the
+      // exact child's settled completion plus absence of its entire group can
+      // produce this durable receipt. A missing receipt remains unknown.
+      if (handle && spawnedReceipt && exited) {
+        try {
+          const result = await handle.completion;
+          if (!maintenanceProcessAbsent(spawnedReceipt.pid))
+            throw maintenanceDenied();
+          await bounded(
+            input.recordEpoch({
+              ...spawnedReceipt,
+              phase: "retired",
+              exitCode: result.code,
+              exitSignal: result.signal,
+              processGroupAbsent: true,
+              retiredAt: new Date().toISOString(),
+              finalFingerprint: readMaintenanceState(root).fingerprint,
+            }),
+            Date.now() + 1_000,
+          );
+        } catch (error) {
+          failure ??= error;
+        }
+      } else if (handle) {
+        failure ??= maintenanceDenied();
+      }
       // Timed-out database operations remain observed in the retained map;
       // they cannot authorize another attempt or produce a cleanup proof.
       await bounded(
@@ -2137,6 +2299,23 @@ export async function settleRetainedRunnerdSession(input: {
     const settled = readMaintenanceState(root);
     assertMaintenanceBinding(settled, input.identity, input.providerSessionId);
     if (settled.runner.lifecycle !== "suspended") throw maintenanceDenied();
+    if (terminalOnly) {
+      // This epoch only confirms delivery of a failed old terminal receipt.
+      // It cannot count as provider cleanup or create/execute a command. A
+      // separate epoch must perform a NEW stop under the persistent marker.
+      if (
+        settled.providerFingerprint !== before.providerFingerprint ||
+        settled.runner.pendingTerminalDelivery != null ||
+        commandDigest(settled.runner.pendingProviderCleanup) !==
+          commandDigest(pendingTerminal) ||
+        commandDigest(settled.control.commands) !==
+          commandDigest(before.control.commands) ||
+        epochProviderPids.size !== 0 ||
+        ![...pids].every(maintenanceProcessAbsent)
+      )
+        throw maintenanceDenied();
+      continue;
+    }
     // The old suspend can precede the restored process's identity event on
     // the wire. Keep that persisted identity provisional until the next
     // no-launch epoch authenticates the exact source event and payload.
@@ -2209,6 +2388,8 @@ export async function settleRetainedRunnerdSession(input: {
       throw maintenanceDenied();
     if (
       settled.provider.lifecycle === "prepared" &&
+      settled.runner.pendingTerminalDelivery == null &&
+      settled.runner.pendingProviderCleanup == null &&
       stopProven &&
       [...providerProofs.values()].every((proof) => proof.authenticated) &&
       provider.providerSettled &&
@@ -2285,8 +2466,8 @@ function acpxProviderPackageAuthority(
   // portable shape launched the already-authenticated sidecar.
   const sourceDependencyRoot = resolve(ownerPackageRoot, "../..");
   const localDependencyRoot = existsSync(
-      resolve(ownerPackageRoot, "node_modules", ".pnpm"),
-    )
+    resolve(ownerPackageRoot, "node_modules", ".pnpm"),
+  )
     ? ownerPackageRoot
     : basename(sourceDependencyRoot) === "node_modules"
       ? resolve(sourceDependencyRoot, "..")
@@ -2480,7 +2661,6 @@ function withRunnerdProviderTrace(
   }
   return result;
 }
-
 export function createCapabilityRunnerdProviderEnvironment(input: {
   provider: NonNullable<CapabilityRunnerdCodexTransportOptions["provider"]>;
   options: CapabilityRunnerdCodexTransportOptions;

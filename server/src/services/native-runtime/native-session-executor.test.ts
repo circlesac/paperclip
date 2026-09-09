@@ -37,6 +37,7 @@ import {
   NativeSessionProtocolIntegrityError,
 } from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
+import * as noLaunchProofModule from "./native-maintenance-no-launch.js";
 import {
   createNativeHarnessBackupStamp,
   verifyNativeHarnessBackupStamp,
@@ -114,6 +115,7 @@ const state = vi.hoisted(() => ({
   execute: vi.fn(),
   cleanup: vi.fn(),
   retireCleanup: vi.fn(),
+  maintenanceIdle: vi.fn(() => true),
   createTransport: vi.fn((_options: RunnerTransportOptions) => ({
     transport: {},
   })),
@@ -168,6 +170,7 @@ vi.mock("../../vendor/paperclip-runner/index.js", async (importOriginal) => ({
   createRunnerdCodexTransport: state.createTransport,
   executeNativeSession: state.execute,
   settleRetainedRunnerdSession: state.cleanup,
+  retainedRunnerdMaintenanceIsIdle: state.maintenanceIdle,
   completeRetainedNativeSessionCleanup: state.retireCleanup,
   parsePaperclipQuestionSet: (value: unknown) => value,
 }));
@@ -2108,6 +2111,7 @@ describe("retained native cleanup activation", () => {
     "live_owner",
     "foreign_event",
     "maintenance_failure",
+    "epoch_commit_failure",
     "activation_commit_failure",
     "activation_commit_stalled",
     "empty_root",
@@ -2123,6 +2127,12 @@ describe("retained native cleanup activation", () => {
     "missing_result_command",
     "bad_identity_hash",
     "foreign_semantic_scope",
+    "legacy_copy",
+    "legacy_changed_copy",
+    "legacy_busy_copy",
+    "legacy_bad_proof",
+    "legacy_extra_attempt",
+    "legacy_activation",
   ])("preserves exact original evidence for %s", async (mode) => {
     const directory = await mkdtemp(
       join(tmpdir(), "paperclip-maintenance-activation-"),
@@ -2160,6 +2170,15 @@ describe("retained native cleanup activation", () => {
       "quarantine",
       `${key}.identity_indeterminate.fixture`,
     );
+    const legacyDirectory = join(directory, `${key}.cleanup-prior`);
+    const legacy = mode.startsWith("legacy_");
+    const proofSpy = vi.spyOn(
+      noLaunchProofModule,
+      "verifyRetainedMaintenanceNoLaunch",
+    );
+    state.maintenanceIdle
+      .mockReset()
+      .mockReturnValue(mode !== "legacy_busy_copy");
     const identity = {
       runId: execution.binding.runId,
       runnerInstanceId: "runner-cleanup",
@@ -2408,6 +2427,13 @@ describe("retained native cleanup activation", () => {
         try {
           const result = await operation(db as unknown as Db);
           if (
+            mode === "epoch_commit_failure" &&
+            (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(
+              -1,
+            )?.phase === "spawned"
+          )
+            throw new Error("injected epoch commit failure");
+          if (
             mode === "activation_commit_stalled" &&
             (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(
               -1,
@@ -2510,6 +2536,52 @@ describe("retained native cleanup activation", () => {
       );
       for (const [file, data] of source)
         await writeFile(join(quarantine, file), JSON.stringify(data));
+      let legacyBytes: string[] | null = null;
+      if (legacy) {
+        // This suite isolates filesystem/lease orchestration. The real pure
+        // producer proof and raw runner composition have separate canaries.
+        await mkdir(join(legacyDirectory, "runner"), { recursive: true });
+        await mkdir(join(legacyDirectory, "control-plane"));
+        legacyBytes = source.map(([, value]) =>
+          JSON.stringify({ ...value, failedCopyFixture: true }),
+        );
+        for (let index = 0; index < source.length; index++)
+          await writeFile(
+            join(legacyDirectory, source[index]![0]),
+            legacyBytes[index]!,
+          );
+        coordinator.recoveryHistory = [
+          {
+            kind: "native_cleanup_maintenance",
+            version: 1,
+            phase: "started",
+            requestId: "native-cleanup:prior",
+          },
+          {
+            kind: "native_cleanup_maintenance",
+            version: 1,
+            phase: "operator_required",
+            requestId: "native-cleanup:prior",
+          },
+        ];
+        if (mode === "legacy_extra_attempt")
+          await mkdir(join(directory, `${key}.cleanup-other`));
+        if (mode === "legacy_activation")
+          await writeFile(
+            join(legacyDirectory, "cleanup-activation.json"),
+            "{}",
+          );
+        proofSpy.mockImplementation((input) =>
+          mode === "legacy_bad_proof"
+            ? null
+            : {
+                kind: "codex_pre_spawn_terminal_latch_v1",
+                requestId: input.requestId,
+                originalFingerprint: input.original.fingerprint,
+                attemptedFingerprint: input.attempted.fingerprint,
+              },
+        );
+      }
       const original = await Promise.all(
         source.map(([file]) => readFile(join(quarantine, file), "utf8")),
       );
@@ -2517,6 +2589,70 @@ describe("retained native cleanup activation", () => {
       state.retireCleanup.mockReset();
       state.cleanup.mockImplementation(async (input) => {
         await input.authorize();
+        if (legacy) {
+          expect(input.stateDirectory).not.toBe(legacyDirectory);
+          expect(
+            await Promise.all(
+              source.map(([file]) =>
+                readFile(join(input.stateDirectory, file), "utf8"),
+              ),
+            ),
+          ).toEqual(legacyBytes);
+          expect(proofSpy).toHaveBeenCalledOnce();
+          expect(proofSpy.mock.calls[0]![0]).toMatchObject({
+            companyId: run.companyId,
+            agentId: run.agentId,
+            identity,
+            requestId: "native-cleanup:prior",
+          });
+          if (mode === "legacy_changed_copy") {
+            await writeFile(join(legacyDirectory, source[0][0]), "{}");
+            await input.authorize();
+          }
+        }
+        expect(
+          (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(
+            -1,
+          ),
+        ).toMatchObject({
+          phase: "staged",
+          stagingName: input.stateDirectory.split("/").at(-1),
+        });
+        const epoch = {
+          schema: "paperclip.native_cleanup_runner_epoch.v1",
+          requestId: input.requestId,
+          epoch: 0,
+          launchId: "fixture-launch",
+          stateDirectory: input.stateDirectory,
+          initialFingerprint: input.sourceFingerprint,
+          runnerArtifact: {
+            path: "/fixture/runnerd",
+            version: "fixture",
+            digest: "fixture-digest",
+          },
+        };
+        await input.recordEpoch({ ...epoch, phase: "launch_intent" });
+        await input.recordEpoch({
+          ...epoch,
+          phase: "spawned",
+          pid: 31337,
+          processGroupId: 31337,
+          processStartedAt: "2026-09-08T00:00:00.000Z",
+          spawnedAt: "2026-09-08T00:00:00.100Z",
+        });
+        await input.recordEpoch({
+          ...epoch,
+          phase: "retired",
+          pid: 31337,
+          processGroupId: 31337,
+          processStartedAt: "2026-09-08T00:00:00.000Z",
+          spawnedAt: "2026-09-08T00:00:00.100Z",
+          exitCode: 0,
+          exitSignal: null,
+          processGroupAbsent: true,
+          retiredAt: "2026-09-08T00:00:01.000Z",
+          finalFingerprint: "fixture-settled",
+        });
         if (mode === "changed_empty_root") {
           await writeFile(join(root, "late-owner"), "preserved");
           await input.authorize();
@@ -2564,12 +2700,20 @@ describe("retained native cleanup activation", () => {
       if (mode === "settled") {
         const cleanupEnvironment = state.cleanup.mock.calls[0]![0].environment;
         expect(cleanupEnvironment).toEqual(
-          buildNativeProviderEnvironment({}, process.env, execution.workspace.cwd),
+          buildNativeProviderEnvironment(
+            {},
+            process.env,
+            execution.workspace.cwd,
+          ),
         );
         expect(cleanupEnvironment).not.toHaveProperty("OPENAI_API_KEY");
         expect(cleanupEnvironment).not.toHaveProperty("CODEX_API_KEY");
       }
       const ineligible = [
+        "legacy_busy_copy",
+        "legacy_bad_proof",
+        "legacy_extra_attempt",
+        "legacy_activation",
         "live_owner",
         "foreign_event",
         "nonempty_root",
@@ -2583,6 +2727,7 @@ describe("retained native cleanup activation", () => {
         "wrong_provider_account",
       ].includes(mode);
       const succeeds = [
+        "legacy_copy",
         "settled",
         "activation_commit_stalled",
         "empty_root",
@@ -2627,11 +2772,34 @@ describe("retained native cleanup activation", () => {
       }
       if (succeeds) {
         await access(root);
+        if (legacy) {
+          expect(
+            await Promise.all(
+              source.map(([file]) =>
+                readFile(join(legacyDirectory, file), "utf8"),
+              ),
+            ),
+          ).toEqual(legacyBytes);
+          expect(
+            (coordinator.recoveryHistory as Array<Record<string, unknown>>)[2],
+          ).toMatchObject({
+            copiedFromRequestId: "native-cleanup:prior",
+            copiedFromStagingName: `${key}.cleanup-prior`,
+          });
+        }
         expect(
-          (coordinator.recoveryHistory as Array<Record<string, unknown>>).map(
-            (entry) => entry.phase,
-          ),
-        ).toEqual(["started", "activation_prepared", "settled"]);
+          (coordinator.recoveryHistory as Array<Record<string, unknown>>)
+            .slice(legacy ? 2 : 0)
+            .map((entry) => entry.phase),
+        ).toEqual([
+          "started",
+          "staged",
+          "launch_intent",
+          "spawned",
+          "retired",
+          "activation_prepared",
+          "settled",
+        ]);
       } else if (mode === "activation_commit_failure") {
         // Simulate a fresh caller after the in-memory reservation ended.
         // The canonical directory must not look reusable without its
@@ -2648,9 +2816,26 @@ describe("retained native cleanup activation", () => {
           (coordinator.recoveryHistory as Array<Record<string, unknown>>).map(
             (entry) => entry.phase,
           ),
-        ).toEqual(["started", "activation_prepared", "operator_required"]);
+        ).toEqual([
+          "started",
+          "staged",
+          "launch_intent",
+          "spawned",
+          "retired",
+          "activation_prepared",
+          "operator_required",
+        ]);
+      } else if (mode === "epoch_commit_failure") {
+        expect(
+          (coordinator.recoveryHistory as Array<Record<string, unknown>>).map(
+            (entry) => entry.phase,
+          ),
+        ).toEqual(["started", "staged", "launch_intent", "operator_required"]);
+        await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
       }
     } finally {
+      proofSpy.mockRestore();
+      state.maintenanceIdle.mockReset().mockReturnValue(true);
       releaseCommit();
       if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
       else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;

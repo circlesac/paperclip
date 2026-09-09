@@ -56,7 +56,9 @@ export {
   resolveSourceCodexHome,
   settleRetainedRunnerdSession,
   retainedRunnerdCleanupProofIsCurrent,
+  retainedRunnerdMaintenanceIsIdle,
   type RetainedRunnerdCleanupProof,
+  type RetainedRunnerdMaintenanceEpochReceipt,
   type RunnerdCodexTransport,
   type RunnerdCodexTransportOptions,
 } from "./live/runnerd-codex-transport.js";

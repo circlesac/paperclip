@@ -204,6 +204,8 @@ export interface DurablePrpControlPlaneOptions {
   identity: DurableRecoveryIdentity;
   expectedRunnerVersion: string;
   expectedRunnerDigest: string;
+  /** Complete caller-owned admission before consuming a credential or releasing commands. */
+  beforeAuthenticatedConnection?: () => Promise<void>;
   onSemanticToolInput?: (input: {
     readonly callId: string;
     readonly operationId: string;
@@ -973,6 +975,8 @@ export class DurablePrpControlPlane {
   #port: number | null = null;
   #onSemanticToolInput?: DurablePrpControlPlaneOptions["onSemanticToolInput"];
   #onCommittedEvent?: DurablePrpControlPlaneOptions["onCommittedEvent"];
+  #beforeAuthenticatedConnection?:
+    DurablePrpControlPlaneOptions["beforeAuthenticatedConnection"];
   #onProtocolIntegrityError?:
     DurablePrpControlPlaneOptions["onProtocolIntegrityError"];
   #protocolIntegrityError: NativeSessionProtocolIntegrityError | null = null;
@@ -1001,6 +1005,8 @@ export class DurablePrpControlPlane {
     this.#expectedRunnerDigest = options.expectedRunnerDigest;
     this.#onSemanticToolInput = options.onSemanticToolInput;
     this.#onCommittedEvent = options.onCommittedEvent;
+    this.#beforeAuthenticatedConnection =
+      options.beforeAuthenticatedConnection;
     this.#onProtocolIntegrityError = options.onProtocolIntegrityError;
     this.#connectionLeaseTtlMs = options.connectionLeaseTtlMs ?? 60_000;
   }
@@ -1319,7 +1325,7 @@ export class DurablePrpControlPlane {
       return;
     }
     if (connection.secureChannel === null && kind === "auth_response") {
-      this.#authResponse(connection, envelope);
+      await this.#authResponse(connection, envelope);
       return;
     }
     if (
@@ -1539,10 +1545,10 @@ export class DurablePrpControlPlane {
     });
   }
 
-  #authResponse(
+  async #authResponse(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
-  ): void {
+  ): Promise<void> {
     const pending = connection.pendingChallenge;
     const payload = envelope.payload as Record<string, unknown> | undefined;
     if (
@@ -1555,10 +1561,7 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
-    // WebSocket callbacks run synchronously on the mock core's event loop. Re-reading,
-    // validating, consuming, minting, and persisting here forms one state mutation
-    // boundary, so another proof cannot interleave with bootstrap consumption.
-    const authorization = this.#reauthorizePendingChallenge(
+    let authorization = this.#reauthorizePendingChallenge(
       pending,
       Date.now(),
     );
@@ -1577,6 +1580,26 @@ export class DurablePrpControlPlane {
     if (!proofMatches(expectedClientProof, payload.clientProof)) {
       connection.close();
       return;
+    }
+    if (this.#beforeAuthenticatedConnection) {
+      await this.#beforeAuthenticatedConnection();
+      // The admission callback may await durable ownership. Recheck the exact
+      // challenge, credential snapshot, expiry, and live connection afterward;
+      // credential consumption through welcome remains one synchronous boundary.
+      if (this.#protocolIntegrityError !== null) {
+        connection.close();
+        return;
+      }
+      if (
+        !this.#connections.has(connection) ||
+        connection.pendingChallenge !== pending
+      )
+        return;
+      authorization = this.#reauthorizePendingChallenge(pending, Date.now());
+      if (authorization === null) {
+        connection.close();
+        return;
+      }
     }
     const clientProof = expectedClientProof.toString("hex");
     let leaseToken: string | null = null;
