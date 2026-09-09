@@ -3910,3 +3910,46 @@ All nine new/modified standalone command, transfer and projection source/test
 files pass Prettier. Shared service/integration additions were range-formatted;
 their existing whole-file formatting debt is not claimed fixed. No lockfile,
 runner binary or wireframe image changed. Deployment remains a separate step.
+
+### September 9: server 73 deployed; live Discord registration verified
+
+The combined Discord command/Teams conflict changes were committed and pushed
+as `b9461c4a6`. At `06:26:25.820 UTC`, root checked zero active runs before
+stopping server 72 (PID 77253), which exited cleanly. With the server stopped,
+the existing JavaScript backup helper produced the private compressed database
+backup `pre-73-backup.bFPVGs/pre-server-73-20260909-012635.sql.gz` (7,762,243
+bytes, directory 0700 and file 0600). No existing backups were pruned. Gzip
+integrity passed; a restore has not been tested. Migration inspection showed
+exactly 0257 and 0258 pending; both applied, leaving 257 journal entries and
+an up-to-date schema. Backup and migration metadata are recorded in ignored
+`pre-server-73-migration-0909.log`.
+
+Server 73 is PID **11923**, tool handle **73311**, listening on
+`127.0.0.1:3137`. Its loaded version is `2026.831.0+607.git.b9461c4a6`, started
+`06:29:02.753 UTC` and recovery-ready `06:29:06.792 UTC`. Both loopback and
+private Tailscale health returned 200/ready. Public Funnel port 8443 still
+returns 404 for Board-health GET. The proxy and unrelated checkout on port
+3103 were not changed. Current log: `server-experimental-landing-73.log`.
+
+Discord's existing bot `1546330979860221952` connected, then its newly verified
+native-command callback was installed through one automatic runtime rebuild.
+The Gateway reconnected successfully. At `06:29:05.036 UTC`, the service stored
+processed registration action `6900a77f-147b-407a-89f7-04398d73b8f0` with phase
+and outcome `registered`, and real provider command ID `1547131713472430131`.
+Its instance-wide ownership row points to the original company/endpoint/action;
+the active endpoint now exposes slash commands and ephemeral messages. This is
+real provider registration through existing secret references, not a mocked
+receipt. It does **not** prove the live `/paperclip` invocation, private reply,
+DM-new or close experience; those still require browser qualification.
+
+The safe run inventory at `06:30:30.324 UTC` remained 290 terminal runs
+(262 succeeded, 26 failed, two cancelled), zero active, with the latest start
+still `02:15:47.812 UTC`. No new model turn or provider conversation was sent.
+The qualified runner SHA256 remains
+`6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`;
+lockfile SHA256 remains
+`47a7c09302d47843054d0301f8f52f3da935b9c6ac771bace0409da752b6af7f`.
+Historical ambiguous deliveries and native recovery evidence were not manually
+modified. The latest actual browser inventory still reports the Mac locked.
+Discord login was already restored; only OS unlock is needed to resume browser
+work. Teams additionally requires the previously documented eligible tenant.

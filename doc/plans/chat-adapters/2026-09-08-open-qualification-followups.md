@@ -39,30 +39,39 @@ permissions and audit. Do not narrow completion to whichever tests pass.
 
 ## Current deployment
 
-Implementation `739750c15` is pushed, including native recovery, Discord native
-forms, Telegram video-note intake and editable Teams validation.
-Server **72** is running:
+Implementation `b9461c4a6` is pushed and deployed, including automatic Discord
+command registration/admission and Teams personal-file consent with conflict
+recovery, alongside the previous native recovery/forms/video-note repairs.
+Server **73** is running:
 
-| Field                    | Verified value                                                          |
-| ------------------------ | ----------------------------------------------------------------------- |
-| PID / tool handle        | `77253` / `44437`                                                       |
-| Listener                 | `127.0.0.1:3137`                                                        |
-| Loaded server version    | `2026.831.0+599.git.739750c15.dirty`                                    |
-| Started / recovery ready | `05:00:10.725` / `05:00:14.326 UTC`, September 9                        |
-| Native runner SHA256     | `6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`      |
+| Field                    | Verified value                                                       |
+| ------------------------ | -------------------------------------------------------------------- |
+| PID / tool handle        | `11923` / `73311`                                                    |
+| Listener                 | `127.0.0.1:3137`                                                     |
+| Loaded server version    | `2026.831.0+607.git.b9461c4a6`                                         |
+| Started / recovery ready | `06:29:02.753` / `06:29:06.792 UTC`, September 9                        |
+| Native runner SHA256     | `6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`     |
 | Live DB                  | `chat_adapters_live_3103` on local PostgreSQL `55439`, role `paperclip` |
-| Last checked runs        | 290 terminal: 262 succeeded, 26 failed, 2 cancelled; zero active        |
-| Last new run             | September 9, `02:15:47.812 UTC`                                         |
+| Last checked runs        | 290 terminal: 262 succeeded, 26 failed, 2 cancelled; zero active       |
+| Last new run             | September 9, `02:15:47.812 UTC`                                        |
 
 Both loopback and private Tailscale health returned 200/ready. Public Funnel's
 Board-health GET remains 404. Discord Gateway reconnected bot
-`1546330979860221952`; its existing endpoint automatically changed modal
-capability from false to true. The health response's Git commit is dynamic;
-use loaded version and process start to identify deployed code.
-The dirty suffix reflects preserved inactive Teams transfer/schema work;
-no Teams runtime hook or transfer service was imported at startup, and no new
-Teams migration was applied. Server 71 exited cleanly after the fresh
-zero-active-run check at 04:59:53.222 UTC. The qualified runner SHA is unchanged.
+`1546330979860221952`. Automatic registration committed a processed/registered
+receipt for command `1547131713472430131` at `06:29:05.036 UTC`; the active
+endpoint now has both slash-command and ephemeral-message capability. This
+proves live provider registration, not invocation or private-response UX.
+The health response's Git commit is dynamic; use loaded version and process
+start to identify deployed code.
+
+Server 72 exited cleanly after a fresh zero-active-run check at
+`06:26:25.820 UTC`. Before migration, the stopped server's database was backed
+up to private `pre-73-backup.bFPVGs/pre-server-73-20260909-012635.sql.gz`
+(7,762,243 bytes; directory 0700/file 0600; gzip integrity passed; restore not
+tested). Migrations 0257 and 0258 then applied successfully: journal count 257,
+up to date. No credentials or historical recovery records were rewritten.
+At `06:29:50.202 UTC`, the run inventory remained 290 terminal, zero active.
+The qualified runner and lockfile SHA256 values are unchanged.
 
 Private Board: `https://dottas-macbook-pro.tail29c1aa.ts.net`.
 Public webhook-only proxy: port `3104` → `3137`; Funnel uses stable port
@@ -81,7 +90,8 @@ All local runtime material is under ignored
 `.paperclip-runtime/chat-adapters-live/`, including:
 
 - `start-server.sh`: configured isolated startup, no embedded credentials.
-- `server-experimental-landing-72.log`: current server log.
+- `server-experimental-landing-73.log`: current server log.
+- `pre-server-73-migration-0909.log`: private backup/migration metadata.
 - `qualified-runnerd-2400740c`: preserved old qualified runner backup.
 - `home/instances/chat-adapters-live/runtime/paperclip-runner/durable-sessions`:
   live native roots; do not manipulate historical evidence.
@@ -95,11 +105,13 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Immediate next actions
 
-1. **Resume real browser qualification on server 72.** Latest actual browser
+1. **Resume real browser qualification on server 73.** Latest actual browser
    inventory reports **Mac locked**; the user has been asked to unlock it.
    Discord login was restored before the lock. Do not request Discord login
    again unless the actual provider page requires it.
-2. Repeat same-thread Discord/Slack conversations, queueing and two-file output
+2. Run Discord native-command checklist DC4a, including private status, DM new,
+   guild new guidance and bound-thread close. Then repeat same-thread
+   Discord/Slack conversations, queueing and two-file output
    on this deployment. Check transitions, failure copy, final placement,
    reaction cleanup, duplicates and usable returned files, not just final text.
 3. On GitHub, exercise the deployed unavailable-file fallback, click its task
@@ -120,12 +132,14 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
-**Latest pushed checkpoint (`693cfa888`):** Teams personal-file output is now wired to
+**Current Teams composition (`693cfa888`, included in deployed `b9461c4a6`):**
+Teams personal-file output is now wired to
 the real service: source-derived recipient authority, atomic Board intent,
 authenticated callback, staged worker, public receipt projection and audited
-stage/version resolution. Root has not restarted server 72 or applied the new
-table there. A native committed-response digest-format mismatch and a cold
-Board-send runtime initialization bug were reproduced and fixed. Focused Board
+stage/version resolution. Server 73 includes its schema and runtime activation;
+eligible-tenant live qualification remains blocked. A native committed-response
+digest-format mismatch and a cold Board-send runtime initialization bug were
+reproduced and fixed. Focused Board
 and native-source suites pass 12/12 and 8/8. After fixing two scheduling
 regressions caught by the first full run, the corrected full integration suite
 passes 690/690 on a fresh database (134.68 seconds). The browser suite passes
@@ -134,15 +148,15 @@ passes 690/690 on a fresh database (134.68 seconds). The browser suite passes
 receipt screenshots and shortened the repeated pre-send explanation in a
 retained receipt. This is not live Teams consent/file qualification.
 
-Current follow-up: the review reproduced a conflict-state liveness gap where
-Activity offered no action although the protocol could safely cancel. A
+Completed follow-up in `b9461c4a6`: the review reproduced a conflict-state
+liveness gap where Activity offered no action although the protocol could safely cancel. A
 read-only, exact-scoped proof now offers only cancellation after ownership is
 cleared or coherently expired; the versioned resolver remains authoritative.
 Fresh protocol/projection tests pass 90/90, composed tests 39/39 and existing
 UI/API tests 84/84. The combined follow-up passes the full 711-case suite.
 
 Discord automatic registration is now composed with configure, resume and
-runtime reconciliation in the working tree. Five root service tests pass,
+runtime reconciliation in deployed `b9461c4a6`. Five root service tests pass,
 including a process-reconstructed unknown POST settled by GET without reposting,
 automatic upgrade, an external namespace conflict, and healthy Gateway
 preservation on optional registration failure. The native command handler
@@ -151,8 +165,15 @@ integration run 711/711 (142.31 seconds). Root runtime/helper tests pass 119/119
 and the deterministic browser suite 31/31. The first full run's three fixture
 isolation failures were fixed; its single Slack socket error did not reproduce
 in isolation or the corrected run and is not claimed as a repaired provider bug.
-Deployment remains separate from these checks. The Mac lock prevents live UI
-qualification; the most recent inventory was checked again this turn.
+Deployment and real command registration are verified above, separately from
+these checks. The Mac lock prevents live command/UI qualification; the most
+recent inventory was checked again after the restart.
+
+### Earlier parallel checkpoints (historical, superseded by the deployment above)
+
+The checkpoints below retain intermediate failures and evidence boundaries.
+Their references to inactive hooks, pending integration or server 71/72 are
+historical states, not current blockers. Current remaining work is listed above.
 
 Pushed `f5698f533` isolates Teams expiry recovery and adds guarded Discord
 command registration groundwork. Pushed `aacd4963f` adds the opt-in awaited
@@ -483,6 +504,15 @@ recovery. Its retired conversation generation must not regain external access.
 
 ## Verified automated gates and limitations
 
+Latest combined service integration passes **711/711**, no skips, on fresh
+`chat_commands_full_20260909_root02` (142.31 seconds). Final runtime/helper
+tests pass **119/119**, and deterministic Board browser tests **31/31**, zero
+retries (2.8 minutes), on `chat_commands_browser_20260909_root01`. Plain server
+TypeScript passes. These cover the deployed implementation with mocked
+provider/model ports, not a live command or Teams consent journey. Earlier
+cohorts below retain their original narrower scope; the permanent log records
+both the first failed combined run and the corrected run's exact source hashes.
+
 On the frozen native candidate: optimized full transport **133/133** (zero
 skips, 198.64 seconds), controller **69/69**, optimized Rust lib **248/248**,
 and the Codex/native/supervisor/durable integration targets passed.
@@ -499,7 +529,7 @@ It is not combined server→real-provider recovery proof. Only local Codex
 surviving-runner, remote/listen and missing-independent-checkpoint cases remain
 unsupported and fail closed.
 
-Latest final Discord workflow integration **641/641**, zero skips, ran on fresh
+Earlier Discord modal workflow integration **641/641**, zero skips, ran on fresh
 `chat_discord_modal_final_20260909_root02` (123.87 seconds). Root's focused
 seven-file cohort passes **165/165** and plain server TypeScript passes.
 The first full attempt passed 637/638 because a fixture's unscoped initialization
