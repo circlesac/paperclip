@@ -3302,3 +3302,83 @@ still reports the Mac locked. No new live provider message was sent during
 these audits. The scratch handoff has been shortened to current deployment,
 remaining work and protected recovery evidence; earlier scratch checkpoints
 remain available in Git at `f66bedd63`.
+
+The rejection observer was then committed/pushed as `6c5e9c215` and loaded in
+proxy PID 27961 after confirming the old proxy had no active connections. A
+non-mutating GET through public Funnel at 03:51:14 UTC returned 404 and emitted
+exactly one method-rejection record without request details. Server 69 and the
+native runner were unchanged. This is proxy deployment proof, not a new live
+provider message.
+
+### September 9: actual Discord button-denial boundary
+
+The new standalone test joins the installed patched Discord adapter, actual
+Chat SDK and Paperclip runtime instead of stopping at a mocked SDK callback.
+It showed that Gateway normalization produces plain JSON: the raw
+`deferUpdate` and `isMessageComponent` functions used by the service's denial
+check do not survive. A real service/database composition then reproduced the
+bug: repeated delivery of a synthetic Gateway interaction created one durable
+filtered denial and no wakeup, yet attempted two success acknowledgments and no
+ephemeral rejection. The prior hand-built fixture invented the missing raw
+functions and therefore concealed this mismatch. The runtime's foreign-guild
+filter also silently resolved, causing a success acknowledgment without calling
+the scoped service.
+
+The repair assigns action transport context inside the runtime, never from
+provider JSON. A denied Gateway action surfaces the existing safe rejection
+sentinel after its denial audit is durable. Out-of-guild Gateway actions reject
+before the application callback. Other providers and webhook filtering retain
+their behavior. A held-webhook/concurrent-Gateway test verifies that the
+runtime's asynchronous request context cannot mislabel the other path, and
+forged payload transport fields do not supply that context.
+
+These tests simulate Discord socket replies and do not prove that a real
+provider accepts multiple replies to the same interaction token. The new
+denial composition does exercise the real adapter → SDK → runtime → service →
+PostgreSQL boundary; it is not a live click or native model continuation.
+
+### September 9: Telegram photo constraints and exact document fallback
+
+The previous classifier sent every image MIME type through Telegram's photo
+method. Real generated PNG/JPEG fixtures reproduced seven failures in which
+unsupported geometry, unqualified image formats, truncated headers or excessive
+photo bytes still selected `sendPhoto`. Telegram separately limits photo byte
+size, width-plus-height and aspect ratio; see its
+[sendPhoto contract](https://core.telegram.org/bots/api#sendphoto).
+
+The replacement makes the lane decision before provider I/O. Recognized static
+PNG/JPEG containers within a conservative 10,000,000-byte budget, combined
+dimensions at most 10,000 and aspect ratio at most 20 remain photos. Other
+images retain their original bytes as documents. GIF/WebP document selection is
+conservative, not a claim that Telegram can never decode those formats. The bounded container/header
+probe does not decompress pixels: Telegram still validates the compressed
+payload. Unknown formats, animation and malformed known headers fall back
+conservatively. Independent review added contradictory JPEG component-header
+cases, without introducing a decoder or unbounded metadata work.
+
+Tests inspect multipart bytes through the actual pinned Telegram adapter and
+the real publication service/database. Exact-limit and just-over-limit cases
+are separate. A simulated uncertain photo send remains `delivery_unknown` with
+one attempt and no automatic document resend, preserving the existing duplicate
+risk boundary. Audio/video routing stays unchanged. No live Telegram upload is
+claimed by these provider-I/O simulations.
+
+Root's final verification passes **624/624** full chat integration tests, zero
+skips, in **126.88 seconds**, using fresh
+`chat_adapters_telegram_photo_20260909_root01`. The focused photo/Discord/runtime
+cohort passes **199/199** in 6.27 seconds; direct server TypeScript passes.
+Independent review found no remaining blocker in this bounded repair. New files
+and documentation pass Prettier; existing large shared files were formatted
+only within changed sections. No whole-workspace test or new live browser pass
+is implied.
+
+The changes are committed/pushed as `d5ec721f2`. Server 69 drained zero runs
+and exited cleanly. Server **70**, PID **54936**, handle **62091**, started at
+**03:57:19.082 UTC**, loaded `2026.831.0+591.git.d5ec721f2.dirty`, and reached
+recovery-ready at **03:57:22.072 UTC**. Only the two root documentation edits
+were uncommitted at startup, accounting for the suffix; implementation was
+frozen and committed. The qualified native runner hash `6279d39a…` is unchanged.
+Loopback and private Tailscale health both pass, and Discord Gateway reconnected
+bot `1546330979860221952`. The final actual browser probe still reports the Mac
+locked. User Discord login is not being requested again; OS unlock is needed
+for live conversations and interaction/file retesting.
