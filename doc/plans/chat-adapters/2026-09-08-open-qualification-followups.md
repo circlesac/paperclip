@@ -7,6 +7,72 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 03:11 UTC: the wider private transport run is **119/124**, not
+green. James owns fixes for external legacy prepare ordering, stale test-held
+command references after atomic commits, rejected-attach failure policy and
+activation-failure cleanup. Root independently reproduced the ordinary second
+warm turn timeout twice: the provider and controller completed and ACKed the
+new run's seven events, but an early local cursor reset reread the previous
+run's twelve events while controller activation was still pending. Move local
+epoch/cursor reset to confirmed activation and fence the event pump; do not
+increase the timeout. The original three-turn regression must pass again.
+
+Server generated admission passed **27/27** at its seam (real checkpoint rebind,
+real restart classifier and guarded registration/lifecycle callbacks, no provider
+launch); existing executor tests passed **260/260**. These do not prove the
+combined package/server path. Independent review also requires coordinator lease
+time to be checked after database lock waits, not with a pre-transaction clock.
+The selected-artifact negative and final source/archive guards remain under
+review. No candidate is staged or deployed.
+
+September 9, 03:06 UTC: Slack/Discord partial-file restart tests are frozen and
+pass **2/2** focused. Root's full chat integration rerun passes **612/612**, zero
+skips, in **110.37 seconds** on fresh
+`chat_adapters_multifile_restart_20260909_root01`. This is a test-only publication
+coverage addition; no production duplicate-send bug was found. Native recovery
+remains separate: server admission is adding projectless origin-lease proof and
+fresh ownership checks after materialization, before bootstrap/spawn/auth. The
+normal runner and live server remain unchanged.
+
+September 9, 03:02 UTC: independent review found and the candidate now closes
+the final activation-confirmation crash window: the runner retains its pending
+receipt until the controller durably completes and acknowledges it. A lost final
+ACK recovers only with the exact still-valid participating lease; the completed
+receipt alone never grants authority. Root independently passed controller
+**68/68** (5.46 seconds) and **16/16** selected real-process restart/refusal cases
+(25.77 seconds; 107 unrelated cases filtered) using private runner SHA
+`9aa212434b74283d672a2d91c70dded90d14493c4cb86a5b7a2b7445a65ec890`.
+The matrix is still expanding; these are not a frozen full transport pass.
+
+The direct factory must also preserve a valid pending runner when core JSON is
+malformed, before any legacy quarantine rename. This and future-route cleanup
+have dedicated regressions. Server admission still needs genuine managed and
+projectless/transient checkpoint/classifier proof. A transient lease identifier
+may select an origin-run DB record but cannot authorize itself; derive it from
+that terminal origin's frozen input, exact scope and independently bound owner.
+Boole is adding Slack/Discord partial multi-file retry composition tests; review
+found a coverage gap, not a reproduced production duplicate-send bug.
+
+September 9, 02:55 UTC: `572466472` is pushed; the task-company navigation,
+ordinary-upload binding and outgoing-composer readiness fixes are committed.
+Only native transition implementation/tests remain uncommitted. Normal runner
+SHA is still exactly `2400740c02b85a0099c18c17cb8567905c8dd07fc677363c90f98d0d9b9dbbc8`;
+server 68 has not restarted and no new live provider turn was sent during this
+mixed-source recovery work.
+
+Private-artifact recovery now passes all three result/ACK/activation loss windows
+with fresh controller and runner processes, both local and routed (**6/6**).
+The controller cohort passes **64/64**. Server preservation passes **10/10**,
+but real checkpoint-rebind/restart-classifier admission remains unfinished;
+these counts are not an end-to-end server recovery claim. Root's static protocol
+manifest, capability contract/inventory and protocol coverage checks pass.
+Independent root review additionally requires route validation before changing
+launch material, confirmed activation before releasing the old route, and
+cleanup of future registrations when attachment queueing/result wait fails.
+James owns those fixes and regressions; Boole is independently reviewing Rust
+durability and capability boundaries. Do not deploy until the composed path is
+qualified.
+
 September 9, 02:47 UTC: GitHub navigation is pushed as `e7f069603`; server 68
 still runs loaded `3a2a911bd` and normal runner `2400740c…`, not the pending
 protocol. Root independently repeated the 32 URL/stream units and server types.
@@ -48,9 +114,9 @@ pending the separately moving runner protocol.
 Following the task-link destination exposed a separate preexisting multi-company
 bug: a different selected organization survives UUID/identifier redirection,
 and ordinary task uploads receive **422 Issue does not belong to company**.
-All four isolated browser cases reproduce (UUID/wrong-prefix identifier, default
-and classic task interfaces). Boole is fixing loaded-task company navigation and
-upload binding; root owns the browser regression. The earlier banner's explicit
+All four initial isolated browser cases reproduced (UUID/wrong-prefix identifier,
+default and classic task interfaces). The fix and expanded six-case browser
+regression are now committed as `572466472`. The earlier banner's explicit
 channel-upload path already binds the actual task company and is unaffected.
 
 September 9, 02:30 UTC: Discord login is restored and the live two-file repeat
@@ -616,8 +682,7 @@ plain final said “The old attachment is no longer available to reuse.” No fi
 or substitute was published. Receipt-to-final was 19.421 seconds. This proves
 edited-source invalidation, **not deletion**. The permanent log has exact IDs.
 
-The subsequent Telegram queued-media journey **failed** on CHA-26, generation
-10. Image run `fd7011b6-323b-461a-bc43-a81835bece5f` accepted its semantic result
+The subsequent Telegram queued-media journey **failed** on CHA-26, generation 10. Image run `fd7011b6-323b-461a-bc43-a81835bece5f` accepted its semantic result
 at 21:05:05.377 UTC, but failed ten seconds later because the runner did not
 durably suspend before checkpoint. Document B was genuinely queued 15.743
 seconds before A finished, started 32ms after A finished, then failed with

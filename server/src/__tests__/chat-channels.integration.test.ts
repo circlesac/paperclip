@@ -4,7 +4,13 @@ import {
   generateKeyPairSync,
   randomUUID,
 } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -32458,6 +32464,291 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
   });
 
+  it.each(["slack", "discord"] as const)(
+    "preserves a published %s file prefix across restart and retries only an explicitly resolved ambiguous upload",
+    async (provider) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const { callbacks, endpoint, runtime, service } =
+        provider === "slack"
+          ? await configuredSlackEndpoint(fixture, { storage: storage.storage })
+          : await configuredDiscordEndpoint(fixture, {
+              storage: storage.storage,
+            });
+      let restarted: ChatChannelService | undefined;
+      try {
+        const channel = makeThread({
+          channelId:
+            provider === "slack" ? "C-PARTIAL-FILES" : "333333333333332811",
+          id:
+            provider === "slack"
+              ? "slack:C-PARTIAL-FILES:4400.81"
+              : "discord:1457808928258658549:333333333333332811:555555555555552811",
+          name: "partial-files-restart",
+        });
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          provider,
+          thread: channel.thread,
+          message: makeMessage({
+            id: provider === "slack" ? "4400.81" : "555555555555552811",
+            text: "@maya prepare the selected file batch",
+            mentioned: true,
+          }),
+          trigger: "mention",
+        });
+        await qualifySetupRoundTrip(service, endpoint.id);
+        await service.test(endpoint.id, "owner-user");
+        const [conversation] = await service.listConversations(endpoint.id);
+        if (!conversation)
+          throw new Error("Expected partial-file conversation");
+        const attachmentIds: string[] = [];
+        const bodies = [1, 2, 3].map((index) =>
+          Buffer.from(`exact selected file ${index}`, "utf8"),
+        );
+        for (const [index, body] of bodies.entries()) {
+          const stored = await storage.storage.putFile({
+            companyId: fixture.companyId,
+            namespace: `issues/${conversation.issueId}`,
+            originalFilename: `selected-${index + 1}.txt`,
+            contentType: "text/plain",
+            body,
+          });
+          const attachment = await issueService(db).createAttachment({
+            issueId: conversation.issueId,
+            provider: stored.provider,
+            objectKey: stored.objectKey,
+            contentType: stored.contentType,
+            byteSize: stored.byteSize,
+            sha256: stored.sha256,
+            originalFilename: stored.originalFilename,
+            createdByUserId: "owner-user",
+          });
+          attachmentIds.push(attachment.id);
+        }
+        const initialRuntime = runtime.endpoints.get(endpoint.id);
+        if (!initialRuntime)
+          throw new Error("Expected initial provider runtime");
+        initialRuntime.posts.length = 0;
+        initialRuntime.postResultIds.push("1789000.000001", "1789000.000002");
+        let initialAttempts = 0;
+        initialRuntime.postHook = async () => {
+          initialAttempts += 1;
+          if (initialAttempts === 3)
+            throw new Error(
+              "socket closed after the second upload request was written",
+            );
+        };
+        const text =
+          "The complete answer is saved; the three selected files follow.";
+        const blocked = await service.publishBoardMessage(
+          endpoint.id,
+          conversation.id,
+          text,
+          "partial-file-restart",
+          "owner-user",
+          attachmentIds,
+        );
+        expect(blocked).toMatchObject({
+          state: "delivery_unknown",
+          attempts: 1,
+          providerMessageId: null,
+        });
+        if (!blocked.commentId)
+          throw new Error("Expected durable batch comment");
+        const readBatch = () =>
+          db
+            .select()
+            .from(chatPublications)
+            .where(eq(chatPublications.commentId, blocked.commentId!))
+            .orderBy(asc(chatPublications.createdAt));
+        const initialBatch = await readBatch();
+        expect(initialBatch.map((row) => row.state)).toEqual([
+          "published",
+          "published",
+          "delivery_unknown",
+          "pending",
+        ]);
+        expect(initialBatch.map((row) => row.attempts)).toEqual([1, 1, 1, 0]);
+        expect(
+          initialBatch.map((row) => row.payload.attachmentIds ?? []),
+        ).toEqual([[], ...attachmentIds.map((id) => [id])]);
+        expect(initialBatch[2]!.id).toBe(blocked.id);
+        expect(initialRuntime.posts).toEqual([
+          { threadId: channel.thread.id, text },
+          {
+            threadId: channel.thread.id,
+            text: provider === "slack" ? "" : "Shared selected-1.txt.",
+            files: [
+              expect.objectContaining({
+                filename: "selected-1.txt",
+                data: bodies[0],
+              }),
+            ],
+          },
+        ]);
+        expect(initialAttempts).toBe(3);
+        const prefix = initialBatch.slice(0, 2);
+        const prefixLinks = await db
+          .select()
+          .from(chatMessageLinks)
+          .where(
+            inArray(
+              chatMessageLinks.publicationId,
+              prefix.map((row) => row.id),
+            ),
+          )
+          .orderBy(asc(chatMessageLinks.id));
+        expect(prefixLinks).toHaveLength(2);
+        const commentBefore = await db
+          .select()
+          .from(issueComments)
+          .where(eq(issueComments.id, blocked.commentId));
+        expect(commentBefore).toEqual([
+          expect.objectContaining({ body: text }),
+        ]);
+        await service.shutdown();
+
+        const fresh = createService(new FakeChatSdkRuntime(), undefined, {
+          storage: storage.storage,
+        });
+        restarted = fresh.service;
+        fresh.runtime.initializeHook = async () => {
+          fresh.runtime.endpoints
+            .get(endpoint.id)!
+            .postResultIds.push("1789000.000003", "1789000.000004");
+        };
+        await restarted.processPendingPublications();
+        await restarted.processPendingPublications();
+        expect(await readBatch()).toEqual(initialBatch);
+        expect(fresh.runtime.endpoints.get(endpoint.id)?.posts ?? []).toEqual(
+          [],
+        );
+        const partial = await request(
+          routesApp(db, fixture.companyId, restarted),
+        )
+          .get(
+            `/api/chat-endpoints/${endpoint.id}/conversations/${conversation.id}/publications/${prefix[0]!.id}/status`,
+          )
+          .expect(200);
+        expect(partial.body).toMatchObject({
+          total: 4,
+          published: 2,
+          publication: {
+            id: blocked.id,
+            state: "delivery_unknown",
+            attempts: 1,
+            nextAttemptAt: null,
+          },
+        });
+        expect(
+          (await restarted.listActivity(endpoint.id)).find(
+            (row) => row.id === blocked.id,
+          ),
+        ).toMatchObject({
+          kind: "publication",
+          status: "delivery_unknown",
+          replayable: false,
+          resolutionActions: ["mark_delivered", "retry_anyway", "cancel"],
+        });
+        await expect(
+          restarted.replayPublication(endpoint.id, blocked.id),
+        ).rejects.toMatchObject({
+          status: 409,
+          details: { code: "chat_publication_resolution_required" },
+        });
+        expect(await readBatch()).toEqual(initialBatch);
+        await restarted.resolvePublication(
+          endpoint.id,
+          blocked.id,
+          "retry_anyway",
+          "owner-user",
+        );
+        await restarted.processPendingPublications();
+        const completed = await readBatch();
+        expect(completed.map((row) => row.state)).toEqual([
+          "published",
+          "published",
+          "published",
+          "published",
+        ]);
+        expect(completed.map((row) => row.attempts)).toEqual([1, 1, 2, 1]);
+        expect(completed.slice(0, 2)).toEqual(prefix);
+        expect(
+          await db
+            .select()
+            .from(chatMessageLinks)
+            .where(
+              inArray(
+                chatMessageLinks.publicationId,
+                prefix.map((row) => row.id),
+              ),
+            )
+            .orderBy(asc(chatMessageLinks.id)),
+        ).toEqual(prefixLinks);
+        expect(
+          await db
+            .select()
+            .from(issueComments)
+            .where(eq(issueComments.id, blocked.commentId)),
+        ).toEqual(commentBefore);
+        const resumedRuntime = fresh.runtime.endpoints.get(endpoint.id);
+        expect(resumedRuntime?.posts).toEqual(
+          [2, 3].map((index) => ({
+            threadId: channel.thread.id,
+            text: provider === "slack" ? "" : `Shared selected-${index}.txt.`,
+            files: [
+              expect.objectContaining({
+                filename: `selected-${index}.txt`,
+                data: bodies[index - 1],
+              }),
+            ],
+          })),
+        );
+        expect(initialRuntime.posts).toHaveLength(2);
+        expect(initialAttempts).toBe(3);
+        if (provider === "slack")
+          expect(resumedRuntime?.slackFilePublicationAttempts).toBe(2);
+        expect(
+          await db
+            .select({ details: activityLog.details })
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.entityId, blocked.id),
+                eq(activityLog.action, "chat.publication_retry_anyway"),
+              ),
+            ),
+        ).toEqual([
+          {
+            details: expect.objectContaining({
+              duplicateRiskAccepted: true,
+              previousState: "delivery_unknown",
+              nextState: "retry",
+            }),
+          },
+        ]);
+        const finalStatus = await restarted.getPublicationBatchStatus(
+          endpoint.id,
+          conversation.id,
+          prefix[0]!.id,
+        );
+        expect(finalStatus).toMatchObject({
+          total: 4,
+          published: 4,
+          publication: { state: "published" },
+        });
+        await restarted.processPendingPublications();
+        expect(resumedRuntime?.posts).toHaveLength(2);
+        expect(await readBatch()).toEqual(completed);
+      } finally {
+        await service.shutdown();
+        await retirePublicationFixture(restarted ?? service, endpoint.id);
+      }
+    },
+  );
+
   it("recovers an accepted Slack file receipt without uploading twice or exposing provider identifiers", async () => {
     const fixture = await seedCompany();
     const storage = createStorageService();
@@ -42498,7 +42789,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ? "another-account"
           : mode === "missing_account"
             ? undefined
-            : mode === "malformed_account" ? 123 : providerAccount;
+            : mode === "malformed_account"
+              ? 123
+              : providerAccount;
       const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
       const directory = mkdtempSync(
         path.join(os.tmpdir(), "paperclip-chat-cleanup-retry-"),
@@ -42565,22 +42858,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(eq(heartbeatRuns.id, context.runId));
         if (mode === "older_warm_run") {
           const olderId = randomUUID();
-          await db
-            .insert(heartbeatRuns)
-            .values({
-              id: olderId,
-              companyId: context.fixture.companyId,
-              agentId: context.fixture.assignedAgentId,
-              status: "succeeded",
-              finishedAt: new Date(Date.now() - 60_000),
-              runtimeMode: "native",
-              nativeIssueId: context.issue.id,
-              nativeSessionId,
-              runnerInstanceId,
-              processPid: 99_999_999,
-              processGroupId: 99_999_999,
-              runnerProfileJson: { nativeExecutionInput: inputFor(olderId) },
-            });
+          await db.insert(heartbeatRuns).values({
+            id: olderId,
+            companyId: context.fixture.companyId,
+            agentId: context.fixture.assignedAgentId,
+            status: "succeeded",
+            finishedAt: new Date(Date.now() - 60_000),
+            runtimeMode: "native",
+            nativeIssueId: context.issue.id,
+            nativeSessionId,
+            runnerInstanceId,
+            processPid: 99_999_999,
+            processGroupId: 99_999_999,
+            runnerProfileJson: { nativeExecutionInput: inputFor(olderId) },
+          });
         }
         await deliverMessage({
           callbacks: context.runtime.configurations.get(context.endpoint.id)!
@@ -42653,27 +42944,23 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .update(agentWakeupRequests)
           .set({ status: "failed", runId })
           .where(eq(agentWakeupRequests.id, action.id));
-        await db
-          .insert(nativeRunFinalizations)
-          .values({
-            companyId: context.fixture.companyId,
-            issueId: context.issue.id,
-            runId,
-            phase: "observed",
-            attempt: 0,
-            leaseOwner: mode === "leased" ? "other-owner" : null,
-          });
-        await db
-          .insert(environmentLeases)
-          .values({
-            companyId: context.fixture.companyId,
-            issueId: context.issue.id,
-            heartbeatRunId: runId,
-            provider: "local",
-            status: "failed",
-            releasedAt: new Date(),
-            cleanupStatus: mode === "pending_lease_cleanup" ? "pending" : null,
-          });
+        await db.insert(nativeRunFinalizations).values({
+          companyId: context.fixture.companyId,
+          issueId: context.issue.id,
+          runId,
+          phase: "observed",
+          attempt: 0,
+          leaseOwner: mode === "leased" ? "other-owner" : null,
+        });
+        await db.insert(environmentLeases).values({
+          companyId: context.fixture.companyId,
+          issueId: context.issue.id,
+          heartbeatRunId: runId,
+          provider: "local",
+          status: "failed",
+          releasedAt: new Date(),
+          cleanupStatus: mode === "pending_lease_cleanup" ? "pending" : null,
+        });
         await db
           .update(issues)
           .set({ status: "in_review", executionRunId: null })
@@ -42810,17 +43097,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             JSON.stringify({ ...files[1][1], lifecycle: "ready" }),
           );
         if (mode === "late_event")
-          await db
-            .insert(heartbeatRunEvents)
-            .values({
-              companyId: context.fixture.companyId,
-              agentId: context.fixture.assignedAgentId,
-              runId,
-              seq: 1,
-              eventType: "session.started",
-              sourceInstanceId: runnerInstanceId,
-              payload: { prpEvent: { sourceKind: "runner" } },
-            });
+          await db.insert(heartbeatRunEvents).values({
+            companyId: context.fixture.companyId,
+            agentId: context.fixture.assignedAgentId,
+            runId,
+            seq: 1,
+            eventType: "session.started",
+            sourceInstanceId: runnerInstanceId,
+            payload: { prpEvent: { sourceKind: "runner" } },
+          });
         if (mode === "source_edited")
           await db
             .update(issueComments)
@@ -42918,8 +43203,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     async (kind) => {
       const context = await failedChatRetryFixture("telegram");
       const hasCheckpoint = [
-        "checkpoint", "distinct_account", "null_account", "wrong_account",
-        "missing_account", "malformed_account", "wrong_thread", "missing_thread",
+        "checkpoint",
+        "distinct_account",
+        "null_account",
+        "wrong_account",
+        "missing_account",
+        "malformed_account",
+        "wrong_thread",
+        "missing_thread",
       ].includes(kind);
       const providerAccount =
         kind === "null_account"
@@ -42932,7 +43223,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           ? "another-account"
           : kind === "missing_account"
             ? undefined
-            : kind === "malformed_account" ? 123 : providerAccount;
+            : kind === "malformed_account"
+              ? 123
+              : providerAccount;
       const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
       let stateDirectory: string | null = null;
       try {
@@ -45347,7 +45640,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   ] as const)(
     "keeps provider startup diagnostics private on %s fixture %s (%s)",
     async (provider, suffix, surface) => {
-      const context = await safeNativeProgressFixture(provider, suffix, surface);
+      const context = await safeNativeProgressFixture(
+        provider,
+        suffix,
+        surface,
+      );
       try {
         const run = await context.createRun("startup recovery");
         // This is a publication-boundary fixture, not proof that a provider
@@ -50152,18 +50449,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, context.runId));
       const laterId = randomUUID();
-      await db
-        .insert(heartbeatRuns)
-        .values({
-          ...originalRun,
-          id: laterId,
-          wakeupRequestId: null,
-          nativeSessionId: randomUUID(),
-          runnerInstanceId: randomUUID(),
-          contextSnapshot: {},
-          status: "running",
-          resultJson: null,
-        });
+      await db.insert(heartbeatRuns).values({
+        ...originalRun,
+        id: laterId,
+        wakeupRequestId: null,
+        nativeSessionId: randomUUID(),
+        runnerInstanceId: randomUUID(),
+        contextSnapshot: {},
+        status: "running",
+        resultJson: null,
+      });
       const laterResult = {
         ...context.result,
         reportedWorkDisposition: "needs_review" as const,

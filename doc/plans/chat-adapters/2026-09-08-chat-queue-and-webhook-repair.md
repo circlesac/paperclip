@@ -1959,13 +1959,13 @@ was active, root sent `native-file-roundtrip-landing-0908.txt` through
 No API or database write manufactured either input or result. Both belong to
 CHA-26, conversation `e3ee142e-4f21-41a9-9636-7fb5770094d5`, generation 10.
 
-| Evidence | Image A | Document B |
-| --- | --- | --- |
-| Delivery | `78763969-0116-4f4b-9f0b-977824b1244e` | `f8ef6070-61de-4eae-bd86-2cfe7717dcf5` |
-| Source comment | `0e780b80-b455-435b-af37-00a1ddeab6a1` | `17909654-58f9-4348-a5eb-ca8848b33a71` |
-| Wake | `61580c49-cadd-44ef-891d-e6cd3796e8e4` | `e8b2b68a-93d7-45ec-aea3-12731c91d58a` |
-| Run | `fd7011b6-323b-461a-bc43-a81835bece5f` | `fcf7adc4-39a5-4c42-8cbb-a9723ad22302` |
-| Started → finished UTC | 21:04:24.679 → 21:05:15.515 | 21:05:15.547 → 21:05:15.854 |
+| Evidence               | Image A                                | Document B                             |
+| ---------------------- | -------------------------------------- | -------------------------------------- |
+| Delivery               | `78763969-0116-4f4b-9f0b-977824b1244e` | `f8ef6070-61de-4eae-bd86-2cfe7717dcf5` |
+| Source comment         | `0e780b80-b455-435b-af37-00a1ddeab6a1` | `17909654-58f9-4348-a5eb-ca8848b33a71` |
+| Wake                   | `61580c49-cadd-44ef-891d-e6cd3796e8e4` | `e8b2b68a-93d7-45ec-aea3-12731c91d58a` |
+| Run                    | `fd7011b6-323b-461a-bc43-a81835bece5f` | `fcf7adc4-39a5-4c42-8cbb-a9723ad22302` |
+| Started → finished UTC | 21:04:24.679 → 21:05:15.515            | 21:05:15.547 → 21:05:15.854            |
 
 Each run has exactly its own current comment. B's durable wake was created at
 **21:04:59.772**, **15.743 seconds before A finished**, and B started **32ms**
@@ -2064,14 +2064,14 @@ in the existing PR conversation, CHA-9, issue
 `5329b4bf-6b16-40d5-ad69-65bcbeac2ab3`, conversation
 `6f313c48-e684-421f-a730-dd68112c1e2c`.
 
-| Evidence | A | B |
-| --- | --- | --- |
-| GitHub comment | `5592125256` | `5592126853` |
-| Delivery | `fee9ddbe-9fa1-466a-b049-97b51a3ba568` | `69cb52ff-00e5-45c6-b746-f9df5deae2f4` |
-| Source comment | `a0d072be-b9ee-4781-84cb-1d2d054a889a` | `906ecf81-67df-45ab-ba24-395a87e2662c` |
-| Run | `75758d19-9680-4083-a0b6-2d5598d21bae` | `38dfc3ec-4fa7-4ed4-8563-7650dfce3d47` |
-| Started → finished UTC | 21:29:33.515 → 21:29:33.835 | 21:29:41.069 → 21:29:41.079 |
-| Failure | `native_session_cleanup_quarantined` | `setup_failed`: `reviewed_chat_execution_binding_not_authorized` |
+| Evidence               | A                                      | B                                                                |
+| ---------------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| GitHub comment         | `5592125256`                           | `5592126853`                                                     |
+| Delivery               | `fee9ddbe-9fa1-466a-b049-97b51a3ba568` | `69cb52ff-00e5-45c6-b746-f9df5deae2f4`                           |
+| Source comment         | `a0d072be-b9ee-4781-84cb-1d2d054a889a` | `906ecf81-67df-45ab-ba24-395a87e2662c`                           |
+| Run                    | `75758d19-9680-4083-a0b6-2d5598d21bae` | `38dfc3ec-4fa7-4ed4-8563-7650dfce3d47`                           |
+| Started → finished UTC | 21:29:33.515 → 21:29:33.835            | 21:29:41.069 → 21:29:41.079                                      |
+| Failure                | `native_session_cleanup_quarantined`   | `setup_failed`: `reviewed_chat_execution_binding_not_authorized` |
 
 A failed before B was submitted: **no queued execution was exercised**. The
 runtime cleanup domain is company plus backend kind/name, so Telegram A's
@@ -2709,10 +2709,10 @@ message; progress updates edited that same answer message. UI snapshots and
 database timing agree on FIFO order:
 
 | Provider / pair | First execution | Follow-up received before first finished | Second execution | Dispatch gap |
-| --- | ---: | ---: | ---: | ---: |
-| Discord C/D | 26.716s | 17.489s | 11.586s | 61ms |
-| Slack C/D | 38.312s | 21.035s | 12.193s | 53ms |
-| GitHub A/B | 28.207s | 11.382s | 12.947s | 57ms |
+| --------------- | --------------: | ---------------------------------------: | ---------------: | -----------: |
+| Discord C/D     |         26.716s |                                  17.489s |          11.586s |         61ms |
+| Slack C/D       |         38.312s |                                  21.035s |          12.193s |         53ms |
+| GitHub A/B      |         28.207s |                                  11.382s |          12.947s |         57ms |
 
 These are execution durations, not user-visible latency; the second source
 waited for its predecessor. Discord runs are `0bb4e127-8219-4ae3-add3-01a4ea14525c`
@@ -3030,12 +3030,12 @@ app-server session using `gpt-5.6-luna`. Child agents had no browser surface and
 independently correlated only scoped delivery, run, publication and canonical
 tool metadata. No fixture outcomes were inserted into the database.
 
-| Measurement | Discord before → repeat | Slack before → repeat |
-| --- | ---: | ---: |
-| Run duration | 67.925 → 60.073 s | 67.801 → 51.030 s |
-| Provider source → last published file | 72.840 → 64.926 s | 78.439 → 61.173 s |
-| Outer model tool calls | 6 → 4 | 7 → 5 |
-| Underlying tool operations | 7 → 5 | 7 → 5 |
+| Measurement                           | Discord before → repeat | Slack before → repeat |
+| ------------------------------------- | ----------------------: | --------------------: |
+| Run duration                          |       67.925 → 60.073 s |     67.801 → 51.030 s |
+| Provider source → last published file |       72.840 → 64.926 s |     78.439 → 61.173 s |
+| Outer model tool calls                |                   6 → 4 |                 7 → 5 |
+| Underlying tool operations            |                   7 → 5 |                 7 → 5 |
 
 Discord run `265d35e0-af1e-421b-b3e2-61ba65fcc288` and Slack run
 `12d6d924-9748-4d13-ad6e-2035937e12dd` both succeeded and committed.
@@ -3149,3 +3149,24 @@ not a live multi-company fallback or continuous transition recording.
 The final full deterministic chat browser cohort passed **29/29**, zero retries,
 in **2.8 minutes**, including the six new navigation/upload cases and preserved
 nonlegacy query/hash and selected-organization checks.
+
+### September 9: partial Slack/Discord file batches across worker restart
+
+A focused real-service regression now covers a selected-file batch whose text
+and first file succeed, second upload has an ambiguous socket failure, and third
+file remains pending. A fresh service instance does not resend the published
+prefix or advance past the unknown delivery. The authenticated status API reports
+two of four publications delivered, Activity exposes explicit resolution, and
+ordinary replay is rejected. An audited `retry_anyway` retries only the uncertain
+file and then sends the remaining file; original text, first-file bytes, message
+links and comment remain unchanged. Final attempts are `[1, 1, 2, 1]`, and another
+worker pass produces no sends.
+
+Both Slack and Discord cases pass (**2/2**) on a fresh PostgreSQL database. This
+is a coverage addition, not a reproduced production duplicate-send fix. The real
+service, database, access checks and publication queue are exercised; provider
+I/O and its ambiguous failure are simulated. It does not establish whether an
+actually timed-out provider accepted the uncertain file, which is why explicit
+duplicate-risk acceptance remains required.
+Root's full chat integration rerun passed **612/612**, zero skips, in
+**110.37 seconds**, using fresh `chat_adapters_multifile_restart_20260909_root01`.
