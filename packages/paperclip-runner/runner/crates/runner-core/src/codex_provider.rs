@@ -1178,6 +1178,17 @@ impl CodexProvider {
         Ok(())
     }
 
+    pub(crate) fn restore_descendant_thread_identities(&mut self, identities: &BTreeSet<String>) {
+        // Exact provider-confirmed lineage lives as long as the root session.
+        // Evicting it would turn later child progress into a root integrity fault.
+        self.descendant_thread_ids
+            .extend(identities.iter().cloned());
+    }
+
+    pub(crate) fn descendant_thread_identities(&self) -> &BTreeSet<String> {
+        &self.descendant_thread_ids
+    }
+
     pub(crate) fn restore_settled_turn_identities(
         &mut self,
         provider_turn_ids: impl IntoIterator<Item = String>,
@@ -2134,10 +2145,8 @@ impl CodexProvider {
                 }
             };
             if identity == NotificationThread::Descendant {
-                let newly_known = notification_thread_id(&params).is_some_and(|id| {
-                    self.descendant_thread_ids.len() < 256
-                        && self.descendant_thread_ids.insert(id.to_owned())
-                });
+                let newly_known = notification_thread_id(&params)
+                    .is_some_and(|id| self.descendant_thread_ids.insert(id.to_owned()));
                 // Retain each discovered child's effect inventory independently of
                 // the informational diagnostic budget, then bound repeated progress.
                 if !newly_known && self.notification_identity_diagnostics >= 32 {

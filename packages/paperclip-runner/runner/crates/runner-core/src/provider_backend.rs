@@ -797,6 +797,8 @@ struct CodexProviderState {
     #[serde(default)]
     settled_provider_turn_ids: std::collections::BTreeSet<String>,
     #[serde(default)]
+    descendant_thread_ids: std::collections::BTreeSet<String>,
+    #[serde(default)]
     settled_provider_turn_filter: DurableReplayFilter,
     #[serde(default)]
     receipt_limit_diagnostic_emitted: bool,
@@ -882,6 +884,7 @@ impl CodexProviderState {
             completed_turn_process_generation: None,
             completed_provider_turn_id: None,
             settled_provider_turn_ids: std::collections::BTreeSet::new(),
+            descendant_thread_ids: std::collections::BTreeSet::new(),
             settled_provider_turn_filter: DurableReplayFilter::default(),
             receipt_limit_diagnostic_emitted: false,
             receipt_limit_interrupt_pending: false,
@@ -1468,6 +1471,7 @@ impl CodexCommandExecutor {
                 "failed to resume {provider_name} provider: {error}"
             ))
         })?;
+        provider.restore_descendant_thread_identities(&state.descendant_thread_ids);
         provider.enable_durable_tool_call_replays();
         provider
             .restore_settled_turn_identities(
@@ -1914,6 +1918,7 @@ impl CodexCommandExecutor {
             .map_err(|error| {
                 DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
             })?;
+            provider.restore_descendant_thread_identities(&state.descendant_thread_ids);
             provider.enable_durable_tool_call_replays();
             provider
                 .restore_settled_turn_identities(
@@ -3513,6 +3518,12 @@ impl CodexCommandExecutor {
                         .state
                         .as_mut()
                         .expect("Codex state remains available while polling");
+                    state.descendant_thread_ids = self
+                        .provider
+                        .as_ref()
+                        .expect("provider remains available while polling")
+                        .descendant_thread_identities()
+                        .clone();
                     state.extend_events(vec![NormalizedProviderEvent {
                         event_type: "harness.diagnostic".to_owned(),
                         priority: EventPriority::P1,
@@ -4373,6 +4384,7 @@ mod tests {
             completed_turn_process_generation: None,
             completed_provider_turn_id: None,
             settled_provider_turn_ids: std::collections::BTreeSet::new(),
+            descendant_thread_ids: std::collections::BTreeSet::new(),
             settled_provider_turn_filter: DurableReplayFilter::default(),
             receipt_limit_diagnostic_emitted: false,
             receipt_limit_interrupt_pending: false,

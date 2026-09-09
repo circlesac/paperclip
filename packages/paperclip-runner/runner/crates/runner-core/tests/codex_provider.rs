@@ -4901,3 +4901,80 @@ fn durable_integrity_failure_preserves_code_and_stops_provider_authority() {
     executor.shutdown().expect("cleanup");
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn durable_descendant_lineage_survives_capacity_and_provider_restoration() {
+    let directory = temporary_directory("descendant-restoration");
+    let config = provider_config(
+        &directory,
+        &["--descendant-notifications", "--durable-turn-ids"],
+    );
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({
+                "provider": config, "authorizedTools": task_context_tool_set(),
+                "completionContract": {"revision": "lineage-contract", "criterionIds": ["lineage"]}
+            }),
+        ))
+        .unwrap();
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    first
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Read test context."}),
+        ))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut completed = false;
+    let mut children = std::collections::BTreeSet::new();
+    while std::time::Instant::now() < deadline && !completed {
+        for event in poll_and_ack(&mut first).unwrap() {
+            assert_ne!(event.event_type, "turn.failed");
+            if event.payload["classification"] == "descendant" {
+                children.insert(
+                    event.payload["receivedThreadId"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+            completed |= event.event_type == "run.terminal";
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(completed);
+    assert_eq!(children.len(), 300);
+    first.shutdown().unwrap();
+    drop(first);
+
+    let mut restored = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut child_seen = false;
+    while std::time::Instant::now() < deadline && !child_seen {
+        for event in poll_and_ack(&mut restored).unwrap() {
+            assert_ne!(event.event_type, "turn.failed");
+            assert_ne!(
+                event.event_type, "run.terminal",
+                "child completion cannot complete the root"
+            );
+            child_seen |= event.payload["classification"] == "descendant"
+                && event.payload["receivedThreadId"] == "descendant-299";
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        child_seen,
+        "restoration must recognize an existing child's terminal without rediscovery"
+    );
+    restored.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
