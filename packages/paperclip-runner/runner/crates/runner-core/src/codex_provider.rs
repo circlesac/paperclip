@@ -2873,7 +2873,13 @@ fn classify_notification_thread(
         && turn_ids.is_empty()
         && !matches!(
             method,
-            "warning" | "configWarning" | "guardianWarning" | "deprecationNotice"
+            "warning"
+                | "configWarning"
+                | "guardianWarning"
+                | "deprecationNotice"
+                | "remoteControl/status/changed"
+                | "mcpServer/startupStatus/updated"
+                | "account/rateLimits/updated"
         )
     {
         return Err(LocalRunnerError::invalid(

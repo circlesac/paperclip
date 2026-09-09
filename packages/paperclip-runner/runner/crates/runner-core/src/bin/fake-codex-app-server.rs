@@ -256,7 +256,7 @@ fn finish_turn(state_path: &Path, state: &mut FakeState, status: &str) -> io::Re
         .unwrap_or_else(|| "provider-turn-1".to_owned());
     send(json!({
         "method": "item/completed",
-        "params": {"item": {
+        "params": {"threadId": state.thread_id, "turnId": turn_id, "item": {
             "id": "message-1",
             "type": "agentMessage",
             "status": "completed",
@@ -307,10 +307,10 @@ fn emit_ambiguous_turn_evidence(
     }
 }
 
-fn emit_ambiguous_turn_item() -> io::Result<()> {
+fn emit_ambiguous_turn_item(state: &FakeState) -> io::Result<()> {
     send(json!({
         "method": "item/completed",
-        "params": {"item": {
+        "params": {"threadId": state.thread_id, "item": {
             "id": "replacement-message-before-terminal",
             "type": "agentMessage",
             "status": "completed",
@@ -1184,7 +1184,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if malformed_error_second_turn_start && turn_start_count == 2 {
                     if hold_ambiguous_second_turn_after_item {
-                        emit_ambiguous_turn_item()?;
+                        emit_ambiguous_turn_item(&state)?;
                     }
                     send(json!({"id": id, "error": {}}))?;
                     if emits_ambiguous_turn_evidence
@@ -1205,7 +1205,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "result": {"turn": {"status": "inProgress"}}
                     }))?;
                     if hold_ambiguous_second_turn_after_item {
-                        emit_ambiguous_turn_item()?;
+                        emit_ambiguous_turn_item(&state)?;
                         continue;
                     }
                     if emits_ambiguous_turn_evidence
@@ -1412,11 +1412,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }),
                             json!({
                                 "method": "rawResponseItem/completed",
-                                "params": {"item": {"id": "raw-tail", "type": "reasoning"}}
+                                "params": {"threadId": state.thread_id, "turnId": provider_turn_id, "item": {"id": "raw-tail", "type": "reasoning"}}
                             }),
                             json!({
                                 "method": "rawResponse/completed",
-                                "params": {"response": {"id": "response-tail"}}
+                                "params": {"threadId": state.thread_id, "turnId": provider_turn_id, "response": {"id": "response-tail"}}
                             }),
                             json!({
                                 "method": "thread/goal/updated",
