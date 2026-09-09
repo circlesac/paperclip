@@ -335,6 +335,8 @@ export interface ChatSdkCallbackEvent<T> {
   endpointId: string;
   event: T;
   provider: ChatSdkProvider;
+  /** Runtime-assigned action ingress context; never read from provider payloads. */
+  transport?: "discord_gateway";
 }
 
 export interface DiscordRootMentionAdmissionEvent {
@@ -1358,6 +1360,7 @@ function registerCallbacks(
   trackCallback: <T>(callback: () => Promise<T> | T) => Promise<T>,
   acceptsProviderScope: (raw: unknown) => boolean,
   providerUpdateId: () => number | undefined,
+  actionTransport: () => ChatSdkCallbackEvent<ActionEvent>["transport"],
 ): void {
   const messageCallback =
     (trigger: ChatSdkMessageTrigger) =>
@@ -1430,9 +1433,26 @@ function registerCallbacks(
   }
   if (callbacks.onAction) {
     chat.onAction(async (event) => {
-      if (!acceptsProviderScope(event.raw)) return;
+      const transport = actionTransport();
+      if (!acceptsProviderScope(event.raw)) {
+        if (transport === "discord_gateway") {
+          // Resolving would tell the Gateway adapter to acknowledge a click
+          // that never reached Paperclip's scoped action authorization.
+          throw Object.assign(
+            new Error("Discord Gateway action is outside the configured guild"),
+            { code: "chat_discord_gateway_action_rejected" },
+          );
+        }
+        return;
+      }
       await trackCallback(
-        async () => await callbacks.onAction?.({ endpointId, provider, event }),
+        async () =>
+          await callbacks.onAction?.({
+            endpointId,
+            provider,
+            event,
+            ...(transport ? { transport } : {}),
+          }),
       );
     });
   }
@@ -1576,6 +1596,10 @@ export class ChatSdkEndpointRuntime {
       },
       (raw) => this.acceptsProviderScope(raw),
       () => this.webhookIngress.getStore()?.providerUpdateId,
+      () =>
+        this.provider === "discord" && !this.webhookIngress.getStore()
+          ? "discord_gateway"
+          : undefined,
     );
   }
 

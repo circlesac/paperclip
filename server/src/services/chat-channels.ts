@@ -102,6 +102,7 @@ import {
   normalizeUploadAttachmentContentType,
 } from "../attachment-types.js";
 import { isUniqueViolation } from "../db-errors.js";
+import { telegramAttachmentForUpload } from "./chat-telegram-photo.js";
 import {
   nativeFailedRunRetryStateIsSafe,
   nativePreProviderRetryAfterCleanupStateIsSafe,
@@ -17427,19 +17428,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         runtimeContext,
         safelyKnown,
       );
-      const raw = event.event.raw;
-      const isDiscordGatewayComponent =
+      if (
         event.provider === "discord" &&
-        raw !== null &&
-        typeof raw === "object" &&
-        "deferUpdate" in raw &&
-        typeof raw.deferUpdate === "function" &&
-        "isMessageComponent" in raw &&
-        typeof raw.isMessageComponent === "function";
-      if (isDiscordGatewayComponent) {
+        event.transport === "discord_gateway"
+      ) {
         // Discord renders deferUpdate as a successful click. After the denial
         // audit is durable, surface a transport-only sentinel so the Gateway
-        // adapter can deliberately withhold that misleading acknowledgement.
+        // adapter can withhold that misleading acknowledgement. The runtime,
+        // not raw JSON or discord.js methods, supplies the ingress context.
         throw Object.assign(
           new Error("Discord Gateway action was not admitted by Paperclip"),
           { code: "chat_discord_gateway_action_rejected" },
@@ -26759,30 +26755,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
   }
 
-  function telegramAttachmentForUpload(file: FileUpload): Attachment {
-    const mimeType = file.mimeType?.toLowerCase() ?? "application/octet-stream";
-    const contentType = normalizeContentType(mimeType);
-    // Telegram's native audio player accepts MP3/M4A and its video method
-    // accepts MPEG4. Other allowed formats still travel losslessly as
-    // documents; choose before I/O, never replay an uncertain media send.
-    const type: Attachment["type"] = contentType.startsWith("image/")
-      ? "image"
-      : contentType === "audio/mpeg" || contentType === "audio/mp4"
-        ? "audio"
-        : contentType === "video/mp4"
-          ? "video"
-          : "file";
-    const data =
-      file.data instanceof ArrayBuffer ? Buffer.from(file.data) : file.data;
-    return {
-      data,
-      mimeType,
-      name: file.filename,
-      size: data instanceof Blob ? data.size : data.byteLength,
-      type,
-    };
-  }
-
   function discordMarkdownAttachment(text: string): FileUpload {
     return {
       data: Buffer.from(text, "utf8"),
@@ -27055,7 +27027,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           input.payload,
         );
         if (input.endpoint.provider === "telegram") {
-          attachments = uploads.map(telegramAttachmentForUpload);
+          attachments = await Promise.all(
+            uploads.map(telegramAttachmentForUpload),
+          );
         } else {
           files = uploads;
         }

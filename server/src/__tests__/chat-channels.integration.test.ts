@@ -14,7 +14,9 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { crc32 } from "node:zlib";
 import express from "express";
+import sharp from "sharp";
 import request from "supertest";
 import {
   and,
@@ -24895,8 +24897,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it("durably audits a rejected Discord Gateway action before surfacing transport rejection", async () => {
     const fixture = await seedCompany();
-    const { callbacks, endpoint, service } =
+    const { callbacks, endpoint, runtime, service, wakeup } =
       await configuredDiscordEndpoint(fixture);
+    let pinned: ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
     try {
       await db
         .update(chatEndpoints)
@@ -24904,42 +24907,85 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .where(eq(chatEndpoints.id, endpoint.id));
       if (!callbacks.onAction)
         throw new Error("Discord action callback was not registered");
-      const channel = makeThread({
-        channelId: "333333333333333333",
-        id: "discord:1457808928258658549:333333333333333333:555555555555555598",
-        name: "discord-action-denial",
+      const configuration = runtime.configurations.get(endpoint.id)!;
+      const observedErrors: string[] = [];
+      const onAction = vi.fn(
+        async (
+          event: Parameters<NonNullable<typeof callbacks.onAction>>[0],
+        ) => {
+          try {
+            await callbacks.onAction!(event);
+          } catch (error) {
+            observedErrors.push(String((error as { code?: unknown }).code));
+            throw error;
+          }
+        },
+      );
+      pinned = createChatSdkEndpointRuntime({
+        ...configuration,
+        callbacks: { onMessage() {}, onAction },
+        enableDiscordGateway: false,
+        logger: "silent",
       });
-      const rawGatewayInteraction = {
-        deferUpdate: vi.fn(),
+      await pinned.initialize();
+      const applicationId =
+        configuration.providerConfig.provider === "discord"
+          ? configuration.providerConfig.credentials.applicationId
+          : undefined;
+      const gatewayInteraction = {
+        applicationId,
+        channel: {
+          id: "555555555555555598",
+          parentId: "333333333333333333",
+          type: 11,
+        },
+        channelId: "555555555555555598",
+        componentType: 2,
+        customId: "pcq:forged-discord-action\nforged-value",
+        deferUpdate: vi.fn().mockResolvedValue(undefined),
+        guildId: "1457808928258658549",
+        id: "777777777777777710",
+        isChatInputCommand: () => false,
         isMessageComponent: () => true,
-      };
-
-      await expect(
-        callbacks.onAction({
-          endpointId: endpoint.id,
-          provider: "discord",
-          event: {
-            actionId: "pcq:forged-discord-action",
-            adapter: {} as never,
-            messageId: "555555555555555597",
-            openModal: async () => undefined,
-            raw: rawGatewayInteraction,
-            thread: channel.thread,
-            threadId: channel.thread.id,
-            user: {
-              userId: "444444444444444444",
-              userName: "discord-user",
-              fullName: "Discord User",
-              isBot: false,
-              isMe: false,
-              isSystem: false,
-            },
-            value: "forged-value",
-          },
+        message: { id: "555555555555555597" },
+        reply: vi.fn(async () => {
+          const rows = await db
+            .select()
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.endpointId, endpoint.id),
+                eq(chatDeliveries.eventKind, "action"),
+              ),
+            );
+          expect(rows).toHaveLength(1);
+          expect(rows[0]?.state).toBe("filtered");
         }),
-      ).rejects.toMatchObject({
-        code: "chat_discord_gateway_action_rejected",
-      });
+        token: "synthetic-interaction-token",
+        type: 3,
+        user: {
+          id: "444444444444444444",
+          username: "discord-user",
+          globalName: "Discord User",
+          bot: false,
+        },
+        version: 1,
+      };
+      const adapter = pinned.getProviderAdapter() as unknown as {
+        handleGatewayInteraction(
+          event: typeof gatewayInteraction,
+        ): Promise<void>;
+      };
+      const priorWakeups = wakeup.mock.calls.length;
+      // Repeat one synthetic Gateway delivery. These are response attempts,
+      // not proof that Discord accepts two replies to one interaction token.
+      await adapter.handleGatewayInteraction(gatewayInteraction);
+      await adapter.handleGatewayInteraction(gatewayInteraction);
+      expect(onAction).toHaveBeenCalledTimes(2);
+      expect(onAction.mock.calls[0]![0].event.raw).not.toHaveProperty(
+        "deferUpdate",
+      );
+      expect(wakeup.mock.calls).toHaveLength(priorWakeups);
 
       const denials = await db
         .select()
@@ -24967,8 +25013,26 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(JSON.stringify(denials)).not.toContain(
         "pcq:forged-discord-action",
       );
-      expect(rawGatewayInteraction.deferUpdate).not.toHaveBeenCalled();
+      expect({
+        errors: observedErrors,
+        successAcknowledgements:
+          gatewayInteraction.deferUpdate.mock.calls.length,
+        rejectionReplies: gatewayInteraction.reply.mock.calls.length,
+      }).toEqual({
+        errors: [
+          "chat_discord_gateway_action_rejected",
+          "chat_discord_gateway_action_rejected",
+        ],
+        successAcknowledgements: 0,
+        rejectionReplies: 2,
+      });
+      expect(gatewayInteraction.reply).toHaveBeenLastCalledWith({
+        content:
+          "This action is no longer available. Open the linked Paperclip task or ask an operator to link this account.",
+        flags: 64,
+      });
     } finally {
+      await pinned?.shutdown();
       await service.shutdown();
     }
   });
@@ -33929,6 +33993,258 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ]);
   });
 
+  it.each([
+    "ratio_20",
+    "ratio_21",
+    "portrait_21",
+    "dimensions_10000",
+    "dimensions_10001",
+    "jpeg",
+    "gif",
+    "webp",
+    "malformed",
+    "photo_size_limit",
+    "photo_size_over",
+    "ambiguous",
+  ] as const)(
+    "selects the Telegram photo boundary before provider I/O (%s)",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const { callbacks, endpoint, runtime, service } =
+        await configuredTelegramEndpoint(fixture, { storage: storage.storage });
+      let pinned: ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
+      let threadSpy: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        const chatId = "77119914";
+        const dm = makeThread({
+          channelId: `telegram:${chatId}`,
+          id: `telegram:${chatId}`,
+          isDM: true,
+          name: "Telegram photo boundaries",
+        });
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          provider: "telegram",
+          thread: dm.thread,
+          message: makeMessage({
+            id: `${chatId}:1`,
+            text: "Return this exact image",
+            userId: chatId,
+          }),
+          trigger: "direct_message",
+        });
+        await qualifySetupRoundTrip(service, endpoint.id, chatId);
+        await service.test(endpoint.id, "owner-user");
+        const [conversation] = await service.listConversations(endpoint.id);
+        if (!conversation) throw new Error("Expected photo test conversation");
+
+        const [width, height] =
+          mode === "ratio_20"
+            ? [200, 10]
+            : mode === "ratio_21"
+              ? [210, 10]
+              : mode === "portrait_21"
+                ? [10, 210]
+                : mode === "dimensions_10000"
+                  ? [9500, 500]
+                  : mode === "dimensions_10001"
+                    ? [9501, 500]
+                    : [16, 16];
+        const format =
+          mode === "jpeg" || mode === "gif" || mode === "webp" ? mode : "png";
+        let bytes = await sharp({
+          create: { width, height, channels: 3, background: "#e08040" },
+        })
+          .toFormat(format)
+          .toBuffer();
+        if (mode === "malformed") bytes = bytes.subarray(0, 20);
+        if (mode === "photo_size_limit" || mode === "photo_size_over") {
+          // A genuine PNG with a legal uncompressed ancillary text chunk;
+          // exercise upload bytes without allocating/decompressing huge pixels.
+          const target = 10_000_000 + Number(mode === "photo_size_over");
+          const payload = Buffer.alloc(target - bytes.length - 12, 0x78);
+          payload.write("padding\0", 0, "ascii");
+          const chunk = Buffer.alloc(payload.length + 12);
+          chunk.writeUInt32BE(payload.length);
+          chunk.write("tEXt", 4, "ascii");
+          payload.copy(chunk, 8);
+          chunk.writeUInt32BE(crc32(chunk.subarray(4, -4)), chunk.length - 4);
+          bytes = Buffer.concat([
+            bytes.subarray(0, -12),
+            chunk,
+            bytes.subarray(-12),
+          ]);
+          expect(bytes.length).toBe(target);
+        }
+        if (mode !== "malformed") {
+          await expect(sharp(bytes).metadata()).resolves.toMatchObject({
+            width,
+            height,
+            format,
+          });
+        }
+        const filename = `original-${mode}.${format}`;
+        const mimeType = `image/${format}`;
+        const stored = await storage.storage.putFile({
+          companyId: fixture.companyId,
+          namespace: `issues/${conversation.issueId}`,
+          originalFilename: filename,
+          contentType: mimeType,
+          body: bytes,
+        });
+        const attachment = await issueService(db).createAttachment({
+          issueId: conversation.issueId,
+          provider: stored.provider,
+          objectKey: stored.objectKey,
+          contentType: stored.contentType,
+          byteSize: stored.byteSize,
+          sha256: stored.sha256,
+          originalFilename: stored.originalFilename,
+          createdByUserId: "owner-user",
+        });
+        const expectedMethod = [
+          "ratio_21",
+          "portrait_21",
+          "dimensions_10001",
+          "gif",
+          "webp",
+          "malformed",
+          "photo_size_over",
+        ].includes(mode)
+          ? "sendDocument"
+          : "sendPhoto";
+        const methods: string[] = [];
+        const uploadedBytes: Buffer[] = [];
+        vi.stubGlobal(
+          "fetch",
+          vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+            const url = new URL(String(input));
+            expect(url.hostname).toBe("api.telegram.org");
+            const method = url.pathname.split("/").at(-1)!;
+            methods.push(method);
+            if (method === "sendPhoto" || method === "sendDocument") {
+              expect(init?.body).toBeInstanceOf(FormData);
+              const file = (init!.body as FormData).get(
+                method === "sendPhoto" ? "photo" : "document",
+              ) as File;
+              expect(file.name).toBe(filename);
+              expect(file.type).toBe(mimeType);
+              uploadedBytes.push(Buffer.from(await file.arrayBuffer()));
+              if (mode === "ambiguous")
+                throw new TypeError("fetch failed", {
+                  cause: Object.assign(new Error("synthetic connection loss"), {
+                    code: "UND_ERR_SOCKET",
+                  }),
+                });
+              if (expectedMethod === "sendDocument" && method === "sendPhoto") {
+                return Response.json(
+                  {
+                    ok: false,
+                    error_code: 400,
+                    description: "Bad Request: PHOTO_INVALID_DIMENSIONS",
+                  },
+                  { status: 400 },
+                );
+              }
+            } else expect(method).toBe("sendRichMessage");
+            return Response.json({
+              ok: true,
+              result: {
+                message_id: 100 + methods.length,
+                date: 1_788_700_002,
+                chat: { id: Number(chatId), type: "private" },
+              },
+            });
+          }),
+        );
+        pinned = createChatSdkEndpointRuntime({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          callbacks: { onMessage() {} },
+          logger: "silent",
+          persistence: {
+            async compareAndSet() {
+              return true;
+            },
+            async deleteIfVersion() {
+              return true;
+            },
+            async read() {
+              return null;
+            },
+          },
+          providerConfig: {
+            provider: "telegram",
+            userName: "photo_fixture_bot",
+            credentials: {
+              botToken: "123:synthetic-photo-fixture",
+              secretToken: "synthetic",
+            },
+          },
+        });
+        const adapter = pinned.getProviderAdapter();
+        const endpointRuntime = runtime.endpoints.get(endpoint.id)!;
+        const originalThread = endpointRuntime.thread.bind(endpointRuntime);
+        threadSpy = vi
+          .spyOn(endpointRuntime, "thread")
+          .mockImplementation((threadId) => ({
+            ...originalThread(threadId),
+            post: async (message: unknown) => {
+              const posted = await adapter.postMessage(
+                threadId,
+                message as Parameters<typeof adapter.postMessage>[1],
+              );
+              return { id: posted.id, threadId };
+            },
+          }));
+        const result = await service.publishBoardMessage(
+          endpoint.id,
+          conversation.id,
+          "Original image attached",
+          `photo-boundary-${mode}`,
+          "owner-user",
+          [attachment.id],
+        );
+        expect(methods).toEqual(["sendRichMessage", expectedMethod]);
+        expect(uploadedBytes).toEqual([bytes]);
+        expect(result.state).toBe(
+          mode === "ambiguous" ? "delivery_unknown" : "published",
+        );
+        const publications = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, endpoint.id),
+              eq(chatPublications.commentId, result.commentId!),
+            ),
+          )
+          .orderBy(asc(chatPublications.createdAt));
+        expect(
+          publications.map((row) => ({
+            state: row.state,
+            attempts: row.attempts,
+          })),
+        ).toEqual([
+          { state: "published", attempts: 1 },
+          {
+            state: mode === "ambiguous" ? "delivery_unknown" : "published",
+            attempts: 1,
+          },
+        ]);
+        await service.processPendingPublications();
+        expect(methods).toEqual(["sendRichMessage", expectedMethod]);
+      } finally {
+        threadSpy?.mockRestore();
+        await pinned?.shutdown();
+        vi.unstubAllGlobals();
+        await retirePublicationFixture(service, endpoint.id);
+      }
+    },
+  );
+
   it("maps Telegram image, audio, and video output onto native media lanes", async () => {
     const fixture = await seedCompany();
     const storage = createStorageService();
@@ -33983,7 +34299,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     ] as const;
     const attachmentIds: string[] = [];
     for (const item of media) {
-      const body = Buffer.from(`native-${item.type}`, "utf8");
+      const body =
+        item.type === "image"
+          ? await sharp({
+              create: {
+                width: 16,
+                height: 16,
+                channels: 3,
+                background: "#e08040",
+              },
+            })
+              .png()
+              .toBuffer()
+          : Buffer.from(`native-${item.type}`, "utf8");
       const stored = await storage.storage.putFile({
         companyId: fixture.companyId,
         namespace: `issues/${conversation.issueId}`,
