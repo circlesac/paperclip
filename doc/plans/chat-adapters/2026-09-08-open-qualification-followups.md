@@ -138,11 +138,14 @@ the next implementation pass:
   interaction agent. Capability flags stay truthful until this is complete.
 - **Teams personal file output:** existing bot credentials can support native
   consent/upload without new Graph permissions; the pinned adapter does not
-  implement the consent callbacks. The consent-waiting state, per-file progress,
-  exact authorization, encrypted upload capability, URL policy and uncertain
-  delivery semantics have an approved foundation design; helper/SDK-boundary
-  implementation is in progress without service activation yet. Channel/group
-  files still need their documented fallback; do not infer broader authority.
+  implement the consent callbacks. The new inactive helper/actual-SDK hook
+  foundation passes root **81/81**, the owner's egress cohort **119/119**, and
+  plain server types. It protects upload capability privacy, exact bytes and
+  receipts, and uncertain delivery. Actual encrypted early-accept buffering,
+  restart recovery, consent-waiting publication state, worker and UI/batch
+  integration are still required before activation. The early-accept test is
+  in-memory only. Channel/group files retain their documented fallback; do not
+  infer broader authority.
 
 Root owns shared verification, documentation, Git and deployment. Server 71
 remains on committed `efbc92616`; these new changes are not deployed or live

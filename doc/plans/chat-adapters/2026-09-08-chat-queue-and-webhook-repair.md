@@ -3606,3 +3606,38 @@ Root independently repeated that same cohort: 66/66, 1.05 seconds,
 Production still rejects a missing parser; no silent compatibility fallback
 was introduced. This later fixture-only change is distinct from the full-run
 source snapshot above. These tests simulate provider I/O, not live chats.
+
+### September 9: Teams personal-file consent transport foundation
+
+The pinned Teams SDK returned HTTP 200 for synthetic accept/decline invokes
+without invoking a file-consent callback. Two genuine RED cases established
+that gap. An explicit per-App hook now projects authenticated personal-chat
+consent events and waits for the caller's durable-receipt callback before
+acknowledging. The contract test replaces only the SDK service-token validator;
+it is not evidence of real JWT validation, a tenant installation or a live file.
+
+The new foundation keeps upload URLs in private fields, binds consent to the
+exact actor, tenant, endpoint, source and file, and snapshots and verifies file
+bytes inside the upload capability itself. PUTs use bounded, DNS/socket-pinned
+HTTPS requests without redirects or bearer credentials. A final upload receipt
+requires bounded JSON with matching item identity, filename and size. An
+ambiguous PUT is not resent; a missing upload session is not proof of failure.
+Consent acceptance, successful upload and visible file-card delivery are three
+distinct states. The commercial SharePoint host family is a conservative
+supported policy, not an exhaustive claim about Microsoft upload hosts.
+Provider basis: [Teams file consent](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/bots-filesv4)
+and [upload sessions](https://learn.microsoft.com/en-us/graph/api/driveitem-createuploadsession?view=graph-rest-1.0).
+
+Root reviewed all production code and independently passed **81/81** in the
+two new test files (639 ms; `teams-file-consent-foundation-root-0909.log`).
+The owner's new-plus-egress cohort passed **119/119**, and plain server
+TypeScript passed. Independent review found no additional blocker in this
+inactive foundation.
+
+This commit does **not** activate native file output. Durable encrypted
+early-consent buffering, restart restoration, per-file publication intents,
+current authorization, unknown-result reconciliation and UI/batch states still
+must be connected. The early-accept test retains an in-memory event only; it
+does not prove restart durability. Channel/group files retain their existing
+fallback without new Graph permissions. Eligible-tenant live qualification
+remains outstanding. No provider request or server restart occurred here.
