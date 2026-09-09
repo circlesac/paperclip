@@ -39,17 +39,17 @@ permissions and audit. Do not narrow completion to whichever tests pass.
 
 ## Current deployment
 
-Implementation `b9461c4a6` is pushed and deployed, including automatic Discord
-command registration/admission and Teams personal-file consent with conflict
-recovery, alongside the previous native recovery/forms/video-note repairs.
-Server **73** is running:
+Implementation `cfbda24be` is pushed and deployed, adding lossless long replies
+and scoped Teams pictures to automatic Discord commands, Teams personal-file
+consent and the previous native recovery/forms/video-note repairs.
+Server **74** is running:
 
 | Field                    | Verified value                                                       |
 | ------------------------ | -------------------------------------------------------------------- |
-| PID / tool handle        | `11923` / `73311`                                                    |
+| PID / tool handle        | `7070` / `34451`                                                     |
 | Listener                 | `127.0.0.1:3137`                                                     |
-| Loaded server version    | `2026.831.0+607.git.b9461c4a6`                                         |
-| Started / recovery ready | `06:29:02.753` / `06:29:06.792 UTC`, September 9                        |
+| Loaded server version    | `2026.831.0+609.git.cfbda24be`                                         |
+| Started / recovery ready | `07:07:32.964` / `07:07:39.382 UTC`, September 9                        |
 | Native runner SHA256     | `6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`     |
 | Live DB                  | `chat_adapters_live_3103` on local PostgreSQL `55439`, role `paperclip` |
 | Last checked runs        | 290 terminal: 262 succeeded, 26 failed, 2 cancelled; zero active       |
@@ -64,13 +64,13 @@ proves live provider registration, not invocation or private-response UX.
 The health response's Git commit is dynamic; use loaded version and process
 start to identify deployed code.
 
-Server 72 exited cleanly after a fresh zero-active-run check at
-`06:26:25.820 UTC`. Before migration, the stopped server's database was backed
-up to private `pre-73-backup.bFPVGs/pre-server-73-20260909-012635.sql.gz`
-(7,762,243 bytes; directory 0700/file 0600; gzip integrity passed; restore not
-tested). Migrations 0257 and 0258 then applied successfully: journal count 257,
-up to date. No credentials or historical recovery records were rewritten.
-At `06:29:50.202 UTC`, the run inventory remained 290 terminal, zero active.
+Server 73 exited cleanly after a fresh zero-active-run check at
+`07:06:44.529 UTC`. Its stopped database was backed up to private
+`pre-74-backup.MYm5xK/pre-server-74-20260909-020706.sql.gz`
+(8,035,012 bytes; directory 0700/file 0600; gzip integrity passed; restore not
+tested; no backup pruned). No migration was needed: journal count 257, up to
+date. No credentials or historical recovery records were rewritten.
+At `07:08:52.041 UTC`, the run inventory remained 290 terminal, zero active.
 The qualified runner and lockfile SHA256 values are unchanged.
 
 Private Board: `https://dottas-macbook-pro.tail29c1aa.ts.net`.
@@ -90,8 +90,8 @@ All local runtime material is under ignored
 `.paperclip-runtime/chat-adapters-live/`, including:
 
 - `start-server.sh`: configured isolated startup, no embedded credentials.
-- `server-experimental-landing-73.log`: current server log.
-- `pre-server-73-migration-0909.log`: private backup/migration metadata.
+- `server-experimental-landing-74.log`: current server log.
+- `pre-server-74-backup-0909.log`: private backup/schema metadata.
 - `qualified-runnerd-2400740c`: preserved old qualified runner backup.
 - `home/instances/chat-adapters-live/runtime/paperclip-runner/durable-sessions`:
   live native roots; do not manipulate historical evidence.
@@ -105,7 +105,7 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Immediate next actions
 
-1. **Resume real browser qualification on server 73.** Latest actual browser
+1. **Resume real browser qualification on server 74.** Latest actual browser
    inventory reports **Mac locked**; the user has been asked to unlock it.
    Discord login was restored before the lock. Do not request Discord login
    again unless the actual provider page requires it.
@@ -132,7 +132,7 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
-**Working tree after server 73 (not deployed):** a bounded parallel acceptance
+**Deployed in `cfbda24be` on server 74:** a bounded parallel acceptance
 audit found two gaps beyond the browser lock. Explicit Board publication accepts
 100,000 characters but the shared projector silently keeps only 40,000. Four
 real-service Slack/GitHub new/existing-comment cases reproduced the missing

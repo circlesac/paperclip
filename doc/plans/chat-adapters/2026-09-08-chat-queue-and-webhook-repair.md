@@ -4046,3 +4046,35 @@ At `07:05:05.965 UTC`, the live inventory still showed only the same 290
 terminal runs (262 succeeded, 26 failed, two cancelled) and no active run.
 Deployment remains a separate next step; no old failed or uncertain turn was
 manually rewritten or replayed to manufacture this result.
+
+### September 9: server 74 deployed after full regression
+
+Committed and pushed `cfbda24be` with the verified long-text and Teams-picture
+changes. At `07:06:44.529 UTC`, a fresh inventory showed zero active runs before
+server 73 (PID 11923, handle 73311) received SIGTERM and exited cleanly. With it
+stopped, the existing JavaScript backup helper produced
+`pre-74-backup.MYm5xK/pre-server-74-20260909-020706.sql.gz` (8,035,012 bytes,
+private directory 0700/file 0600). No backup was pruned. Gzip integrity passed;
+restore has not been tested. Migration inspection remained up to date with
+257 journal entries; no migration was applied for this change.
+
+Server **74** is PID **7070**, handle **34451**, listener `127.0.0.1:3137`,
+loaded version `2026.831.0+609.git.cfbda24be`. It started at `07:07:32.964 UTC`
+and reached recovery-ready at `07:07:39.382 UTC`. Loopback and private
+Tailscale health returned 200/ready; the public Funnel Board-health check
+returned 404. The existing Discord bot reconnected its Gateway. The API still
+reports the original Discord, GitHub, Slack and Telegram endpoints active.
+This is server/configuration readiness, not a newly sent provider conversation.
+
+At `07:08:52.041 UTC`, the live database still had 290 terminal runs
+(262 succeeded, 26 failed, two cancelled), zero active; the latest start was
+still `02:15:47.812 UTC`. Native runner and lockfile hashes remain unchanged.
+The proxy and unrelated checkout on port 3103 were not touched. Runtime log:
+`server-experimental-landing-74.log`; backup/schema metadata:
+`pre-server-74-backup-0909.log`, both ignored local artifacts.
+
+A fresh post-deployment browser attempt again reported the Mac locked and
+automatic unlock unavailable. Discord login was already restored; OS unlock
+is the remaining browser gate. Teams separately still needs an eligible
+tenant. No new live model/provider result, historical recovery or complete
+production-readiness claim is made from this deployment.
