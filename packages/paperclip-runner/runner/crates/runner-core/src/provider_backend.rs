@@ -919,7 +919,12 @@ impl CodexProviderState {
             || self.schema != PROVIDER_STATE_SCHEMA
             || !matches!(
                 self.lifecycle.as_str(),
-                "prepared" | "session_open" | "turn_active" | "provider_exited" | "closed"
+                "prepared"
+                    | "session_open"
+                    | "turn_active"
+                    | "provider_exited"
+                    | "reconciliation_required"
+                    | "closed"
             )
             || self
                 .thread_id
@@ -1892,6 +1897,15 @@ impl CodexCommandExecutor {
 
     fn ensure_provider(&mut self) -> Result<&mut CodexProvider, DurableRunnerError> {
         self.restore_provider_if_needed()?;
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.lifecycle == "reconciliation_required")
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider session requires explicit reconciliation and a fresh session",
+            ));
+        }
         if self.provider.is_none() {
             let state = self.state.as_ref().ok_or_else(|| {
                 DurableRunnerError::invalid("Codex provider has not been prepared")
@@ -3464,7 +3478,9 @@ impl CodexCommandExecutor {
                         .state
                         .as_mut()
                         .expect("Codex state available while polling");
-                    state.lifecycle = "provider_exited".to_owned();
+                    // Neither an integrity failure nor a full lineage ledger can
+                    // safely reopen this provider session, even after event ACK.
+                    state.lifecycle = "reconciliation_required".to_owned();
                     state.completed_turn_authoritative = false;
                     state.completed_turn_process_generation = None;
                     state.completed_provider_turn_id = None;
@@ -3903,6 +3919,27 @@ impl CodexCommandExecutor {
 impl CommandExecutor for CodexCommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
         self.restore()?;
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.lifecycle == "reconciliation_required")
+            && !matches!(
+                command.command_type.as_str(),
+                "session.snapshot"
+                    | "session.close"
+                    | "session.destroy"
+                    | "runner.drain"
+                    | "runner.suspend"
+                    | "runner.shutdown"
+                    | "turn.interrupt"
+                    | "run.cancel"
+                    | "turn.stop"
+            )
+        {
+            return Err(DurableRunnerError::invalid(
+                "Codex provider session requires explicit reconciliation and a fresh session",
+            ));
+        }
         match command.command_type.as_str() {
             "run.prepare" => self.prepare(&command.payload),
             "run.attach" => {

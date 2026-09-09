@@ -5026,7 +5026,42 @@ fn durable_descendant_lineage_survives_capacity_and_provider_restoration() {
         persisted["descendantThreadIds"].as_array().unwrap().len(),
         4096
     );
-    assert_eq!(persisted["lifecycle"], "provider_exited");
+    assert_eq!(persisted["lifecycle"], "reconciliation_required");
+    // Acknowledging all terminal events must not authorize another provider turn.
+    while !poll_and_ack(&mut bounded).unwrap().is_empty() {}
+    for kind in ["turn.start", "session.open", "run.attach"] {
+        let error = bounded
+            .execute(&command("blocked", 5, kind, json!({"text":"Retry"})))
+            .expect_err("reconciliation cannot be bypassed in the current executor");
+        assert!(error
+            .to_string()
+            .contains("requires explicit reconciliation"));
+    }
     bounded.shutdown().unwrap();
+    let mut restored = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    for kind in ["turn.start", "session.open", "run.attach"] {
+        let error = restored
+            .execute(&command(
+                "blocked-after-restart",
+                6,
+                kind,
+                json!({"text":"Retry"}),
+            ))
+            .expect_err("restart must retain the reconciliation fence");
+        assert!(error
+            .to_string()
+            .contains("requires explicit reconciliation"));
+    }
+    let persisted_after_restart: Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        persisted_after_restart["providerProcessGeneration"],
+        persisted["providerProcessGeneration"]
+    );
+    assert_eq!(
+        persisted_after_restart["lifecycle"],
+        "reconciliation_required"
+    );
+    restored.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
