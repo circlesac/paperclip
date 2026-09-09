@@ -3733,3 +3733,33 @@ capability changed from false before restart to true afterward, with status
 active. This verifies deployed automatic capability upgrade, not a successful
 user modal. At 05:00:24.491 UTC run counts were unchanged. The Mac lock still
 prevents live browser qualification; no new chat or model turn was sent.
+
+### September 9: bounded Teams maintenance and owned Discord registration
+
+Teams expiry maintenance now isolates every row, advances its bounded scan past
+malformed evidence, and bounds projection lock waits to 250 ms. Genuine failing
+tests reproduced both oldest-row starvation and a held endpoint lock blocking
+unrelated expiry. The new scheduling cursor is memory-only, shared by services
+using the same database object, and conveys no authority. Failed rows preserve
+their exact stored evidence. The owner's fresh PostgreSQL cohort passes
+**151/151** on `chat_teams_recovery_20260909_protocol01`. Buffered acceptance
+survives expiry recovery without a second consent POST or PUT; maintenance
+itself never performs provider I/O.
+
+Discord command registration groundwork now has a closed durable descriptor
+for `/paperclip status`, `new`, and `close`. It preserves other app commands,
+uses individual writes only, and reconciles uncertain writes with GET rather
+than blindly reposting. A public ownership marker is an identifier, not a
+credential; the stored descriptor and exact provider identity remain required.
+Discord's name-upsert API cannot exclude a concurrent external administrator;
+the helper explicitly documents that limitation. Root independently passes
+**24/24** registration/Discord unit cases. This helper is not yet registered by
+the live service; SDK command acknowledgement and service admission are separate
+remaining work.
+
+Teams source/worker/callback integration is concurrently under test, not yet
+deployed. Its first composed Board flow passes **4/4** with actual inbound SDK
+parsing, real database admission/consent/projection, and controlled provider
+ports. It verifies one exact-byte PUT and one final card after acceptance plus
+three missing/ambiguous-recipient fallbacks. This is not tenant/JWT/live proof.
+The browser inventory still reports the Mac locked, not a Discord login error.

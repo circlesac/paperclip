@@ -8,7 +8,7 @@ import {
   it,
   vi,
 } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   agents,
   assets,
@@ -83,7 +83,7 @@ suite(
     });
     afterEach(() => vi.restoreAllMocks());
 
-    async function fixture() {
+    async function fixture(consentLifetimeMs = 60_000) {
       const companyId = randomUUID();
       const agentId = randomUUID();
       const applicationId = randomUUID();
@@ -224,7 +224,7 @@ suite(
       const service = () => teamsFileTransferService(db, opts);
       const created = await service().issue(
         a,
-        new Date(clock.getTime() + 60_000),
+        new Date(clock.getTime() + consentLifetimeMs),
       );
       const read = () =>
         db
@@ -900,6 +900,307 @@ suite(
         (await f.service().process(f.a.companyId, f.created.id)).phase,
       ).toBe("consent_unknown");
       expect(f.opts.postConsent).toHaveBeenCalledTimes(1);
+    });
+
+    it("advances bounded expiry pages past malformed oldest records across fresh service instances", async () => {
+      const f = await fixture();
+      const ids = [f.created.id];
+      for (let index = 0; index < 2; index++) {
+        const publicationId = randomUUID();
+        await db.insert(chatPublications).values({
+          id: publicationId,
+          companyId: f.a.companyId,
+          endpointId: f.a.endpointId,
+          conversationId: f.a.conversationId,
+          issueId: f.a.issueId,
+          commentId: f.a.commentId,
+          idempotencyKey: `expiry:${publicationId}`,
+          payload: {
+            text: "Same authorized artifact",
+            attachmentIds: [f.a.attachmentId],
+          },
+        });
+        const a = { ...f.a, publicationId };
+        const sibling = await teamsFileTransferService(db, {
+          ...f.opts,
+          authorize: async () => ({ ...a }),
+        }).issue(a, (await f.read()).expiresAt);
+        ids.push(sibling.id);
+      }
+      ids.sort();
+      for (const id of ids.slice(0, 2))
+        await db
+          .update(chatTeamsFileTransfers)
+          .set({
+            authorityDigest: "0".repeat(64),
+            updatedAt: new Date(Date.now() - 120_000),
+            reason: "https://private.invalid/?token=POISON-SWEEP-CANARY",
+          })
+          .where(eq(chatTeamsFileTransfers.id, id));
+      const poisonedBefore = await db
+        .select()
+        .from(chatTeamsFileTransfers)
+        .where(inArray(chatTeamsFileTransfers.id, ids.slice(0, 2)));
+      f.advance(61_000);
+      for (let index = 0; index < 2; index++) {
+        const result = await f.service().expireAndRecover(f.a.companyId, 1);
+        expect(result).toMatchObject({ scanned: 1, recovered: 0, failed: 1 });
+        expect(JSON.stringify(result)).not.toContain("POISON-SWEEP-CANARY");
+      }
+      expect(
+        await f.service().expireAndRecover(f.a.companyId, 1),
+      ).toMatchObject({ scanned: 1, recovered: 1, failed: 0 });
+      const [healthy] = await db
+        .select()
+        .from(chatTeamsFileTransfers)
+        .where(eq(chatTeamsFileTransfers.id, ids[2]!));
+      expect(healthy!.phase).toBe("expired");
+      expect(
+        await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(inArray(chatTeamsFileTransfers.id, ids.slice(0, 2))),
+      ).toEqual(poisonedBefore);
+      // The cursor wraps, but neither mutates nor interprets the poisoned rows.
+      expect(
+        await f.service().expireAndRecover(f.a.companyId, 1),
+      ).toMatchObject({ scanned: 1, recovered: 0, failed: 1 });
+      expect(f.opts.postConsent).not.toHaveBeenCalled();
+      expect(f.opts.uploadRequest).not.toHaveBeenCalled();
+    });
+
+    it("recovers buffered acceptance after actual card POST receipt projection rolls back without reposting", async () => {
+      const f = await fixture(5 * 60_000);
+      let release!: () => void, entered!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      f.opts.postConsent = vi.fn(async () => {
+        entered();
+        await hold;
+        return { id: "card-1" };
+      });
+      f.opts.project = vi.fn(async (_tx, transfer) => {
+        if (transfer.phase === "awaiting_consent")
+          throw new Error("receipt projection rollback");
+      });
+      const work = f.service().process(f.a.companyId, f.created.id);
+      void work.catch(() => {});
+      await started;
+      try {
+        expect(await f.service().recordConsent(await f.event())).toBe(
+          "recorded",
+        );
+        const buffered = await f.read();
+        expect(buffered.phase).toBe("consent_sending");
+        expect(buffered.privateState.response).toBeDefined();
+        release();
+        await expect(work).rejects.toThrow("receipt projection rollback");
+        expect(await f.read()).toEqual(buffered);
+        f.advance(91_000);
+        await f.service().expireAndRecover(f.a.companyId);
+        const unknown = await f.read();
+        expect(unknown).toMatchObject({
+          phase: "consent_unknown",
+          consentMessageId: null,
+          reason: "worker_outcome_unknown",
+        });
+        expect(unknown.privateState.response).toEqual(
+          buffered.privateState.response,
+        );
+        expect(f.opts.uploadRequest).not.toHaveBeenCalled(); // sweep performs no effects
+        f.opts.project = undefined;
+        expect(
+          (await f.service().process(f.a.companyId, f.created.id)).phase,
+        ).toBe("file_info_pending");
+        expect(f.opts.postConsent).toHaveBeenCalledTimes(1);
+        expect(f.opts.uploadRequest).toHaveBeenCalledTimes(1);
+        expect((await f.read()).consentMessageId).toBeNull(); // callback proof, not an invented POST receipt
+      } finally {
+        release();
+        await work.catch(() => {});
+      }
+    });
+
+    it("skips a held publication lock during expiry and recovers it on a later wrap", async () => {
+      const f = await fixture();
+      f.advance(61_000);
+      let release!: () => void, entered!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const ready = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const owner = db.transaction(async (tx) => {
+        await tx
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.id, f.a.publicationId))
+          .for("update");
+        entered();
+        await hold;
+      });
+      await ready;
+      const sweep = f.service().expireAndRecover(f.a.companyId, 1);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          sweep,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("sweep blocked on an unrelated owner")),
+              2_000,
+            );
+          }),
+        ]);
+        expect(result).toMatchObject({ scanned: 1, recovered: 0, failed: 1 });
+        expect((await f.read()).phase).toBe("consent_pending");
+      } finally {
+        clearTimeout(timer);
+        release();
+        await owner;
+        await sweep;
+      }
+      expect(
+        await f.service().expireAndRecover(f.a.companyId, 1),
+      ).toMatchObject({ scanned: 1, recovered: 1, failed: 0 });
+      expect((await f.read()).phase).toBe("expired");
+      expect(f.opts.postConsent).not.toHaveBeenCalled();
+    });
+
+    it("bounds a held projection endpoint lock and still expires another endpoint in the same sweep", async () => {
+      const f = await fixture();
+      const [originalEndpoint] = await db
+        .select()
+        .from(chatEndpoints)
+        .where(eq(chatEndpoints.id, f.a.endpointId));
+      const endpointId = randomUUID(),
+        conversationId = randomUUID(),
+        publicationId = randomUUID(),
+        connectionId = randomUUID();
+      const [originalConnection] = await db
+        .select()
+        .from(toolConnections)
+        .where(eq(toolConnections.id, originalEndpoint!.connectionId));
+      await db
+        .insert(toolConnections)
+        .values({
+          id: connectionId,
+          companyId: f.a.companyId,
+          applicationId: originalConnection!.applicationId,
+          uid: randomUUID(),
+          name: "Other Teams fixture",
+          transport: "chat_sdk",
+          connectionPurpose: "channel",
+        });
+      await db.insert(chatEndpoints).values({
+        id: endpointId,
+        companyId: f.a.companyId,
+        connectionId,
+        provider: "microsoft-teams",
+        publicId: randomUUID(),
+        assignedAgentId: originalEndpoint!.assignedAgentId,
+        status: "draft",
+      });
+      await db.insert(chatConversations).values({
+        id: conversationId,
+        companyId: f.a.companyId,
+        endpointId,
+        issueId: f.a.issueId,
+        externalConversationId: "a:other-personal",
+        externalThreadId: "teams:YTpvdGhlci1wZXJzb25hbA",
+        externalLabel: "Other personal",
+        isDirectMessage: true,
+        sessionGeneration: f.a.conversationGeneration,
+      });
+      await db.insert(chatPublications).values({
+        id: publicationId,
+        companyId: f.a.companyId,
+        endpointId,
+        conversationId,
+        issueId: f.a.issueId,
+        commentId: f.a.commentId,
+        idempotencyKey: `lock:${publicationId}`,
+        payload: {
+          text: "Same exact artifact",
+          attachmentIds: [f.a.attachmentId],
+        },
+      });
+      const a = {
+        ...f.a,
+        endpointId,
+        conversationId,
+        publicationId,
+        providerConversationId: "a:other-personal",
+      };
+      const sibling = await teamsFileTransferService(db, {
+        ...f.opts,
+        authorize: async () => ({ ...a }),
+      }).issue(a, (await f.read()).expiresAt);
+      f.opts.project = async (tx, transfer) => {
+        await tx
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, transfer.endpointId))
+          .for("no key update");
+      };
+      f.advance(61_000);
+      let release!: () => void, entered!: () => void;
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const ready = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const owner = db.transaction(async (tx) => {
+        await tx
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, f.a.endpointId))
+          .for("update");
+        entered();
+        await hold;
+      });
+      await ready;
+      const before = await f.read();
+      const sweep = f.service().expireAndRecover(f.a.companyId, 2);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        expect(
+          await Promise.race([
+            sweep,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () =>
+                  reject(
+                    new Error("projection lock prevented bounded recovery"),
+                  ),
+                2_000,
+              );
+            }),
+          ]),
+        ).toMatchObject({ scanned: 2, recovered: 1, failed: 1 });
+        expect(await f.read()).toEqual(before); // failed projection rolled back
+        const [healthy] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, sibling.id));
+        expect(healthy!.phase).toBe("expired");
+      } finally {
+        clearTimeout(timer);
+        release();
+        await owner;
+        await sweep;
+      }
+      expect(
+        await f.service().expireAndRecover(f.a.companyId, 2),
+      ).toMatchObject({ scanned: 1, recovered: 1, failed: 0 });
+      expect((await f.read()).phase).toBe("expired");
+      expect(f.opts.postConsent).not.toHaveBeenCalled();
     });
 
     it("conflict during send retains the exact intent; late receipt cannot reopen, expired ownership permits explicit stop", async () => {

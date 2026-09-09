@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, inArray, lte, or } from "drizzle-orm";
+import { and, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { ChatFileTransferPhase } from "@paperclipai/shared";
 import { guardedRemoteHttpFetch } from "./remote-http-fetch.js";
@@ -118,6 +118,16 @@ const unknownPhase: Record<string, string> = {
   uploading: "upload_unknown",
   file_info_sending: "file_info_unknown",
 };
+// Scheduling progress only: never authority, private capability, or an I/O
+// receipt. Fresh service objects sharing this exact Db continue the bounded
+// scan; a server restart safely restarts the scan from the beginning.
+const expiryRecoveryCursors = new WeakMap<Db, Map<string, string>>();
+export interface TeamsFileRecoverySweepSummary {
+  scanned: number;
+  recovered: number;
+  failed: number;
+  cursor: string | null;
+}
 
 export interface TeamsFileTransferOptions {
   /** Required by runtime activation: atomic public publication/link projection.
@@ -222,7 +232,12 @@ export function teamsFileTransferService(
   options: TeamsFileTransferOptions,
 ) {
   const now = options.now ?? (() => new Date());
-  async function locked(tx: Tx, companyId: string, id: string) {
+  async function locked(
+    tx: Tx,
+    companyId: string,
+    id: string,
+    nonblocking = false,
+  ) {
     // Match normal publication claims and issue(): publication -> transfer ->
     // policy/source locks. The unlocked lookup selects a candidate, not authority.
     const candidate = await tx
@@ -245,7 +260,7 @@ export function teamsFileTransferService(
           eq(chatPublications.id, candidate.publicationId),
         ),
       )
-      .for("update")
+      .for("update", nonblocking ? { noWait: true } : undefined)
       .then((rows) => rows[0]);
     if (!publication) fail();
     const row = await tx
@@ -257,7 +272,7 @@ export function teamsFileTransferService(
           eq(chatTeamsFileTransfers.id, id),
         ),
       )
-      .for("update")
+      .for("update", nonblocking ? { noWait: true } : undefined)
       .then((rows) => rows[0]);
     if (!row || row.publicationId !== publication.id) fail();
     if (authorityHash(authority(row)) !== row.authorityDigest) fail();
@@ -844,60 +859,121 @@ export function teamsFileTransferService(
     if (!row) fail();
     return summary(row);
   }
-  async function expireAndRecover(companyId: string, limit = 25) {
-    const rows = await db
-      .select({ id: chatTeamsFileTransfers.id })
-      .from(chatTeamsFileTransfers)
-      .where(
+  async function expireAndRecover(
+    companyId: string,
+    limit = 25,
+  ): Promise<TeamsFileRecoverySweepSummary> {
+    if (!z.uuid().safeParse(companyId).success) fail();
+    const size = Number.isSafeInteger(limit)
+      ? Math.min(100, Math.max(1, limit))
+      : 25;
+    let cursors = expiryRecoveryCursors.get(db);
+    if (!cursors) {
+      cursors = new Map();
+      expiryRecoveryCursors.set(db, cursors);
+    }
+    const cursor = cursors.get(companyId);
+    const cutoff = now();
+    const eligible = and(
+      eq(chatTeamsFileTransfers.companyId, companyId),
+      or(
         and(
-          eq(chatTeamsFileTransfers.companyId, companyId),
-          or(
-            and(
-              inArray(chatTeamsFileTransfers.phase, [...sending, "conflict"]),
-              lte(chatTeamsFileTransfers.attemptExpiresAt, now()),
-            ),
-            and(
-              inArray(chatTeamsFileTransfers.phase, [
-                "consent_pending",
-                "awaiting_consent",
-                "upload_pending",
-              ]),
-              lte(chatTeamsFileTransfers.expiresAt, now()),
-            ),
-          ),
-          // A bounded sweep never calls provider transport. claim below is NOT used.
+          inArray(chatTeamsFileTransfers.phase, [...sending, "conflict"]),
+          lte(chatTeamsFileTransfers.attemptExpiresAt, cutoff),
         ),
-      )
-      .orderBy(chatTeamsFileTransfers.updatedAt)
-      .limit(Math.min(100, Math.max(1, limit)));
-    for (const candidate of rows)
-      await db.transaction(async (tx) => {
-        let row = await locked(tx, companyId, candidate.id);
-        if (
-          (sending.includes(row.phase) || row.phase === "conflict") &&
-          row.attemptExpiresAt &&
-          row.attemptExpiresAt <= now()
-        ) {
-          row = await update(tx, row, {
-            phase:
-              row.phase === "conflict" ? "conflict" : unknownPhase[row.phase],
-            attemptId: null,
-            attemptExpiresAt: null,
-            reason:
-              row.phase === "conflict" ? row.reason : "worker_outcome_unknown",
-          });
-        } else if (
-          ["consent_pending", "awaiting_consent", "upload_pending"].includes(
-            row.phase,
-          ) &&
-          row.expiresAt <= now()
-        ) {
-          await update(tx, row, {
-            phase: "expired",
-            reason: "unused_consent_expired",
-          });
-        }
-      });
+        and(
+          inArray(chatTeamsFileTransfers.phase, [
+            "consent_pending",
+            "awaiting_consent",
+            "upload_pending",
+          ]),
+          lte(chatTeamsFileTransfers.expiresAt, cutoff),
+        ),
+      ),
+    );
+    let rows: Array<{ id: string }>;
+    try {
+      rows = await db
+        .select({ id: chatTeamsFileTransfers.id })
+        .from(chatTeamsFileTransfers)
+        .where(
+          and(
+            eligible,
+            cursor ? gt(chatTeamsFileTransfers.id, cursor) : undefined,
+          ),
+        )
+        .orderBy(chatTeamsFileTransfers.id)
+        .limit(size);
+      if (cursor && rows.length < size) {
+        const wrapped = await db
+          .select({ id: chatTeamsFileTransfers.id })
+          .from(chatTeamsFileTransfers)
+          .where(and(eligible, lte(chatTeamsFileTransfers.id, cursor)))
+          .orderBy(chatTeamsFileTransfers.id)
+          .limit(size - rows.length);
+        rows.push(...wrapped);
+      }
+    } catch {
+      throw new Error(
+        "Teams file recovery selection is temporarily unavailable",
+      );
+    }
+    const result: TeamsFileRecoverySweepSummary = {
+      scanned: 0,
+      recovered: 0,
+      failed: 0,
+      cursor: cursor ?? null,
+    };
+    for (const candidate of rows) {
+      // Progress over rejected rows too. Neither corrupt evidence nor a held
+      // publication lock can pin every later scan to the same oldest page.
+      cursors.set(companyId, candidate.id);
+      result.cursor = candidate.id;
+      result.scanned++;
+      try {
+        const recovered = await db.transaction(async (tx) => {
+          // The projection may need endpoint/conversation rows too. Bound
+          // only maintenance lock waits, including locks inside that callback.
+          await tx.execute(sql`set local lock_timeout = '250ms'`);
+          const row = await locked(tx, companyId, candidate.id, true);
+          if (
+            (sending.includes(row.phase) || row.phase === "conflict") &&
+            row.attemptExpiresAt &&
+            row.attemptExpiresAt <= now()
+          ) {
+            await update(tx, row, {
+              phase:
+                row.phase === "conflict" ? "conflict" : unknownPhase[row.phase],
+              attemptId: null,
+              attemptExpiresAt: null,
+              reason:
+                row.phase === "conflict"
+                  ? row.reason
+                  : "worker_outcome_unknown",
+            });
+            return true;
+          } else if (
+            ["consent_pending", "awaiting_consent", "upload_pending"].includes(
+              row.phase,
+            ) &&
+            row.expiresAt <= now()
+          ) {
+            await update(tx, row, {
+              phase: "expired",
+              reason: "unused_consent_expired",
+            });
+            return true;
+          }
+          return false;
+        });
+        if (recovered) result.recovered++;
+      } catch {
+        // Keep the exact evidence and rollback any paired projection. Only
+        // closed counters escape; never log SQL parameters/ciphertext/errors.
+        result.failed++;
+      }
+    }
+    return result;
   }
   async function cancel(companyId: string, id: string) {
     return db.transaction(async (tx) => {
