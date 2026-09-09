@@ -116,13 +116,24 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
-The next bounded pass is in progress: actual Slack modal `view_submission`
-and Teams `task/fetch`/`task/submit` adapter-to-runtime tests, plus Discord's
-generated question card → parsed concurrent clicks → real service/DB → one
-continuation publication. Existing direct-callback tests do not establish
-these joined boundaries. Real provider I/O and model execution are explicitly
-outside the synthetic composition tests. Server 70 remains unchanged until
-any new production repair is frozen and verified; no new live browser pass.
+Discord's generated question card → parsed concurrent clicks → real service/DB
+→ one continuation publication now passes on a fresh database. The Slack
+signed `view_submission` bridge passes 10/10; its final callback is a pure
+validator/observer, so a separately joined real-service corrected-retry case
+is the next bounded coverage task. Provider I/O and model execution are
+explicitly simulated, not newly qualified live journeys.
+
+The Teams `task/fetch`/`task/submit` bridge found a genuine error-only card that
+removed the original inputs and Submit after invalid answers. A frozen repair
+rebuilds only current authorized invalid forms with known bounded draft values
+and readable question labels. Slack inline errors and all stale/denied guards
+stay unchanged. Helper/Teams tests pass 31/31; independent helper/Teams/Slack
+review passes 41/41; real-service Slack/Teams invalid-form cases pass 2/2.
+The fresh full database regression passes 624/624, zero skips, in 120.61 seconds
+on `chat_modal_correction_20260909_root01`; root's helper/Teams/Slack repeat
+passes 41/41 and plain server TypeScript passes.
+The Teams JWT checker is an explicit test double, not eligible-tenant proof.
+Server 70 remains unchanged until the production repair is fully verified.
 
 - **Telegram photo eligibility (complete):** bounded PNG/JPEG metadata selects
   photo within supported geometry and a conservative 10,000,000-byte budget.

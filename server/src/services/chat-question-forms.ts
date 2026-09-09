@@ -689,6 +689,74 @@ export function validateChatQuestionFormSubmission(args: {
 }
 
 /**
+ * Teams replaces a dialog on errors, unlike Slack's inline field errors.
+ * Rebuild only an invalid-but-current form, after the caller's source and actor
+ * authorization. Neither provider input nor a stale token can refresh a form.
+ */
+export function chatQuestionFormValidationResponse(
+  args: Parameters<typeof validateChatQuestionFormSubmission>[0] & {
+    provider: "slack" | "microsoft-teams";
+  },
+): ModalResponse {
+  const validation = validateChatQuestionFormSubmission(args);
+  if (validation.ok || validation.code !== "invalid_form") {
+    return chatQuestionFormDenialResponse();
+  }
+  if (args.provider === "slack") {
+    return { action: "errors", errors: validation.fieldErrors };
+  }
+  if (args.provider !== "microsoft-teams")
+    return chatQuestionFormDenialResponse();
+  const modal = buildChatQuestionFormModal(
+    args.interaction,
+    args.callbackId,
+    args.payload,
+  );
+  if (!modal) return chatQuestionFormDenialResponse();
+
+  const children: ModalElement["children"] = [
+    {
+      type: "text",
+      content: "Please check the answers below and submit again.",
+    },
+  ];
+  for (const child of modal.children) {
+    if (child.type !== "text_input" && child.type !== "select") {
+      children.push(child);
+      continue;
+    }
+    const error = validation.fieldErrors[child.id];
+    if (error)
+      children.push({ type: "text", content: `${child.label}: ${error}` });
+    const value = args.values[child.id];
+    if (child.type === "text_input") {
+      // Keep over-field-limit drafts editable, but never reflect unbounded
+      // provider text. If the global native-form ceiling trims it, say so.
+      const initialValue = value?.slice(0, MAX_NATIVE_TEXT_LENGTH);
+      if (value && value.length > MAX_NATIVE_TEXT_LENGTH) {
+        children.push({
+          type: "text",
+          content: `${child.label}: This draft was shortened to ${MAX_NATIVE_TEXT_LENGTH} characters.`,
+        });
+      }
+      children.push({
+        ...child,
+        ...(initialValue !== undefined ? { initialValue } : {}),
+      });
+    } else {
+      const option = child.options.find(
+        (candidate) => candidate.value === value,
+      );
+      children.push({
+        ...child,
+        ...(option ? { initialOption: option.value } : {}),
+      });
+    }
+  }
+  return { action: "update", modal: { ...modal, children } };
+}
+
+/**
  * Lookup helper for onAction after actor/resource/message authorization. It
  * verifies both durable rows and rebuilds the modal from the current pending
  * interaction; it does not consume either token.

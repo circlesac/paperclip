@@ -28685,6 +28685,87 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(teamsRouteCount()).toBe(routeCountAfterValidOpen);
 
       const validSubmit = modalEvent(modal.callbackId);
+      const invalidSubmit = {
+        ...validSubmit,
+        event: {
+          ...validSubmit.event,
+          values: { ...validSubmit.event.values, [textField.id]: "" },
+        },
+      };
+      const wakeupsBeforeInvalidForm = context.wakeup.mock.calls.length;
+      const invalidFormResponse = await callbacks.onModalSubmit(
+        invalidSubmit as Parameters<
+          NonNullable<typeof callbacks.onModalSubmit>
+        >[0],
+      );
+      if (provider === "microsoft-teams") {
+        expect(invalidFormResponse).toMatchObject({
+          action: "update",
+          modal: {
+            callbackId: modal.callbackId,
+            privateMetadata: modal.callbackId,
+            children: expect.arrayContaining([
+              expect.objectContaining({
+                type: "select",
+                id: selectField.id,
+                initialOption: productionValue,
+              }),
+              expect.objectContaining({
+                type: "text_input",
+                id: textField.id,
+                initialValue: "",
+              }),
+              expect.objectContaining({
+                type: "text",
+                content: "What should the release note say?: Enter a response",
+              }),
+            ]),
+          },
+        });
+      } else {
+        expect(invalidFormResponse).toEqual({
+          action: "errors",
+          errors: { [textField.id]: "Enter a response" },
+        });
+      }
+      expect(context.wakeup).toHaveBeenCalledTimes(wakeupsBeforeInvalidForm);
+      await expect(
+        db
+          .select({ status: issueThreadInteractions.status })
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, interaction.id)),
+      ).resolves.toEqual([{ status: "pending" }]);
+      await expect(
+        db
+          .select({ status: chatActions.status })
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.providerActionId, modal.callbackId),
+            ),
+          ),
+      ).resolves.toEqual([{ status: "issued" }]);
+      await expect(
+        db
+          .select({ id: issueQuestionResponseDeliveries.id })
+          .from(issueQuestionResponseDeliveries)
+          .where(
+            eq(issueQuestionResponseDeliveries.interactionId, interaction.id),
+          ),
+      ).resolves.toEqual([]);
+      await expect(
+        db
+          .select({ id: activityLog.id })
+          .from(activityLog)
+          .where(
+            and(
+              eq(activityLog.companyId, fixture.companyId),
+              eq(activityLog.entityId, conversation.issueId),
+              eq(activityLog.action, "issue.thread_interaction_answered"),
+            ),
+          ),
+      ).resolves.toEqual([]);
       await db
         .update(companyMemberships)
         .set({ membershipRole: "viewer", updatedAt: new Date() })

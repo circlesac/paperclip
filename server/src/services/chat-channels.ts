@@ -234,6 +234,7 @@ import {
 } from "./question-response-delivery.js";
 import {
   chatQuestionFormDenialResponse,
+  chatQuestionFormValidationResponse,
   claimChatQuestionFormSubmission,
   completeChatQuestionFormSubmission,
   isChatQuestionFormOpenActionId,
@@ -18734,7 +18735,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     });
     if (!validation.ok) {
       if (validation.code === "invalid_form") {
-        return { action: "errors", errors: validation.fieldErrors };
+        return chatQuestionFormValidationResponse({
+          provider: event.provider,
+          callbackId: event.event.callbackId,
+          privateMetadata: event.event.privateMetadata,
+          interaction,
+          payload: loaded.payload,
+          values: event.event.values,
+        });
       }
       return deny(
         `chat_modal_${validation.code}`,

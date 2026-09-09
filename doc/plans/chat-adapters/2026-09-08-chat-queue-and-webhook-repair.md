@@ -3411,3 +3411,46 @@ lockfile workflow. Unscoped “current” labels in dated provider results have
 been explicitly tied to their original checkpoints. Historical September 6
 setup failures and case rows remain intact, rather than being relabeled as
 current success.
+
+### September 9: editable Teams validation repair
+
+The joined Teams task-module test reproduced a real failure: the pinned
+adapter turned an `errors` response into a replacement card containing only
+two text blocks. Original inputs and Submit disappeared, and the visible error
+label exposed an opaque field ID. The first focused run passed 12/13, with
+this missing-correction path as the genuine failure.
+
+Paperclip now rebuilds an invalid-but-current Teams form after the existing
+source, actor, destination, publication and pending-interaction checks. The
+replacement preserves the original durable callback token and known choices,
+uses canonical question labels for errors, and retains text up to the existing
+3,000-character native-form ceiling. If that ceiling shortens a draft, the
+form says so. Unknown fields/options are not reflected. Stale, expired or
+denied submissions remain noneditable, and Slack retains inline field errors.
+No provider-authentication checks or SDK dependencies were changed.
+
+The actual pinned HTTP bridge, Teams event dispatcher, adapter and Chat SDK
+now carry an invalid submission through the correction card and a successful
+second submission, including the SDK's consumed-context behavior. The isolated
+test substitutes only the instance service-token checker, explicitly not a
+Microsoft tenant/JWT proof. The final callback uses the same form helper and
+canonical validator, not database authorization. Separately, the real-service
+Slack/Teams database cases prove invalid forms leave the interaction pending
+and token issued, with no new wake, answer delivery or answered audit. Existing
+denial, corrected answer, concurrency and replay assertions remain intact.
+
+The helper/Teams cohort passes **31/31**, the two fresh-database service cases
+pass **2/2**, and independent review reran helper/Teams/Slack **41/41** with no
+blocking finding. Direct server TypeScript passes. These are deterministic
+boundaries, not a live Teams modal or aggregate card-size qualification. Logs
+are `teams-modal-editable-green-freeze-0909.log`,
+`teams-modal-service-green-0909.log` and
+`teams-invalid-form-independent-review-0909.log` in ignored runtime storage.
+
+Final frozen-code regression passes **624/624**, zero skips/failures, on fresh
+`chat_modal_correction_20260909_root01` in **120.61 seconds**. Root separately
+reran the helper/Teams/Slack cohort **41/41** in 2.35 seconds, and plain server
+TypeScript passed without rebuilding or staging the native runner. Logs:
+`teams-modal-full-root-final-0909.log`, `teams-modal-root-review-0909.log` and
+`teams-modal-full-root-types-0909.log`. The normal runner remains exact SHA256
+`6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`.

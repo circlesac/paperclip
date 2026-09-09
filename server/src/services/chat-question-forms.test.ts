@@ -5,6 +5,7 @@ import {
   buildChatQuestionFormModal,
   chatQuestionFormActionRecords,
   chatQuestionFormDenialResponse,
+  chatQuestionFormValidationResponse,
   claimChatQuestionFormSubmission,
   completeChatQuestionFormSubmission,
   createChatQuestionFormDraft,
@@ -97,6 +98,166 @@ function interaction(
 }
 
 describe("chat question forms", () => {
+  function invalidFormFixture() {
+    const current = interaction();
+    const now = new Date();
+    const draft = createChatQuestionFormDraft(current, { now })!;
+    const payload = parseChatQuestionFormSubmitTokenPayload(
+      chatQuestionFormActionRecords(draft, {
+        companyId: current.companyId,
+        endpointId: "44444444-4444-4444-8444-444444444444",
+        conversationId: "55555555-5555-4555-8555-555555555555",
+        publicationId: "66666666-6666-4666-8666-666666666666",
+      })[1]!.payload,
+    )!;
+    const select = payload.fields[0]!;
+    const text = payload.fields[1]!;
+    if (select.kind !== "single_select" || text.kind !== "text")
+      throw new Error("Unexpected fixture fields");
+    return {
+      select,
+      text,
+      args: {
+        provider: "microsoft-teams" as const,
+        callbackId: draft.submitActionId,
+        interaction: current,
+        payload,
+        now,
+        values: {
+          [select.fieldId]: select.options[0]!.value,
+          [text.fieldId]: "x",
+        },
+      },
+    };
+  }
+
+  it("rebuilds only the current invalid Teams form with readable errors and retained draft values", () => {
+    const { args, select, text } = invalidFormFixture();
+    const before = structuredClone(args);
+    const result = chatQuestionFormValidationResponse(args);
+    expect(result.action).toBe("update");
+    if (result.action !== "update")
+      throw new Error("Expected editable Teams form");
+    expect(result.modal).toMatchObject({
+      callbackId: args.callbackId,
+      privateMetadata: args.callbackId,
+      children: expect.arrayContaining([
+        expect.objectContaining({
+          type: "select",
+          id: select.fieldId,
+          initialOption: select.options[0]!.value,
+        }),
+        expect.objectContaining({
+          type: "text_input",
+          id: text.fieldId,
+          initialValue: "x",
+        }),
+        expect.objectContaining({
+          type: "text",
+          content:
+            "What should the release note say?: Enter at least 3 characters",
+        }),
+      ]),
+    });
+    expect(args).toEqual(before);
+    const visibleErrors = result.modal.children.filter(
+      (child) => child.type === "text",
+    );
+    expect(JSON.stringify(visibleErrors)).not.toContain("pcff:");
+    expect(JSON.stringify(visibleErrors)).not.toContain(args.interaction.id);
+  });
+
+  it("keeps Slack's original inline field error response unchanged", () => {
+    const { args, text } = invalidFormFixture();
+    expect(
+      chatQuestionFormValidationResponse({ ...args, provider: "slack" }),
+    ).toEqual({
+      action: "errors",
+      errors: { [text.fieldId]: "Enter at least 3 characters" },
+    });
+  });
+
+  it.each([
+    "callback",
+    "private_metadata",
+    "expired",
+    "answered",
+    "wrong_interaction",
+    "valid",
+  ] as const)(
+    "never refreshes an unauthorized, stale or non-invalid form (%s)",
+    (mode) => {
+      const { args, text } = invalidFormFixture();
+      const input = {
+        ...args,
+        ...(mode === "callback"
+          ? { callbackId: `pcfs:${"A".repeat(22)}` }
+          : {}),
+        ...(mode === "private_metadata" ? { privateMetadata: "forged" } : {}),
+        ...(mode === "expired"
+          ? { now: new Date(Date.parse(args.payload.expiresAt)) }
+          : {}),
+        ...(mode === "answered"
+          ? {
+              interaction: { ...args.interaction, status: "answered" as const },
+            }
+          : {}),
+        ...(mode === "wrong_interaction"
+          ? { interaction: { ...args.interaction, id: "other-interaction" } }
+          : {}),
+        ...(mode === "valid"
+          ? { values: { ...args.values, [text.fieldId]: "Corrected answer" } }
+          : {}),
+      };
+      expect(chatQuestionFormValidationResponse(input)).toEqual({
+        action: "clear",
+      });
+    },
+  );
+
+  it("omits unexpected fields and unrecognized options instead of reflecting provider tokens", () => {
+    const { args, select, text } = invalidFormFixture();
+    const result = chatQuestionFormValidationResponse({
+      ...args,
+      values: {
+        [select.fieldId]: "unrecognized-provider-choice",
+        [text.fieldId]: "x",
+        "private-field-name": "private-extra-value",
+      },
+    });
+    expect(result.action).toBe("update");
+    if (result.action !== "update")
+      throw new Error("Expected current form rebuild");
+    expect(JSON.stringify(result)).not.toContain("private-field-name");
+    expect(JSON.stringify(result)).not.toContain("private-extra-value");
+    expect(JSON.stringify(result)).not.toContain(
+      "unrecognized-provider-choice",
+    );
+    expect(
+      result.modal.children.find((child) => child.type === "select"),
+    ).toMatchObject({ initialOption: undefined });
+  });
+
+  it.each([600, 3001])(
+    "bounds reflected text without silently truncating a %i-character draft",
+    (length) => {
+      const { args, text } = invalidFormFixture();
+      const value = "x".repeat(length);
+      const result = chatQuestionFormValidationResponse({
+        ...args,
+        values: { ...args.values, [text.fieldId]: value },
+      });
+      if (result.action !== "update")
+        throw new Error("Expected editable over-limit draft");
+      expect(
+        result.modal.children.find((child) => child.type === "text_input"),
+      ).toMatchObject({ initialValue: value.slice(0, 3000) });
+      expect(JSON.stringify(result).includes("draft was shortened")).toBe(
+        length > 3000,
+      );
+    },
+  );
+
   it("issues opaque open, submit, field, and option tokens as durable action rows", () => {
     const now = new Date("2026-09-05T12:00:00.000Z");
     const draft = createChatQuestionFormDraft(interaction(), { now });
