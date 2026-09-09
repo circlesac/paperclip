@@ -3708,3 +3708,28 @@ Root also independently passes the two unchanged egress suites **38/38**
 (855 ms; `teams-file-egress-root-0909.log`), complementing its 81-case inactive
 Teams foundation run. No real provider browser action was possible: the latest
 inventory still reports Mac locked, not a Discord login failure.
+
+### September 9: server 72 deploys Discord forms and Telegram video notes
+
+Root pushed Discord implementation `739750c15` after the final 641-case run.
+A fresh live-database check at 04:59:53.222 UTC found 290 terminal runs and zero
+active runs (latest start 02:15:47.812 UTC). Validated server 71 PID 28614 exited
+cleanly before root started server **72**, PID **77253**, tool handle **44437**.
+It listens only on `127.0.0.1:3137`; loaded version is
+`2026.831.0+599.git.739750c15.dirty`, started 05:00:10.725 UTC and recovery-ready
+05:00:14.326 UTC. Log: `server-experimental-landing-72.log`.
+
+The dirty suffix is preserved in the evidence: inactive Teams transfer modules
+and schema work were present, but had no runtime/service imports or applied
+migration at startup. This is not a clean-checkout release qualification.
+The ordinary native runner remains the exact qualified SHA256
+`6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`.
+No other checkout or port 3103 was touched.
+
+Loopback and private Tailscale health returned ready. Public webhook-only Funnel
+still returns 404 for a Board-health GET. Discord Gateway connected bot
+`1546330979860221952`; a read-only endpoint query confirmed its stored modal
+capability changed from false before restart to true afterward, with status
+active. This verifies deployed automatic capability upgrade, not a successful
+user modal. At 05:00:24.491 UTC run counts were unchanged. The Mac lock still
+prevents live browser qualification; no new chat or model turn was sent.

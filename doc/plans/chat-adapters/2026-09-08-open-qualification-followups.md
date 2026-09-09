@@ -39,26 +39,30 @@ permissions and audit. Do not narrow completion to whichever tests pass.
 
 ## Current deployment
 
-Implementation `efbc92616` is pushed, including verified native recovery,
-Discord denials, Telegram photo routing and editable Teams validation.
-Server **71** is running:
+Implementation `739750c15` is pushed, including native recovery, Discord native
+forms, Telegram video-note intake and editable Teams validation.
+Server **72** is running:
 
 | Field                    | Verified value                                                          |
 | ------------------------ | ----------------------------------------------------------------------- |
-| PID / tool handle        | `28614` / `80118`                                                       |
+| PID / tool handle        | `77253` / `44437`                                                       |
 | Listener                 | `127.0.0.1:3137`                                                        |
-| Loaded server version    | `2026.831.0+594.git.efbc92616`                                          |
-| Started / recovery ready | `04:14:35.135` / `04:14:37.785 UTC`, September 9                        |
+| Loaded server version    | `2026.831.0+599.git.739750c15.dirty`                                    |
+| Started / recovery ready | `05:00:10.725` / `05:00:14.326 UTC`, September 9                        |
 | Native runner SHA256     | `6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`      |
 | Live DB                  | `chat_adapters_live_3103` on local PostgreSQL `55439`, role `paperclip` |
 | Last checked runs        | 290 terminal: 262 succeeded, 26 failed, 2 cancelled; zero active        |
 | Last new run             | September 9, `02:15:47.812 UTC`                                         |
 
-Both loopback and private Tailscale health returned 200/ready. Discord Gateway
-reconnected bot `1546330979860221952`. The health response's Git commit is
-dynamic; use loaded version and process start to identify deployed code.
-The worktree was clean at startup. Server 70 exited cleanly after a fresh
-zero-active-run check at 04:14:28.148 UTC. The qualified runner SHA is unchanged.
+Both loopback and private Tailscale health returned 200/ready. Public Funnel's
+Board-health GET remains 404. Discord Gateway reconnected bot
+`1546330979860221952`; its existing endpoint automatically changed modal
+capability from false to true. The health response's Git commit is dynamic;
+use loaded version and process start to identify deployed code.
+The dirty suffix reflects preserved inactive Teams transfer/schema work;
+no Teams runtime hook or transfer service was imported at startup, and no new
+Teams migration was applied. Server 71 exited cleanly after the fresh
+zero-active-run check at 04:59:53.222 UTC. The qualified runner SHA is unchanged.
 
 Private Board: `https://dottas-macbook-pro.tail29c1aa.ts.net`.
 Public webhook-only proxy: port `3104` → `3137`; Funnel uses stable port
@@ -77,7 +81,7 @@ All local runtime material is under ignored
 `.paperclip-runtime/chat-adapters-live/`, including:
 
 - `start-server.sh`: configured isolated startup, no embedded credentials.
-- `server-experimental-landing-71.log`: current server log.
+- `server-experimental-landing-72.log`: current server log.
 - `qualified-runnerd-2400740c`: preserved old qualified runner backup.
 - `home/instances/chat-adapters-live/runtime/paperclip-runner/durable-sessions`:
   live native roots; do not manipulate historical evidence.
@@ -91,7 +95,7 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Immediate next actions
 
-1. **Resume real browser qualification on server 71.** Latest actual browser
+1. **Resume real browser qualification on server 72.** Latest actual browser
    inventory reports **Mac locked**; the user has been asked to unlock it.
    Discord login was restored before the lock. Do not request Discord login
    again unless the actual provider page requires it.
@@ -128,7 +132,7 @@ the next implementation pass:
   files remain rejected. Final fresh-database regression: 6/6, including exact
   bytes after restart and current access revocation; adjacent parser/adapter/photo
   checks: 114/114; plain server TypeScript passed before the concurrent Discord
-  edits. The new Telegram path is not yet deployed or live qualified.
+  edits. The new Telegram path is deployed on server 72 but not live qualified.
 - **Discord native forms:** v6 now implements native text/select open/submit,
   current source/actor authorization, identical/conflicting duplicate handling
   and actor-scoped private correction/reopen. Existing endpoints automatically
@@ -149,14 +153,18 @@ the next implementation pass:
   in-memory only. Channel/group files retain their documented fallback; do not
   infer broader authority.
 
-Root owns shared verification, documentation, Git and deployment. Server 71
-remains on committed `efbc92616`; these new changes are not deployed or live
-qualified. Browser control still reports Mac locked. The worktree must retain
-all parallel edits, and no lockfile or PR work is part of this pass.
+Root owns shared verification, documentation, Git and deployment. Server 72
+loads the committed Discord/Telegram implementations at `739750c15`;
+the new native modal and video-note journeys are not live qualified.
+Teams durable transfer, schema, safe batch UI/API and optional runtime hooks
+are now being implemented in parallel without activation. Root owns shared
+service integration and migration review. Browser control still reports Mac
+locked. Preserve all parallel edits; no lockfile or PR work is part of this pass.
 
-The September 9 04:31 UTC browser probe still reports the Mac lock screen,
-not a Discord login failure. Loopback health is ready on server 71; the live
-database has 290 terminal runs and no active run, latest start 02:15:47.812 UTC.
+The September 9 browser inventory still reports the Mac lock screen,
+not a Discord login failure. Loopback/private health is ready on server 72; the
+05:00:24 UTC check has 290 terminal runs and no active run, latest start
+02:15:47.812 UTC.
 No new live provider conversation has been sent during this audit pass.
 
 Discord's generated question card → parsed concurrent clicks → real service/DB
