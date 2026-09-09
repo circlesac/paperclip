@@ -3238,3 +3238,19 @@ was not restarted; live run audit remained 290 terminal runs and zero active,
 with no new run since 02:15:47 UTC. Subsequent server checks use direct
 `pnpm exec tsc --noEmit` after explicit TS-only dependency builds. The Mac is
 currently locked, so no new live-provider browser result is claimed here.
+
+The native slice was committed and pushed as `2344814f2`. After scoped
+formatting, root reran **55/55** selected protocol/warm cases and **260/260**
+executor tests; package TS build/types, direct server types and Rust formatting
+passed. Server 68 drained zero active runs and exited; the normal five-second
+HTTP close deadline retired remaining connections. Root deliberately staged
+and strict-verified the exact optimized `6279d39a…` artifact. Its real-Codex
+canary (`paperclip-real-startup-phHTMj`) passed with exactly one provider process,
+no model turn, original startup receipt retained and reopen denied before RPC.
+
+Server **69**, PID **12088**, started **03:36:05.657 UTC**, loaded
+`2026.831.0+588.git.2344814f2`, and completed recovery **03:36:09.175 UTC**.
+Loopback and private Tailscale health returned 200/ready. Discord Gateway
+reconnected the same bot identity. Live run counts remained 290 terminal and
+zero active. The browser remained locked at the final actual probe, so this
+is a verified deployment/startup checkpoint, not a new live conversation pass.

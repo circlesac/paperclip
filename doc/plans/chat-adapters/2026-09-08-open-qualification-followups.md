@@ -7,6 +7,25 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 03:38 UTC: **`2344814f2` is committed and pushed**. Final scoped
+formatting is complete; package TS build/types, direct server types and Rust
+format check pass. Post-format root verification passes **55/55** selected
+protocol/warm cases and **260/260** executor tests. Server 68 exited cleanly
+after draining zero active runs; its remaining HTTP connections used the normal
+five-second close deadline. The exact optimized `6279d39a…` runner is now
+deliberately staged, strict-signed and verified. Its real-Codex startup/reopen
+canary passes with one actual provider process and no model turn.
+
+Server **69**, PID **12088**, handle **77339**, started at **03:36:05.657 UTC**
+with loaded version `2026.831.0+588.git.2344814f2`; recovery is ready at
+**03:36:09.175 UTC**. Both loopback and private Tailscale health pass, and the
+Discord Gateway reconnects bot `1546330979860221952`. Live DB still has 290
+terminal runs and zero active. Log: `server-experimental-landing-69.log` under
+the ignored runtime directory. The final actual in-app browser probe still
+reports **Mac locked**. Do not claim new live chat proof: next action is unlock,
+then repeat Discord/Slack conversations and files plus GitHub omission link →
+task upload against server 69. Teams and historical cleanup gaps remain open.
+
 September 9, 03:32 UTC: the final optimized candidate now passes **133/133**
 full transport tests, zero skips, in **198.64 seconds**. Root independently
 passed the full focused recovery matrix **26/26**, controller **69/69**, optimized
