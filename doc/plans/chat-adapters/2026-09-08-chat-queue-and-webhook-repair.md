@@ -2874,3 +2874,37 @@ maintenance counts remained one/two. This deployment includes the verified
 paginated path fix, accepted-answer UI, batching guidance and actionable GitHub
 file fallback. The last two instruction changes still await live UI retesting
 after the Mac is unlocked; no measured latency improvement is claimed yet.
+
+### September 9: reproducible public ingress diagnosis
+
+The opt-in `scripts/smoke/chat-webhook-ingress.mjs` can compare one public Slack
+webhook request with the same path on an explicit loopback target. It sends
+only `{}` with a deliberately malformed Slack signature, never a real event.
+It does not read credentials, follow redirects, retry, consume response bodies,
+use environment proxies, or run automatically. Each target has one eight-second
+deadline covering DNS, connection, TLS and response headers. Output contains
+only closed outcome/timing fields, without URLs, public IDs, headers or raw
+errors. An explicit public relay IP preserves the original hostname and SNI;
+this distinguishes Funnel ingress from private MagicDNS routing. Debug modes
+that could expose request options are refused before networking.
+
+Root independently passed all **49/49** fixture tests and syntax checking,
+then ran the frozen canary once at **01:26:34–35 UTC**. Public Funnel 8443
+returned HTTP 401 in **457.815ms**, and the loopback webhook-only proxy returned
+401 in **9.047ms**. Server log request IDs
+`6772cb3a-4179-49d1-b6a4-b69d2866d609` and
+`38653171-56e7-467d-960a-db0396237639` confirm the exact expected rejections;
+live database deltas were **zero deliveries, zero runs and zero publications**.
+Private Board/public webhook exposure was not changed. This proves current
+route reachability and safe rejection, not signed-event admission, provider-
+origin reliability, user latency percentiles or chat experience quality.
+
+Earlier scoped probes also reached both public relay address families/ports.
+The host sleep log contains no sleep/wake transition during 19:45–20:00 local,
+covering the delayed Slack source. Neither that nor bounded Tailscale logs
+localizes the original pre-proxy HTTP error. It remains unresolved.
+
+The canary exposed a separate generic HTTP logging defect: raw webhook buffers
+are included as numeric byte properties in warning logs. The observed body
+was only the inert `{}` fixture, not an actual leaked credential. A narrowly
+scoped raw-body/error-prose suppression regression is now in progress.
