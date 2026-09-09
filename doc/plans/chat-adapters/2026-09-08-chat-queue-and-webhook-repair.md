@@ -2931,3 +2931,36 @@ publications**; both generic HTTP warnings now contain only the placeholder
 webhook route and `reqBody: "[REDACTED]"`, not the observed raw Buffer bytes.
 This verifies the deployed logging fix without publishing any chat message.
 The new provider startup/attach fencing remains a separate, undeployed slice.
+
+### September 9: actual Codex startup-failure ownership canary
+
+`scripts/tests/native-provider-startup-codex.mjs` is an explicit opt-in check
+against Codex CLI **0.153.4** and the normally staged optimized runner. It
+requires `--run`, an absolute `--codex-binary` and the caller's exact
+`--expected-runner-sha256`. No arguments or `--help` launch nothing. It creates
+only new private synthetic homes with file-only auth storage, never reads live
+credentials/history, and never sends a turn command. A recording shim immediately
+execs the actual Codex binary; its PID/birth/group ledger provides an independent
+process-launch observation, not a simulated provider response.
+
+Root reproduced the final script against runner
+`0ad458ece73ae9b80a6be2b584afc07b9b7ed3e5e266dd4ddfe3c6f026a922d2`.
+The actual provider received exactly `initialize`, `initialized` and
+`thread/resume`. The random absent rollout failed as expected. All three
+startup facts committed while `session.open` was still pending; the requested
+thread remained unauthenticated and the exact direct-child exit was observed.
+The explicit `processTreeRetired: false` remains false. Reopening the actual
+runner denied snapshot/open before a second provider launch or RPC; the launch
+ledger, complete provider trace, original startup receipt and failed-command
+result were unchanged. Both runner ChildProcesses were joined with exit 1.
+
+Root fixture `paperclip-real-startup-fXxrjh` and its summary/trace remain under
+the host's temporary directory for inspection; provider PID was 35821. CLI
+preflight checks observed zero launches and fixture creation, and eight isolated
+emergency-cleanup checks covered absent, matching, mismatched and still-live
+owners. Emergency signals are restricted to an exactly matched fixture PID;
+unproven cleanup is reported rather than silently accepted. This is real
+provider startup qualification, not successful chat execution, a model-latency
+measurement, full-tree retirement, or permission to retry historical sessions.
+The broader transport suite still has separately tracked readiness and fixture
+issues; this canary passing is not a release-completion claim.
