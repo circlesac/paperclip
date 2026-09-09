@@ -3072,3 +3072,33 @@ The paste recovery is functional. Experience still needs improvement: the
 direct-attachment advice names “this Paperclip task” without a clickable task
 link. A focused fix is under investigation; unavailable GitHub private generic
 file import itself is not claimed to work.
+
+### September 9: connected-task layout and stale-route admission
+
+The real Board's connection banner became unreadable with Properties open:
+action buttons squeezed “Connected to Discord” into a narrow multiline column.
+Root reproduced the failure in a deterministic browser test, then grouped the
+identity text and wrapped actions using existing layout tokens. The regression
+checks 340-, 500- and 760-pixel test containers for single-line heading text and
+contained, visible actions. Root reloaded the actual connected Discord task and
+visually verified the readable header and second-row actions. Composer behavior
+and explicit-only outbound publication are unchanged. Focused component/draft
+tests passed **26/26**, UI types and all four styling gates passed.
+The full deterministic chat browser cohort passed **23/23**, zero retries, in
+2.5 minutes against its own throwaway instance, not the live provider server.
+
+Independent route review found that warm attachment briefly registers old and
+new URLs for one mutable controller. Runtime-response admission now requires
+the route's run ID to match the controller's current run, before consulting
+cached commands. Real controller rotation tests reproduce old cached/uncached
+and premature new-route admission; rejected requests leave the journal unchanged,
+while the current route retains idempotency. Root's focused server cohort passed
+**65/65** and server types passed. This is a stale-admission fix, not evidence of
+a provider-level authorization bypass or a complete handoff-loss repair.
+
+The separate attach-result-loss transition is still under development and
+independent review on a private runner artifact. Its first composed regression
+now passes, but restart, lease and downgrade qualification remain unfinished.
+The normal runner and live server 68 are unchanged. Teams Developer Portal was
+also checked in the in-app browser and currently requires Microsoft sign-in;
+there is still no qualified Microsoft 365 tenant/bot installation.

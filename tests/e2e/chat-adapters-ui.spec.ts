@@ -1838,6 +1838,74 @@ test.describe.serial("native chat adapter UI", () => {
 });
 
 test.describe("Board send delivery refresh", () => {
+  test("keeps the connected-task banner readable in narrow task panes", async ({
+    page,
+    request,
+  }) => {
+    const seed = await seedCompanyAndAgent(request);
+    const issue = await json<{ id: string; identifier: string }>(
+      await request.post(`/api/companies/${seed.companyId}/issues`, {
+        data: { title: "Connected banner layout", status: "backlog" },
+      }),
+      "create connected banner task",
+    );
+    await page.route("**/api/instance/settings/experimental", (route) =>
+      fulfill(route, { enableChatConnectors: true }),
+    );
+    await page.route(`**/api/issues/${issue.id}/chat-binding`, (route) =>
+      fulfill(route, {
+        endpointId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        conversationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        provider: "discord",
+        externalLabel: "#a-long-but-readable-qualification-channel-name",
+        externalUrl: "https://discord.com/channels/test-server/test-thread",
+        assignedAgentLocked: true,
+      }),
+    );
+    await page.goto(`/${seed.prefix}/issues/${issue.identifier}`);
+    const banner = page.getByRole("region", {
+      name: "External conversation",
+      exact: true,
+    });
+    const heading = banner.getByText("Connected to Discord", { exact: true });
+    await expect(heading).toBeVisible();
+    // Exercise container widths independently of the operator's sidebar and
+    // Properties preferences. These are test constraints, not product styles.
+    for (const width of [340, 500, 760]) {
+      await banner.evaluate((element, value) => {
+        element.style.width = `${value}px`;
+      }, width);
+      await expect
+        .poll(() =>
+          heading
+            .evaluate((element) => ({
+              height: element.getBoundingClientRect().height,
+              lineHeight: Number.parseFloat(getComputedStyle(element).lineHeight),
+            }))
+            .then(({ height, lineHeight }) => height <= lineHeight * 1.5),
+        )
+        .toBe(true);
+      const bounds = await banner.boundingBox();
+      expect(bounds).not.toBeNull();
+      for (const action of [
+        banner.getByRole("link", { name: "Open Discord", exact: true }),
+        banner.getByRole("button", { name: "Send to channel", exact: true }),
+        banner.getByRole("link", { name: "Connection", exact: true }),
+      ]) {
+        await expect(action).toBeVisible();
+        const box = await action.boundingBox();
+        expect(box).not.toBeNull();
+        expect(box!.x).toBeGreaterThanOrEqual(bounds!.x);
+        expect(box!.x + box!.width).toBeLessThanOrEqual(
+          bounds!.x + bounds!.width,
+        );
+        expect(box!.y + box!.height).toBeLessThanOrEqual(
+          bounds!.y + bounds!.height,
+        );
+      }
+    }
+  });
+
   test("uploads images and files directly from an empty channel composer without publishing early", async ({
     page,
     request,

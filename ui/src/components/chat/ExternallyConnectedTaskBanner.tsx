@@ -383,37 +383,44 @@ function ConnectedTaskComposer({
     : null;
   const activityPath = `/apps/chat/${binding.endpointId}/activity`;
   return (
-    <div className="space-y-3 rounded-lg border border-border bg-muted/40 p-3 text-sm">
+    <section
+      aria-label="External conversation"
+      className="space-y-3 rounded-lg border border-border bg-muted/40 p-3 text-sm"
+    >
       <div className="flex flex-wrap items-center gap-3">
-        <Radio className="h-4 w-4 shrink-0 text-muted-foreground" />
-        <div className="min-w-0 flex-1">
-          <p className="font-medium">
-            Connected to {providerNames[binding.provider]}
-          </p>
-          <p className="truncate text-xs text-muted-foreground">
-            {binding.externalLabel} · Agent assignment is fixed for this
-            external task.
-          </p>
+        <div className="flex min-w-0 flex-1 basis-64 items-center gap-3">
+          <Radio className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium">
+              Connected to {providerNames[binding.provider]}
+            </p>
+            <p className="truncate text-xs text-muted-foreground">
+              {binding.externalLabel} · Agent assignment is fixed for this
+              external task.
+            </p>
+          </div>
         </div>
-        {binding.externalUrl && (
-          <Button asChild size="sm" variant="outline">
-            <a href={binding.externalUrl} target="_blank" rel="noreferrer">
-              Open {providerNames[binding.provider]} <ExternalLink />
-            </a>
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          {binding.externalUrl && (
+            <Button asChild size="sm" variant="outline">
+              <a href={binding.externalUrl} target="_blank" rel="noreferrer">
+                Open {providerNames[binding.provider]} <ExternalLink />
+              </a>
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setComposing((value) => !value)}
+          >
+            Send to channel
           </Button>
-        )}
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => setComposing((value) => !value)}
-        >
-          Send to channel
-        </Button>
-        <Button asChild size="sm" variant="ghost">
-          <Link to={`/apps/chat/${binding.endpointId}/conversations`}>
-            Connection
-          </Link>
-        </Button>
+          <Button asChild size="sm" variant="ghost">
+            <Link to={`/apps/chat/${binding.endpointId}/conversations`}>
+              Connection
+            </Link>
+          </Button>
+        </div>
       </div>
       {composing && (
         <div className="space-y-2 border-t border-border pt-3">
@@ -684,6 +691,6 @@ function ConnectedTaskComposer({
           </div>
         </div>
       )}
-    </div>
+    </section>
   );
 }

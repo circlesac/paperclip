@@ -7,6 +7,25 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 02:30 UTC: Discord login is restored and the live two-file repeat
+below is verified; it is no longer an external gate. The Board's connected-task
+header was visibly squeezed by its action buttons with Properties open. Root
+reproduced it in a narrow-container browser regression, grouped the text and
+wrapping actions using existing tokens, and visually verified the live fix.
+Focused UI tests pass **26/26**, UI types and all four token gates pass; the full
+chat browser cohort passed **23/23** in 2.5 minutes. A separate stale-route guard
+is committed as `0dad2b7f6` and passed root's
+**65/65** server tests and server types: neither the pre-registered next route
+nor a retained old route may admit runtime responses for the wrong run epoch.
+
+James's attach-result-loss protocol has its first private-artifact red-to-green
+proof, but restart/bootstrap and negative-authority coverage plus independent
+review are unfinished. Boole's current-source GitHub task-link fallback has
+focused proof and is still being hardened. Do not stage the private runner or
+restart server 68 with mixed protocol sources. Teams Developer Portal was
+opened in the in-app browser and presents a Microsoft sign-in page; no qualified
+tenant or bot installation is available. Continue other providers while blocked.
+
 September 9, 02:06 UTC: server **68**, PID **79398**, handle **93624**, is
 healthy on loopback **3137**, loaded `3a2a911bd` with normal runner `2400740c…`.
 Both loopback and private Tailscale health report ready. Total runs remain 286,
@@ -1229,11 +1248,10 @@ device`, with host usage at **32/32** segments. No positively identified
 7. **Teams external gate.** There is no qualified Microsoft 365 tenant/admin
    setup. Deterministic tests are not live Teams qualification. Continue other
    providers while this real external gate remains.
-8. **Discord browser login required.** The current Eigenjoy browser session
-   expired when reopening the conversation. Its login page is open and the
-   user was notified. The bot endpoint remains active; Slack/GitHub/Telegram
-   browsers are signed in. Do not claim a new Discord live retest until login
-   and a visible conversation result are verified.
+8. **Discord browser login restored.** The user signed back in. Root's latest
+   same-thread native Luna request visibly returned the image and text-file
+   previews; full TXT content was inspected. This closes the login gate, not
+   the separate historical recovery and pending attach-result-loss work.
 9. **Native reasoning selection.** The legacy configured-low field is ignored
    by the current native path. Luna is verified, effective effort is not.
    This behavior also exists on master. Keep the recorded qualification honest;
