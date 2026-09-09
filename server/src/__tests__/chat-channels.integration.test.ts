@@ -11,6 +11,8 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -28196,6 +28198,536 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     });
     await service.shutdown();
+  });
+
+  it("resolves a signed Slack modal correction after SDK context consumption exactly once", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service, wakeup } =
+      await configuredSlackEndpoint(fixture);
+    let pinned: ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
+    let providerServer: Server | undefined;
+    try {
+      const channelId = "C-SIGNED-MODAL";
+      const threadTs = "1788.100";
+      const externalUserId = `U-MODAL-${randomUUID()}`;
+      const channel = makeThread({
+        channelId,
+        id: `slack:${channelId}:${threadTs}`,
+        name: "signed-modal",
+      });
+      // Existing fixture helpers establish the endpoint, conversation and
+      // published question. From block_actions onward, signed envelopes pass
+      // through the real adapter/SDK/runtime and unmocked service callbacks.
+      // Provider HTTP and the scheduler remain deterministic test boundaries.
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: channel.thread,
+        message: makeMessage({
+          id: threadTs,
+          text: "@maya collect deployment details",
+          mentioned: true,
+          userId: externalUserId,
+        }),
+        trigger: "mention",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id, externalUserId);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await service.listConversations(endpoint.id);
+      if (!conversation) throw new Error("Expected signed modal conversation");
+      const [principal] = await db
+        .select()
+        .from(chatExternalPrincipals)
+        .where(
+          and(
+            eq(chatExternalPrincipals.companyId, fixture.companyId),
+            eq(chatExternalPrincipals.provider, "slack"),
+            eq(chatExternalPrincipals.externalId, externalUserId),
+          ),
+        );
+      const linkedUserId = `signed-modal-user-${randomUUID()}`;
+      const now = new Date();
+      await db.insert(authUsers).values({
+        id: linkedUserId,
+        name: "Modal Operator",
+        email: `${linkedUserId}@example.com`,
+        emailVerified: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      await db.insert(companyMemberships).values({
+        companyId: fixture.companyId,
+        principalType: "user",
+        principalId: linkedUserId,
+        status: "active",
+        membershipRole: "operator",
+      });
+      const intent = await service.createLinkIntent(
+        endpoint.id,
+        principal.id,
+        1_800,
+      );
+      const identityToken = new URL(intent.confirmationUrl).searchParams.get(
+        "token",
+      );
+      if (!identityToken) throw new Error("Expected modal identity token");
+      await service.confirmIdentityLink(identityToken, linkedUserId);
+      const interaction = await issueThreadInteractionService(db).create(
+        { id: conversation.issueId, companyId: fixture.companyId },
+        {
+          kind: "ask_user_questions",
+          continuationPolicy: "wake_assignee",
+          title: "Deployment details",
+          payload: {
+            version: 1,
+            title: "Deployment details",
+            submitLabel: "Continue",
+            questions: [
+              {
+                id: "environment",
+                prompt: "Where should I deploy?",
+                selectionMode: "single",
+                required: true,
+                allowOther: false,
+                options: [
+                  { id: "staging", label: "Staging" },
+                  { id: "production", label: "Production" },
+                ],
+              },
+              {
+                id: "reason",
+                prompt: "What should the release note say?",
+                selectionMode: "single",
+                required: true,
+                allowOther: true,
+                options: [
+                  {
+                    id: "__paperclip_text__",
+                    label: "Type an answer",
+                    freeText: true,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        { agentId: fixture.assignedAgentId },
+      );
+      runtime.endpoints.get(endpoint.id)!.postResultIds.push("1788.200");
+      await service.processPendingPublications();
+      const publication = await db
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.endpointId, endpoint.id),
+            eq(chatPublications.conversationId, conversation.id),
+          ),
+        )
+        .then((rows) =>
+          rows.find((row) => row.payload.interactionId === interaction.id),
+        );
+      const openAction = publication?.payload.card?.actions?.find(
+        (action) => action.type === "callback",
+      );
+      if (!publication?.providerMessageId || openAction?.type !== "callback") {
+        throw new Error("Expected published question form action");
+      }
+      const configuration = runtime.configurations.get(endpoint.id)!;
+      if (
+        configuration.providerConfig.provider !== "slack" ||
+        !callbacks.onModalSubmit
+      ) {
+        throw new Error("Expected Slack provider and service modal callback");
+      }
+      const credentials = configuration.providerConfig.credentials;
+      type SlackView = {
+        callback_id: string;
+        private_metadata: string;
+        blocks: Array<{
+          block_id: string;
+          element: {
+            type: string;
+            action_id: string;
+            options?: Array<{ text: { text: string }; value: string }>;
+          };
+        }>;
+      };
+      const views: SlackView[] = [];
+      const providerMethods: string[] = [];
+      const unexpectedProviderMethods: string[] = [];
+      providerServer = createServer(async (request, response) => {
+        let body = "";
+        for await (const chunk of request) body += String(chunk);
+        const params = new URLSearchParams(body);
+        const method = request.url?.split("/").at(-1) ?? "";
+        providerMethods.push(method);
+        let result: unknown;
+        if (method === "conversations.replies") {
+          result = {
+            ok: true,
+            messages: [
+              {
+                type: "message",
+                ts: publication.providerMessageId,
+                thread_ts: threadTs,
+                channel: channelId,
+                user: credentials.botUserId,
+                text: "Deployment details",
+              },
+            ],
+          };
+        } else if (method === "users.info") {
+          result = {
+            ok: true,
+            user: {
+              id: params.get("user"),
+              name: "maya",
+              real_name: "Maya",
+              is_bot: true,
+              profile: { display_name: "Maya" },
+            },
+          };
+        } else if (method === "views.open") {
+          views.push(JSON.parse(params.get("view")!) as SlackView);
+          result = { ok: true, view: { id: "V-SIGNED-MODAL" } };
+        } else {
+          unexpectedProviderMethods.push(method);
+          result = { ok: false, error: "unexpected_test_provider_method" };
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(result));
+      });
+      await new Promise<void>((resolve) =>
+        providerServer!.listen(0, "127.0.0.1", resolve),
+      );
+      const onSubmit = vi.fn(callbacks.onModalSubmit);
+      pinned = createChatSdkEndpointRuntime({
+        ...configuration,
+        callbacks: { ...callbacks, onModalSubmit: onSubmit },
+        logger: "silent",
+        providerConfig: {
+          ...configuration.providerConfig,
+          credentials: {
+            ...credentials,
+            apiUrl: `http://127.0.0.1:${(providerServer.address() as AddressInfo).port}/api/`,
+          },
+        },
+      });
+      await pinned.initialize();
+      const signed = (payload: unknown) => {
+        const body = new URLSearchParams({
+          payload: JSON.stringify(payload),
+        }).toString();
+        const timestamp = String(Math.floor(Date.now() / 1_000));
+        const signature = createHmac("sha256", credentials.signingSecret!)
+          .update(`v0:${timestamp}:${body}`)
+          .digest("hex");
+        return new Request("https://paperclip.test/webhooks/slack", {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            "x-slack-request-timestamp": timestamp,
+            "x-slack-signature": `v0=${signature}`,
+          },
+          body,
+        });
+      };
+      const wireUser = {
+        id: externalUserId,
+        username: "operator",
+        name: "Modal Operator",
+      };
+      const opened = await pinned.handleWebhook(
+        signed({
+          type: "block_actions",
+          team: { id: "T-PAPERCLIP" },
+          user: wireUser,
+          channel: { id: channelId },
+          container: {
+            type: "message",
+            channel_id: channelId,
+            message_ts: publication.providerMessageId,
+            thread_ts: threadTs,
+          },
+          message: { ts: publication.providerMessageId, thread_ts: threadTs },
+          actions: [{ action_id: openAction.actionId, value: interaction.id }],
+          trigger_id: "synthetic-signed-modal-trigger",
+        }),
+      );
+      expect(opened.status).toBe(200);
+      expect(views).toHaveLength(1);
+      const view = views[0]!;
+      const metadata = JSON.parse(view.private_metadata) as {
+        c: string;
+        m: string;
+      };
+      expect(metadata).toEqual({ c: expect.any(String), m: view.callback_id });
+      const select = view.blocks.find(
+        (block) => block.element.type === "static_select",
+      )!;
+      const text = view.blocks.find(
+        (block) => block.element.type === "plain_text_input",
+      )!;
+      const production = select.element.options!.find(
+        (option) => option.text.text === "Production",
+      )!;
+      expect(production.value).not.toBe("production");
+      const submit = (value: string) =>
+        signed({
+          type: "view_submission",
+          team: { id: "T-PAPERCLIP" },
+          user: wireUser,
+          view: {
+            id: "V-SIGNED-MODAL",
+            callback_id: view.callback_id,
+            private_metadata: view.private_metadata,
+            state: {
+              values: {
+                [select.block_id]: {
+                  [select.element.action_id]: {
+                    type: "static_select",
+                    selected_option: production,
+                  },
+                },
+                [text.block_id]: {
+                  [text.element.action_id]: { type: "plain_text_input", value },
+                },
+              },
+            },
+          },
+        });
+      const sdkContextRows = () =>
+        db
+          .select({ id: chatSdkState.id })
+          .from(chatSdkState)
+          .where(
+            and(
+              eq(chatSdkState.companyId, fixture.companyId),
+              eq(chatSdkState.endpointId, endpoint.id),
+              eq(
+                chatSdkState.stateKey,
+                `cache:${createHash("sha256").update(`modal-context:slack:${metadata.c}`).digest("hex")}`,
+              ),
+            ),
+          );
+      const submissionState = async () => ({
+        interactions: await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, interaction.id)),
+        tokens: await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.providerActionId, view.callback_id),
+            ),
+          ),
+        deliveries: await db
+          .select()
+          .from(issueQuestionResponseDeliveries)
+          .where(
+            eq(issueQuestionResponseDeliveries.interactionId, interaction.id),
+          ),
+        audits: await db
+          .select()
+          .from(activityLog)
+          .where(
+            and(
+              eq(activityLog.companyId, fixture.companyId),
+              eq(activityLog.entityId, conversation.issueId),
+              eq(activityLog.action, "issue.thread_interaction_answered"),
+            ),
+          ),
+      });
+      await expect(sdkContextRows()).resolves.toHaveLength(1);
+      const before = await submissionState();
+      expect(before.interactions).toEqual([
+        expect.objectContaining({ status: "pending" }),
+      ]);
+      expect(before.tokens).toEqual([
+        expect.objectContaining({ status: "issued" }),
+      ]);
+      expect(before.deliveries).toEqual([]);
+      expect(before.audits).toEqual([]);
+      const wakeupsBefore = wakeup.mock.calls.length;
+      const invalid = await pinned.handleWebhook(submit(""));
+      expect(invalid.status).toBe(200);
+      expect(await invalid.json()).toEqual({
+        response_action: "errors",
+        errors: { [text.block_id]: "Enter a response" },
+      });
+      expect(onSubmit.mock.calls[0]![0].event).toMatchObject({
+        relatedThread: { id: conversation.externalThreadId },
+        relatedMessage: { id: publication.providerMessageId },
+      });
+      await expect(sdkContextRows()).resolves.toEqual([]);
+      expect(await submissionState()).toEqual(before);
+      expect(wakeup).toHaveBeenCalledTimes(wakeupsBefore);
+
+      const setRole = (membershipRole: "viewer" | "operator") =>
+        db
+          .update(companyMemberships)
+          .set({ membershipRole, updatedAt: new Date() })
+          .where(
+            and(
+              eq(companyMemberships.companyId, fixture.companyId),
+              eq(companyMemberships.principalType, "user"),
+              eq(companyMemberships.principalId, linkedUserId),
+            ),
+          );
+      await setRole("viewer");
+      const denied = await pinned.handleWebhook(
+        submit("Add regional failover"),
+      );
+      expect(denied.status).toBe(200);
+      expect(await denied.json()).toEqual({
+        response_action: "errors",
+        errors: {
+          [select.block_id]:
+            "This form is no longer authorized. Close it and open the linked Paperclip task.",
+        },
+      });
+      expect(await submissionState()).toEqual(before);
+      expect(wakeup).toHaveBeenCalledTimes(wakeupsBefore);
+      const denials = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            sql`${chatDeliveries.normalizedEvent}->'modal'->>'code' = 'chat_modal_principal_not_authorized'`,
+          ),
+        );
+      expect(denials).toHaveLength(1);
+      expect(denials[0]).toMatchObject({
+        state: "filtered",
+        conversationId: conversation.id,
+      });
+      await setRole("operator");
+      const corrected = await pinned.handleWebhook(
+        submit("  Add regional failover  "),
+      );
+      expect(corrected.status).toBe(200);
+      expect(await corrected.json()).toEqual({ response_action: "clear" });
+      await vi.waitFor(async () => {
+        expect(wakeup).toHaveBeenCalledTimes(wakeupsBefore + 1);
+        expect((await submissionState()).deliveries).toEqual([
+          expect.objectContaining({
+            status: "fallback_queued",
+            deliveryMode: "wake_fallback",
+          }),
+        ]);
+      });
+      expect(wakeup).toHaveBeenLastCalledWith(
+        fixture.assignedAgentId,
+        expect.objectContaining({
+          idempotencyKey: `question-response:${interaction.id}`,
+          requestedByActorType: "user",
+          requestedByActorId: linkedUserId,
+          contextSnapshot: expect.objectContaining({
+            issueId: conversation.issueId,
+            interactionId: interaction.id,
+            source: "issue.interaction.respond",
+          }),
+        }),
+      );
+      const accepted = await submissionState();
+      expect(accepted.interactions).toEqual([
+        expect.objectContaining({
+          companyId: fixture.companyId,
+          issueId: conversation.issueId,
+          status: "answered",
+          resolvedByUserId: linkedUserId,
+          result: {
+            version: 1,
+            summaryMarkdown: null,
+            answers: [
+              { questionId: "environment", optionIds: ["production"] },
+              {
+                questionId: "reason",
+                optionIds: [],
+                otherText: "Add regional failover",
+              },
+            ],
+          },
+        }),
+      ]);
+      expect(accepted.tokens).toEqual([
+        expect.objectContaining({
+          status: "processed",
+          conversationId: conversation.id,
+          principalId: principal.id,
+          result: {
+            code: "question_form_answered",
+            interactionId: interaction.id,
+          },
+        }),
+      ]);
+      expect(accepted.deliveries).toHaveLength(1);
+      expect(accepted.audits).toEqual([
+        expect.objectContaining({
+          actorId: linkedUserId,
+          details: expect.objectContaining({
+            source: "external_chat_modal",
+            endpointId: endpoint.id,
+            conversationId: conversation.id,
+            publicationId: publication.id,
+          }),
+        }),
+      ]);
+      const duplicate = await pinned.handleWebhook(
+        submit("  Add regional failover  "),
+      );
+      expect(duplicate.status).toBe(200);
+      expect(await duplicate.json()).toEqual({ response_action: "clear" });
+      expect(await submissionState()).toEqual(accepted);
+      expect(wakeup).toHaveBeenCalledTimes(wakeupsBefore + 1);
+      expect(onSubmit).toHaveBeenCalledTimes(4);
+      for (const [event] of onSubmit.mock.calls.slice(1)) {
+        expect(event).toMatchObject({
+          endpointId: endpoint.id,
+          provider: "slack",
+          event: {
+            callbackId: view.callback_id,
+            privateMetadata: view.callback_id,
+            user: { userId: externalUserId },
+          },
+        });
+        expect(event.event.relatedThread).toBeUndefined();
+        expect(event.event.relatedMessage).toBeUndefined();
+      }
+      await expect(service.listConversations(endpoint.id)).resolves.toEqual([
+        expect.objectContaining({
+          id: conversation.id,
+          issueId: conversation.issueId,
+          externalThreadId: channel.thread.id,
+        }),
+      ]);
+      expect(
+        providerMethods.filter((method) => method === "views.open"),
+      ).toHaveLength(1);
+      expect(unexpectedProviderMethods).toEqual([]);
+    } finally {
+      try {
+        await pinned?.shutdown();
+      } finally {
+        try {
+          await retirePublicationFixture(service, endpoint.id);
+        } finally {
+          if (providerServer) {
+            await new Promise<void>((resolve, reject) => {
+              providerServer!.close((error) =>
+                error ? reject(error) : resolve(),
+              );
+              providerServer!.closeAllConnections();
+            });
+          }
+        }
+      }
+    }
   });
 
   it.each([

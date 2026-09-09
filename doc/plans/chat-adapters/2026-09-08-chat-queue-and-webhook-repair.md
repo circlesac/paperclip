@@ -3454,3 +3454,58 @@ TypeScript passed without rebuilding or staging the native runner. Logs:
 `teams-modal-full-root-final-0909.log`, `teams-modal-root-review-0909.log` and
 `teams-modal-full-root-types-0909.log`. The normal runner remains exact SHA256
 `6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`.
+
+The repair is committed/pushed as `efbc92616`. After checking zero active
+runs at **04:14:28.148 UTC**, root gracefully stopped server 70 (exit 0).
+Server **71**, PID **28614**, handle **80118**, started from a clean worktree
+at **04:14:35.135 UTC**, loaded `2026.831.0+594.git.efbc92616`, and reached
+recovery-ready at **04:14:37.785 UTC**. Loopback and private Tailscale health
+both returned 200/ready, and Discord Gateway connected the expected bot
+`1546330979860221952`. Proxy configuration and the qualified runner are
+unchanged. This is deployment readiness, not a new live provider pass.
+
+### September 9: Slack corrected modal joined to database authorization
+
+The separate Slack bridge's callback-only limitation is now covered by an
+additional real-service database regression. Existing deterministic fixtures
+establish the endpoint, linked operator, conversation and published question.
+From the signed `block_actions` envelope onward, the installed adapter, Chat
+SDK, runtime and unmocked service callbacks carry the flow through the actual
+database. Only provider HTTP and the scheduler remain simulated.
+
+The test opens the service-generated form and submits an invalid answer. It
+checks the actual SDK context row existed and was consumed, while the durable
+form token remains issued and the interaction pending. Revoking the linked
+user to viewer then denies the corrected submission with one filtered receipt
+and no answer or wake. Restoring operator access allows canonical answers
+using the original durable token despite absent SDK thread/message context.
+One durable `fallback_queued` / `wake_fallback` receipt and one correctly scoped
+scheduler call result. Repeating the submission clears the modal without
+changing the answer, receipt, token, audit or conversation and without a
+second wake. The test ends at that queued fallback, not a native model turn.
+
+The new case plus the existing Slack/Teams database cases pass **3/3**, with
+622 other cases filtered, in **7.59 seconds**. Five adjacent files pass
+**140/140**, and plain server TypeScript passes. Scoped formatting and diff
+checks pass. Early failures were fixture corrections, not product defects;
+this addition changes no production code. Logs are
+`slack-signed-modal-service-final-0909.log`,
+`slack-signed-modal-adjacent-final-0909.log` and
+`slack-signed-modal-service-types-final-0909.log`. The test does not qualify a
+real Slack modal, provider account, public webhook route or model execution.
+
+Root's full fresh-database regression passes **625/625**, zero skips/failures,
+in **125.87 seconds** on `chat_slack_modal_joined_20260909_root01`; plain server
+TypeScript also passes. Log: `slack-signed-modal-full-root-0909.log`. This run
+loaded the semantic freeze before a subsequent test-only cleanup adjustment:
+independent review found serial shutdown could skip closing the fake HTTP
+server if an earlier shutdown rejected. Nested `finally` now always closes
+it and uses the existing endpoint-retirement helper to isolate subsequent
+database workers. There is no production change or new server restart.
+
+The final cleanup source passes the focused Slack/Teams database cohort
+**3/3** in **8.38 seconds** on another fresh database and plain server
+TypeScript. Log: `slack-signed-modal-service-retirement-final-0909.log`.
+Root independently inspected the nested cleanup, and the diff remains limited
+to imports plus the one new test. The latest actual browser probe still
+reports Mac locked: no Discord login retry or live conversation was attempted.

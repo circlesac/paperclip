@@ -39,15 +39,16 @@ permissions and audit. Do not narrow completion to whichever tests pass.
 
 ## Current deployment
 
-Implementation `d5ec721f2` is pushed, including verified native recovery,
-Discord denials and Telegram photo routing. Server **70** is running:
+Implementation `efbc92616` is pushed, including verified native recovery,
+Discord denials, Telegram photo routing and editable Teams validation.
+Server **71** is running:
 
 | Field                    | Verified value                                                          |
 | ------------------------ | ----------------------------------------------------------------------- |
-| PID / tool handle        | `54936` / `62091`                                                       |
+| PID / tool handle        | `28614` / `80118`                                                       |
 | Listener                 | `127.0.0.1:3137`                                                        |
-| Loaded server version    | `2026.831.0+591.git.d5ec721f2.dirty`                                    |
-| Started / recovery ready | `03:57:19.082` / `03:57:22.072 UTC`, September 9                        |
+| Loaded server version    | `2026.831.0+594.git.efbc92616`                                          |
+| Started / recovery ready | `04:14:35.135` / `04:14:37.785 UTC`, September 9                        |
 | Native runner SHA256     | `6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`      |
 | Live DB                  | `chat_adapters_live_3103` on local PostgreSQL `55439`, role `paperclip` |
 | Last checked runs        | 290 terminal: 262 succeeded, 26 failed, 2 cancelled; zero active        |
@@ -56,9 +57,8 @@ Discord denials and Telegram photo routing. Server **70** is running:
 Both loopback and private Tailscale health returned 200/ready. Discord Gateway
 reconnected bot `1546330979860221952`. The health response's Git commit is
 dynamic; use loaded version and process start to identify deployed code.
-The loaded `.dirty` suffix reflects only root-owned documentation edits at
-startup; implementation files were committed and verified. Server 69 exited
-cleanly after draining zero active runs. The qualified runner SHA is unchanged.
+The worktree was clean at startup. Server 70 exited cleanly after a fresh
+zero-active-run check at 04:14:28.148 UTC. The qualified runner SHA is unchanged.
 
 Private Board: `https://dottas-macbook-pro.tail29c1aa.ts.net`.
 Public webhook-only proxy: port `3104` → `3137`; Funnel uses stable port
@@ -77,7 +77,7 @@ All local runtime material is under ignored
 `.paperclip-runtime/chat-adapters-live/`, including:
 
 - `start-server.sh`: configured isolated startup, no embedded credentials.
-- `server-experimental-landing-70.log`: current server log.
+- `server-experimental-landing-71.log`: current server log.
 - `qualified-runnerd-2400740c`: preserved old qualified runner backup.
 - `home/instances/chat-adapters-live/runtime/paperclip-runner/durable-sessions`:
   live native roots; do not manipulate historical evidence.
@@ -91,7 +91,7 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Immediate next actions
 
-1. **Resume real browser qualification on server 70.** Latest actual browser
+1. **Resume real browser qualification on server 71.** Latest actual browser
    inventory reports **Mac locked**; the user has been asked to unlock it.
    Discord login was restored before the lock. Do not request Discord login
    again unless the actual provider page requires it.
@@ -119,9 +119,16 @@ describe the normal binary as continuously unchanged across that earlier check.
 Discord's generated question card → parsed concurrent clicks → real service/DB
 → one continuation publication now passes on a fresh database. The Slack
 signed `view_submission` bridge passes 10/10; its final callback is a pure
-validator/observer, so a separately joined real-service corrected-retry case
-is the next bounded coverage task. Provider I/O and model execution are
-explicitly simulated, not newly qualified live journeys.
+validator/observer. A separate signed adapter/runtime-to-real-service/DB case
+now covers invalid submission consuming SDK context, revoked-user denial,
+restored operator correction and duplicate no-op. Its three-case database
+cohort and 140 adjacent tests pass; root's full 625-case regression passes in
+125.87 seconds on fresh `chat_slack_modal_joined_20260909_root01`. The final
+test-only teardown adjustment separately passes all three focused database
+cases and plain server TypeScript. The case proves one durable
+`wake_fallback` receipt and simulated scheduler call, not a native model turn.
+Provider I/O and model execution remain explicitly simulated, not newly
+qualified live journeys.
 
 The Teams `task/fetch`/`task/submit` bridge found a genuine error-only card that
 removed the original inputs and Submit after invalid answers. A frozen repair
@@ -133,7 +140,8 @@ The fresh full database regression passes 624/624, zero skips, in 120.61 seconds
 on `chat_modal_correction_20260909_root01`; root's helper/Teams/Slack repeat
 passes 41/41 and plain server TypeScript passes.
 The Teams JWT checker is an explicit test double, not eligible-tenant proof.
-Server 70 remains unchanged until the production repair is fully verified.
+The repair is deployed on server 71, with healthy Board and connected Discord
+Gateway. No new live provider conversation or Teams tenant proof is implied.
 
 - **Telegram photo eligibility (complete):** bounded PNG/JPEG metadata selects
   photo within supported geometry and a conservative 10,000,000-byte budget.
@@ -164,7 +172,7 @@ approvalPolicy: never}`. Injecting an effort field is rejected; resolving
 
 The latest user reports Discord login restored; root's subsequent browser probe
 still reports **Mac locked**. Only the OS unlock is being requested. Root
-rechecked server 70 health and the 3104/3137 listeners; no new live provider
+rechecked server 71 health and the 3104/3137 listeners; no new live provider
 turn has been sent during this code-only audit.
 
 ## Latest provider evidence — scope matters
@@ -177,8 +185,8 @@ low field is outside the native v4 contract. Do not claim it is running low effo
 
 | Provider | Latest useful real evidence                                                                                                           | Still missing                                                                     |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Discord  | Server 68 same-thread image/TXT return on CHA-32; both previews and full TXT inspected, one attempt per output; bot reconnected on 70 | Live repeat on 70, remaining runbook cases, second-process takeover               |
-| Slack    | Server 68 same-thread image/TXT return on CHA-33; exact received bytes retained; live edited-source reuse denied                      | Live repeat on 70, remaining lifecycle/governance/failure permutations            |
+| Discord  | Server 68 same-thread image/TXT return on CHA-32; both previews and full TXT inspected, one attempt per output; bot reconnected on 71 | Live repeat on 71, remaining runbook cases, second-process takeover               |
+| Slack    | Server 68 same-thread image/TXT return on CHA-33; exact received bytes retained; live edited-source reuse denied                      | Live repeat on 71, remaining lifecycle/governance/failure permutations            |
 | GitHub   | Server 68 honest unavailable-private-file reply, followed by correct pasted-text answer on the same session                           | New safe task-link → task-upload live journey and remaining runbook cases         |
 | Telegram | Earlier real text/media/reaction/backlog cases; accepted CHA-26 image answer later delivered without another model run                | Exact failed document-B recovery and remaining file/interaction/performance cases |
 | Teams    | Deterministic personal/channel progress, actions, access and safe file-link coverage                                                  | Actual qualified tenant setup and live provider journeys                          |
@@ -289,13 +297,19 @@ It is not combined server→real-provider recovery proof. Only local Codex
 surviving-runner, remote/listen and missing-independent-checkpoint cases remain
 unsupported and fail closed.
 
-Latest full chat integration **624/624**, zero skips, ran on fresh
-`chat_adapters_telegram_photo_20260909_root01` (126.88 seconds).
-Root's focused parser/runtime/adapter cohort passes **199/199** and direct
-server types pass. The full suite includes Discord's parsed denial path,
-Telegram photo boundaries, and previous Slack/Discord partial-file batches
-across restart and explicit ambiguous-file resolution. Provider I/O is
-simulated. Log: `chat-final-photo-discord-root-0909.log` in ignored runtime.
+Latest full chat integration **625/625**, zero skips, ran on fresh
+`chat_slack_modal_joined_20260909_root01` (125.87 seconds). A later test-only
+nested-cleanup/fixture-retirement adjustment passes the final-source focused
+Slack/Teams **3/3** and plain server TypeScript; the full run loaded the prior
+semantic freeze, not that cleanup delta.
+Root's focused helper/Teams/Slack cohort passes **41/41** and direct server
+types pass. The earlier parser/runtime/adapter cohort passed **199/199**.
+The full suite includes Slack's signed corrected-modal/database flow,
+Teams invalid-form preservation, Discord's parsed
+question/denial paths, Telegram photo boundaries, and previous Slack/Discord
+partial-file batches across restart and explicit ambiguous-file resolution.
+Provider I/O is simulated. Latest log: `slack-signed-modal-full-root-0909.log`
+in ignored runtime.
 
 Full deterministic chat browser **29/29**, zero retries (2.8 minutes), includes
 six task-company/upload routes and readiness behavior. It is not live provider
