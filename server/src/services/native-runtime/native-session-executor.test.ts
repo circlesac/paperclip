@@ -7357,6 +7357,139 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
+  it.each([
+    "prepared",
+    "awaiting_result",
+    "runner_prepared",
+    "schema_only",
+    "malformed",
+    "foreign_scope",
+    "expired",
+    "revoked",
+  ] as const)(
+    "preserves unadmitted forward warm-transition evidence (%s)",
+    async (variant) => {
+      const stateBase = await mkdtemp(
+        join(tmpdir(), "paperclip-pending-warm-transition-"),
+      );
+      const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      process.env.PAPERCLIP_RUNNER_STATE_DIR = stateBase;
+      const currentExecution = {
+        ...execution,
+        binding: {
+          ...execution.binding,
+          companyId: `warm-company-${variant}`,
+          runId: `warm-run-${variant}`,
+          agentId: `warm-agent-${variant}`,
+          executionWorkspaceId: `warm-workspace-${variant}`,
+        },
+        session: {
+          ...execution.session,
+          normalizedSessionId: `warm-session-${variant}`,
+        },
+      } as NativeExecutionInputV1;
+      const identity = {
+        runId: currentExecution.binding.runId,
+        normalizedSessionId: currentExecution.session.normalizedSessionId,
+        runnerInstanceId: `warm-runner-${variant}`,
+        environmentLeaseId: currentExecution.binding.executionWorkspaceId,
+      };
+      try {
+        state.createBackend.mockClear();
+        state.createTransport.mockClear();
+        await createRunnerdBackend({
+          db: leaseDb(currentExecution),
+          execution: currentExecution,
+          runnerInstanceId: identity.runnerInstanceId,
+        });
+        state.createBackend.mock.calls[0]![1].codexTransportFactory!();
+        const root = state.createTransport.mock.calls[0]![0].stateDirectory!;
+        await mkdir(join(root, "control-plane"), { recursive: true });
+        await mkdir(join(root, "runner"), { recursive: true });
+        await mkdir(join(root, "codex-home"), { recursive: true });
+        // These are deliberately unadmitted selectors, not an invented valid
+        // receipt or a forged process-retirement claim. Even invalid/unsupported
+        // forward evidence must never fall through the legacy quarantine path.
+        const pending = {
+          phase: variant === "awaiting_result" ? "awaiting_result" : "prepared",
+          receipt: {
+            schema: "paperclip.runner.warm-transition.v1",
+            newIdentity: {
+              ...identity,
+              runId:
+                variant === "foreign_scope" ? "foreign-run" : identity.runId,
+            },
+            leaseExpiresAtUnixMs:
+              variant === "expired" ? 1 : Date.now() + 60_000,
+          },
+          credentialId: "unadmitted-credential",
+        };
+        const core =
+          variant === "runner_prepared"
+            ? durableControlPlaneState(identity)
+            : {
+                ...durableControlPlaneState(identity),
+                schema:
+                  "paperclip.runner.durable.control-plane-state.warm-transition.v1",
+                ...(variant === "schema_only"
+                  ? {}
+                  : { warmTransition: pending }),
+                leases: {
+                  "unadmitted-credential": {
+                    revokedAt:
+                      variant === "revoked" ? new Date().toISOString() : null,
+                  },
+                },
+              };
+        const runner = {
+          ...durableRunnerState(identity, "ready"),
+          schema: "paperclip.runner.durable.state.warm-transition.v1",
+          warmTransition: pending,
+        };
+        const coreBytes =
+          variant === "malformed"
+            ? '{"schema":"paperclip.runner.durable.control-plane-state.warm-transition.v1",'
+            : JSON.stringify(core);
+        const runnerBytes = JSON.stringify(runner);
+        const corePath = join(
+          root,
+          "control-plane",
+          "control-plane-state.json",
+        );
+        const runnerPath = join(root, "runner", "runner-state.json");
+        const launchMaterial = join(root, "codex-home", "config.toml");
+        await writeFile(corePath, coreBytes);
+        await writeFile(runnerPath, runnerBytes);
+        await writeFile(
+          launchMaterial,
+          "fixture launch material must remain untouched\n",
+        );
+        state.createBackend.mockClear();
+        state.createTransport.mockClear();
+        await expect(
+          createRunnerdBackend({
+            db: leaseDb(currentExecution),
+            execution: currentExecution,
+            runnerInstanceId: identity.runnerInstanceId,
+          }),
+        ).rejects.toThrow("native_runner_warm_transition_recovery_unproven");
+        expect(await readFile(corePath, "utf8")).toBe(coreBytes);
+        expect(await readFile(runnerPath, "utf8")).toBe(runnerBytes);
+        expect(await readFile(launchMaterial, "utf8")).toBe(
+          "fixture launch material must remain untouched\n",
+        );
+        await expect(access(join(stateBase, "quarantine"))).rejects.toThrow();
+        expect(state.createBackend).not.toHaveBeenCalled();
+        expect(state.createTransport).not.toHaveBeenCalled();
+      } finally {
+        if (previousStateDirectory === undefined)
+          delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+        else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+        await rm(stateBase, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.each(["unknown_schema", "unknown_lifecycle"] as const)(
     "quarantines an exact-run runner state with %s",
     async (caseName) => {

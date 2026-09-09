@@ -48,9 +48,11 @@ import {
   createRunnerdCodexTransport,
   defaultCapabilityRunnerdBinary,
   executeNativeSession,
+  inspectWarmRunTransition,
   parseNativeExecutionInput,
   parsePaperclipQuestionSet,
   resolveSourceCodexHome,
+  readRunnerdArtifactBinding,
   retainedRunnerdMaintenanceIsIdle,
   settleRetainedRunnerdSession,
   validatePrpEvent,
@@ -3544,13 +3546,455 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
   }
 }
 
+function hasRetainedWarmTransitionEvidence(root: string): boolean {
+  for (const [directory, filename, maximum] of [
+    [
+      "control-plane",
+      "control-plane-state.json",
+      NATIVE_DURABLE_IDENTITY_MAX_BYTES,
+    ],
+    ["runner", "runner-state.json", NATIVE_RUNNER_STATE_MAX_BYTES],
+  ] as const) {
+    const path = resolve(root, directory, filename);
+    if (!lstatSync(path, { throwIfNoEntry: false })) continue;
+    let bytes: string;
+    try {
+      bytes = readBoundedNativeFile(
+        path,
+        maximum,
+        "runner_state_too_large",
+      ).toString("utf8");
+    } catch {
+      // The ordinary verifier still owns unreadable legacy state. Inspect the
+      // other file before deciding whether this is a forward-protocol fence.
+      continue;
+    }
+    try {
+      const state = record(JSON.parse(bytes));
+      if (
+        Object.prototype.hasOwnProperty.call(state, "warmTransition") ||
+        state.schema ===
+          "paperclip.runner.durable.control-plane-state.warm-transition.v1" ||
+        state.schema === "paperclip.runner.durable.state.warm-transition.v1"
+      )
+        return true;
+    } catch {
+      // This is detection only, never admission. A damaged forward receipt
+      // must remain available to its owner rather than become legacy state.
+      if (
+        bytes.includes("warm-transition.v1") ||
+        bytes.includes('"warmTransition"')
+      )
+        return true;
+    }
+  }
+  return false;
+}
+
+type VerifiedWarmTransitionBinding = {
+  runnerInstanceId: string;
+  environmentLeaseId: string;
+  transitionId: string;
+  stateFingerprint: string;
+};
+
+function readWarmTransitionSnapshot(root: string) {
+  if (
+    ![root, resolve(root, "control-plane"), resolve(root, "runner")].every(
+      isSafeNativeStateDirectory,
+    )
+  ) {
+    throw new Error("native_runner_warm_transition_recovery_unproven");
+  }
+  const core = readBoundedNativeFile(
+    resolve(root, "control-plane", "control-plane-state.json"),
+    NATIVE_DURABLE_IDENTITY_MAX_BYTES,
+    "native_runner_warm_transition_recovery_unproven",
+  );
+  const runner = readBoundedNativeFile(
+    resolve(root, "runner", "runner-state.json"),
+    NATIVE_RUNNER_STATE_MAX_BYTES,
+    "native_runner_warm_transition_recovery_unproven",
+  );
+  try {
+    return {
+      controlPlaneState: JSON.parse(core.toString("utf8")) as unknown,
+      runnerState: JSON.parse(runner.toString("utf8")) as unknown,
+      stateFingerprint: nativeSha256([
+        core.toString("base64"),
+        runner.toString("base64"),
+      ]),
+    };
+  } catch {
+    throw new Error("native_runner_warm_transition_recovery_unproven");
+  }
+}
+
+/** Forward receipts select a protocol boundary, never a process owner. */
+async function verifyWarmTransitionRestart(input: {
+  db: Db;
+  execution: NativeExecutionInput;
+  restartRecovery?: NativeRestartRecoveryClaim;
+  runnerExecutionTarget?: AdapterExecutionTarget | null;
+}): Promise<VerifiedWarmTransitionBinding> {
+  const deny = (): never => {
+    throw new Error("native_runner_warm_transition_recovery_unproven");
+  };
+  const claim = input.restartRecovery;
+  // A surviving runner needs its own authenticated reattach path. Do not
+  // reinterpret that claim, remote evidence, or an incomplete bootstrap as
+  // permission to launch another process against a retained transition.
+  if (
+    claim?.kind !== "resume_dead_runner" ||
+    input.runnerExecutionTarget?.kind === "remote" ||
+    input.execution.provider.kind !== "codex" ||
+    input.execution.session.driverKind !== "codex_app_server" ||
+    claim.runId !== input.execution.binding.runId
+  )
+    return deny();
+  const root = scopedRunnerdStateRoot(input.execution);
+  const snapshot = readWarmTransitionSnapshot(root);
+  const artifact = readRunnerdArtifactBinding(resolvePaperclipRunnerBinary());
+  const controller = await currentNativeControllerIdentity();
+  const binding = input.execution.binding;
+  let finalAuthorityCheck: (() => boolean) | undefined;
+  const verified = await input.db.transaction(async (tx) => {
+    const current = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, binding.runId),
+          eq(heartbeatRuns.companyId, binding.companyId),
+        ),
+      )
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0]);
+    const coordinator = await tx
+      .select()
+      .from(nativeRunFinalizations)
+      .where(
+        and(
+          eq(nativeRunFinalizations.runId, binding.runId),
+          eq(nativeRunFinalizations.companyId, binding.companyId),
+        ),
+      )
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0]);
+    const issue = await tx
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.id, binding.issueId),
+          eq(issues.companyId, binding.companyId),
+        ),
+      )
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0]);
+    const now = new Date();
+    if (
+      !current ||
+      !coordinator ||
+      !issue ||
+      issue.executionRunId !== binding.runId ||
+      current.agentId !== binding.agentId ||
+      current.nativeIssueId !== binding.issueId ||
+      current.runtimeMode !== "native" ||
+      current.status !== "running" ||
+      current.finishedAt !== null ||
+      current.nativeSessionId !== nativeSessionKey(input.execution) ||
+      !current.runnerInstanceId ||
+      isNativeRunnerOwnershipHeld(current) ||
+      coordinator.issueId !== binding.issueId ||
+      coordinator.phase !== "observed" ||
+      coordinator.resultId !== null ||
+      coordinator.leaseOwner !== claim.leaseOwner ||
+      !coordinator.leaseExpiresAt ||
+      coordinator.leaseExpiresAt <= now ||
+      coordinator.controllerBootId !== controller.bootId ||
+      coordinator.controllerPid !== controller.pid ||
+      coordinator.controllerProcessStartedAt?.getTime() !==
+        controller.processStartedAt.getTime() ||
+      coordinator.controllerGeneration !== claim.controllerGeneration
+    )
+      return deny();
+    const profile = record(current.runnerProfileJson);
+    let frozen: NativeExecutionInput;
+    try {
+      frozen = parseNativeExecutionInput(profile.nativeExecutionInput);
+    } catch {
+      return deny();
+    }
+    if (nativeSha256(frozen) !== nativeSha256(input.execution)) return deny();
+    const cancellation = record(record(current.resultJson).nativeCancellation);
+    if (
+      cancellation.scope === "run" &&
+      ["pending", "acknowledged"].includes(String(cancellation.dispatchState))
+    )
+      return deny();
+    let expectedEnvironmentLeaseId = binding.executionWorkspaceId;
+    if (binding.executionWorkspaceId === binding.runId) {
+      // Projectless runs retain the first run's lease while their workspace
+      // placeholder changes. The receipt only SELECTS that origin: its frozen
+      // DB execution, full scope and terminal ownership independently prove it.
+      const selectedLease = record(
+        record(record(snapshot.runnerState).warmTransition).receipt,
+      ).newIdentity;
+      const originId = record(selectedLease).environmentLeaseId;
+      if (
+        typeof originId !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+          originId,
+        )
+      )
+        return deny();
+      const origin = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, originId),
+            eq(heartbeatRuns.companyId, binding.companyId),
+          ),
+        )
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0]);
+      if (
+        !origin ||
+        origin.agentId !== binding.agentId ||
+        origin.nativeIssueId !== binding.issueId ||
+        origin.runtimeMode !== "native" ||
+        !["succeeded", "failed", "cancelled", "timed_out"].includes(
+          origin.status,
+        ) ||
+        origin.finishedAt === null ||
+        isNativeRunnerOwnershipHeld(origin) ||
+        origin.runnerInstanceId !== current.runnerInstanceId ||
+        origin.nativeSessionId !== current.nativeSessionId
+      )
+        return deny();
+      let originExecution: NativeExecutionInput;
+      try {
+        originExecution = parseNativeExecutionInput(
+          record(origin.runnerProfileJson).nativeExecutionInput,
+        );
+      } catch {
+        return deny();
+      }
+      if (
+        originExecution.binding.runId !== origin.id ||
+        originExecution.binding.executionWorkspaceId !== origin.id ||
+        originExecution.binding.companyId !== binding.companyId ||
+        originExecution.binding.agentId !== binding.agentId ||
+        originExecution.binding.issueId !== binding.issueId ||
+        nativeSessionScopeKey(originExecution) !==
+          nativeSessionScopeKey(input.execution)
+      )
+        return deny();
+      expectedEnvironmentLeaseId = origin.id;
+    }
+    const inspectionInput = {
+      ...snapshot,
+      expectedNewIdentity: {
+        runnerInstanceId: current.runnerInstanceId,
+        environmentLeaseId: expectedEnvironmentLeaseId,
+        runId: binding.runId,
+        normalizedSessionId: nativeSessionKey(input.execution),
+        turnId: `turn-${binding.runId}`,
+        itemId: `item-${binding.runId}`,
+      },
+      expectedRunnerVersion: artifact.version,
+      expectedRunnerDigest: artifact.digest,
+    };
+    const proof = inspectWarmRunTransition({
+      ...inspectionInput,
+      now: Date.now(),
+    });
+    if (!proof) return deny();
+    const prior = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.id, proof.receipt.oldIdentity.runId),
+          eq(heartbeatRuns.companyId, binding.companyId),
+        ),
+      )
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0]);
+    if (
+      !prior ||
+      prior.agentId !== binding.agentId ||
+      prior.nativeIssueId !== binding.issueId ||
+      prior.runtimeMode !== "native" ||
+      !["succeeded", "failed", "cancelled", "timed_out"].includes(
+        prior.status,
+      ) ||
+      prior.finishedAt === null ||
+      isNativeRunnerOwnershipHeld(prior) ||
+      prior.runnerInstanceId !== current.runnerInstanceId ||
+      prior.nativeSessionId !== current.nativeSessionId ||
+      proof.receipt.oldIdentity.runnerInstanceId !== prior.runnerInstanceId ||
+      proof.receipt.oldIdentity.normalizedSessionId !== prior.nativeSessionId ||
+      proof.receipt.oldIdentity.environmentLeaseId !==
+        expectedEnvironmentLeaseId ||
+      proof.receipt.oldIdentity.turnId !== `turn-${prior.id}` ||
+      proof.receipt.oldIdentity.itemId !== `item-${prior.id}`
+    )
+      return deny();
+    let previousExecution: NativeExecutionInput;
+    try {
+      previousExecution = parseNativeExecutionInput(
+        record(prior.runnerProfileJson).nativeExecutionInput,
+      );
+    } catch {
+      return deny();
+    }
+    if (
+      previousExecution.binding.runId !== prior.id ||
+      previousExecution.binding.companyId !== binding.companyId ||
+      previousExecution.binding.agentId !== binding.agentId ||
+      previousExecution.binding.issueId !== binding.issueId ||
+      nativeSessionScopeKey(previousExecution) !==
+        nativeSessionScopeKey(input.execution)
+    )
+      return deny();
+    const history = coordinator.recoveryHistory.at(-1);
+    const checkpoint = record(profile.sessionCheckpoint);
+    const checkpointIdentity = record(checkpoint.identity);
+    const processEvidence = record(checkpoint.process);
+    if (
+      !history ||
+      history.disposition !== claim.kind ||
+      history.controllerBootId !== controller.bootId ||
+      history.controllerPid !== controller.pid ||
+      history.controllerGeneration !== claim.controllerGeneration ||
+      history.recoveryRequestId !== claim.recoveryRequestId ||
+      history.providerAttempt !== claim.providerAttempt ||
+      history.stateRootAction !== "reuse_exact_root" ||
+      history.hasCheckpoint !== true ||
+      history.checkpointIdentityMatches !== true ||
+      history.hasProviderEvidence !== true ||
+      checkpointIdentity.runId !== binding.runId ||
+      checkpointIdentity.companyId !== binding.companyId ||
+      checkpointIdentity.issueId !== binding.issueId ||
+      checkpointIdentity.agentId !== binding.agentId ||
+      checkpointIdentity.sessionId !== current.nativeSessionId ||
+      history.processPid !== prior.processPid ||
+      history.processStartedAt !== prior.processStartedAt?.toISOString() ||
+      processEvidence.runnerPid !== prior.processPid ||
+      processEvidence.runnerProcessGroupId !== prior.processGroupId ||
+      prior.processGroupId !== prior.processPid ||
+      !cleanupProcessAbsent(prior.processPid)
+    )
+      return deny();
+    // Recheck every independently retained provider owner, including process
+    // groups. These are DB/checkpoint facts, not claims in a copied journal.
+    const known = history.knownProviderPids;
+    if (
+      !Array.isArray(known) ||
+      known.length === 0 ||
+      known.length > 16 ||
+      ![
+        history.liveProviderPids,
+        history.ambiguousProviderPids,
+        history.recycledProviderPids,
+      ].every((pids) => Array.isArray(pids) && pids.length === 0)
+    )
+      return deny();
+    const checkpointPids = new Set<number>();
+    for (const [pidKey, startedKey] of [
+      ["providerPid", "providerProcessStartedAt"],
+      ["codexPid", "codexProcessStartedAt"],
+      ["sidecarPid", "sidecarProcessStartedAt"],
+      ["agentPid", "agentProcessStartedAt"],
+    ] as const) {
+      const pid = processEvidence[pidKey];
+      if (pid === null || pid === undefined) continue;
+      if (
+        typeof processEvidence[startedKey] !== "string" ||
+        !Number.isFinite(Date.parse(processEvidence[startedKey] as string)) ||
+        !cleanupProcessAbsent(pid)
+      )
+        return deny();
+      checkpointPids.add(pid);
+    }
+    if (
+      checkpointPids.size === 0 ||
+      new Set(known).size !== checkpointPids.size ||
+      known.some(
+        (pid) =>
+          typeof pid !== "number" ||
+          !checkpointPids.has(pid) ||
+          !cleanupProcessAbsent(pid),
+      )
+    )
+      return deny();
+    // These fences remain relevant if maintenance evidence appears after
+    // initial construction. Every later registration/launch/auth gate repeats
+    // them; no settled receipt or pending transition bypasses quarantine.
+    await assertRetainedNativeSourceArchiveSettled(tx as unknown as Db, {
+      companyId: binding.companyId,
+      issueId: binding.issueId,
+      stateKey: basename(root),
+    });
+    await assertCleanupActivationCommitted(
+      tx as unknown as Db,
+      root,
+      input.execution,
+    );
+    finalAuthorityCheck = () => {
+      if (
+        readWarmTransitionSnapshot(root).stateFingerprint !==
+        snapshot.stateFingerprint
+      )
+        return false;
+      const selected = readRunnerdArtifactBinding(
+        resolvePaperclipRunnerBinary(),
+      );
+      if (
+        selected.version !== artifact.version ||
+        selected.digest !== artifact.digest
+      )
+        return false;
+      const finalProof = inspectWarmRunTransition({
+        ...inspectionInput,
+        now: Date.now(),
+      });
+      return (
+        coordinator.leaseExpiresAt!.getTime() > Date.now() &&
+        finalProof?.receipt.transitionId === proof.receipt.transitionId &&
+        finalProof.receipt.leaseExpiresAtUnixMs > Date.now()
+      );
+    };
+    if (!finalAuthorityCheck()) return deny();
+    return {
+      runnerInstanceId: current.runnerInstanceId,
+      environmentLeaseId: expectedEnvironmentLeaseId,
+      transitionId: proof.receipt.transitionId,
+      stateFingerprint: snapshot.stateFingerprint,
+    };
+  });
+  // A lock wait or the transaction completion itself can outlive a lease.
+  // Never carry a timestamp sampled before those awaits into admission.
+  if (!finalAuthorityCheck?.()) return deny();
+  return verified;
+}
+
 async function migrateRunnerdStateRootForExecution(input: {
   db: Db;
   execution: NativeExecutionInput;
   allowVerifiedBackup: boolean;
   allowRetainedWarmRunner: boolean;
   restartRecovery?: NativeRestartRecoveryClaim;
-}): Promise<void> {
+  runnerExecutionTarget?: AdapterExecutionTarget | null;
+}): Promise<VerifiedWarmTransitionBinding | undefined> {
   const scoped = scopedRunnerdStateRoot(input.execution);
   // A crash can leave a source archive intent before/after its rename. Until
   // that exact maintenance is settled, absence of a canonical root is not
@@ -3563,6 +4007,13 @@ async function migrateRunnerdStateRootForExecution(input: {
   if (existsSync(scoped)) {
     if (!isSafeNativeStateDirectory(scoped)) {
       throw new Error("runner_state_directory_unsafe");
+    }
+    if (hasRetainedWarmTransitionEvidence(scoped)) {
+      // A copied receipt is not restart/process authority. Keep both valid
+      // unsupported and invalid forward evidence out of destructive legacy
+      // migration until the exact transition admission path proves its owner.
+      const verified = await verifyWarmTransitionRestart(input);
+      return verified;
     }
     await assertCleanupActivationCommitted(input.db, scoped, input.execution);
     const identity = readRunnerdDurableIdentity(scoped);
@@ -3809,10 +4260,22 @@ function runnerdStateRoot(execution: NativeExecutionInput): string {
   return scoped;
 }
 
-function loadRunnerdDurableBinding(execution: NativeExecutionInput): {
+function loadRunnerdDurableBinding(
+  execution: NativeExecutionInput,
+  transition?: VerifiedWarmTransitionBinding,
+): {
   runnerInstanceId: string;
   environmentLeaseId: string;
 } | null {
+  if (transition) {
+    if (
+      readWarmTransitionSnapshot(runnerdStateRoot(execution))
+        .stateFingerprint !== transition.stateFingerprint
+    ) {
+      throw new Error("native_runner_warm_transition_recovery_unproven");
+    }
+    return transition;
+  }
   const identity = readRunnerdDurableIdentity(runnerdStateRoot(execution));
   // The run id is intentionally different during a continuation. Reuse only
   // the verified runner/lease binding from the same company-scoped durable
@@ -5895,8 +6358,9 @@ async function executePaperclipNativeSessionWithinScope(
   if (environmentScope) {
     await trace.end(environmentScope, { endedAtMs: environmentEndedAtMs });
   }
+  let retainedTransition: VerifiedWarmTransitionBinding | undefined;
   if (input.useRunnerd) {
-    await migrateRunnerdStateRootForExecution({
+    retainedTransition = await migrateRunnerdStateRootForExecution({
       db: input.db,
       execution: input.execution,
       allowVerifiedBackup:
@@ -5908,10 +6372,11 @@ async function executePaperclipNativeSessionWithinScope(
       // durable-state verifier continues to require a suspended runner.
       allowRetainedWarmRunner: hasIdleWarmNativeSessionOwner(input),
       restartRecovery: input.restartRecovery,
+      runnerExecutionTarget: input.runnerExecutionTarget,
     });
   }
   const durableRunnerBinding = input.useRunnerd
-    ? loadRunnerdDurableBinding(input.execution)
+    ? loadRunnerdDurableBinding(input.execution, retainedTransition)
     : null;
   const effectiveRunnerInstanceId =
     durableRunnerBinding?.runnerInstanceId ?? input.runnerInstanceId;
@@ -8399,6 +8864,7 @@ export async function createRunnerdBackend(input: {
   }
   initializingSessionToolAuthorities.add(sessionScopeId);
   try {
+    let retainedTransition: VerifiedWarmTransitionBinding | undefined;
     // executePaperclipNativeSession holds the full session-scope claim and
     // verifies/migrates the durable root before it acquires the coordinator
     // lease. Avoid reclassifying the same root after that path has marked its
@@ -8406,9 +8872,10 @@ export async function createRunnerdBackend(input: {
     // performs the complete fail-closed verification here.
     if (
       executingRunnerdSessionScopes.get(sessionScopeId) !==
-      input.execution.binding.runId
+        input.execution.binding.runId ||
+      hasRetainedWarmTransitionEvidence(scopedRunnerdStateRoot(input.execution))
     ) {
-      await migrateRunnerdStateRootForExecution({
+      retainedTransition = await migrateRunnerdStateRootForExecution({
         db: input.db,
         execution: input.execution,
         allowVerifiedBackup:
@@ -8416,9 +8883,14 @@ export async function createRunnerdBackend(input: {
           input.runnerExecutionTarget.transport === "sandbox",
         allowRetainedWarmRunner: false,
         restartRecovery: input.restartRecovery,
+        runnerExecutionTarget: input.runnerExecutionTarget,
       });
     }
-    return await createRunnerdBackendWithinSessionClaim(input, sessionScopeId);
+    return await createRunnerdBackendWithinSessionClaim(
+      input,
+      sessionScopeId,
+      retainedTransition,
+    );
   } finally {
     initializingSessionToolAuthorities.delete(sessionScopeId);
   }
@@ -8427,7 +8899,9 @@ export async function createRunnerdBackend(input: {
 async function createRunnerdBackendWithinSessionClaim(
   input: Parameters<typeof createRunnerdBackend>[0],
   sessionScopeId: string,
+  retainedTransition?: VerifiedWarmTransitionBinding,
 ): Promise<NativeSessionBackend> {
+  let recoveryPending = retainedTransition !== undefined;
   const target = input.runnerExecutionTarget ?? { kind: "local" as const };
   const currentWakeComments = await resolveCurrentWakeCommentsBinding(
     input.db,
@@ -8461,12 +8935,11 @@ async function createRunnerdBackendWithinSessionClaim(
   }
   const root = runnerdStateRoot(input.execution);
   const durableIdentity = readRunnerdDurableIdentity(root);
-  const durableBinding = durableIdentityMatchesSession(
-    durableIdentity,
-    input.execution,
-  )
-    ? durableIdentity
-    : null;
+  const durableBinding = retainedTransition
+    ? loadRunnerdDurableBinding(input.execution, retainedTransition)
+    : durableIdentityMatchesSession(durableIdentity, input.execution)
+      ? durableIdentity
+      : null;
   const effectiveRunnerInstanceId =
     durableBinding?.runnerInstanceId ?? input.runnerInstanceId;
   const effectiveEnvironmentLeaseId =
@@ -9910,6 +10383,9 @@ async function createRunnerdBackendWithinSessionClaim(
         PAPERCLIP_WORKSPACE_CWD: input.execution.workspace.cwd,
       };
   const archiveContinuityState = async () => {
+    if (hasRetainedWarmTransitionEvidence(root)) {
+      throw new Error("native_runner_warm_transition_recovery_unproven");
+    }
     const archiveToken = `${Date.now()}-${randomUUID()}`;
     const archiveRoot = resolve(root, "continuity-breaks", archiveToken);
     mkdirSync(archiveRoot, { recursive: true, mode: 0o700 });
@@ -9955,7 +10431,8 @@ async function createRunnerdBackendWithinSessionClaim(
     return current.execute(call);
   };
   const backend = createNativeSessionBackend(runnerExecution, {
-    runnerInstanceId: input.runnerInstanceId,
+    runnerInstanceId:
+      retainedTransition?.runnerInstanceId ?? input.runnerInstanceId,
     environment: effectiveRunnerEnvironment,
     workingDirectoryAuthority: remoteTarget
       ? "remote_runner"
@@ -10145,8 +10622,53 @@ async function createRunnerdBackendWithinSessionClaim(
           turnId: `turn-${input.execution.binding.runId}`,
           itemId: `item-${input.execution.binding.runId}`,
         },
-        controlPlaneRegistration: (authority, attachmentIdentity) =>
-          measureNativeRunnerSpan(
+        warmTransitionRegistrationMode: retainedTransition
+          ? "routed_connect"
+          : undefined,
+        authorizeWarmTransitionRecovery: retainedTransition
+          ? async (
+              stage:
+                "before_bootstrap" | "before_spawn" | "before_authentication",
+            ) => {
+              if (!recoveryPending) return;
+              const current = await verifyWarmTransitionRestart(input);
+              if (
+                current.transitionId !== retainedTransition.transitionId ||
+                (stage === "before_bootstrap" &&
+                  current.stateFingerprint !==
+                    retainedTransition.stateFingerprint)
+              ) {
+                throw new Error(
+                  "native_runner_warm_transition_recovery_unproven",
+                );
+              }
+            }
+          : undefined,
+        onWarmTransitionRecoveryCompleted: retainedTransition
+          ? (completed: { transitionId: string }) => {
+              // Only the package's fresh completed new-authority snapshot can
+              // reach this callback. A tombstone or caller hint cannot retire
+              // the server's pending-recovery admission checks.
+              if (completed?.transitionId !== retainedTransition.transitionId) {
+                throw new Error(
+                  "native_runner_warm_transition_recovery_unproven",
+                );
+              }
+              recoveryPending = false;
+            }
+          : undefined,
+        controlPlaneRegistration: async (authority, attachmentIdentity) => {
+          if (retainedTransition && recoveryPending) {
+            const current = await verifyWarmTransitionRestart(input);
+            if (
+              current.stateFingerprint !== retainedTransition.stateFingerprint
+            ) {
+              throw new Error(
+                "native_runner_warm_transition_recovery_unproven",
+              );
+            }
+          }
+          return measureNativeRunnerSpan(
             input.trace,
             "runner.transport.connect",
             async () => {
@@ -10376,7 +10898,8 @@ async function createRunnerdBackendWithinSessionClaim(
                 },
               };
             },
-          ),
+          );
+        },
       }).transport,
   });
   const priorAuthorityEpoch = sessionToolAuthorityEpochs.get(sessionScopeId);

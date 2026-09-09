@@ -16,6 +16,8 @@ use crate::provider_bridge::{semantic_value_digest, MAX_COMPLETION_SUMMARY_CHARS
 use super::{DurableRunnerConfig, DurableRunnerError, PROTOCOL, PROTOCOL_VERSION};
 
 const STATE_SCHEMA: &str = "paperclip.runner.durable.state.v1";
+pub(crate) const TRANSITION_STATE_SCHEMA: &str =
+    "paperclip.runner.durable.state.warm-transition.v1";
 const STATE_FILE: &str = "runner-state.json";
 const MAX_RECENT_COMMANDS: usize = 128;
 const MAX_DIAGNOSTICS: usize = 32;
@@ -162,6 +164,104 @@ pub(crate) struct PendingTerminalDelivery {
     pub(crate) lifecycle: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WarmRunIdentity {
+    pub runner_instance_id: String,
+    pub environment_lease_id: String,
+    pub run_id: String,
+    pub normalized_session_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+}
+
+impl WarmRunIdentity {
+    pub(crate) fn from_config(config: &DurableRunnerConfig) -> Self {
+        Self {
+            runner_instance_id: config.runner_instance_id.clone(),
+            environment_lease_id: config.environment_lease_id.clone(),
+            run_id: config.run_id.clone(),
+            normalized_session_id: config.normalized_session_id.clone(),
+            turn_id: config.turn_id.clone(),
+            item_id: config.item_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct WarmRunTransition {
+    pub schema: String,
+    pub transition_id: String,
+    pub old_identity: WarmRunIdentity,
+    pub new_identity: WarmRunIdentity,
+    pub command_id: String,
+    pub controller_seq: u64,
+    pub command_fingerprint: String,
+    pub result_digest: String,
+    pub old_acked_source_seq: u64,
+    pub connection: Value,
+    pub runner_version: String,
+    pub runner_digest: String,
+    pub lease_id: String,
+    pub lease_expires_at_unix_ms: u64,
+    pub lease_revocation_epoch: u64,
+}
+
+impl WarmRunTransition {
+    pub(crate) fn new(
+        config: &DurableRunnerConfig,
+        next: &DurableRunnerConfig,
+        command: &Command,
+        result: &StoredCommandResult,
+        ack: u64,
+        lease_id: String,
+        lease_expires_at_unix_ms: u64,
+        lease_revocation_epoch: u64,
+    ) -> Result<Self, DurableRunnerError> {
+        let mut receipt = Self {
+            schema: "paperclip.runner.warm-transition.v1".to_owned(),
+            transition_id: String::new(),
+            old_identity: WarmRunIdentity::from_config(config),
+            new_identity: WarmRunIdentity::from_config(next),
+            command_id: command.command_id.clone(),
+            controller_seq: command.controller_seq,
+            command_fingerprint: command_fingerprint(command)?,
+            result_digest: canonical_digest(
+                &serde_json::to_value(result)
+                    .map_err(|error| DurableRunnerError::invalid(error.to_string()))?,
+            ),
+            old_acked_source_seq: ack,
+            connection: command
+                .payload
+                .pointer("/paperclipNextAuthority/connection")
+                .cloned()
+                .ok_or_else(|| DurableRunnerError::invalid("warm transition connection missing"))?,
+            runner_version: config.runner_version.clone(),
+            runner_digest: config.runner_digest.clone(),
+            lease_id,
+            lease_expires_at_unix_ms,
+            lease_revocation_epoch,
+        };
+        let mut body = serde_json::to_value(&receipt)
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        body.as_object_mut()
+            .expect("receipt object")
+            .remove("transitionId");
+        receipt.transition_id = canonical_digest(&body);
+        Ok(receipt)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PendingWarmRunTransition {
+    pub receipt: WarmRunTransition,
+    pub phase: String,
+    pub command: Command,
+    pub result: StoredCommandResult,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecutorEventReceipt {
@@ -203,6 +303,8 @@ pub struct DurableState {
     pub(crate) pending_terminal_delivery: Option<PendingTerminalDelivery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_provider_cleanup: Option<PendingTerminalDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) warm_transition: Option<PendingWarmRunTransition>,
     #[serde(default)]
     executor_event_receipts: BTreeMap<String, ExecutorEventReceipt>,
     pub diagnostics: Vec<String>,
@@ -234,6 +336,7 @@ impl DurableState {
             processed_command_fingerprints: BTreeMap::new(),
             pending_terminal_delivery: None,
             pending_provider_cleanup: None,
+            warm_transition: None,
             executor_event_receipts: BTreeMap::new(),
             diagnostics: Vec::new(),
             backpressure: false,
@@ -714,7 +817,7 @@ fn command_result(command: &Command, status: &str, result: Value) -> StoredComma
     }
 }
 
-fn command_fingerprint(command: &Command) -> Result<String, DurableRunnerError> {
+pub(crate) fn command_fingerprint(command: &Command) -> Result<String, DurableRunnerError> {
     let value = serde_json::to_value(command).map_err(|error| {
         DurableRunnerError::invalid(format!("failed to fingerprint durable command: {error}"))
     })?;
@@ -726,6 +829,10 @@ fn command_fingerprint(command: &Command) -> Result<String, DurableRunnerError> 
         fingerprint.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     Ok(fingerprint)
+}
+
+pub(crate) fn canonical_digest(value: &Value) -> String {
+    format!("{:x}", Sha256::digest(canonical_json(value).as_bytes()))
 }
 
 fn executor_event_fingerprint(
@@ -915,7 +1022,7 @@ fn validate_binding(
     config: &DurableRunnerConfig,
     allow_legacy_command_journal: bool,
 ) -> Result<(), DurableRunnerError> {
-    if state.schema != STATE_SCHEMA
+    if (state.schema != STATE_SCHEMA && state.schema != TRANSITION_STATE_SCHEMA)
         || state.runner_instance_id != config.runner_instance_id
         || state.environment_lease_id != config.environment_lease_id
         || state.run_id != config.run_id
@@ -928,6 +1035,67 @@ fn validate_binding(
         return Err(DurableRunnerError::invalid(
             "durable state binding does not match this runner invocation",
         ));
+    }
+    match &state.warm_transition {
+        None if state.schema == STATE_SCHEMA => {}
+        Some(transition) if state.schema == TRANSITION_STATE_SCHEMA => {
+            if !matches!(transition.phase.as_str(), "prepared" | "activating")
+                || state.pending_terminal_delivery.is_some()
+                || state.pending_provider_cleanup.is_some()
+                || !state.outbox.is_empty()
+                || transition.result.status != "completed"
+                || transition.result.command_id != transition.command.command_id
+                || transition.result.controller_seq != transition.command.controller_seq
+                || transition.result.command_type != "run.attach"
+            {
+                return Err(DurableRunnerError::invalid(
+                    "warm transition state is inconsistent",
+                ));
+            }
+            transition.command.validate()?;
+            let mut old = config.clone();
+            let identity = &transition.receipt.old_identity;
+            old.runner_instance_id = identity.runner_instance_id.clone();
+            old.environment_lease_id = identity.environment_lease_id.clone();
+            old.run_id = identity.run_id.clone();
+            old.normalized_session_id = identity.normalized_session_id.clone();
+            old.turn_id = identity.turn_id.clone();
+            old.item_id = identity.item_id.clone();
+            old.validate()?;
+            let next = super::runner::next_authority_config(&transition.command, &old)?
+                .ok_or_else(|| DurableRunnerError::invalid("warm transition has no target"))?;
+            let expected = WarmRunTransition::new(
+                &old,
+                &next,
+                &transition.command,
+                &transition.result,
+                transition.receipt.old_acked_source_seq,
+                transition.receipt.lease_id.clone(),
+                transition.receipt.lease_expires_at_unix_ms,
+                transition.receipt.lease_revocation_epoch,
+            )?;
+            if expected != transition.receipt
+                || WarmRunIdentity::from_config(config)
+                    != if transition.phase == "prepared" {
+                        expected.old_identity
+                    } else {
+                        expected.new_identity
+                    }
+                || (transition.phase == "prepared"
+                    && (state.acked_source_seq != expected.old_acked_source_seq
+                        || state.processed_commands.get(&transition.command.command_id)
+                            != Some(&transition.result)))
+            {
+                return Err(DurableRunnerError::invalid(
+                    "warm transition receipt binding is invalid",
+                ));
+            }
+        }
+        _ => {
+            return Err(DurableRunnerError::invalid(
+                "warm transition schema fence is invalid",
+            ))
+        }
     }
     let outbox_bytes = state.outbox.iter().try_fold(0_usize, |total, event| {
         let serialized = serde_json::to_vec(&event.envelope)
@@ -2023,6 +2191,105 @@ mod tests {
             "paperclip-runner-durable-{label}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn warm_transition_snapshot_is_exact_and_never_a_legacy_state() {
+        let directory = temporary_directory("warm-transition-binding");
+        let _ = fs::remove_dir_all(&directory);
+        let mut old = config(directory.clone());
+        old.runner_digest = format!("sha256:{}", "a".repeat(64));
+        let mut next = old.clone();
+        next.run_id = "run_2".to_owned();
+        next.turn_id = "turn_2".to_owned();
+        next.item_id = "item_2".to_owned();
+        let mut attach = command("attach_exact", 1);
+        attach.command_type = "run.attach".to_owned();
+        attach.payload = json!({"paperclipNextAuthority": {
+            "identity": WarmRunIdentity::from_config(&next),
+            "connection": {"mode": "connect", "connectUrl": next.connect_url},
+        }});
+        let mut state = DurableState::new(&old);
+        state.begin_command(&attach).unwrap();
+        let result = state
+            .complete_command(&attach, json!({"status": "attached"}))
+            .unwrap();
+        let receipt = WarmRunTransition::new(
+            &old,
+            &next,
+            &attach,
+            &result,
+            0,
+            "lease_exact".to_owned(),
+            1_800_000_000_000,
+            0,
+        )
+        .unwrap();
+        state.schema = TRANSITION_STATE_SCHEMA.to_owned();
+        state.warm_transition = Some(PendingWarmRunTransition {
+            receipt,
+            phase: "prepared".to_owned(),
+            command: attach,
+            result,
+        });
+        let store = DurableStateStore::new(&directory).unwrap();
+        store.save(&state).unwrap();
+        let (loaded, recovered) = store.load_or_create(&old).unwrap();
+        assert!(recovered);
+        assert_eq!(loaded.warm_transition, state.warm_transition);
+        assert!(
+            store.load_or_create(&next).is_err(),
+            "prepared state is old authority only"
+        );
+        let original = serde_json::to_value(&state).unwrap();
+        for (pointer, replacement) in [
+            ("/schema", json!(STATE_SCHEMA)),
+            ("/warmTransition/phase", json!("confirmed")),
+            (
+                "/warmTransition/receipt/transitionId",
+                json!("f".repeat(64)),
+            ),
+            (
+                "/warmTransition/receipt/newIdentity/runId",
+                json!("foreign_run"),
+            ),
+            ("/warmTransition/receipt/leaseExpiresAtUnixMs", json!(1)),
+            (
+                "/warmTransition/receipt/runnerDigest",
+                json!(format!("sha256:{}", "b".repeat(64))),
+            ),
+            (
+                "/warmTransition/receipt/connection/connectUrl",
+                json!("ws://127.0.0.1:9999/foreign"),
+            ),
+            ("/warmTransition/result/status", json!("failed")),
+            (
+                "/warmTransition/command/payload/paperclipNextAuthority/identity/itemId",
+                json!("foreign_item"),
+            ),
+            ("/ackedSourceSeq", json!(1)),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            let changed: DurableState = serde_json::from_value(changed).unwrap();
+            store.save(&changed).unwrap();
+            assert!(
+                store.load_or_create(&old).is_err(),
+                "mutated {pointer} must be rejected"
+            );
+        }
+        let mut activating = DurableState::new(&next);
+        activating.schema = TRANSITION_STATE_SCHEMA.to_owned();
+        let mut pending = state.warm_transition.clone().unwrap();
+        pending.phase = "activating".to_owned();
+        activating.warm_transition = Some(pending);
+        store.save(&activating).unwrap();
+        store.load_or_create(&next).unwrap();
+        assert!(
+            store.load_or_create(&old).is_err(),
+            "activating state is new authority only"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

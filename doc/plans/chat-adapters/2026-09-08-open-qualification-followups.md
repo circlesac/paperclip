@@ -7,23 +7,52 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
-September 9, 03:11 UTC: the wider private transport run is **119/124**, not
-green. James owns fixes for external legacy prepare ordering, stale test-held
-command references after atomic commits, rejected-attach failure policy and
-activation-failure cleanup. Root independently reproduced the ordinary second
-warm turn timeout twice: the provider and controller completed and ACKed the
-new run's seven events, but an early local cursor reset reread the previous
-run's twelve events while controller activation was still pending. Move local
-epoch/cursor reset to confirmed activation and fence the event pump; do not
-increase the timeout. The original three-turn regression must pass again.
+September 9, 03:32 UTC: the final optimized candidate now passes **133/133**
+full transport tests, zero skips, in **198.64 seconds**. Root independently
+passed the full focused recovery matrix **26/26**, controller **69/69**, optimized
+Rust lib **248/248**, adjacent server tests **75/75**, and generated real-classifier
+server admission **36/36** on fresh root02 with immutable optimized fixtures.
+Existing executor tests pass **260/260**. Review found no remaining blocker in
+this bounded protocol slice; unsupported recovery lanes remain denied. Root's
+real-Codex canary observer fix has genuine red-to-green proof on normal `2400740c…`.
+Next: finish scoped formatting, final source/package typechecks, commit/push,
+deliberately stage the exact `6279d39a…` candidate, run its real-Codex canary and
+restart the idle isolated live server. Live browser qualification still needs
+the Mac unlocked. This is not a completed provider-qualification claim.
 
-Server generated admission passed **27/27** at its seam (real checkpoint rebind,
-real restart classifier and guarded registration/lifecycle callbacks, no provider
-launch); existing executor tests passed **260/260**. These do not prove the
-combined package/server path. Independent review also requires coordinator lease
-time to be checked after database lock waits, not with a pre-transaction clock.
-The selected-artifact negative and final source/archive guards remain under
-review. No candidate is staged or deployed.
+September 9, 03:20 UTC: native recovery is still not ready to stage. The earlier
+full private transport run was **119/124**; the ordinary warm-turn cursor bug
+is now independently green (**4/4** selected cases), and activation-failure
+cleanup has a concrete socket-FIN red-to-green fix. A fresh full transport run
+is underway. Review then found another lifecycle defect: recovery-only server
+authorization survives successful recovery and can reject the next ordinary
+reconnect or warm attach. James and Epicurus are fixing that boundary, with
+Boole independently reviewing completion authority and replay. Retire the
+recovery-only fence only after a fresh authenticated new-authority snapshot
+proves final activation ACK, never from a completed receipt alone.
+
+Root independently passed generated server admission **33/33** in **17.45
+seconds** on fresh `chat_warm_transition_admission_20260909_root01`. This seam
+uses real checkpoint rebind and the real restart classifier with guarded
+registration/lifecycle callbacks, but no provider launch; it is not combined
+server-to-provider recovery qualification. Existing executor tests passed
+**260/260**. Fresh lease decisions after DB lock waits, post-transaction TTL
+checks and repeated archive/cleanup guards are included. New lifecycle changes
+require another rerun. The normal runner remains `2400740c…` and server 68
+remains loaded `3a2a911bd`; root is compiling the optimized candidate without
+staging it. The latest actual browser probe reports the Mac locked. Browser
+qualification is paused until it is unlocked; code and test work continues.
+
+Verification caution (03:24 UTC): server `pnpm typecheck` invokes
+`prepare:runner-vendor`, which performs a full package build and stages the
+runner. Root inadvertently used it and briefly replaced the normal binary with
+optimized candidate `6279d39a…`; the exact qualified `2400740c…` was immediately
+restored from its preserved backup, re-signed and strict-verified. Server 68 was
+not restarted. Live DB audit still shows 290 terminal runs, zero active, with
+the newest start at 02:15:47 UTC and no subsequent run updates. Use
+`pnpm exec tsc --noEmit` in `server/` after an explicit package TS-only build
+until intentional staging is authorized by the final qualification gates.
+Do not describe the normal binary as continuously unchanged through this check.
 
 September 9, 03:06 UTC: Slack/Discord partial-file restart tests are frozen and
 pass **2/2** focused. Root's full chat integration rerun passes **612/612**, zero

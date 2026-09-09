@@ -3170,3 +3170,71 @@ actually timed-out provider accepted the uncertain file, which is why explicit
 duplicate-risk acceptance remains required.
 Root's full chat integration rerun passed **612/612**, zero skips, in
 **110.37 seconds**, using fresh `chat_adapters_multifile_restart_20260909_root01`.
+
+### September 9: crash-safe warm attachment and post-recovery lifecycle
+
+The candidate replaces the ambiguous warm-attachment handoff with a durable
+receipt binding the exact old/new run identities, attachment command and result,
+event ACK cursor, endpoint, artifact and unchanged participating lease. The
+runner persists preparation before returning its result; the controller persists
+the result before acknowledging it. Old authority can replay only the matching
+result and ACK, not admit ordinary work. New authority activates only with the
+same authenticated receipt. The runner retains that receipt until it receives
+the final activation ACK, so a lost confirmation remains recoverable without
+treating a historical completion record as new authority.
+
+Review and real-process regressions caught additional defects along this path:
+
+- Resetting the local event cursor before controller activation reread the old
+  run's event prefix and skipped the new run's completed events. Epoch identity
+  fencing and reset after activation fix the ordinary three-turn timeout.
+- A TCP FIN without a WebSocket close frame left an upgraded socket half-open
+  and prevented activation-failure cleanup from finishing. The owned wire now
+  closes on the remote end event.
+- Recovery-only server authorization incorrectly survived successful recovery,
+  rejecting later normal reconnects and warm attachments. A fresh, uniquely
+  queued, authenticated new-authority snapshot now proves final ACK consumption
+  before retiring that recovery-only fence. Missing/rejected/wrong snapshots,
+  callback exceptions and asynchronous rejection leave ordinary work denied.
+  The fence starts before asynchronous registration/bootstrap, so concurrent
+  turns, attachments and runtime responses cannot race it.
+- An injected crash fixture allowed a later replay to finish while its original
+  process was joining. The loss is now sustained at the actual persistence
+  boundary and both immutable snapshots are checked after the owned processes
+  finish. No saved receipt is rewritten to manufacture the intended crash state.
+
+The server admits only independently proved local Codex `resume_dead_runner`
+recovery, including managed and projectless/transient workspaces. Real current
+run ownership, frozen input, prior terminal owner, process-birth evidence,
+selected artifact and cleanup boundaries are checked before registration,
+bootstrap, spawn and authentication. Lease time is re-evaluated after database
+lock waits. Pending evidence is preserved on denial. Surviving-runner adoption,
+remote/listen recovery and historical quarantines are not enabled by this slice.
+
+Root's optimized runner has SHA
+`6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`.
+The full optimized transport suite passed **133/133**, zero skips, in **198.64
+seconds**. Independent focused recovery verification passed **26/26** in
+**57.14 seconds**, controller **69/69**, optimized Rust library **248/248**, and
+adjacent server tests **75/75**. Existing executor tests passed **260/260**.
+The real-classifier server admission matrix passed **36/36** in **17.75
+seconds** on fresh `chat_warm_transition_admission_20260909_root02` with
+immutable optimized-artifact fixtures. That server seam mocks the backend after
+admission: it is not server-to-provider end-to-end recovery qualification.
+
+The real-Codex startup canary also exposed a stale test observer: atomic commits
+replace command snapshots, so retaining the object returned by `queueCommand`
+never observes its changed status. Reading status/result through stable command
+IDs fixes the canary without weakening assertions. The genuine red-to-green
+check used Codex **0.153.4** and the old qualified runner `2400740c…`, exactly one
+provider process, initialization plus attempted resume, and no model turn. A
+reopen sent no provider RPC and preserved the original failed-startup receipt.
+Direct-child exit was observed; whole-tree retirement was not asserted.
+
+One verification mistake was contained: `server`'s `pnpm typecheck` invokes the
+full runner build and briefly staged the optimized binary. Root restored the
+exact signed `2400740c…` backup and verified its hash and signature. Server 68
+was not restarted; live run audit remained 290 terminal runs and zero active,
+with no new run since 02:15:47 UTC. Subsequent server checks use direct
+`pnpm exec tsc --noEmit` after explicit TS-only dependency builds. The Mac is
+currently locked, so no new live-provider browser result is claimed here.

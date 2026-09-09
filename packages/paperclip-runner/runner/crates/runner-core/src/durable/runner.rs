@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 
 use super::state::{
     Command, CommandDisposition, DurableState, DurableStateStore, EventPriority,
-    PendingTerminalDelivery, StoredCommandResult,
+    PendingTerminalDelivery, PendingWarmRunTransition, StoredCommandResult, WarmRunTransition,
+    TRANSITION_STATE_SCHEMA,
 };
 use super::transport::{
     current_unix_ms, validate_control_identity, AuthenticatedTransport, ConnectionMetadata,
@@ -117,7 +118,7 @@ impl CommandLifecycle {
     }
 }
 
-fn next_authority_config(
+pub(crate) fn next_authority_config(
     command: &Command,
     current: &DurableRunnerConfig,
 ) -> Result<Option<DurableRunnerConfig>, DurableRunnerError> {
@@ -218,15 +219,20 @@ fn apply_authority_rotation(
         ));
     }
     let reconnect_count = state.reconnect_count.saturating_add(1);
-    let mut diagnostics = std::mem::take(&mut state.diagnostics);
-    endpoint.rotate(&next.connect_url, &next.run_id)?;
-    *config = next;
-    let mut rotated = DurableState::new(config);
+    let mut diagnostics = state.diagnostics.clone();
+    let mut rotated = DurableState::new(&next);
+    if let Some(mut transition) = state.warm_transition.clone() {
+        transition.phase = "activating".to_owned();
+        rotated.warm_transition = Some(transition);
+        rotated.schema = TRANSITION_STATE_SCHEMA.to_owned();
+    }
     rotated.reconnect_count = reconnect_count;
     rotated.diagnostics.append(&mut diagnostics);
     rotated.record_diagnostic("runner advanced to a new warm run authority");
+    store.save(&rotated)?;
     *state = rotated;
-    store.save(state)
+    *config = next;
+    endpoint.rotate(&config.connect_url, &config.run_id)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,7 +295,14 @@ fn shutdown_preserving_cleanup<E: CommandExecutor>(
     state: &DurableState,
     executor: &mut E,
 ) -> Result<(), DurableRunnerError> {
-    if state.pending_terminal_delivery.is_some() || state.pending_provider_cleanup.is_some() {
+    if state.warm_transition.is_some() {
+        // A replacement executor may not have restored any provider. Its
+        // ordinary shutdown hook is allowed to restore, so never invoke that
+        // hook while only reconciling an authority receipt. Owned process
+        // handles retain their normal drop/physical cleanup responsibilities.
+        Ok(())
+    } else if state.pending_terminal_delivery.is_some() || state.pending_provider_cleanup.is_some()
+    {
         executor.reconcile_terminal_delivery().map(|_| ())
     } else {
         executor.shutdown()
@@ -355,7 +368,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
     {
         return Ok(());
     }
-    if recovered {
+    if recovered && state.warm_transition.is_none() {
         state.reconnect_count = state.reconnect_count.saturating_add(1);
         state.record_diagnostic("runner restored its durable identity after process recovery");
         state.enqueue_event(
@@ -480,6 +493,87 @@ pub fn run_durable_runner<E: CommandExecutor>(
             state.apply_ack(acked_source_seq)?;
         }
         let connection = welcome.connection;
+        if let Some(transition) = state.warm_transition.clone() {
+            if welcome.warm_transition_version != Some(1) {
+                return Err(DurableRunnerError::invalid(
+                    "warm transition capability was downgraded",
+                ));
+            }
+            if transition.phase == "activating" {
+                if welcome.warm_transition_phase.as_deref() != Some("activated")
+                    || connection.lease_id != transition.receipt.lease_id
+                    || connection.expires_at_unix_ms != transition.receipt.lease_expires_at_unix_ms
+                    || connection.revocation_epoch != transition.receipt.lease_revocation_epoch
+                    || welcome.warm_transition.as_ref()
+                        != Some(
+                            &serde_json::to_value(&transition.receipt)
+                                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?,
+                        )
+                    || !welcome.pending_commands.is_empty()
+                {
+                    return Err(DurableRunnerError::invalid(
+                        "new warm authority was not activated exactly",
+                    ));
+                }
+                // Retain the downgrade-fenced receipt until the controller
+                // durably records completion and acknowledges it. Neither a
+                // successful write nor a welcome alone proves that boundary.
+                if let Err(error) = confirm_warm_activation(
+                    &mut transport,
+                    &state,
+                    &connection,
+                    &transition.receipt,
+                ) {
+                    state.record_diagnostic(format!(
+                        "warm activation confirmation interrupted: {error}"
+                    ));
+                    store.save(&state)?;
+                    disconnected_since = Some(Instant::now());
+                    continue;
+                }
+                let mut activated = state.clone();
+                activated.warm_transition = None;
+                activated.schema = "paperclip.runner.durable.state.v1".to_owned();
+                store.save(&activated)?;
+                state = activated;
+                executor.rotate_authority(&config);
+            } else {
+                let next =
+                    next_authority_config(&transition.command, &config)?.ok_or_else(|| {
+                        DurableRunnerError::invalid("warm transition target disappeared")
+                    })?;
+                let mut sent = state.acked_source_seq;
+                match deliver_warm_attachment(
+                    &mut transport,
+                    &mut state,
+                    &store,
+                    &config,
+                    &next,
+                    &connection,
+                    &transition.command,
+                    &transition.result,
+                    &mut sent,
+                ) {
+                    Ok(()) => {
+                        apply_authority_rotation(
+                            &mut state,
+                            &store,
+                            &mut config,
+                            &mut endpoint,
+                            next,
+                        )?;
+                    }
+                    Err(error) => {
+                        state.record_diagnostic(format!(
+                            "warm attachment receipt replay interrupted: {error}"
+                        ));
+                        store.save(&state)?;
+                    }
+                }
+                disconnected_since = Some(Instant::now());
+                continue;
+            }
+        }
         if state.pending_terminal_delivery.is_some() {
             return reconcile_pending_terminal_delivery(
                 &mut state,
@@ -502,6 +596,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
         let mut disconnected = false;
         for command in welcome.pending_commands {
             let next_authority = next_authority_config(&command, &config)?;
+            require_warm_transition_capability(&next_authority, welcome.warm_transition_version)?;
             let (result, lifecycle) =
                 process_command(&mut state, &store, &config, &mut executor, &command)?;
             let next_authority = next_authority.filter(|_| completed_attachment(&result));
@@ -515,14 +610,18 @@ pub fn run_durable_runner<E: CommandExecutor>(
             }
             lifecycle_after_reply = lifecycle_after_reply.merge(lifecycle);
             let delivery = (|| {
-                if next_authority.is_some() {
-                    wait_for_old_authority_outbox_ack(
+                if let Some(next) = &next_authority {
+                    return deliver_warm_attachment(
                         &mut transport,
                         &mut state,
                         &store,
+                        &config,
+                        next,
                         &connection,
+                        &command,
+                        &result,
                         &mut sent_source_seq,
-                    )?;
+                    );
                 } else if result.status == "failed" {
                     send_outbox(&mut transport, &state, &mut sent_source_seq)?;
                 }
@@ -568,7 +667,6 @@ pub fn run_durable_runner<E: CommandExecutor>(
         }
         if let Some(next) = authority_rotation {
             apply_authority_rotation(&mut state, &store, &mut config, &mut endpoint, next)?;
-            executor.rotate_authority(&config);
             disconnected_since = Some(Instant::now());
             continue;
         }
@@ -676,6 +774,10 @@ pub fn run_durable_runner<E: CommandExecutor>(
                             DurableRunnerError::invalid(format!("command is malformed: {error}"))
                         })?;
                     let next_authority = next_authority_config(&command, &config)?;
+                    require_warm_transition_capability(
+                        &next_authority,
+                        welcome.warm_transition_version,
+                    )?;
                     let (result, lifecycle) =
                         process_command(&mut state, &store, &config, &mut executor, &command)?;
                     let next_authority = next_authority.filter(|_| completed_attachment(&result));
@@ -688,14 +790,18 @@ pub fn run_durable_runner<E: CommandExecutor>(
                         )?;
                     }
                     let delivery = (|| {
-                        if next_authority.is_some() {
-                            wait_for_old_authority_outbox_ack(
+                        if let Some(next) = &next_authority {
+                            return deliver_warm_attachment(
                                 &mut transport,
                                 &mut state,
                                 &store,
+                                &config,
+                                next,
                                 &connection,
+                                &command,
+                                &result,
                                 &mut sent_source_seq,
-                            )?;
+                            );
                         } else if result.status == "failed" {
                             send_outbox(&mut transport, &state, &mut sent_source_seq)?;
                         }
@@ -740,7 +846,6 @@ pub fn run_durable_runner<E: CommandExecutor>(
                             &mut endpoint,
                             next,
                         )?;
-                        executor.rotate_authority(&config);
                         disconnected_since = Some(Instant::now());
                         break;
                     }
@@ -1029,6 +1134,165 @@ fn wait_for_old_authority_outbox_ack(
         }
     }
     Ok(())
+}
+
+fn require_warm_transition_capability(
+    next: &Option<DurableRunnerConfig>,
+    version: Option<u64>,
+) -> Result<(), DurableRunnerError> {
+    if next.is_some() && version != Some(1) {
+        return Err(DurableRunnerError::invalid(
+            "warm transition capability is required before attachment",
+        ));
+    }
+    Ok(())
+}
+
+fn confirm_warm_activation(
+    transport: &mut AuthenticatedTransport,
+    state: &DurableState,
+    connection: &ConnectionMetadata,
+    receipt: &WarmRunTransition,
+) -> Result<(), DurableRunnerError> {
+    transport.send_json(&control_envelope(
+        state,
+        connection,
+        "warm_transition_activated",
+        json!({"transitionId": receipt.transition_id}),
+    ))?;
+    let deadline = Instant::now() + TERMINAL_RESULT_ACK_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(DurableRunnerError::invalid(
+                "warm activation acknowledgement timed out",
+            ));
+        }
+        let Some(message) = transport.receive_json()? else {
+            continue;
+        };
+        validate_control_identity(&message, state, Some(connection))?;
+        match message.get("kind").and_then(Value::as_str) {
+            Some("warm_transition_activated_ack")
+                if message
+                    .pointer("/payload/transitionId")
+                    .and_then(Value::as_str)
+                    == Some(receipt.transition_id.as_str()) =>
+            {
+                return Ok(())
+            }
+            Some("ping") => {
+                transport.send_json(&control_envelope(state, connection, "pong", json!({})))?
+            }
+            _ => {
+                return Err(DurableRunnerError::invalid(
+                    "warm activation fence received unrelated control",
+                ))
+            }
+        }
+    }
+}
+
+fn deliver_warm_attachment(
+    transport: &mut AuthenticatedTransport,
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    next: &DurableRunnerConfig,
+    connection: &ConnectionMetadata,
+    command: &Command,
+    result: &StoredCommandResult,
+    sent_source_seq: &mut u64,
+) -> Result<(), DurableRunnerError> {
+    wait_for_old_authority_outbox_ack(transport, state, store, connection, sent_source_seq)?;
+    let receipt = WarmRunTransition::new(
+        config,
+        next,
+        command,
+        result,
+        state.acked_source_seq,
+        connection.lease_id.clone(),
+        connection.expires_at_unix_ms,
+        connection.revocation_epoch,
+    )?;
+    if let Some(pending) = &state.warm_transition {
+        if pending.phase != "prepared"
+            || pending.receipt != receipt
+            || pending.command != *command
+            || pending.result != *result
+        {
+            return Err(DurableRunnerError::invalid(
+                "warm attachment replay conflicts with its durable receipt",
+            ));
+        }
+    } else {
+        if state.pending_terminal_delivery.is_some() || state.pending_provider_cleanup.is_some() {
+            return Err(DurableRunnerError::invalid(
+                "warm attachment cannot cross a cleanup fence",
+            ));
+        }
+        let mut prepared = state.clone();
+        prepared.schema = TRANSITION_STATE_SCHEMA.to_owned();
+        prepared.warm_transition = Some(PendingWarmRunTransition {
+            receipt: receipt.clone(),
+            phase: "prepared".to_owned(),
+            command: command.clone(),
+            result: result.clone(),
+        });
+        store.save(&prepared)?;
+        *state = prepared;
+    }
+    transport.send_json(&command_result_envelope(state, result))?;
+    let expected = serde_json::to_value(&receipt)
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+    let deadline = Instant::now() + TERMINAL_RESULT_ACK_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(DurableRunnerError::invalid(
+                "warm attachment result acknowledgement timed out",
+            ));
+        }
+        let Some(message) = transport.receive_json()? else {
+            continue;
+        };
+        validate_control_identity(&message, state, Some(connection))?;
+        match message.get("kind").and_then(Value::as_str) {
+            Some("command_result_ack")
+                if message
+                    .pointer("/payload/commandId")
+                    .and_then(Value::as_str)
+                    == Some(result.command_id.as_str())
+                    && message
+                        .pointer("/payload/controllerSeq")
+                        .and_then(Value::as_u64)
+                        == Some(result.controller_seq)
+                    && message
+                        .pointer("/payload/commandType")
+                        .and_then(Value::as_str)
+                        == Some("run.attach")
+                    && message.pointer("/payload/status").and_then(Value::as_str)
+                        == Some("completed")
+                    && message.pointer("/payload/warmTransition") == Some(&expected) =>
+            {
+                return Ok(())
+            }
+            Some("ping") => transport.send_json(&control_envelope(
+                state,
+                connection,
+                "pong",
+                json!({"warmTransitionId": receipt.transition_id}),
+            ))?,
+            Some("ack")
+                if message
+                    .pointer("/payload/ackedSourceSeq")
+                    .and_then(Value::as_u64)
+                    == Some(state.acked_source_seq) => {}
+            _ => {
+                return Err(DurableRunnerError::invalid(
+                    "warm attachment result fence received unrelated control",
+                ))
+            }
+        }
+    }
 }
 
 fn reconcile_pending_terminal_delivery<E: CommandExecutor>(

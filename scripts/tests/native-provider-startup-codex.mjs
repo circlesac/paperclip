@@ -334,13 +334,28 @@ if (args.length === 0 || (args.length === 1 && args[0] === "--help")) {
     try {
       await core.start();
       handle = launch(core, 1);
-      await waitUntil(() => open.status !== "pending");
-      assert.equal(prepare.status, "completed", "prepare_must_succeed");
-      assert.equal(open.status, "failed", "missing_thread_must_fail");
+      // Atomic controller commits publish new snapshots. Observe commands by
+      // stable ID instead of waiting on the original queueCommand object.
+      await waitUntil(
+        () =>
+          (core.getCommand(open.commandId)?.status ?? "pending") !== "pending",
+      );
+      assert.equal(
+        core.getCommand(prepare.commandId)?.status,
+        "completed",
+        "prepare_must_succeed",
+      );
+      assert.equal(
+        core.getCommand(open.commandId)?.status,
+        "failed",
+        "missing_thread_must_fail",
+      );
       assert.ok(
-        open.result?.result?.message?.includes(
-          `no rollout found for thread id ${missingThread}`,
-        ),
+        core
+          .getCommand(open.commandId)
+          ?.result?.result?.message?.includes(
+            `no rollout found for thread id ${missingThread}`,
+          ),
         "exact_missing_rollout_required",
       );
       // The callback completed each durable event commit before failed-command receipt.
@@ -435,7 +450,9 @@ if (args.length === 0 || (args.length === 1 && args[0] === "--help")) {
       ],
     ])
       await copyFile(source, join(snapshots, name));
-    const firstFailure = structuredClone(open.result);
+    const firstFailure = structuredClone(
+      core.getCommand(open.commandId)?.result,
+    );
     const ledgerBefore = await readFile(ledger);
     const identityLedgerBefore = await readFile(identityLedger);
     core = makeCore();
@@ -451,9 +468,15 @@ if (args.length === 0 || (args.length === 1 && args[0] === "--help")) {
       await core.start();
       handle = launch(core, 2);
       await waitUntil(
-        () => snapshot.status !== "pending" && reopen.status !== "pending",
+        () =>
+          (core.getCommand(snapshot.commandId)?.status ?? "pending") !==
+            "pending" &&
+          (core.getCommand(reopen.commandId)?.status ?? "pending") !==
+            "pending",
       );
-      for (const command of [snapshot, reopen]) {
+      for (const queued of [snapshot, reopen]) {
+        const command = core.getCommand(queued.commandId);
+        assert.ok(command, "reopened_command_must_exist");
         assert.equal(command.status, "failed");
         assert.ok(
           command.result?.result?.message?.includes(
