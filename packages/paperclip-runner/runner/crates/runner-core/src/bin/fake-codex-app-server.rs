@@ -1246,6 +1246,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "threadId": "descendant-299", "turnId": "child-turn", "status": "completed"
                     }}))?;
                 }
+                if args.iter().any(|value| value == "--descendant-overflow") {
+                    send(json!({"method": "thread/started", "params": {"thread": {
+                        "id": "descendant-overflow",
+                        "source": {"subAgent": {"thread_spawn": {"parent_thread_id": state.thread_id}}}
+                    }}}))?;
+                }
                 if fail_after_second_turn_start && turn_start_count == 2 {
                     return Err("configured failure after second turn start".into());
                 } else if fail_turn_immediately {

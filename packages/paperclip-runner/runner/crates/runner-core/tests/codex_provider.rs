@@ -4976,5 +4976,57 @@ fn durable_descendant_lineage_survives_capacity_and_provider_restoration() {
         "restoration must recognize an existing child's terminal without rediscovery"
     );
     restored.shutdown().unwrap();
+    drop(restored);
+
+    // Seed the bounded persisted inventory instead of performing thousands of
+    // redundant disk writes, then exercise the real overflow event and fencing.
+    let state_path = directory.join("codex-provider-state.json");
+    let mut persisted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    persisted["descendantThreadIds"] = json!((0..4096)
+        .map(|index| format!("descendant-{index}"))
+        .collect::<Vec<_>>());
+    persisted["config"]["args"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("--descendant-overflow"));
+    fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+    let mut bounded = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    bounded
+        .execute(&command(
+            "bounded-turn",
+            4,
+            "turn.start",
+            json!({"text":"Continue bounded child work."}),
+        ))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut capacity_failed = false;
+    while std::time::Instant::now() < deadline && !capacity_failed {
+        for event in poll_and_ack(&mut bounded).unwrap() {
+            if event.event_type == "turn.failed" {
+                assert_eq!(
+                    event.payload["code"],
+                    "provider_descendant_capacity_exhausted"
+                );
+                assert_eq!(
+                    event.payload["error"]["classification"],
+                    "resource_capacity"
+                );
+                capacity_failed = true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        capacity_failed,
+        "capacity exhaustion must become a specific durable recovery reason"
+    );
+    let persisted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        persisted["descendantThreadIds"].as_array().unwrap().len(),
+        4096
+    );
+    assert_eq!(persisted["lifecycle"], "provider_exited");
+    bounded.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }

@@ -911,7 +911,12 @@ impl CodexProviderState {
             DurableRunnerError::invalid(format!("Codex semantic tool state is invalid: {error}"))
         })?;
         let mut pending_event_ids = HashSet::new();
-        if self.schema != PROVIDER_STATE_SCHEMA
+        if self.descendant_thread_ids.len() > crate::codex_provider::MAX_DESCENDANT_THREAD_IDS
+            || self
+                .descendant_thread_ids
+                .iter()
+                .any(|id| id.is_empty() || id.len() > 240)
+            || self.schema != PROVIDER_STATE_SCHEMA
             || !matches!(
                 self.lifecycle.as_str(),
                 "prepared" | "session_open" | "turn_active" | "provider_exited" | "closed"
@@ -3452,7 +3457,9 @@ impl CodexCommandExecutor {
                 } => {
                     self.handle_tool_call(call_id, operation_id, input)?;
                 }
-                CodexProviderEvent::ProtocolFailure { diagnostic } => {
+                CodexProviderEvent::ProtocolFailure { diagnostic }
+                | CodexProviderEvent::ResourceLimit { diagnostic } => {
+                    let resource_capacity = diagnostic["classification"] == "resource_capacity";
                     let state = self
                         .state
                         .as_mut()
@@ -3482,10 +3489,10 @@ impl CodexCommandExecutor {
                         if let Some(frame_id) = trace_frame_id {
                             provider.record_provider_trace_interpretation(
                                 frame_id,
-                                "codex.identity.invalid_authoritative",
+                                if resource_capacity { "codex.resource_capacity" } else { "codex.identity.invalid_authoritative" },
                                 "rejected",
                                 Vec::new(),
-                                "Rejected provider authority outside the root execution identity",
+                                if resource_capacity { "Provider resource capacity requires explicit reconciliation" } else { "Rejected provider authority outside the root execution identity" },
                             );
                         }
                         let _ = provider.shutdown();
@@ -3518,12 +3525,9 @@ impl CodexCommandExecutor {
                         .state
                         .as_mut()
                         .expect("Codex state remains available while polling");
-                    state.descendant_thread_ids = self
-                        .provider
-                        .as_ref()
-                        .expect("provider remains available while polling")
-                        .descendant_thread_identities()
-                        .clone();
+                    if let Some(id) = child.as_ref() {
+                        state.descendant_thread_ids.insert(id.clone());
+                    }
                     state.extend_events(vec![NormalizedProviderEvent {
                         event_type: "harness.diagnostic".to_owned(),
                         priority: EventPriority::P1,

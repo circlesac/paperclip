@@ -54,6 +54,17 @@ const MAX_PENDING_RUNTIME_REQUESTS: usize = 128;
 const MAX_PENDING_RUNTIME_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const OPENCODE_RUNTIME_REQUEST_METHOD: &str = "paperclip/runtimeRequest";
 pub(crate) const MAX_SETTLED_PROVIDER_TURN_IDS: usize = 4_096;
+pub(crate) const MAX_DESCENDANT_THREAD_IDS: usize = 4_096;
+
+fn remember_descendant_thread(ids: &mut BTreeSet<String>, id: &str) -> Result<bool, &'static str> {
+    if ids.contains(id) {
+        return Ok(false);
+    }
+    if ids.len() >= MAX_DESCENDANT_THREAD_IDS {
+        return Err("provider_descendant_capacity_exhausted");
+    }
+    Ok(ids.insert(id.to_owned()))
+}
 type QuestionOptionLabels = BTreeMap<String, BTreeMap<String, String>>;
 type QuestionSetMapping = (String, Value, QuestionOptionLabels);
 
@@ -390,6 +401,10 @@ pub enum CodexProviderEvent {
     },
     /// An invalid authoritative event must retain its failure meaning across PRP.
     ProtocolFailure {
+        diagnostic: Value,
+    },
+    /// A bounded provider resource was exhausted; this is not identity corruption.
+    ResourceLimit {
         diagnostic: Value,
     },
     RuntimeRequest {
@@ -1073,6 +1088,9 @@ impl CodexProvider {
                         );
                     }
                 }
+                Some(CodexProviderEvent::ResourceLimit { .. }) => {
+                    return Err(LocalRunnerError::invalid("Codex descendant capacity requires reconciliation before fresh-session continuation"));
+                }
                 Some(CodexProviderEvent::ProtocolFailure { .. }) => {
                     return Err(LocalRunnerError::invalid(
                         "Codex protocol integrity failed during warm attachment",
@@ -1183,10 +1201,6 @@ impl CodexProvider {
         // Evicting it would turn later child progress into a root integrity fault.
         self.descendant_thread_ids
             .extend(identities.iter().cloned());
-    }
-
-    pub(crate) fn descendant_thread_identities(&self) -> &BTreeSet<String> {
-        &self.descendant_thread_ids
     }
 
     pub(crate) fn restore_settled_turn_identities(
@@ -2145,8 +2159,24 @@ impl CodexProvider {
                 }
             };
             if identity == NotificationThread::Descendant {
-                let newly_known = notification_thread_id(&params)
-                    .is_some_and(|id| self.descendant_thread_ids.insert(id.to_owned()));
+                let id =
+                    notification_thread_id(&params).expect("classified descendant has an identity");
+                let newly_known = match remember_descendant_thread(
+                    &mut self.descendant_thread_ids,
+                    id,
+                ) {
+                    Ok(newly_known) => newly_known,
+                    Err(code) => {
+                        return Ok(Some(CodexProviderEvent::ResourceLimit {
+                            diagnostic: json!({
+                                "code": code, "recoverable": false, "classification": "resource_capacity",
+                                "message": "Codex reached the child-thread inventory limit. Reconcile child work before continuing in a fresh provider session.",
+                                "method": bounded_method(method), "limit": MAX_DESCENDANT_THREAD_IDS,
+                                "expectedThreadId": self.thread_id, "receivedThreadId": id,
+                            }),
+                        }))
+                    }
+                };
                 // Retain each discovered child's effect inventory independently of
                 // the informational diagnostic budget, then bound repeated progress.
                 if !newly_known && self.notification_identity_diagnostics >= 32 {
@@ -2845,10 +2875,10 @@ fn classify_notification_thread(
     .flatten()
     .filter(|v| !v.is_null())
     .collect();
-    if identities
-        .iter()
-        .any(|id| id.as_str().is_none_or(str::is_empty))
-        || identities.windows(2).any(|ids| ids[0] != ids[1])
+    if identities.iter().any(|id| {
+        id.as_str()
+            .is_none_or(|value| value.is_empty() || value.len() > 240)
+    }) || identities.windows(2).any(|ids| ids[0] != ids[1])
     {
         return Err(LocalRunnerError::invalid(
             "Codex notification has malformed thread identity",
@@ -2859,10 +2889,10 @@ fn classify_notification_thread(
         .flatten()
         .filter(|value| !value.is_null())
         .collect();
-    if turn_ids
-        .iter()
-        .any(|id| id.as_str().is_none_or(str::is_empty))
-        || turn_ids.windows(2).any(|ids| ids[0] != ids[1])
+    if turn_ids.iter().any(|id| {
+        id.as_str()
+            .is_none_or(|value| value.is_empty() || value.len() > 240)
+    }) || turn_ids.windows(2).any(|ids| ids[0] != ids[1])
     {
         return Err(LocalRunnerError::invalid(
             "Codex notification has malformed turn identity",
@@ -3919,6 +3949,34 @@ mod tests {
 #[cfg(test)]
 mod notification_identity_tests {
     use super::*;
+    #[test]
+    fn bounds_lineage_without_eviction_or_misclassifying_capacity_as_integrity() {
+        let mut ids = BTreeSet::new();
+        for index in 0..MAX_DESCENDANT_THREAD_IDS {
+            assert_eq!(
+                remember_descendant_thread(&mut ids, &format!("child-{index}")),
+                Ok(true)
+            );
+        }
+        assert_eq!(remember_descendant_thread(&mut ids, "child-0"), Ok(false));
+        assert_eq!(
+            remember_descendant_thread(&mut ids, "overflow"),
+            Err("provider_descendant_capacity_exhausted")
+        );
+        assert_eq!(ids.len(), MAX_DESCENDANT_THREAD_IDS);
+        assert!(ids.contains("child-0"));
+        assert!(!ids.contains("overflow"));
+        assert_eq!(
+            classify_notification_thread(
+                "turn/completed",
+                "root",
+                &ids,
+                &json!({"threadId":"child-0", "turnId":"child-turn"})
+            )
+            .unwrap(),
+            NotificationThread::Descendant
+        );
+    }
     #[test]
     fn rejects_missing_authority_and_malformed_turn_identities() {
         for method in [
