@@ -3447,6 +3447,88 @@ impl CodexCommandExecutor {
                 } => {
                     self.handle_tool_call(call_id, operation_id, input)?;
                 }
+                CodexProviderEvent::ProtocolFailure { diagnostic } => {
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state available while polling");
+                    state.lifecycle = "provider_exited".to_owned();
+                    state.completed_turn_authoritative = false;
+                    state.completed_turn_process_generation = None;
+                    state.completed_provider_turn_id = None;
+                    state.settle_active_provider_turn_identity()?;
+                    state.active_provider_turn_id = None;
+                    state.push_terminal_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: diagnostic.clone(),
+                    })?;
+                    state.push_terminal_event(NormalizedProviderEvent {
+                        event_type: "turn.failed".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({ "provider": state.config.provider, "status": "failed",
+                            "code": diagnostic["code"], "recoverable": false,
+                            "message": diagnostic["message"], "error": diagnostic }),
+                    })?;
+                    state.extend_terminal_events(terminal_events(state, "turn.failed"))?;
+                    // Commit the authoritative failure before best-effort provider cleanup.
+                    self.save_state()?;
+                    if let Some(mut provider) = self.provider.take() {
+                        if let Some(frame_id) = trace_frame_id {
+                            provider.record_provider_trace_interpretation(
+                                frame_id,
+                                "codex.identity.invalid_authoritative",
+                                "rejected",
+                                Vec::new(),
+                                "Rejected provider authority outside the root execution identity",
+                            );
+                        }
+                        let _ = provider.shutdown();
+                    }
+                    break;
+                }
+                CodexProviderEvent::DescendantNotification { method, params } => {
+                    // Do not normalize a child's turn/completed as a root terminal.
+                    // Retain bounded lineage evidence without credential-bearing payloads.
+                    let child = params
+                        .get("threadId")
+                        .or_else(|| params.pointer("/thread/id"))
+                        .and_then(Value::as_str)
+                        .map(|id| id.chars().take(256).collect::<String>());
+                    let root_thread = self
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.thread_id().to_owned());
+                    let root_turn = self
+                        .provider
+                        .as_ref()
+                        .and_then(CodexProvider::active_provider_turn_id)
+                        .map(str::to_owned);
+                    let child_turn = params
+                        .get("turnId")
+                        .or_else(|| params.pointer("/turn/id"))
+                        .and_then(Value::as_str)
+                        .map(|id| id.chars().take(256).collect::<String>());
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available while polling");
+                    state.extend_events(vec![NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P1,
+                        payload: json!({ "code": "provider_notification_identity", "classification": "descendant",
+                            "method": method.chars().take(128).collect::<String>(), "receivedThreadId": child, "expectedThreadId": root_thread,
+                            "receivedTurnId": child_turn, "expectedTurnId": root_turn }),
+                    }])?;
+                    self.save_state()?;
+                    if let (Some(frame_id), Some(provider)) =
+                        (trace_frame_id, self.provider.as_mut())
+                    {
+                        provider.record_provider_trace_interpretation(frame_id,
+                            "codex.identity.descendant", "mapped", Vec::new(),
+                            "Provider-confirmed descendant progress has no root terminal or tool authority");
+                    }
+                }
                 CodexProviderEvent::Notification { method, params } => {
                     let active_provider_turn_id = if method == "turn/started" {
                         self.provider

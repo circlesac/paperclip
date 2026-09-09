@@ -1654,11 +1654,22 @@ fn ambiguous_replacement_turn_rejects_conflicting_later_identity() {
     );
     assert_eq!(provider.active_provider_turn_id(), Some("provider-turn-2"));
 
-    let conflicting_completion = wait_for_provider_error(&mut provider);
-    assert!(
-        conflicting_completion.contains("another active turn"),
-        "unexpected conflicting-identity error: {conflicting_completion}"
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let diagnostic = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected structured integrity failure"
+        );
+        if let Some(CodexProviderEvent::ProtocolFailure { diagnostic }) =
+            provider.poll().expect("poll identity failure")
+        {
+            break diagnostic;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert_eq!(diagnostic["code"], "turn_binding_mismatch");
+    assert_eq!(diagnostic["recoverable"], false);
+    assert_eq!(diagnostic["expectedTurnId"], "provider-turn-2");
     assert_eq!(provider.active_provider_turn_id(), Some("provider-turn-2"));
 
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
@@ -4838,4 +4849,55 @@ fn codex_completion_emits_the_bound_result_before_the_terminal_event() {
 
     executor.shutdown().expect("stop provider process");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn durable_integrity_failure_preserves_code_and_stops_provider_authority() {
+    let directory = temporary_directory("durable-identity-failure");
+    let config = provider_config(
+        &directory,
+        &[
+            "--malformed-error-second-turn-start",
+            "--conflicting-ambiguous-second-turn",
+        ],
+    );
+    let mut executor = CodexCommandExecutor::new(&directory);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .expect("prepare");
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open");
+    executor
+        .execute(&command(
+            "first",
+            3,
+            "turn.start",
+            json!({"text": "Complete the first turn."}),
+        ))
+        .expect("first turn");
+    wait_for_executor_event(&mut executor, "turn.completed");
+    executor
+        .execute(&command(
+            "second",
+            4,
+            "turn.start",
+            json!({"text": "Start replacement work."}),
+        ))
+        .expect_err("ambiguous response");
+    let failed = wait_for_executor_event(&mut executor, "turn.failed");
+    assert_eq!(failed.payload["code"], "turn_binding_mismatch");
+    assert_eq!(failed.payload["recoverable"], false);
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["lifecycle"], "provider_exited");
+    assert_eq!(persisted["completedTurnAuthoritative"], false);
+    executor.shutdown().expect("cleanup");
+    fs::remove_dir_all(directory).unwrap();
 }

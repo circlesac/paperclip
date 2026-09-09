@@ -383,6 +383,15 @@ pub enum CodexProviderEvent {
         method: String,
         params: Value,
     },
+    /// Provider-confirmed child progress has no root terminal or tool authority.
+    DescendantNotification {
+        method: String,
+        params: Value,
+    },
+    /// An invalid authoritative event must retain its failure meaning across PRP.
+    ProtocolFailure {
+        diagnostic: Value,
+    },
     RuntimeRequest {
         request_id: String,
         question_set: Value,
@@ -537,6 +546,8 @@ pub struct CodexProvider {
     goal_allows_autonomous_turns: bool,
     ambiguous_turn_start_pending: bool,
     settled_provider_turn_ids: SettledProviderTurnIds,
+    descendant_thread_ids: BTreeSet<String>,
+    notification_identity_diagnostics: usize,
     rejected_accepted_turn: Option<RejectedAcceptedTurn>,
     quarantined: bool,
     trace: Option<ProviderTraceSink>,
@@ -798,6 +809,8 @@ impl CodexProvider {
             goal_allows_autonomous_turns: false,
             ambiguous_turn_start_pending: false,
             settled_provider_turn_ids: SettledProviderTurnIds::default(),
+            descendant_thread_ids: BTreeSet::new(),
+            notification_identity_diagnostics: 0,
             rejected_accepted_turn: None,
             quarantined: false,
             trace: ProviderTraceSink::from_environment(),
@@ -1059,6 +1072,17 @@ impl CodexProvider {
                             "Provider emitted a bounded tail notification after the prior turn terminal and before run attachment",
                         );
                     }
+                }
+                Some(CodexProviderEvent::ProtocolFailure { .. }) => {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex protocol integrity failed during warm attachment",
+                    ));
+                }
+                Some(CodexProviderEvent::DescendantNotification { .. }) => {
+                    // Child output cannot certify a quiescent root attachment.
+                    return Err(LocalRunnerError::invalid(
+                        "Codex descendant remains active during warm run attachment",
+                    ));
                 }
                 Some(CodexProviderEvent::ToolCall { .. })
                 | Some(CodexProviderEvent::RuntimeRequest { .. }) => {
@@ -1856,9 +1880,11 @@ impl CodexProvider {
             if method == "item/tool/call" {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
                 if params.get("threadId").and_then(Value::as_str) != Some(self.thread_id.as_str()) {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex tool call named another thread",
-                    ));
+                    return Ok(Some(self.identity_failure(
+                        method,
+                        &params,
+                        "thread_binding_mismatch",
+                    )));
                 }
                 if request_targets_non_active_turn(
                     self.active_provider_turn_id.as_deref(),
@@ -1871,9 +1897,11 @@ impl CodexProvider {
                     LocalRunnerError::invalid("Codex tool call arrived outside an active turn")
                 })?;
                 if params.get("turnId").and_then(Value::as_str) != Some(active_turn_id) {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex tool call named another turn",
-                    ));
+                    return Ok(Some(self.identity_failure(
+                        method,
+                        &params,
+                        "turn_binding_mismatch",
+                    )));
                 }
                 let call_id = bounded_identifier(
                     params.get("callId").and_then(Value::as_str),
@@ -1976,9 +2004,11 @@ impl CodexProvider {
                     && params.get("threadId").and_then(Value::as_str)
                         != Some(self.thread_id.as_str())
                 {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex runtime request named another thread",
-                    ));
+                    return Ok(Some(self.identity_failure(
+                        method,
+                        &params,
+                        "thread_binding_mismatch",
+                    )));
                 }
                 if request_targets_non_active_turn(
                     self.active_provider_turn_id.as_deref(),
@@ -2088,30 +2118,96 @@ impl CodexProvider {
 
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            let identity = match classify_notification_thread(
+                method,
+                &self.thread_id,
+                &self.descendant_thread_ids,
+                &params,
+            ) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    return Ok(Some(self.identity_failure(
+                        method,
+                        &params,
+                        "thread_binding_mismatch",
+                    )))
+                }
+            };
+            if identity == NotificationThread::Descendant {
+                let newly_known = notification_thread_id(&params).is_some_and(|id| {
+                    self.descendant_thread_ids.len() < 256
+                        && self.descendant_thread_ids.insert(id.to_owned())
+                });
+                // Retain each discovered child's effect inventory independently of
+                // the informational diagnostic budget, then bound repeated progress.
+                if !newly_known && self.notification_identity_diagnostics >= 32 {
+                    return Ok(None);
+                }
+                self.notification_identity_diagnostics += 1;
+                // Descendant terminals are progress only. They never settle root authority.
+                return Ok(Some(CodexProviderEvent::DescendantNotification {
+                    method: method.to_owned(),
+                    params,
+                }));
+            }
+            if identity == NotificationThread::UnrelatedInformation {
+                self.notification_identity_diagnostics += 1;
+                if self.notification_identity_diagnostics > 32 {
+                    return Ok(None);
+                }
+                return Ok(Some(CodexProviderEvent::Notification {
+                    method: "warning".to_owned(),
+                    params: json!({
+                        "threadId": self.thread_id,
+                        "message": "ignored unrelated provider information",
+                        "providerMethod": bounded_method(method),
+                        "classification": "unrelated_information",
+                        "expectedThreadId": self.thread_id,
+                        "receivedThreadId": notification_thread_id(&params).map(|id| id.chars().take(256).collect::<String>()),
+                        "expectedTurnId": self.active_provider_turn_id,
+                        "receivedTurnId": notification_turn_id(&params).map(|id| id.chars().take(256).collect::<String>()),
+                    }),
+                }));
+            }
             let terminal_event_type = normalized_codex_terminal_event_type(method, &params);
             let notification_turn_id = params
                 .get("turnId")
                 .or_else(|| params.pointer("/turn/id"))
                 .and_then(Value::as_str);
-            if terminal_event_type.is_some()
-                && notification_turn_id.is_some()
+            if notification_turn_id.is_some()
                 && notification_turn_id != self.active_provider_turn_id.as_deref()
                 && notification_turn_id
                     .is_some_and(|turn_id| self.settled_provider_turn_ids.contains(turn_id))
             {
+                self.notification_identity_diagnostics += 1;
+                if self.notification_identity_diagnostics > 32 {
+                    return Ok(None);
+                }
                 return Ok(Some(CodexProviderEvent::Notification {
                     method: "warning".to_owned(),
                     params: json!({
-                        "message": "ignored a terminal notification for a non-active Codex turn",
-                        "providerMethod": bounded_method(method),
+                        "message": "ignored a notification for a settled Codex turn",
+                        "providerMethod": bounded_method(method), "classification": "stale_settled_turn",
+                        "expectedThreadId": self.thread_id,
+                        "receivedThreadId": self.thread_id,
+                        "expectedTurnId": self.active_provider_turn_id,
+                        "receivedTurnId": notification_turn_id.map(|id| id.chars().take(256).collect::<String>()),
                     }),
                 }));
             }
-            validate_notification_binding(
+            if validate_notification_binding(
                 &self.thread_id,
                 self.active_provider_turn_id.as_deref(),
                 &params,
-            )?;
+            )
+            .is_err()
+            {
+                return Ok(Some(self.identity_failure(
+                    method,
+                    &params,
+                    "turn_binding_mismatch",
+                )));
+            }
             if let Some(terminal_event_type) = terminal_event_type {
                 if self.active_provider_turn_id.is_none() {
                     return Err(LocalRunnerError::invalid(
@@ -2200,10 +2296,25 @@ impl CodexProvider {
         Ok(())
     }
 
+    fn identity_failure(&self, method: &str, params: &Value, code: &str) -> CodexProviderEvent {
+        CodexProviderEvent::ProtocolFailure {
+            diagnostic: json!({
+                "code": code, "recoverable": false,
+                "message": "Codex rejected an event outside the active execution identity",
+                "classification": "invalid_authoritative", "method": bounded_method(method),
+                "expectedThreadId": self.thread_id.chars().take(256).collect::<String>(),
+                "receivedThreadId": notification_thread_id(params).map(|id| id.chars().take(256).collect::<String>()),
+                "expectedTurnId": self.active_provider_turn_id.as_ref().map(|id| id.chars().take(256).collect::<String>()),
+                "receivedTurnId": notification_turn_id(params).map(|id| id.chars().take(256).collect::<String>()),
+            }),
+        }
+    }
+
     pub fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
         self.expected_shutdown = true;
-        self.cancel_pending_requests()?;
-        let result = self.process.terminate_group().map(|_| ());
+        // A failed courtesy response must never prevent process fencing.
+        let cancellation = self.cancel_pending_requests();
+        let result = self.process.terminate_group().map(|_| ()).and(cancellation);
         if let Some(trace) = self.trace.as_mut() {
             trace.finish();
         }
@@ -2693,6 +2804,110 @@ fn contains_provider_work_binding(value: &Value) -> bool {
         }),
         _ => false,
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum NotificationThread {
+    Root,
+    Descendant,
+    UnrelatedInformation,
+}
+
+fn notification_thread_id(params: &Value) -> Option<&str> {
+    params
+        .get("threadId")
+        .or_else(|| params.pointer("/thread/id"))
+        .or_else(|| params.pointer("/turn/threadId"))
+        .and_then(Value::as_str)
+}
+
+fn classify_notification_thread(
+    method: &str,
+    root: &str,
+    descendants: &BTreeSet<String>,
+    params: &Value,
+) -> Result<NotificationThread, LocalRunnerError> {
+    let identities: Vec<&Value> = [
+        params.get("threadId"),
+        params.pointer("/thread/id"),
+        params.pointer("/turn/threadId"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|v| !v.is_null())
+    .collect();
+    if identities
+        .iter()
+        .any(|id| id.as_str().is_none_or(str::is_empty))
+        || identities.windows(2).any(|ids| ids[0] != ids[1])
+    {
+        return Err(LocalRunnerError::invalid(
+            "Codex notification has malformed thread identity",
+        ));
+    }
+    let turn_ids: Vec<&Value> = [params.get("turnId"), params.pointer("/turn/id")]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_null())
+        .collect();
+    if turn_ids
+        .iter()
+        .any(|id| id.as_str().is_none_or(str::is_empty))
+        || turn_ids.windows(2).any(|ids| ids[0] != ids[1])
+    {
+        return Err(LocalRunnerError::invalid(
+            "Codex notification has malformed turn identity",
+        ));
+    }
+    let thread = notification_thread_id(params);
+    if (method.starts_with("turn/") || method.starts_with("paperclip/"))
+        && thread.is_none()
+        && turn_ids.is_empty()
+    {
+        return Err(LocalRunnerError::invalid(
+            "Codex authoritative notification omitted thread identity",
+        ));
+    }
+    // Unbound transport warnings belong to this provider connection. Preserve
+    // their diagnostic meaning; only a different named thread is unrelated.
+    if thread.is_none() || thread == Some(root) {
+        return Ok(NotificationThread::Root);
+    }
+    let parent = [
+        "/thread/source/subAgent/thread_spawn/parent_thread_id",
+        "/thread/source/subAgent/threadSpawn/parentThreadId",
+        "/thread/source/subagent/thread_spawn/parent_thread_id",
+    ]
+    .iter()
+    .find_map(|path| params.pointer(path).and_then(Value::as_str));
+    if thread.is_some()
+        && (thread.is_some_and(|id| descendants.contains(id))
+            || (method == "thread/started"
+                && parent.is_some_and(|id| id == root || descendants.contains(id))))
+    {
+        if method.starts_with("paperclip/") {
+            return Err(LocalRunnerError::invalid(
+                "Codex descendant cannot supply root execution authority",
+            ));
+        }
+        return Ok(NotificationThread::Descendant);
+    }
+    if matches!(
+        method,
+        "thread/started"
+            | "thread/status/changed"
+            | "thread/closed"
+            | "thread/tokenUsage/updated"
+            | "warning"
+            | "configWarning"
+            | "guardianWarning"
+            | "deprecationNotice"
+    ) {
+        return Ok(NotificationThread::UnrelatedInformation);
+    }
+    Err(LocalRunnerError::invalid(
+        "Codex authoritative notification named another thread",
+    ))
 }
 
 fn validate_notification_binding(
@@ -3680,5 +3895,72 @@ mod tests {
             None
         );
         assert_eq!(retain_buffered_message_bytes(usize::MAX, 1), None);
+    }
+}
+
+#[cfg(test)]
+mod notification_identity_tests {
+    use super::*;
+    #[test]
+    fn rejects_missing_authority_and_malformed_turn_identities() {
+        for params in [
+            json!({"status":"completed"}),
+            json!({"threadId":"root","turnId":7}),
+            json!({"threadId":"root","turnId":"a","turn":{"id":"b"}}),
+        ] {
+            assert!(classify_notification_thread(
+                "turn/completed",
+                "root",
+                &BTreeSet::new(),
+                &params
+            )
+            .is_err());
+        }
+        assert_eq!(
+            classify_notification_thread(
+                "configWarning",
+                "root",
+                &BTreeSet::new(),
+                &json!({"message":"warning"})
+            )
+            .unwrap(),
+            NotificationThread::Root
+        );
+    }
+    #[test]
+    fn classifies_provider_lineage_before_root_authority() {
+        let children = BTreeSet::from(["child".to_owned()]);
+        assert_eq!(
+            classify_notification_thread(
+                "thread/status/changed",
+                "root",
+                &children,
+                &json!({"threadId":"unrelated"})
+            )
+            .unwrap(),
+            NotificationThread::UnrelatedInformation
+        );
+        assert_eq!(
+            classify_notification_thread(
+                "turn/completed",
+                "root",
+                &children,
+                &json!({"threadId":"child", "turnId":"child-turn"})
+            )
+            .unwrap(),
+            NotificationThread::Descendant
+        );
+        assert_eq!(classify_notification_thread("thread/started", "root", &children, &json!({"thread":{"id":"grandchild","source":{"subAgent":{"thread_spawn":{"parent_thread_id":"child"}}}}})).unwrap(), NotificationThread::Descendant);
+        for (method, params) in [
+            ("paperclip/runResult", json!({"threadId":"child"})),
+            ("turn/completed", json!({"threadId":"unrelated"})),
+            ("item/started", json!({"threadId":42})),
+            (
+                "item/started",
+                json!({"threadId":"root", "thread":{"id":"other"}}),
+            ),
+        ] {
+            assert!(classify_notification_thread(method, "root", &children, &params).is_err());
+        }
     }
 }
