@@ -42404,6 +42404,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     provider: "slack" | "telegram" | "github",
     externalActorId?: string,
     linkedOriginalActor = false,
+    githubUnavailableFile = false,
   ) {
     const context = await safeNativeProgressFixture(
       provider,
@@ -42411,6 +42412,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       "channel",
       externalActorId,
       linkedOriginalActor,
+      githubUnavailableFile,
     );
     const [issue] = await db
       .select()
@@ -44458,13 +44460,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     teamsSurface: "channel" | "personal" = "channel",
     externalActorId?: string,
     linkedOriginalActor = false,
+    githubUnavailableFile = false,
   ) {
     const fixture = await seedCompany();
     const configured =
       provider === "slack"
         ? await configuredSlackEndpoint(fixture)
         : provider === "github"
-          ? await configuredGitHubEndpoint(fixture)
+          ? await configuredGitHubEndpoint(
+              fixture,
+              githubUnavailableFile
+                ? { storage: createStorageService().storage }
+                : {},
+            )
           : provider === "discord"
             ? await configuredDiscordEndpoint(fixture)
             : provider === "microsoft-teams"
@@ -44546,21 +44554,46 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         externalId: originalActorId,
       });
     }
+    const sourceMessage = makeMessage({
+      id: messageId,
+      mentioned: !thread.thread.isDM,
+      text: thread.thread.isDM
+        ? "Show safe progress"
+        : "@maya show safe progress",
+      userId:
+        externalActorId ??
+        (provider === "telegram" ? telegramChatId : "U-SAFE-PROGRESS"),
+    });
+    if (githubUnavailableFile) {
+      const url =
+        "https://github.com/user-attachments/files/31967808/private-current.txt";
+      sourceMessage.text = `@maya inspect only this exact file: [file](${url})`;
+      sourceMessage.threadId = thread.thread.id;
+      sourceMessage.raw = {
+        type: "issue_comment",
+        threadType: "issue",
+        prNumber: 700 + Number(suffix),
+        repository: { full_name: "paperclipai/paperclip" },
+        comment: {
+          id: Number(messageId),
+          body: sourceMessage.text,
+          user: { id: 42 },
+        },
+      };
+      sourceMessage.formatted = {
+        type: "root",
+        children: [{ type: "link", url, children: [] }],
+      };
+      sourceMessage.attachments.push(
+        ...githubPublicAttachmentsFromMessage(sourceMessage),
+      );
+    }
     await deliverMessage({
       callbacks,
       endpointId: endpoint.id,
       provider,
       thread: thread.thread,
-      message: makeMessage({
-        id: messageId,
-        mentioned: !thread.thread.isDM,
-        text: thread.thread.isDM
-          ? "Show safe progress"
-          : "@maya show safe progress",
-        userId:
-          externalActorId ??
-          (provider === "telegram" ? telegramChatId : "U-SAFE-PROGRESS"),
-      }),
+      message: sourceMessage,
       trigger: thread.thread.isDM ? "direct_message" : "mention",
     });
     const [conversation] = await db
@@ -44638,6 +44671,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       service,
       thread,
       wakeup: configured.wakeup,
+      providerFetch:
+        "providerFetch" in configured ? configured.providerFetch : undefined,
     };
   }
 
@@ -49712,10 +49747,21 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   });
 
   async function committedChatResponseRecoveryFixture(
-    provider: "slack" | "telegram",
+    provider: "slack" | "telegram" | "github",
     format: "coordinator" | "port" = "coordinator",
+    githubUnavailableFile = false,
+    beforeAcceptance?: (
+      context: Awaited<ReturnType<typeof failedChatRetryFixture>>,
+    ) => Promise<void>,
+    summary?: (issueId: string) => string,
   ) {
-    const context = await failedChatRetryFixture(provider);
+    const context = await failedChatRetryFixture(
+      provider,
+      provider === "github" ? "42" : undefined,
+      false,
+      githubUnavailableFile,
+    );
+    await beforeAcceptance?.(context);
     const contractId = randomUUID();
     const sessionId = randomUUID();
     const runnerId = randomUUID();
@@ -49768,6 +49814,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       schema: "paperclip.run_result.v1",
       reportedWorkDisposition: "yielded",
       summary:
+        summary?.(context.issue.id) ??
         "This is the exact accepted answer. I will wait for your next message.",
       completionClaim: {
         contractRevision: "recovered-response-v1",
@@ -49842,17 +49889,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         terminal,
         turnId: `turn-${context.runId}`,
       });
-      await db
-        .insert(heartbeatRunEvents)
-        .values({
-          companyId: binding.companyId,
-          agentId: binding.agentId,
-          runId: binding.runId,
-          seq: 1,
-          eventType: "run.result.accepted",
-          sourceInstanceId: controlPlaneSourceInstanceId,
-          payload: { prpEvent: { sourceKind: "control_plane" } },
-        });
+      await db.insert(heartbeatRunEvents).values({
+        companyId: binding.companyId,
+        agentId: binding.agentId,
+        runId: binding.runId,
+        seq: 1,
+        eventType: "run.result.accepted",
+        sourceInstanceId: controlPlaneSourceInstanceId,
+        payload: { prpEvent: { sourceKind: "control_plane" } },
+      });
     }
     const [acceptedRow] = await db
       .select()
@@ -50167,6 +50212,575 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await context.service.shutdown();
     }
   });
+
+  async function githubOmissionFixture(
+    unavailable = true,
+    beforeAcceptance?: Parameters<
+      typeof committedChatResponseRecoveryFixture
+    >[3],
+    summary?: Parameters<typeof committedChatResponseRecoveryFixture>[4],
+  ) {
+    const egress = vi
+      .spyOn(attachmentEgress, "guardedRemoteHttpFetch")
+      .mockResolvedValue(
+        new Response("private file unavailable", { status: 404 }),
+      );
+    try {
+      const context = await committedChatResponseRecoveryFixture(
+        "github",
+        "coordinator",
+        unavailable,
+        beforeAcceptance,
+        summary,
+      );
+      return {
+        ...context,
+        egress,
+        cleanup: async () => {
+          try {
+            await context.service.shutdown();
+          } finally {
+            egress.mockRestore();
+          }
+        },
+      };
+    } catch (error) {
+      egress.mockRestore();
+      throw error;
+    }
+  }
+
+  it("adds a durable safe task link to the exact GitHub native omission final", async () => {
+    const context = await githubOmissionFixture();
+    try {
+      expect(context.action.payload.attachmentOmissionReasons).toEqual({
+        download_unavailable: 1,
+      });
+      expect(context.egress).toHaveBeenCalledTimes(1);
+      await expect(context.repair()).resolves.toBe(true);
+      await context.service.processPendingPublications(100);
+      const taskUrl = `https://paperclip.example/issues/${context.issue.id}`;
+      const expected = `${context.result.summary}\n\n[Open this Paperclip task](${taskUrl})`;
+      expect(context.providerRuntime.posts.map((post) => post.text)).toEqual([
+        expected,
+      ]);
+      const [publication] = await db
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.endpointId, context.endpoint.id),
+            isNotNull(chatPublications.commentId),
+          ),
+        );
+      expect(publication).toMatchObject({
+        state: "published",
+        attempts: 1,
+        payload: { text: expected },
+      });
+      await context.service.processPendingPublications(100);
+      expect(context.providerRuntime.posts).toHaveLength(1);
+      await expect(
+        db
+          .select({ id: issueAttachments.id })
+          .from(issueAttachments)
+          .where(eq(issueAttachments.issueId, context.issue.id)),
+      ).resolves.toEqual([]);
+    } finally {
+      await context.cleanup();
+    }
+  });
+
+  it.each([
+    { base: null, expected: null },
+    { base: "http://127.0.0.1:3137", expected: null },
+    { base: "https://user:secret@board.example", expected: null },
+    { base: "https://10.0.0.1", expected: null },
+    {
+      base: "https://board.example/prefix?token=PRIVATE#fragment",
+      expected: "https://board.example",
+    },
+  ])(
+    "uses only the configured safe Board origin for GitHub omission navigation: $base",
+    async ({ base, expected }) => {
+      const context = await githubOmissionFixture();
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        await expect(context.repair()).resolves.toBe(true);
+        await context.service.shutdown();
+        restarted = createService(
+          new FakeChatSdkRuntime(),
+          context.providerFetch!,
+          {
+            publicBaseUrl: base,
+            webhookPublicBaseUrl: "https://ingress.example:8443",
+          },
+        );
+        await restarted.service.processPendingPublications(100);
+        const text = restarted.runtime.endpoints.get(context.endpoint.id)!
+          .posts[0]!.text;
+        expect(text).toBe(
+          expected
+            ? `${context.result.summary}\n\n[Open this Paperclip task](${expected}/issues/${context.issue.id})`
+            : context.result.summary,
+        );
+        for (const secret of [
+          "PRIVATE",
+          "secret@",
+          "127.0.0.1",
+          "10.0.0.1",
+          "ingress.example",
+          "#fragment",
+        ])
+          expect(text).not.toContain(secret);
+      } finally {
+        await restarted?.service.shutdown();
+        await context.cleanup();
+      }
+    },
+  );
+
+  it.each(["append_link", "existing_link"] as const)(
+    "keeps GitHub omission navigation byte-stable across a retry and Board-origin change: %s",
+    async (mode) => {
+      const context = await githubOmissionFixture(
+        true,
+        undefined,
+        mode === "existing_link"
+          ? (issueId) =>
+              `Attach directly: [Open this Paperclip task](https://paperclip.example/issues/${issueId})`
+          : undefined,
+      );
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        await expect(context.repair()).resolves.toBe(true);
+        context.providerRuntime.postError = Object.assign(
+          new Error("Rate limited"),
+          { name: "RateLimitError", retryAfter: 60 },
+        );
+        await context.service.processPendingPublications(100);
+        const [before] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
+          );
+        expect(before).toMatchObject({ state: "retry", attempts: 1 });
+        expect(
+          before.payload.text.match(/Open this Paperclip task/g),
+        ).toHaveLength(1);
+        const [preparation] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, context.endpoint.id),
+              eq(chatActions.kind, "github_omission_navigation"),
+            ),
+          );
+        expect(preparation.payload).toMatchObject({
+          publicationId: before.id,
+          runId: context.runId,
+          resultId: context.accepted.resultId,
+          preparedTextSha256: createHash("sha256")
+            .update(before.payload.text)
+            .digest("hex"),
+        });
+        await context.service.shutdown();
+        restarted = createService(
+          new FakeChatSdkRuntime(),
+          context.providerFetch!,
+          { publicBaseUrl: "https://changed.example" },
+        );
+        await db
+          .update(chatPublications)
+          .set({ nextAttemptAt: new Date(0) })
+          .where(eq(chatPublications.id, before.id));
+        await restarted.service.processPendingPublications(100);
+        await restarted.service.processPendingPublications(100);
+        expect(
+          restarted.runtime.endpoints
+            .get(context.endpoint.id)!
+            .posts.map((post) => post.text),
+        ).toEqual([before.payload.text]);
+        await expect(
+          db
+            .select({
+              state: chatPublications.state,
+              attempts: chatPublications.attempts,
+              payload: chatPublications.payload,
+            })
+            .from(chatPublications)
+            .where(eq(chatPublications.id, before.id)),
+        ).resolves.toEqual([
+          { state: "published", attempts: 2, payload: before.payload },
+        ]);
+      } finally {
+        await restarted?.service.shutdown();
+        await context.cleanup();
+      }
+    },
+  );
+
+  it.each([
+    "no_omission",
+    "forged_hint",
+    "explicit_board",
+    "progress",
+    "source_edited",
+    "principal_revoked",
+    "generation_changed",
+  ] as const)(
+    "does not grant GitHub omission navigation from $0",
+    async (mode) => {
+      const context = await githubOmissionFixture(
+        !["no_omission", "forged_hint"].includes(mode),
+      );
+      try {
+        await expect(context.repair()).resolves.toBe(true);
+        const [publication] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
+          );
+        if (mode === "forged_hint")
+          await db
+            .update(chatPublications)
+            .set({
+              payload: {
+                ...publication.payload,
+                attachmentOmissionReasons: { download_unavailable: 1 },
+              } as typeof publication.payload,
+            })
+            .where(eq(chatPublications.id, publication.id));
+        if (mode === "explicit_board")
+          await db
+            .update(chatPublications)
+            .set({ idempotencyKey: `explicit-board:${publication.id}` })
+            .where(eq(chatPublications.id, publication.id));
+        if (mode === "progress")
+          await db
+            .update(chatPublications)
+            .set({
+              payload: { ...publication.payload, progressState: "completed" },
+            })
+            .where(eq(chatPublications.id, publication.id));
+        if (mode === "source_edited")
+          await db
+            .update(issueComments)
+            .set({
+              body: "Source changed",
+              updatedAt: new Date(Date.now() + 1),
+            })
+            .where(
+              eq(issueComments.id, String(context.action.payload.commentId)),
+            );
+        if (mode === "principal_revoked")
+          await db
+            .update(chatEndpoints)
+            .set({ allowUnlinkedPeople: false })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        if (mode === "generation_changed")
+          await db
+            .update(chatEndpoints)
+            .set({
+              setup: sql`jsonb_set(${chatEndpoints.setup}, '{runtimeGeneration}', to_jsonb(coalesce((${chatEndpoints.setup}->>'runtimeGeneration')::int, 0) + 1))`,
+            })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        await context.service.processPendingPublications(100);
+        if (
+          ["source_edited", "principal_revoked", "generation_changed"].includes(
+            mode,
+          )
+        ) {
+          expect(context.providerRuntime.posts).toEqual([]);
+          await expect(
+            db
+              .select({ state: chatPublications.state })
+              .from(chatPublications)
+              .where(eq(chatPublications.id, publication.id)),
+          ).resolves.toEqual([{ state: "cancelled" }]);
+        } else
+          expect(
+            context.providerRuntime.posts.map((post) => post.text),
+          ).toEqual([context.result.summary]);
+        await expect(
+          db
+            .select({ id: chatActions.id })
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.endpointId, context.endpoint.id),
+                eq(chatActions.kind, "github_omission_navigation"),
+              ),
+            ),
+        ).resolves.toEqual([]);
+      } finally {
+        await context.cleanup();
+      }
+    },
+  );
+
+  it.each(["complete_batch", "dropped_sibling", "old_omission"] as const)(
+    "binds GitHub omission navigation to the complete current batch: %s",
+    async (mode) => {
+      let currentCommentId = "";
+      const context = await githubOmissionFixture(true, async (source) => {
+        const callbacks = source.runtime.configurations.get(
+          source.endpoint.id,
+        )!.callbacks;
+        await deliverMessage({
+          callbacks,
+          endpointId: source.endpoint.id,
+          provider: "github",
+          thread: source.thread.thread,
+          message: makeMessage({
+            id: "990099",
+            text: "A plain current follow-up",
+            userId: "42",
+          }),
+          trigger: "subscribed_message",
+        });
+        const [second] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.conversationId, source.conversation.id),
+              eq(chatActions.kind, "inbound_wakeup"),
+              sql`${chatActions.id} <> ${source.action.id}::uuid`,
+            ),
+          );
+        expect(second).toBeDefined();
+        expect(second.payload.attachmentOmissionReasons ?? {}).toEqual({});
+        currentCommentId = String(second.payload.commentId);
+        if (mode === "old_omission") {
+          const historicalRunId = randomUUID();
+          await db.insert(heartbeatRuns).values({
+            id: historicalRunId,
+            companyId: source.fixture.companyId,
+            agentId: source.fixture.assignedAgentId,
+            status: "failed",
+            wakeupRequestId: source.receipt.id,
+            finishedAt: new Date(),
+            contextSnapshot: {
+              issueId: source.issue.id,
+              source: "chat:github",
+              wakeCommentIds: [source.action.payload.commentId],
+            },
+          });
+          await db
+            .update(agentWakeupRequests)
+            .set({ runId: historicalRunId })
+            .where(eq(agentWakeupRequests.id, source.receipt.id));
+          await db
+            .update(agentWakeupRequests)
+            .set({ status: "failed", runId: source.runId })
+            .where(eq(agentWakeupRequests.id, second.id));
+          await db
+            .update(heartbeatRuns)
+            .set({ wakeupRequestId: second.id })
+            .where(eq(heartbeatRuns.id, source.runId));
+        } else {
+          const [receipt] = await db
+            .select()
+            .from(agentWakeupRequests)
+            .where(eq(agentWakeupRequests.id, second.id));
+          await db
+            .update(agentWakeupRequests)
+            .set({
+              status: "coalesced",
+              runId: null,
+              payload: {
+                ...receipt.payload,
+                coalescedIntoWakeupRequestId: source.receipt.id,
+              },
+            })
+            .where(eq(agentWakeupRequests.id, second.id));
+        }
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: {
+              issueId: source.issue.id,
+              taskKey: source.issue.identifier,
+              source: "chat:github",
+              wakeCommentId: currentCommentId,
+              wakeCommentIds:
+                mode === "old_omission"
+                  ? [currentCommentId]
+                  : [source.action.payload.commentId, currentCommentId],
+            },
+          })
+          .where(eq(heartbeatRuns.id, source.runId));
+      });
+      try {
+        expect(context.action.payload.attachmentOmissionReasons).toEqual({
+          download_unavailable: 1,
+        });
+        await expect(context.repair()).resolves.toBe(true);
+        if (mode === "dropped_sibling") {
+          await db
+            .update(heartbeatRuns)
+            .set({
+              contextSnapshot: {
+                issueId: context.issue.id,
+                taskKey: context.issue.identifier,
+                source: "chat:github",
+                wakeCommentId: currentCommentId,
+                wakeCommentIds: [currentCommentId],
+              },
+            })
+            .where(eq(heartbeatRuns.id, context.runId));
+        }
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.posts.map((post) => post.text)).toEqual(
+          mode === "dropped_sibling"
+            ? []
+            : [
+                mode === "complete_batch"
+                  ? `${context.result.summary}\n\n[Open this Paperclip task](https://paperclip.example/issues/${context.issue.id})`
+                  : context.result.summary,
+              ],
+        );
+        const preparations = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, context.endpoint.id),
+              eq(chatActions.kind, "github_omission_navigation"),
+            ),
+          );
+        expect(preparations).toHaveLength(mode === "complete_batch" ? 1 : 0);
+      } finally {
+        await context.cleanup();
+      }
+    },
+  );
+
+  it.each([
+    "text",
+    "progress",
+    "card",
+    "interaction",
+    "explicit",
+    "no_comment",
+    "source_revoked",
+    "control",
+  ] as const)(
+    "refuses changed prepared GitHub omission navigation on retry: %s",
+    async (mode) => {
+      const context = await githubOmissionFixture();
+      try {
+        await expect(context.repair()).resolves.toBe(true);
+        context.providerRuntime.postError = Object.assign(
+          new Error("Rate limited"),
+          { name: "RateLimitError", retryAfter: 60 },
+        );
+        await context.service.processPendingPublications(100);
+        const [publication] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, context.endpoint.id),
+              isNotNull(chatPublications.commentId),
+            ),
+          );
+        expect(publication).toMatchObject({ state: "retry", attempts: 1 });
+        expect(publication.payload.text).toContain("Open this Paperclip task");
+        const payload = { ...publication.payload };
+        if (mode === "text") payload.text += "\nChanged after preparation";
+        if (mode === "progress") payload.progressState = "completed";
+        if (mode === "card")
+          payload.card = {
+            title: "Changed presentation",
+            children: [],
+          } as never;
+        if (mode === "interaction") payload.interactionId = randomUUID();
+        if (mode === "source_revoked")
+          await db
+            .update(chatEndpoints)
+            .set({ allowUnlinkedPeople: false })
+            .where(eq(chatEndpoints.id, context.endpoint.id));
+        if (mode === "control")
+          await db.insert(chatActions).values({
+            companyId: context.fixture.companyId,
+            endpointId: context.endpoint.id,
+            conversationId: context.conversation.id,
+            principalId: context.action.principalId,
+            kind: "task_control_authorization",
+            status: "issued",
+            providerActionId: `task-control-authorization:${publication.id}`,
+            payload: {},
+          });
+        await db
+          .update(chatPublications)
+          .set({
+            payload,
+            nextAttemptAt: new Date(0),
+            ...(mode === "explicit"
+              ? { idempotencyKey: `explicit-board:${publication.id}` }
+              : {}),
+            ...(mode === "control"
+              ? { idempotencyKey: `control:probe:${publication.id}` }
+              : {}),
+            ...(mode === "no_comment" ? { commentId: null } : {}),
+          })
+          .where(eq(chatPublications.id, publication.id));
+        context.providerRuntime.postError = undefined;
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.posts).toEqual([]);
+        expect(context.providerRuntime.edits).toEqual([]);
+        const [after] = await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id));
+        expect(after.state).toBe("cancelled");
+        const preparations = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, context.endpoint.id),
+              eq(chatActions.kind, "github_omission_navigation"),
+            ),
+          );
+        expect(preparations).toHaveLength(1);
+        expect(preparations[0].status).toBe("processed");
+        expect(preparations[0].payload.preparedTextSha256).toBe(
+          createHash("sha256").update(publication.payload.text).digest("hex"),
+        );
+        if (mode === "control") {
+          const [authorization] = await db
+            .select()
+            .from(chatActions)
+            .where(
+              eq(
+                chatActions.providerActionId,
+                `task-control-authorization:${publication.id}`,
+              ),
+            );
+          // Refusal leaves the claim issued, allowing the existing no-send
+          // settlement to cancel it instead of stranding it in processing.
+          expect(authorization.status).toBe("cancelled");
+          expect(authorization.result).toEqual({
+            code: "task_control_authorization_changed",
+          });
+        }
+      } finally {
+        await context.cleanup();
+      }
+    },
+  );
 
   async function linkedCommittedResponseFailure(
     context: Awaited<ReturnType<typeof committedChatResponseRecoveryFixture>>,

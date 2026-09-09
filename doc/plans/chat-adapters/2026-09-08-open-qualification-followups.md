@@ -7,6 +7,24 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+The GitHub omission-navigation slice is frozen: root full integration passed
+**610/610**, zero skips, on fresh `chat_adapters_gh_navigation_20260909_root01`
+(125.11 seconds); focused new cases **26/26** and server types pass. It appends
+or retains the exact safe task link only for a current, accepted native
+`response_wake` input batch with an authenticated download omission, and stores
+a server-only text receipt before transport. Retries preserve that body even
+after Board-base changes; source/access/batch/prepared-body changes are denied.
+This is not a generic private GitHub file-download fix. Deployment remains
+pending the separately moving runner protocol.
+
+Following the task-link destination exposed a separate preexisting multi-company
+bug: a different selected organization survives UUID/identifier redirection,
+and ordinary task uploads receive **422 Issue does not belong to company**.
+All four isolated browser cases reproduce (UUID/wrong-prefix identifier, default
+and classic task interfaces). Boole is fixing loaded-task company navigation and
+upload binding; root owns the browser regression. The earlier banner's explicit
+channel-upload path already binds the actual task company and is unaffected.
+
 September 9, 02:30 UTC: Discord login is restored and the live two-file repeat
 below is verified; it is no longer an external gate. The Board's connected-task
 header was visibly squeezed by its action buttons with Properties open. Root

@@ -3102,3 +3102,28 @@ now passes, but restart, lease and downgrade qualification remain unfinished.
 The normal runner and live server 68 are unchanged. Teams Developer Portal was
 also checked in the in-app browser and currently requires Microsoft sign-in;
 there is still no qualified Microsoft 365 tenant/bot installation.
+
+### September 9: durable GitHub unavailable-file navigation
+
+The observed missing task link now has a deterministic publication fix. Only
+an exact accepted native `response_wake` with a current download omission gets
+the safe Board task URL; older files, response prose and caller hints are not
+evidence. A server-only preparation receipt binds publication, run, result and
+text digest before provider I/O. Already-present links get the same receipt
+without another link. Retries retain identical text across Board-origin changes
+and recheck current source, access, runtime and full coalesced-batch authority.
+Board/progress/control publications and unsupported legacy finals are unchanged.
+
+The real-service failure was reproduced before the fix. New focused cases pass
+**26/26**, URL/publication units **32/32**, and server types pass. Root's full
+fresh-database cohort passed **610/610**, zero skips, in **125.11 seconds**.
+This is not a live deployment or a claim that unsigned private GitHub generic
+files can be imported. The live paste fallback remains the qualified alternative.
+
+Destination follow-through also found a separate existing Board defect: opening
+an unprefixed task UUID while another organization is selected keeps that wrong
+organization in the canonical task route. The ordinary upload then posts the
+wrong company and receives **422 Issue does not belong to company**. Four real
+isolated-browser cases reproduce this, including wrong-prefix identifier links
+and both task interfaces. The loaded-task-company navigation/upload correction
+is in progress; it is not covered by the GitHub service tests above.
