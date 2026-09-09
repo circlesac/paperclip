@@ -3254,3 +3254,51 @@ Loopback and private Tailscale health returned 200/ready. Discord Gateway
 reconnected the same bot identity. Live run counts remained 290 terminal and
 zero active. The browser remained locked at the final actual probe, so this
 is a verified deployment/startup checkpoint, not a new live conversation pass.
+
+### September 9: bounded latency and native-profile audits
+
+The long Slack and Telegram samples remain pre-ingress delays, not proved
+local execution or queue delays. For the Slack sample, source-to-Express was
+61.511 seconds, while its observed proxy request took 23.155 milliseconds and
+Express acknowledgment took 22.525 milliseconds. The Telegram delayed sample
+had source-to-ingress of 234.593 seconds but observed proxy duration of 703.024
+milliseconds. Other GitHub callbacks were acknowledged during the Slack gap.
+Retry headers do not establish the path or existence of unobserved earlier
+attempts. No timeout or reach configuration is being changed on that evidence.
+
+The proxy audit found a narrower diagnostic gap: invalid method, host and path
+requests return before accepted-request observation is installed. An existing
+keep-alive connection can therefore carry an unobserved rejection. Passive
+closed-label rejection diagnostics now cover that boundary. They are local
+qualification logs, not first-party telemetry, and must not record request URLs,
+headers, bodies, endpoint public IDs or arbitrary error prose. Native HTTP parser
+400/431 responses and streaming policy must remain intact. No result here proves
+that this gap caused either provider delay.
+
+The unchanged proxy produced a genuine failing regression: a rejected request
+on the same keep-alive socket returned 404 with zero rejection records. The
+portable helper suite passes **6/6**, and root independently passed **8/8**
+against the actual wired proxy source using ephemeral local HTTP servers.
+The latter also checks the unchanged 1 MiB ceiling and one-shot QA fault fixture.
+Malformed URL parsing now returns 400 instead of escaping the handler. Method,
+host and path rejection remains 404. The observer never starts reading a body,
+and byte counts describe only bytes observed before finish or abort. The
+running proxy has not yet been restarted to load the change; these tests sent
+no request to a live provider or the live proxy.
+
+The native reasoning-effort audit found a missing capability, not a supported
+field being dropped. Maya's five latest succeeded native runs freeze a Codex
+provider profile containing kind, `gpt-5.6-luna` and approval policy `never`,
+without reasoning effort. Native v4 is a closed contract: injected
+`reasoningEffort` or `modelReasoningEffort` is rejected, and legacy low versus
+high configuration resolves to the same native profile. Only the legacy local
+Codex adapter translates that old field. Claiming effective low effort for the
+native runner would therefore be incorrect. Adding it properly requires an
+explicit versioned contract, persisted identity and new/resumed-turn tests plus
+real qualification; silently reinterpreting the old field is not this repair.
+
+The user restored Discord login, but the subsequent actual browser inventory
+still reports the Mac locked. No new live provider message was sent during
+these audits. The scratch handoff has been shortened to current deployment,
+remaining work and protected recovery evidence; earlier scratch checkpoints
+remain available in Git at `f66bedd63`.
