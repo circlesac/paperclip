@@ -4896,9 +4896,17 @@ fn durable_integrity_failure_preserves_code_and_stops_provider_authority() {
     let persisted: Value =
         serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
             .unwrap();
-    assert_eq!(persisted["lifecycle"], "provider_exited");
+    assert_eq!(persisted["lifecycle"], "reconciliation_required");
     assert_eq!(persisted["completedTurnAuthoritative"], false);
     executor.shutdown().expect("cleanup");
+    let mut restored = CodexCommandExecutor::new(&directory);
+    let error = restored
+        .execute(&command("retry", 5, "turn.start", json!({"text":"Retry"})))
+        .expect_err("an integrity failure must also remain fenced after restart");
+    assert!(error
+        .to_string()
+        .contains("requires explicit reconciliation"));
+    restored.shutdown().expect("restored cleanup");
     fs::remove_dir_all(directory).unwrap();
 }
 
