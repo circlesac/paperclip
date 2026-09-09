@@ -215,6 +215,34 @@ than mislabel a consent card or PUT as delivered; dedicated stage resolution
 must replace that guard before the new UI actions are activated. A card/file
 send timeout does not prove that the provider request was cancelled.
 
+Passive transfer/schema/runtime foundation is committed and pushed as
+`146cf23b9`; server 72 still runs the earlier deployed code. A second standalone
+helper cohort now passes root **103/103** on fresh
+`chat_teams_projection_20260909_root01`: personal-recipient proof **35**, safe
+batch projection **36**, and atomic publication projection **32**. The new
+projection records per-attempt intent once, only links the actual final file
+card, preserves explicit operator confirmation without inventing a native ID,
+and defers affirmative no-I/O failures by 30 seconds. Its combined owner cohort
+with encrypted transfer/SDK contracts passes **147/147**. These helpers do not
+yet activate file delivery.
+
+The proof validator checks actual pinned-parser personal activity fields but
+does not authenticate JWTs or authorize users by itself. Original admission
+must supply the verified runtime fence; retained-source checks must bind the
+exact causal requester, not select an unrelated newer personal message. The
+service's new admission/restart cases pass **3/3** with mocked runtime/transport.
+The original normalized proof survives reconstruction exactly, denied reach
+redacts it, and a proofless legacy receipt cannot acquire new authority.
+
+Two further genuine worker regressions were reproduced and fixed in the
+in-flight service integration: generic publication processing sent a pending
+Teams transfer as ordinary text, and its 60-second stale sweep quarantined a
+live 90-second Teams intent. Exact company/publication exclusions and a
+publication-lock-before-lane-check fix both. The combined API/worker block now
+passes **21/21** on fresh `chat_teams_worker_exclusion_20260909_green01`.
+The full 665-case service run and 31-case deterministic browser run are in
+progress; do not treat these targeted results as either complete run.
+
 The September 9 browser inventory still reports the Mac lock screen,
 not a Discord login failure. Loopback/private health is ready on server 72; the
 05:00:24 UTC check has 290 terminal runs and no active run, latest start
