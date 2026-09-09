@@ -18,6 +18,7 @@ import { useToast } from "@/context/ToastContext";
 import { Link } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
 import { useChatConnectorsEnabled } from "@/hooks/useChatConnectorsEnabled";
+import { issuesApi } from "@/api/issues";
 import {
   boardSendDraftKey,
   clearBoardSendDraft,
@@ -86,7 +87,7 @@ export function useIssueChatBinding(companyId: string, issueId: string) {
     enabled: enabled && Boolean(companyId && issueId),
   });
   return {
-    binding: enabled ? query.data ?? null : null,
+    binding: enabled ? (query.data ?? null) : null,
     isLoading: enabled && query.isLoading,
   };
 }
@@ -137,6 +138,20 @@ function ConnectedTaskComposer({
   const retainedScopeKey = useRef<string | null>(null);
   const [unconfirmedRequest, setUnconfirmedRequest] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const uploadInFlight = useRef(false);
+  const mounted = useRef(true);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadedAttachments, setUploadedAttachments] = useState<
+    IssueAttachment[]
+  >([]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const storageKey = binding
     ? boardSendDraftKey(
         companyId,
@@ -198,6 +213,8 @@ function ConnectedTaskComposer({
     idempotencyKey.current = null;
     setBody("");
     setSelectedAttachmentIds([]);
+    setUploadedAttachments([]);
+    setUploadError(null);
     setComposing(false);
     invalidateTask();
     pushToast(publicationFeedback.published);
@@ -294,6 +311,55 @@ function ConnectedTaskComposer({
         tone: "error",
       }),
   });
+  const uploadDisabled = Boolean(
+    retainedSend.current ||
+    publication ||
+    publish.isPending ||
+    publish.isError ||
+    unconfirmedRequest ||
+    storageError ||
+    !deliveryScopeReady ||
+    uploading,
+  );
+  async function uploadFile(file: File) {
+    if (uploadDisabled || uploadInFlight.current || retainedSend.current)
+      return;
+    uploadInFlight.current = true;
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const attachment = await issuesApi.uploadAttachment(
+        companyId,
+        issueId,
+        file,
+      );
+      if (!mounted.current) return;
+      setUploadedAttachments((current) => [...current, attachment]);
+      setSelectedAttachmentIds((current) => [...current, attachment.id]);
+      idempotencyKey.current = null;
+    } catch (error) {
+      if (mounted.current) {
+        setUploadError(
+          `${error instanceof Error ? error.message : "Upload could not be confirmed."} No channel message was sent. Check task files before retrying the upload.`,
+        );
+      }
+    } finally {
+      uploadInFlight.current = false;
+      if (mounted.current) setUploading(false);
+      // An interrupted response may still have stored the file on this task.
+      invalidateTask();
+    }
+  }
+  // Keep newly uploaded files usable before the task refetch completes. Once
+  // present, server metadata wins (especially a file bound to a sent comment).
+  const taskAttachments = [
+    ...new Map(
+      [...uploadedAttachments, ...attachments].map((attachment) => [
+        attachment.id,
+        attachment,
+      ]),
+    ).values(),
+  ];
   const showingRetainedFiles = Boolean(retainedSend.current);
   // Comment binding removes files from new-send eligibility, not from the
   // immutable receipt for the current send. Saved names survive reload while
@@ -304,11 +370,13 @@ function ConnectedTaskComposer({
         originalFilename:
           retainedSend.current?.attachmentNames?.find((file) => file.id === id)
             ?.name ??
-          attachments.find((attachment) => attachment.id === id)
+          taskAttachments.find((attachment) => attachment.id === id)
             ?.originalFilename ??
           "Selected task file (details unavailable)",
       }))
-    : attachments.filter((attachment) => attachment.issueCommentId === null);
+    : taskAttachments.filter(
+        (attachment) => attachment.issueCommentId === null,
+      );
   const currentPublication = publicationStatus.data?.publication ?? publication;
   const currentFeedback = currentPublication
     ? publicationFeedback[currentPublication.state]
@@ -372,6 +440,43 @@ function ConnectedTaskComposer({
             }}
             placeholder="Write only what should be visible in the provider conversation."
           />
+          {selectedAttachmentIds.length > 0 && !body.trim() && (
+            <p className="text-xs text-muted-foreground">
+              Add a message to send with your files.
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={fileInput}
+              type="file"
+              className="hidden"
+              aria-label="Attach file to channel update"
+              disabled={uploadDisabled}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (file) void uploadFile(file);
+              }}
+            />
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={uploadDisabled}
+              onClick={() => fileInput.current?.click()}
+            >
+              <Paperclip />
+              {uploading ? "Uploading…" : "Attach file"}
+            </Button>
+            <p className="text-xs text-muted-foreground">
+              Files stay on this task until you send them to the channel.
+            </p>
+          </div>
+          {uploadError && (
+            <p role="alert" className="text-xs text-destructive">
+              {uploadError}
+            </p>
+          )}
           {visibleAttachments.length > 0 && (
             <fieldset
               className="space-y-2 rounded-md border border-border bg-background p-3"
@@ -431,25 +536,27 @@ function ConnectedTaskComposer({
               {storageError}
             </p>
           )}
-          {(publish.isError || unconfirmedRequest) && !publication && (
-            <div
-              role="alert"
-              className="space-y-1 rounded-md border border-border bg-background p-3 text-xs"
-            >
-              <p className="font-medium">Delivery result not confirmed</p>
-              <p className="text-muted-foreground">
-                Your exact draft and request identity are kept. Retry safely to
-                learn the authoritative publication state without creating a
-                duplicate.
-              </p>
-              <Link
-                className="inline-block font-medium underline underline-offset-4"
-                to={activityPath}
+          {(publish.isError || unconfirmedRequest) &&
+            !publish.isPending &&
+            !publication && (
+              <div
+                role="alert"
+                className="space-y-1 rounded-md border border-border bg-background p-3 text-xs"
               >
-                Open Activity
-              </Link>
-            </div>
-          )}
+                <p className="font-medium">Delivery result not confirmed</p>
+                <p className="text-muted-foreground">
+                  Your exact draft and request identity are kept. Retry safely
+                  to learn the authoritative publication state without creating
+                  a duplicate.
+                </p>
+                <Link
+                  className="inline-block font-medium underline underline-offset-4"
+                  to={activityPath}
+                >
+                  Open Activity
+                </Link>
+              </div>
+            )}
           {publication && currentPublication && currentFeedback && (
             <div
               role={
@@ -505,6 +612,7 @@ function ConnectedTaskComposer({
                     setUnconfirmedRequest(false);
                     setPublication(null);
                     setSelectedAttachmentIds([]);
+                    setUploadedAttachments([]);
                     idempotencyKey.current = null;
                     publish.reset();
                   }}
@@ -523,12 +631,14 @@ function ConnectedTaskComposer({
               disabled={
                 !body.trim() ||
                 publish.isPending ||
+                uploading ||
                 Boolean(publication) ||
                 Boolean(storageError) ||
                 !deliveryScopeReady
               }
               onClick={() => {
                 if (
+                  uploadInFlight.current ||
                   !storageKey ||
                   loadedStorageKey.current !== storageKey ||
                   retainedScopeKey.current !== storageKey
@@ -540,7 +650,7 @@ function ConnectedTaskComposer({
                   attachmentNames: selectedAttachmentIds.map((id) => ({
                     id,
                     name:
-                      attachments.find((attachment) => attachment.id === id)
+                      taskAttachments.find((attachment) => attachment.id === id)
                         ?.originalFilename ?? "Unnamed attachment",
                   })),
                   body: body.trim(),

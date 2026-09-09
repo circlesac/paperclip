@@ -2650,3 +2650,43 @@ private Tailscale Board URL is unchanged and now targets 3137; the existing
 public webhook-only proxy on 3104 also targets 3137. Public host/path/method
 restrictions and Funnel ports remain unchanged. No other worktree was stopped
 or edited.
+
+### September 9: inline Board uploads and real Discord/Slack delivery
+
+Hands-on testing exposed an empty-task gap: Send to channel listed existing
+task files but could not upload a new one. It now uses the normal task
+attachment API directly, selects the chosen file, and keeps it internal until
+the explicit external Send. Uploads disable Send until they settle; a late
+upload cannot select a file in a new binding scope. Task refetch metadata wins
+over the temporary local upload list, and retained publication names/IDs stay
+immutable. Upload failure keeps the message editable, refreshes task files,
+and does not claim a failed response proves that no file was stored.
+
+A second live observation found "Delivery result not confirmed" flashing during
+an ordinary in-flight send. That warning now appears only after an unconfirmed
+response, not while Sending. Both defects have genuine failing regressions.
+The existing component/retained-draft cohort passes 26/26; UI typecheck and
+token gates pass. The full deterministic browser suite passes 22/22, followed
+by the final changed Board-send cohort at 5/5 after the feedback repair. Its
+new test uses real task file upload/download endpoints, checks exact PNG and
+text bytes, and mocks only the provider-binding/publication boundary.
+
+Live environment: server 63 on private Tailscale HTTPS, with UI source reloaded;
+provider accounts are the signed-in in-app Discord and Slack sessions. Each
+journey started at the provider thread's task link, expanded Send to channel,
+uploaded the synthetic cat PNG and 152-byte text fixture, then explicitly sent.
+Actual provider image and text previews were inspected. Discord's three parts
+published once each in 2.08 seconds, comment
+`371da48f-767f-4e7a-a26a-fd4a6e10c07f`, provider messages
+`1547041743319339098`, `1547041746913988618`, `1547041750336675840`, in CHA-29's
+existing thread. Slack's three parts published once each in 6.35 seconds,
+comment `718e370c-d074-4dbf-81d4-6f5f5f73304b`, provider messages
+`1788914152.507729`, `1788914157.210729`, `1788914158.401459`, in CHA-30's
+existing thread. No extra agent run was created. The final Slack journey showed
+the corrected Sending state without the premature warning.
+
+Functional outcome: these explicit Board-to-provider file journeys passed.
+Experience: file selection and pending/success behavior are usable, but the
+historical failed agent notices remain visible. This is not a pass for agent
+recovery, inbound media, or every provider. The attachment previews do not prove
+remote byte hashes; exact-byte checks here are deterministic local API tests.

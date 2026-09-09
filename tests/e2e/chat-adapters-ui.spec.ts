@@ -1838,6 +1838,155 @@ test.describe.serial("native chat adapter UI", () => {
 });
 
 test.describe("Board send delivery refresh", () => {
+  test("uploads images and files directly from an empty channel composer without publishing early", async ({
+    page,
+    request,
+  }) => {
+    const seed = await seedCompanyAndAgent(request);
+    const issue = await json<{ id: string; identifier: string }>(
+      await request.post(`/api/companies/${seed.companyId}/issues`, {
+        data: { title: "Upload channel files", status: "backlog" },
+      }),
+      "create upload task",
+    );
+    const endpointId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const conversationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const publicationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const sends: Record<string, unknown>[] = [];
+    let releaseSend!: () => void;
+    const sendResponse = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    await page.route("**/api/instance/settings/experimental", (route) =>
+      fulfill(route, { enableChatConnectors: true }),
+    );
+    await page.route(`**/api/issues/${issue.id}/chat-binding`, (route) =>
+      fulfill(route, {
+        endpointId,
+        conversationId,
+        provider: "discord",
+        externalLabel: "#upload-test",
+        assignedAgentLocked: true,
+      }),
+    );
+    await page.route(
+      `**/api/chat-endpoints/${endpointId}/conversations/${conversationId}/publications`,
+      async (route) => {
+        sends.push(bodyOf(route));
+        await sendResponse;
+        return fulfill(
+          route,
+          { id: publicationId, state: "streaming", attempts: 1 },
+          201,
+        );
+      },
+    );
+    await page.route(
+      `**/api/chat-endpoints/${endpointId}/conversations/${conversationId}/publications/${publicationId}/status`,
+      (route) =>
+        fulfill(route, {
+          publication: { id: publicationId, state: "pending", attempts: 0 },
+          total: 3,
+          published: 0,
+        }),
+    );
+    await page.goto(`/${seed.prefix}/issues/${issue.identifier}`);
+    await page
+      .getByRole("button", { name: "Send to channel", exact: true })
+      .click();
+    const input = page.getByLabel("Attach file to channel update", {
+      exact: true,
+    });
+    const files = [
+      {
+        name: "channel-image.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jfFoAAAAASUVORK5CYII=",
+          "base64",
+        ),
+      },
+      {
+        name: "channel-report.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("Synthetic channel upload proof.\n"),
+      },
+    ];
+    for (const file of files) {
+      await input.setInputFiles(file);
+      await expect(
+        page
+          .getByRole("group", { name: "Include task files", exact: true })
+          .getByRole("checkbox", { name: file.name, exact: true }),
+      ).toBeChecked();
+      await expect(input).toBeEnabled();
+    }
+    expect(sends).toHaveLength(0);
+    const stored = await json<
+      {
+        id: string;
+        originalFilename: string;
+        contentPath: string;
+        issueCommentId: string | null;
+      }[]
+    >(
+      await request.get(`/api/issues/${issue.id}/attachments`),
+      "read uploaded files",
+    );
+    expect(stored).toHaveLength(2);
+    for (const file of files) {
+      const attachment = stored.find(
+        (item) => item.originalFilename === file.name,
+      )!;
+      expect(attachment.issueCommentId).toBeNull();
+      const content = await request.get(attachment.contentPath);
+      expect(content.ok()).toBe(true);
+      expect(await content.body()).toEqual(file.buffer);
+    }
+    expect(
+      await json<unknown[]>(
+        await request.get(`/api/issues/${issue.id}/comments`),
+        "read internal comments",
+      ),
+    ).toHaveLength(0);
+    await page
+      .getByRole("textbox", { name: "Board update", exact: true })
+      .fill("Publish these two synthetic files.");
+    await page
+      .getByRole("button", { name: "Send to channel", exact: true })
+      .last()
+      .click();
+    await expect.poll(() => sends.length).toBe(1);
+    await expect(
+      page.getByRole("button", { name: "Sending…", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page.getByText("Delivery result not confirmed", { exact: true }),
+    ).toHaveCount(0);
+    releaseSend();
+    expect(sends[0].attachmentIds).toEqual(
+      files.map(
+        (file) =>
+          stored.find((item) => item.originalFilename === file.name)!.id,
+      ),
+    );
+    await expect(input).toBeDisabled();
+    await page.reload();
+    const retained = page.getByRole("group", {
+      name: "Files in this send",
+      exact: true,
+    });
+    for (const file of files) {
+      await expect(
+        retained.getByRole("checkbox", { name: file.name, exact: true }),
+      ).toBeChecked();
+      await expect(
+        retained.getByRole("checkbox", { name: file.name, exact: true }),
+      ).toBeDisabled();
+    }
+    expect(sends).toHaveLength(1);
+  });
+
   for (const outcome of [
     "published",
     "failed",

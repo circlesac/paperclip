@@ -15,6 +15,10 @@ const mockChatEndpointsApi = vi.hoisted(() => ({
   getPublicationBatchStatus: vi.fn(),
 }));
 const pushToastMock = vi.hoisted(() => vi.fn());
+const uploadAttachmentMock = vi.hoisted(() => vi.fn());
+vi.mock("@/api/issues", () => ({
+  issuesApi: { uploadAttachment: uploadAttachmentMock },
+}));
 vi.mock("@/hooks/useChatConnectorsEnabled", () => ({
   useChatConnectorsEnabled: () => ({ enabled: true, loaded: true }),
 }));
@@ -234,6 +238,168 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       expect.any(String),
       [attachment.id],
     );
+  });
+
+  it("uploads a new file on an empty task without sending, then preserves its exact selection for publication", async () => {
+    let finishUpload!: (value: unknown) => void;
+    uploadAttachmentMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishUpload = resolve;
+        }),
+    );
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValue({
+      id: "uploaded-file-publication",
+      state: "streaming",
+      attempts: 1,
+    });
+    await renderBanner();
+    await act(() => findButton(container, "Send to channel").click());
+    await act(() =>
+      setTextareaValue(
+        container.querySelector("textarea")!,
+        "The requested image.",
+      ),
+    );
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    const file = new File(["synthetic image bytes"], "cat.png", {
+      type: "image/png",
+    });
+    Object.defineProperty(input!, "files", {
+      value: [file],
+      configurable: true,
+    });
+    await act(() => {
+      input!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flushReact();
+    expect(uploadAttachmentMock).toHaveBeenCalledWith(
+      "company-1",
+      "issue-1",
+      file,
+    );
+    expect(findButton(container, "Uploading…").disabled).toBe(true);
+    const send = [...container.querySelectorAll("button")]
+      .filter((button) => button.textContent?.trim() === "Send to channel")
+      .at(-1)!;
+    expect(send.disabled).toBe(true);
+    expect(mockChatEndpointsApi.publishBoardMessage).not.toHaveBeenCalled();
+    finishUpload({
+      id: "uploaded-image",
+      companyId: "company-1",
+      issueId: "issue-1",
+      issueCommentId: null,
+      originalFilename: "cat.png",
+    });
+    await flushReact();
+    expect(container.textContent).toContain(
+      "Files stay on this task until you send them to the channel.",
+    );
+    expect(
+      container
+        .querySelector('button[role="checkbox"]')
+        ?.getAttribute("aria-checked"),
+    ).toBe("true");
+    expect(mockChatEndpointsApi.publishBoardMessage).not.toHaveBeenCalled();
+    await act(() => send.click());
+    await flushReact();
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledWith(
+      "endpoint-1",
+      "conversation-1",
+      "The requested image.",
+      expect.any(String),
+      ["uploaded-image"],
+    );
+    expect(findButton(container, "Attach file").disabled).toBe(true);
+    expect(
+      readBoardSendDraft(
+        boardSendDraftKey(
+          "company-1",
+          "issue-1",
+          "endpoint-1",
+          "conversation-1",
+        ),
+      )?.attachmentNames,
+    ).toEqual([{ id: "uploaded-image", name: "cat.png" }]);
+  });
+
+  it("keeps the message editable after an unconfirmed upload and never sends it automatically", async () => {
+    uploadAttachmentMock.mockRejectedValueOnce(
+      new Error("Upload connection interrupted"),
+    );
+    await renderBanner();
+    await act(() => findButton(container, "Send to channel").click());
+    await act(() =>
+      setTextareaValue(
+        container.querySelector("textarea")!,
+        "Keep this draft.",
+      ),
+    );
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    Object.defineProperty(input!, "files", {
+      value: [new File(["file"], "report.txt")],
+      configurable: true,
+    });
+    await act(() => {
+      input!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flushReact();
+    expect(container.textContent).toContain("Upload connection interrupted");
+    expect(container.textContent).toContain("Check task files before retrying");
+    expect(container.querySelector("textarea")?.value).toBe("Keep this draft.");
+    expect(container.querySelector("textarea")?.disabled).toBe(false);
+    expect(findButton(container, "Attach file").disabled).toBe(false);
+    expect(mockChatEndpointsApi.publishBoardMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not select a late upload in a different conversation", async () => {
+    let finishUpload!: (value: unknown) => void;
+    uploadAttachmentMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishUpload = resolve;
+        }),
+    );
+    const queryClient = await renderBanner();
+    await act(() => findButton(container, "Send to channel").click());
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    Object.defineProperty(input!, "files", {
+      value: [new File(["file"], "old.txt")],
+      configurable: true,
+    });
+    await act(() => {
+      input!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flushReact();
+    queryClient.setQueryData(["issue-chat-binding", "company-1", "issue-1"], {
+      endpointId: "endpoint-2",
+      conversationId: "conversation-2",
+      provider: "slack",
+      externalLabel: "#second",
+      assignedAgentLocked: true,
+    });
+    await flushReact();
+    await act(() => findButton(container, "Send to channel").click());
+    finishUpload({
+      id: "old-upload",
+      companyId: "company-1",
+      issueId: "issue-1",
+      issueCommentId: null,
+      originalFilename: "old.txt",
+    });
+    await flushReact();
+    expect(container.textContent).not.toContain("old.txt");
+    expect(container.querySelectorAll('button[role="checkbox"]')).toHaveLength(
+      0,
+    );
+    expect(findButton(container, "Attach file").disabled).toBe(false);
+    expect(mockChatEndpointsApi.publishBoardMessage).not.toHaveBeenCalled();
   });
 
   it.each(["published", "cancelled"] as const)(
@@ -633,6 +799,9 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     );
     const queryClient = await renderBanner();
     await composeAndSubmit("Original conversation only");
+    expect(container.textContent).not.toContain(
+      "Delivery result not confirmed",
+    );
     const originalCall = mockChatEndpointsApi.publishBoardMessage.mock.calls[0];
     queryClient.setQueryData(["issue-chat-binding", "company-1", "issue-1"], {
       endpointId: "endpoint-2",
