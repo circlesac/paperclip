@@ -3013,3 +3013,62 @@ on that exact normal binary. This includes the startup/no-relaunch, legacy
 terminal replay, held/lost ACK, rejected attach, both 1,024-event provider-state
 variants and preexisting transport cases. Server deployment follows separately;
 the Mac is still locked, so no new live chat or latency-improvement claim is made.
+
+Deployment checkpoint: server **68** loaded `3a2a911bd` at **02:06:03 UTC** on
+loopback 3137 with the exact normal binary above. Both local and private
+Tailscale health/startup recovery report ready. No new run was created (286
+total, zero active), and historical Discord/Telegram recovery histories stayed
+at 9/11 entries and one/two maintenance attempts. A subsequent browser inventory
+succeeded: the Mac is now unlocked and live provider qualification can resume.
+
+### September 9, 02:11–02:16 UTC: live media repeat and GitHub fallback
+
+Root used the signed-in in-app Discord thread and Slack thread as the user,
+uploaded the same PNG and TXT, and sent the same media request body with a new
+diagnostic marker. Each request ran alone on Maya's existing native Codex
+app-server session using `gpt-5.6-luna`. Child agents had no browser surface and
+independently correlated only scoped delivery, run, publication and canonical
+tool metadata. No fixture outcomes were inserted into the database.
+
+| Measurement | Discord before → repeat | Slack before → repeat |
+| --- | ---: | ---: |
+| Run duration | 67.925 → 60.073 s | 67.801 → 51.030 s |
+| Provider source → last published file | 72.840 → 64.926 s | 78.439 → 61.173 s |
+| Outer model tool calls | 6 → 4 | 7 → 5 |
+| Underlying tool operations | 7 → 5 | 7 → 5 |
+
+Discord run `265d35e0-af1e-421b-b3e2-61ba65fcc288` and Slack run
+`12d6d924-9748-4d13-ad6e-2035937e12dd` both succeeded and committed.
+Preparation/read/size/hash commands fell from three to one; image inspection,
+two distinct per-file registrations and the final-response protocol remained.
+Slack still used separate model calls for the registrations. This is one repeat
+per channel, in later same-thread context and on a newer runner: descriptive
+improvement, not an isolated causal effect or a performance guarantee.
+
+Root observed working/progress feedback replaced by the final answer, actual
+returned image and text-file previews, no failure banner or duplicate answer,
+and opened Discord's returned TXT full-file viewer to inspect all three lines.
+All new publication parts were first-attempt with no ambiguous delivery.
+Discord final message `1547066896724000940`, PNG `1547067154116124686`, TXT
+`1547067156687097926`; Slack final `1788919977.524779`, PNG
+`1788920033.463569`, TXT `1788920035.360249`. Discord's source eyes reaction
+cleared; Slack's remained while its native Stop control disappeared on completion.
+These observations are sampled transitions, not a continuous recording.
+
+Stored returned assets match the exact received bytes. Discord's PNG matches
+the original local 2,111,878-byte fixture. Slack's received PNG is 2,088,249 bytes
+and differs from the local upload, but matches the earlier Slack received PNG
+exactly; the returned asset matches that provider-received input. The 152-byte
+TXT matches throughout. Remote downloaded bytes were not independently hashed.
+
+GitHub's new private-file fallback request was sent through the dedicated QA
+PR's comment UI, not the implementation PR. Source comment `5594742103` yielded
+one native Luna run and one reply, `5594742965`, stating that the exact file
+could not be imported and offering direct Paperclip attachment or pasted text.
+No file content was guessed and no browser credential was borrowed. Root then
+followed the paste suggestion with the complete synthetic original text and
+visually verified reply `5594755807`: “Shape: hexagon. Color: teal. Count: 47.”
+The paste recovery is functional. Experience still needs improvement: the
+direct-attachment advice names “this Paperclip task” without a clickable task
+link. A focused fix is under investigation; unavailable GitHub private generic
+file import itself is not claimed to work.

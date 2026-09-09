@@ -7,6 +7,36 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 02:06 UTC: server **68**, PID **79398**, handle **93624**, is
+healthy on loopback **3137**, loaded `3a2a911bd` with normal runner `2400740c…`.
+Both loopback and private Tailscale health report ready. Total runs remain 286,
+zero active; historical Discord/Telegram history entries remain 9/11 and
+maintenance attempts one/two. A verified backup of this normal binary is at
+`.paperclip-runtime/chat-adapters-live/qualified-runnerd-2400740c`; retain it
+before future candidate staging to avoid losing the qualified artifact.
+
+The browser inventory now succeeds: **the Mac is unlocked**. Resume live
+Discord/Slack media-batching A/B and GitHub fallback qualification in parallel
+using in-app tabs 22/27/26 (Slack 23 was closed and reopened as 27).
+Leave implementation PR tab 7 alone. Child agents cannot access the parent-only
+browser surface; root owns UI sends while agents independently correlate the
+scoped run/delivery/publication records.
+
+Live Discord media repeat sent once at 02:11:27 UTC in the existing CHA-32
+thread. Run `265d35e0-af1e-421b-b3e2-61ba65fcc288` succeeded/committed in
+60.073 seconds, same native Codex/Luna session, versus 67.925 seconds for the
+earlier identical two-file task. This one-run difference is descriptive, not
+causal proof of a latency improvement. Root visually inspected both returned
+attachments and opened the returned TXT's full-file preview: correct synthetic
+content, no failure notice or duplicate answer. Detailed timing/tool analysis
+is recorded in the permanent log. Slack's matching run
+`12d6d924-9748-4d13-ad6e-2035937e12dd` succeeded in 51.030 seconds, both actual
+files visually verified. GitHub's unavailable-file advice and subsequent
+pasted-text recovery also completed in the browser; direct-attachment advice
+still lacks a clickable task link and needs a focused correction. Each live
+request was sent after the previous run/files settled, avoiding cross-channel
+same-agent queue contention.
+
 September 9, 02:04 UTC: the final composed transport cohort passed **105/105**
 (143.09 seconds), zero skips. Normal optimized runner SHA is
 `2400740c02b85a0099c18c17cb8567905c8dd07fc677363c90f98d0d9b9dbbc8`;
