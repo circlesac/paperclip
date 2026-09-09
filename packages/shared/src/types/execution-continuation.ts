@@ -14,6 +14,8 @@ export interface ExecutionContinuationEnvelope {
     id: string;
     authorType: string;
     authorId: string | null;
+    /** Run-authored Local CLI comments retain user attribution but are not human direction. */
+    createdByRunId?: string | null;
     body: string;
     createdAt: string;
     updatedAt: string;
