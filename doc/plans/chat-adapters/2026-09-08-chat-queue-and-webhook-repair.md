@@ -3509,3 +3509,64 @@ TypeScript. Log: `slack-signed-modal-service-retirement-final-0909.log`.
 Root independently inspected the nested cleanup, and the diff remains limited
 to imports plus the one new test. The latest actual browser probe still
 reports Mac locked: no Discord login retry or live conversation was attempted.
+
+### September 9: maximal safe capability audit reopened implementation gaps
+
+The full goal audit distinguishes a truthful current fallback from completion
+of the original maximal-safe-provider requirement. The installed Discord
+adapter lacks modal open/submit hooks, and the service restricts native forms
+to Slack/Teams. A read-only synthetic native modal-submit probe produced no
+callback or acknowledgment. Discord itself documents text/select modals over
+the existing interaction transport, so the adapter omission is not a provider
+or authorization impossibility. Implementation is now in progress; no new
+native Discord modal is yet qualified. See the official
+[modal components](https://docs.discord.com/developers/components/using-modal-components)
+and [response constraints](https://docs.discord.com/developers/interactions/receiving-and-responding).
+
+A separate Telegram parser-to-service RED uses a valid 16×16, one-second MP4
+fixture whose codec/container were checked with ffprobe. The video-note input
+has no MIME/name, matching the provider schema; current intake reports an
+unsupported type before any storage call. The test fails on expected one
+stored file versus zero. This is a real metadata-boundary defect, not a failed
+provider login. Log: `telegram-video-note-red-0909.log`; fresh database
+`chat_telegram_video_note_red_20260909_root01`. Telegram's
+[video-note contract](https://core.telegram.org/bots/api#sendvideonote)
+identifies the format as MPEG4. The correction must remain subtype- and
+file-identity-bound and preserve the policy for ordinary unknown files.
+
+Teams' personal-chat native file consent/upload flow is another missing
+implementation, supported with bot credentials and the already-generated
+`supportsFiles` manifest capability. It does not justify granting Graph access
+for channel/group files. The installed Microsoft SDK has accept/decline events,
+but the Chat adapter does not register them. The durable consent/batch status,
+upload authority and uncertainty handling are being reviewed before code.
+See the [Microsoft file contract](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/bots-filesv4).
+The eligible-tenant live gate remains unresolved.
+
+### September 9: Telegram video-note metadata repair qualified offline
+
+The pinned Telegram parser wrapper now supplies `video/mp4` only when the raw
+message is a structurally valid video note and its file ID, unique ID, size and
+square dimensions exactly match the sole parsed video attachment. It does not
+replace a supplied MIME type or accept an ordinary unknown document. Existing
+webhook authentication, current access checks and byte limits remain in force.
+No generic MIME allowlist, provider credentials or durable locator schema changed.
+
+The final six-case service run passed on fresh database
+`chat_telegram_video_note_final_20260909_root01`: current intake, new-service
+restart, unknown document denial, malformed note denial, declared oversize
+denial before fetch, and access revoked after receipt before restart. Successful
+cases assert the exact `getFile.file_id`, downloaded/stored bytes, asset SHA256,
+MIME, durable descriptor and one scheduled wake. The original fetch closure is
+made unusable in restart tests. Log: `telegram-video-note-final-0909.log`; 6/6
+passed, 625 other cases filtered, 5.27 seconds. This is not a full-suite run.
+
+The helper/actual-adapter/photo cohort passed 114/114, including the real
+Telegram webhook secret check; plain server TypeScript passed before the
+concurrent Discord edits. The valid synthetic 997-byte MP4 is embedded in a
+source fixture and was independently checked with ffprobe (16×16, one second).
+Root reviewed the production helper, adapter hook, descriptor preservation and
+new integration cleanup, and independently passed the helper/photo cohort
+40/40 (764 ms; `telegram-video-note-root-units-0909.log`). No new live Telegram
+upload or bot message was made;
+server 71 still runs the previously committed production code.

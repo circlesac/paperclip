@@ -116,6 +116,43 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
+**New maximal-capability audit, September 9:** the original goal is not met by
+documenting every adapter omission as a fallback. Three concrete gaps now own
+the next implementation pass:
+
+- **Telegram video-note intake:** the pinned parser produces video attachments
+  without filename/MIME, as permitted by Telegram's video-note schema. The
+  default policy rejected them before download. A real parser-to-service test
+  with a valid MP4 reproduced zero stored files. The narrowly scoped fix now
+  binds provider-declared video-note identity to MPEG4 metadata; ordinary unknown
+  files remain rejected. Final fresh-database regression: 6/6, including exact
+  bytes after restart and current access revocation; adjacent parser/adapter/photo
+  checks: 114/114; plain server TypeScript passed before the concurrent Discord
+  edits. The new Telegram path is not yet deployed or live qualified.
+- **Discord native forms:** the installed adapter has no modal-open method and
+  ignores native modal submissions; Paperclip also gates forms to Slack/Teams.
+  Discord supports native text/select modals with existing Gateway credentials.
+  Renderer/open/submit support, current source/actor authorization, duplicate
+  handling and an actor-scoped correction/reopen flow are being implemented.
+  A modal submission cannot itself open another Discord modal. Owner: native
+  interaction agent. Capability flags stay truthful until this is complete.
+- **Teams personal file output:** existing bot credentials can support native
+  consent/upload without new Graph permissions; the pinned adapter does not
+  implement the consent callbacks. The consent-waiting state, per-file progress,
+  exact authorization, encrypted upload capability, URL policy and uncertain
+  delivery semantics are under design review before edits. Channel/group
+  files still need their documented fallback; do not infer broader authority.
+
+Root owns shared verification, documentation, Git and deployment. Server 71
+remains on committed `efbc92616`; these new changes are not deployed or live
+qualified. Browser control still reports Mac locked. The worktree must retain
+all parallel edits, and no lockfile or PR work is part of this pass.
+
+The September 9 04:31 UTC browser probe still reports the Mac lock screen,
+not a Discord login failure. Loopback health is ready on server 71; the live
+database has 290 terminal runs and no active run, latest start 02:15:47.812 UTC.
+No new live provider conversation has been sent during this audit pass.
+
 Discord's generated question card → parsed concurrent clicks → real service/DB
 → one continuation publication now passes on a fresh database. The Slack
 signed `view_submission` bridge passes 10/10; its final callback is a pure

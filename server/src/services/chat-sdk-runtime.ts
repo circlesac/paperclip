@@ -49,6 +49,7 @@ import {
   type WebhookOptions,
 } from "chat";
 import type { StateAdapter } from "chat";
+import { normalizeTelegramVideoNoteAttachments } from "./chat-telegram-video-note.js";
 import {
   githubAttachmentLocator,
   githubAttachmentCommentFetch,
@@ -1072,7 +1073,17 @@ function createProviderAdapter(
         nativeStreaming: true,
         userName: config.userName,
       };
-      return createTelegramAdapter(adapterConfig);
+      const adapter = createTelegramAdapter(adapterConfig);
+      const parser = adapter as unknown as {
+        extractAttachments(raw: TelegramRawMessage): Attachment[];
+      };
+      if (typeof parser.extractAttachments !== "function") {
+        throw new Error("Telegram attachment parser contract is unavailable");
+      }
+      const extractAttachments = parser.extractAttachments.bind(adapter);
+      parser.extractAttachments = (raw) =>
+        normalizeTelegramVideoNoteAttachments(raw, extractAttachments(raw));
+      return adapter;
     }
   }
 }

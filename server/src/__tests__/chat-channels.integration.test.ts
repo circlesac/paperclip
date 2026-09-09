@@ -123,6 +123,7 @@ import {
 } from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
+import { TELEGRAM_VIDEO_NOTE_MP4 } from "./fixtures/telegram-video-note.js";
 import {
   GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS,
   githubAttachmentLocator,
@@ -50476,6 +50477,272 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         ),
     ).resolves.toHaveLength(0);
   });
+
+  it.each([
+    "current",
+    "restart",
+    "unknown_document",
+    "malformed_note",
+    "oversize",
+    "revoked_after_receipt",
+  ] as const)(
+    "ingests a pinned Telegram video-note without optional MIME metadata (%s)",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const deferred = mode === "restart" || mode === "revoked_after_receipt";
+      const { callbacks, endpoint, runtime, service, wakeup } =
+        await configuredTelegramEndpoint(fixture, {
+          storage: storage.storage,
+          deferWebhookProcessing: deferred,
+          scheduleDeferredWork: () => undefined,
+        });
+      const configuration = runtime.configurations.get(endpoint.id)!;
+      const pinned = createChatSdkEndpointRuntime({
+        ...configuration,
+        logger: "silent",
+      });
+      const providerRequests: string[] = [];
+      let restarted: ReturnType<typeof createService> | undefined;
+      let recoveredParser:
+        ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
+      const fetchSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async (input, init) => {
+          const url = new URL(
+            input instanceof Request ? input.url : String(input),
+          );
+          if (url.hostname !== "api.telegram.org")
+            throw new Error("Unexpected fixture host");
+          if (url.pathname.endsWith("/getFile")) {
+            expect(JSON.parse(String(init?.body))).toEqual({
+              file_id: "telegram-video-note-fixture",
+            });
+            providerRequests.push("getFile");
+            return Response.json({
+              ok: true,
+              result: { file_path: "video-notes/fixture.mp4" },
+            });
+          }
+          if (url.pathname.endsWith("/video-notes/fixture.mp4")) {
+            providerRequests.push("download");
+            return new Response(TELEGRAM_VIDEO_NOTE_MP4, {
+              headers: { "content-type": "video/mp4" },
+            });
+          }
+          throw new Error("Unexpected fixture provider method");
+        });
+      try {
+        // Only provider I/O and scheduling are simulated. Parse with the real
+        // pinned adapter, then use real durable descriptors and service policy.
+        Object.assign(runtime.endpoints.get(endpoint.id)!, {
+          attachmentRecoveryDescriptor:
+            pinned.attachmentRecoveryDescriptor.bind(pinned),
+          rehydrateAttachment: pinned.rehydrateAttachment.bind(pinned),
+        });
+        const raw = {
+          message_id: 41,
+          date: Math.floor(Date.now() / 1_000),
+          chat: { id: 77115569, type: "private" },
+          from: { id: 77115569, is_bot: false, first_name: "Video fixture" },
+          video_note: {
+            file_id: "telegram-video-note-fixture",
+            file_unique_id: "telegram-video-note-unique",
+            length: 16,
+            duration: 1,
+            file_size: TELEGRAM_VIDEO_NOTE_MP4.length,
+          },
+        };
+        if (mode === "malformed_note") raw.video_note.duration = -1;
+        if (mode === "oversize")
+          raw.video_note.file_size = MAX_ATTACHMENT_BYTES + 1;
+        const { video_note: _note, ...withoutNote } = raw;
+        const message = pinned.parseTelegramCommandMessage(
+          mode === "unknown_document"
+            ? {
+                ...withoutNote,
+                document: {
+                  file_id: "unknown-document",
+                  file_unique_id: "unknown-document-unique",
+                  file_name: "unknown.bin",
+                  file_size: TELEGRAM_VIDEO_NOTE_MP4.length,
+                },
+              }
+            : raw,
+        )!;
+        const dm = makeThread({
+          channelId: "77115569",
+          id: "telegram:77115569",
+          isDM: true,
+        });
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          provider: "telegram",
+          thread: dm.thread,
+          message,
+          trigger: "direct_message",
+        });
+        if (deferred) {
+          const [received] = await db
+            .select()
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.endpointId, endpoint.id));
+          expect(received).toMatchObject({ state: "received", attempts: 0 });
+          expect(providerRequests).toEqual([]);
+          expect(storage.putFile).not.toHaveBeenCalled();
+          expect(wakeup).not.toHaveBeenCalled();
+          // Stop the original service and throw away all live fetch closures.
+          // The replacement parser must reconstruct the exact durable file ID.
+          message.attachments[0]!.fetchData = vi.fn(async () => {
+            throw new Error("Original live closure must not run after restart");
+          });
+          await service.shutdown();
+          recoveredParser = createChatSdkEndpointRuntime({
+            ...configuration,
+            logger: "silent",
+          });
+          const nextRuntime = new FakeChatSdkRuntime();
+          const replace = nextRuntime.replaceEndpoint.bind(nextRuntime);
+          vi.spyOn(nextRuntime, "replaceEndpoint").mockImplementation(
+            async (options) => {
+              const next = await replace(options);
+              Object.assign(next, {
+                attachmentRecoveryDescriptor:
+                  recoveredParser!.attachmentRecoveryDescriptor.bind(
+                    recoveredParser,
+                  ),
+                rehydrateAttachment:
+                  recoveredParser!.rehydrateAttachment.bind(recoveredParser),
+              });
+              const thread = next.thread.bind(next);
+              vi.spyOn(next, "thread").mockImplementation((threadId) => ({
+                ...thread(threadId),
+                isDM: recoveredParser!.getProviderAdapter().isDM!(threadId),
+              }));
+              return next;
+            },
+          );
+          if (mode === "revoked_after_receipt") {
+            await db
+              .update(chatEndpoints)
+              .set({ allowDirectMessages: false, updatedAt: new Date() })
+              .where(eq(chatEndpoints.id, endpoint.id));
+          }
+          await db
+            .update(chatDeliveries)
+            .set({ nextAttemptAt: new Date(0) })
+            .where(eq(chatDeliveries.id, received.id));
+          restarted = createService(
+            nextRuntime,
+            fakeTelegramFetch() as typeof globalThis.fetch,
+            { storage: storage.storage, scheduleDeferredWork: () => undefined },
+          );
+          await restarted.service.processPendingDeliveries(25, received.id);
+          expect(message.attachments[0]!.fetchData).not.toHaveBeenCalled();
+        }
+        if (!["current", "restart"].includes(mode)) {
+          expect(storage.putFile).not.toHaveBeenCalled();
+          expect(providerRequests).toEqual([]);
+          expect(wakeup).not.toHaveBeenCalled();
+          expect(restarted?.wakeup.mock.calls.length ?? 0).toBe(0);
+          const [denied] = await db
+            .select()
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.endpointId, endpoint.id));
+          if (mode === "revoked_after_receipt")
+            expect(denied.state).toBe("filtered");
+          else
+            expect(denied.redactedError).toContain(
+              mode === "oversize" ? "declared too large" : "unsupported type",
+            );
+          await expect(
+            db
+              .select({ id: issueAttachments.id })
+              .from(issueAttachments)
+              .where(eq(issueAttachments.companyId, fixture.companyId)),
+          ).resolves.toEqual([]);
+          return;
+        }
+        expect(storage.putFile).toHaveBeenCalledOnce();
+        expect(storage.putFile.mock.calls[0]![0]).toMatchObject({
+          body: TELEGRAM_VIDEO_NOTE_MP4,
+          contentType: "video/mp4",
+        });
+        expect(providerRequests).toEqual(["getFile", "download"]);
+        expect(restarted?.wakeup ?? wakeup).toHaveBeenCalledOnce();
+        const [conversation] = await (
+          restarted?.service ?? service
+        ).listConversations(endpoint.id);
+        const [delivery] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id));
+        expect(delivery).toMatchObject({
+          state: "processed",
+          redactedError: null,
+          conversationId: conversation.id,
+        });
+        expect(delivery.normalizedEvent).toMatchObject({
+          message: {
+            providerMessageId: "77115569:41",
+            attachments: [
+              {
+                mimeType: "video/mp4",
+                recovery: {
+                  version: 1,
+                  provider: "telegram",
+                  attachment: { type: "video", mimeType: "video/mp4" },
+                  locator: {
+                    kind: "telegram_file_id",
+                    fileId: raw.video_note.file_id,
+                    fileUniqueId: raw.video_note.file_unique_id,
+                  },
+                },
+              },
+            ],
+          },
+        });
+        await expect(
+          db
+            .select({
+              sha256: assets.sha256,
+              byteSize: assets.byteSize,
+              contentType: assets.contentType,
+            })
+            .from(issueAttachments)
+            .innerJoin(assets, eq(assets.id, issueAttachments.assetId))
+            .where(eq(issueAttachments.issueId, conversation.issueId)),
+        ).resolves.toEqual([
+          {
+            sha256: createHash("sha256")
+              .update(TELEGRAM_VIDEO_NOTE_MP4)
+              .digest("hex"),
+            byteSize: TELEGRAM_VIDEO_NOTE_MP4.length,
+            contentType: "video/mp4",
+          },
+        ]);
+      } finally {
+        try {
+          await pinned.shutdown();
+        } finally {
+          try {
+            await recoveredParser?.shutdown();
+          } finally {
+            try {
+              await retirePublicationFixture(service, endpoint.id);
+            } finally {
+              try {
+                await restarted?.service.shutdown();
+              } finally {
+                fetchSpy.mockRestore();
+              }
+            }
+          }
+        }
+      }
+    },
+  );
 
   it("ingests bounded Telegram photo, audio, video, and document attachments without stranding text", async () => {
     const fixture = await seedCompany();
