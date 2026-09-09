@@ -2755,3 +2755,33 @@ Verification passed 244 executor cases and 32 real-database recovery/admission
 cases, server types, and independent review; the review's duplicate-history
 finding was fixed with a real-database negative. This is pre-deployment evidence,
 not a live recovery claim.
+
+### September 9: accepted open-task answers remain visible in the Board
+
+The original failed Discord journey exposed a distinct display defect: its
+accepted checklist existed in the durable native result, but blanket `yielded`
+filtering showed only a 117-character preamble. A completed `response_wake`
+can answer now while keeping the task open; it is not an unanswered question.
+
+The native event projection now marks only an exact, single accepted
+control-plane result with an explicit nonblank response-wake key, empty
+attention, matching owner/session/turn, and a later successful same-run terminal.
+The task timeline renders that accepted summary exactly once. Proposed,
+provider-authored, mismatched, live, question/approval and ambiguous evidence
+remain excluded. A real failing steering-boundary regression ensures that
+separating acceptance from the terminal does not lose or duplicate the answer.
+
+Verification: 282 focused cases, adapter-utils/UI typechecks, token gates and
+diff checks passed. Replaying the original authoritative events returns all
+1,340 characters, SHA-256
+`28eaa91bed824f4a400b56b988444cf7c36dff0a8496dae890791df801091dd0`.
+Live Board CHA-29 was reloaded and scrolled: all three sections and 17 bullets
+are now visible, while the later failed B remains a separate failed turn.
+No semantic result or external message was rewritten and no answer was rerun.
+
+Server 65 deployed `d47f2099f` on loopback 3137 after an idle graceful drain.
+Its canonical archival preserved the original Discord directory and copied
+the full bounded provider home, but control-only maintenance still ended
+`operator_required` (`cleanup-mZx1xU`). That failure is under read-only diagnosis;
+this display fix and the fresh-thread successes do not prove historical
+physical cleanup or failed-follow-up retry.

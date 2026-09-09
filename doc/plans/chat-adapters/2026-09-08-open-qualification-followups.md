@@ -7,6 +7,25 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 00:52 UTC: server **65**, PID **68642**, runs `d47f2099f` on
+loopback 3137. Server 64 drained with zero interrupted runs and closed cleanly.
+The new canonical lane automatically preserved and archived Discord CHA-29's
+original owner, then staged the complete 51,434,930-byte provider home. Its
+control-only maintenance still became `operator_required`, request
+`native-cleanup:75e0faf7-bc67-4a4b-b206-ce0c0f4340be`, staging `cleanup-mZx1xU`.
+James is diagnosing that exact failed copy read-only. Do not retry from the
+original or manually move either directory. Archival success is not settlement.
+
+The Board accepted-answer fix now passes 282 focused cases, contract/UI types,
+token gates and live UI retest. Original CHA-29's full 1,340-character checklist
+is visible across all three sections after reload; its later failed B remains
+correctly separate. A steering-anchor regression ensures an accepted response
+split from its terminal renders exactly once. No provider publication, semantic
+result or historical failure was rewritten. Native image+text round trips in
+the fresh Discord and Slack threads also passed, with actual provider previews;
+both took about 68 seconds. Epicurus is measuring model/tool versus transport
+latency without changing live state. Teams and historical Telegram gaps remain.
+
 September 9, 00:48 UTC: server **64** (PID 61627, port **3137**) is running
 `58de1c105`, including the normally staged runner below. Fresh Discord CHA-32
 and Slack CHA-33 completed checklists and separate follow-ups. Genuine overlapping

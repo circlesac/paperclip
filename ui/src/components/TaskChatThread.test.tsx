@@ -13,6 +13,8 @@ import type {
   IssueThreadInteraction,
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
+import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
+import type { HeartbeatRunEvent } from "@paperclipai/shared";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -1459,6 +1461,199 @@ describe("TaskChatThread runtime transcript selection", () => {
     ).toContain("Continued after steering · Working for");
     expect(container.textContent).toContain(
       `Queued ${new Date("2026-08-25T17:59:32.000Z").toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} · Steered ${new Date("2026-08-25T18:00:02.000Z").toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`,
+    );
+  });
+
+  it.each([
+    "missing_result_metadata",
+    "yielded_result_metadata",
+    "steered_missing_result_metadata",
+    "pending_attention",
+    "live",
+    "failed",
+    "proposed",
+    "question",
+    "approval",
+  ])("renders only an authorized terminal response-wake answer: %s", (mode) => {
+    const runId = "native-checklist-response";
+    const summary =
+      "**Before release**\n- Test and rehearse rollback.\n\n**During release**\n- Deploy incrementally and watch errors.\n\n**After release**\n- Verify workflows and record follow-ups.";
+    const result = {
+      schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "yielded",
+      summary,
+      completionClaim: { objectiveSatisfied: true, remainingWork: [] },
+      continuation: {
+        kind: "response_wake",
+        idempotencyKey: "next-chat-input",
+      },
+      attentionRequests:
+        mode === "question" || mode === "approval"
+          ? [
+              {
+                kind:
+                  mode === "question"
+                    ? "ask_user_questions"
+                    : "request_confirmation",
+              },
+            ]
+          : [],
+      evidence: [],
+      verification: [],
+      artifacts: [],
+    };
+    const event = (
+      seq: number,
+      eventType: string,
+      payload: Record<string, unknown>,
+    ) =>
+      ({
+        id: seq,
+        companyId: "company-1",
+        agentId: "agent-1",
+        stream: "system",
+        level: "info",
+        color: null,
+        message: null,
+        runId,
+        seq,
+        eventType,
+        createdAt: new Date("2026-08-25T18:00:00Z"),
+        payload: {
+          prpEvent: {
+            schema: "paperclip.prp.event.v1",
+            schemaVersion: 1,
+            runId,
+            eventType,
+            sourceEventId: `checklist-${seq}`,
+            sourceKind:
+              eventType === "run.result.accepted" ||
+              eventType === "run.terminal"
+                ? "control_plane"
+                : "runner",
+            sourceInstanceId: "runner-1",
+            sourceSeq: seq,
+            normalizedSessionId: "session-1",
+            emittedAt: `2026-08-25T18:00:0${seq}Z`,
+            payload,
+          },
+        },
+      }) satisfies HeartbeatRunEvent;
+    nativeTranscriptState.transcriptByRun.set(
+      runId,
+      nativeRunEventsToTranscript([
+        event(1, "item.completed", {
+          kind: "agentMessage",
+          channel: "progress",
+          item: {
+            id: "preamble",
+            type: "agentMessage",
+            channel: "progress",
+            text: "I’m providing the requested checklist and leaving the task open.",
+          },
+        }),
+        event(2, "run.result.proposed", result),
+        ...(mode === "proposed"
+          ? []
+          : [event(3, "run.result.accepted", { result })]),
+        event(4, "run.terminal", {
+          schema: "paperclip.prp.terminal.v1",
+          turnTerminalState: "completed",
+          runTerminalState: "succeeded",
+          reportedWorkDisposition: "yielded",
+        }),
+      ]),
+    );
+    render(
+      <TaskChatThread
+        comments={
+          mode === "steered_missing_result_metadata"
+            ? [
+                {
+                  id: "response-wake-steering",
+                  companyId: "company-1",
+                  issueId: "issue-1",
+                  authorType: "user",
+                  authorAgentId: null,
+                  authorUserId: "user-1",
+                  body: "Keep the task open for follow-up.",
+                  presentation: null,
+                  metadata: null,
+                  runId: null,
+                  followUpRequested: true,
+                  consumedByRunId: runId,
+                  steeredIntoRunId: runId,
+                  conversationAnchorAt: new Date("2026-08-25T18:00:03.500Z"),
+                  createdAt: new Date("2026-08-25T18:00:03.000Z"),
+                  updatedAt: new Date("2026-08-25T18:00:03.500Z"),
+                },
+              ]
+            : []
+        }
+        onAdd={async () => {}}
+        issueStatus="in_progress"
+        interactions={
+          mode === "pending_attention"
+            ? [planReviewInteraction("pending", "revision-3", runId)]
+            : []
+        }
+        activeRun={
+          mode === "live"
+            ? {
+                id: runId,
+                runtimeMode: "native",
+                status: "running",
+                invocationSource: "issue",
+                triggerDetail: null,
+                agentId: "agent-1",
+                agentName: "Runner",
+                adapterType: "paperclip_runner",
+                createdAt: "2026-08-25T18:00:00Z",
+                startedAt: "2026-08-25T18:00:00Z",
+                finishedAt: null,
+              }
+            : undefined
+        }
+        linkedRuns={[
+          {
+            runId,
+            runtimeMode: "native",
+            status:
+              mode === "live"
+                ? "running"
+                : mode === "failed"
+                  ? "failed"
+                  : "succeeded",
+            agentId: "agent-1",
+            agentName: "Runner",
+            adapterType: "paperclip_runner",
+            createdAt: "2026-08-25T18:00:00Z",
+            startedAt: "2026-08-25T18:00:00Z",
+            finishedAt: mode === "live" ? null : "2026-08-25T18:00:30Z",
+            resultJson: mode.endsWith("missing_result_metadata")
+              ? { recoveredExecutionFailure: { errorCode: "adapter_failed" } }
+              : { nativeResult: result },
+          },
+        ]}
+      />,
+    );
+    const responses = container.querySelectorAll(
+      '[data-testid="task-chat-final-response"]',
+    );
+    if (
+      mode !== "missing_result_metadata" &&
+      mode !== "yielded_result_metadata" &&
+      mode !== "steered_missing_result_metadata"
+    ) {
+      expect(responses).toHaveLength(0);
+      return;
+    }
+    expect(responses).toHaveLength(1);
+    expect(responses[0]?.textContent).toContain("Before release");
+    expect(responses[0]?.textContent).toContain("After release");
+    expect(responses[0]?.textContent).not.toContain("I’m providing");
+    expect(container.textContent).not.toContain(
+      "The runner returned no user-facing response.",
     );
   });
 

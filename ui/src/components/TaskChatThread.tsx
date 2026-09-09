@@ -32,6 +32,7 @@ import {
   embedPlanDocumentAtWriteBoundary,
   omitProgressRepeatedByResponseAcrossSegments,
   paperclipRunnerFinalResponse,
+  paperclipRunnerAcceptedResponseWake,
   paperclipRunnerTimelineItems,
   prependIssueBrief,
   settledRunChildren,
@@ -1298,8 +1299,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const entries = transcriptByRun.get(source.id) ?? [];
       const meta = linkedRunMetaById.get(source.id);
       const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
+      const parsedSource = transcriptToTaskChatItems(entries, {
+        runId: source.id,
+        agentName: meta?.agentName,
+        running: false,
+      });
+      const sourceHasPendingAttention = (interactions ?? []).some(
+        (interaction) =>
+          interaction.sourceRunId === source.id &&
+          interaction.status === "pending",
+      );
+      const sourceAcceptedResponseWake =
+        source.status === "succeeded" &&
+        !sourceHasPendingAttention &&
+        paperclipRunnerAcceptedResponseWake(parsedSource, source.id);
       const sourceYielded =
-        acceptedSemanticResultDisposition(meta?.resultJson) === "yielded";
+        (acceptedSemanticResultDisposition(meta?.resultJson) === "yielded" ||
+          entries.some(
+            (entry) =>
+              entry.kind === "run_result" && entry.disposition === "yielded",
+          )) &&
+        !sourceAcceptedResponseWake;
       const sourceIsPaperclipRunner = isNativePaperclipRunnerRun(source);
       const decidedCommentId = presentationDecisionCommentId(meta?.resultJson);
       const progressCommentIds = semanticProgressCommentIds(meta?.resultJson);
@@ -1563,11 +1583,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         sourceIsPaperclipRunner && !sourceYielded
           ? (sourcePresentationText ??
             paperclipRunnerFinalResponse(
-              transcriptToTaskChatItems(entries, {
-                runId: source.id,
-                agentName: meta?.agentName,
-                running: false,
-              }),
+              parsedSource,
               {
                 runId: source.id,
                 agentName: meta?.agentName,
@@ -1595,14 +1611,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           sourceIsPaperclipRunner &&
           !sourceYielded &&
           !sourceHasPresentationComment
-            ? paperclipRunnerFinalResponse(parsed, {
-                runId: source.id,
-                agentName: meta?.agentName,
-                fallbackSummary:
-                  segmentIndex === lastPopulatedSegmentIndex
-                    ? acceptedSummary
-                    : undefined,
-              })
+            ? sourceAcceptedResponseWake
+              // A steering anchor may split acceptance from its terminal.
+              // Keep the whole-run proof and render its answer exactly once.
+              ? segmentIndex === lastPopulatedSegmentIndex
+                ? paperclipRunnerFinalResponse(parsedSource, {
+                    runId: source.id,
+                    agentName: meta?.agentName,
+                  })
+                : undefined
+              : paperclipRunnerFinalResponse(parsed, {
+                  runId: source.id,
+                  agentName: meta?.agentName,
+                  fallbackSummary:
+                    segmentIndex === lastPopulatedSegmentIndex
+                      ? acceptedSummary
+                      : undefined,
+                })
             : undefined;
         const children = settledRunChildren(
           timelineItemsBySegment[segmentIndex] ?? [],
