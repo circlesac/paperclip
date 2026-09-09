@@ -2869,9 +2869,12 @@ fn classify_notification_thread(
         ));
     }
     let thread = notification_thread_id(params);
-    if (method.starts_with("turn/") || method.starts_with("paperclip/"))
-        && thread.is_none()
+    if thread.is_none()
         && turn_ids.is_empty()
+        && !matches!(
+            method,
+            "warning" | "configWarning" | "guardianWarning" | "deprecationNotice"
+        )
     {
         return Err(LocalRunnerError::invalid(
             "Codex authoritative notification omitted thread identity",
@@ -3912,6 +3915,17 @@ mod notification_identity_tests {
     use super::*;
     #[test]
     fn rejects_missing_authority_and_malformed_turn_identities() {
+        for method in [
+            "item/started",
+            "item/completed",
+            "item/agentMessage/delta",
+            "thread/goal/updated",
+            "unknown/authority",
+        ] {
+            assert!(
+                classify_notification_thread(method, "root", &BTreeSet::new(), &json!({})).is_err()
+            );
+        }
         for params in [
             json!({"status":"completed"}),
             json!({"threadId":"root","turnId":7}),

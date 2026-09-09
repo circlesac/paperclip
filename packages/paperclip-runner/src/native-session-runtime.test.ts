@@ -784,13 +784,13 @@ describe("executeNativeSession recovery", () => {
     });
   });
 
-  it("surfaces the provider's model rejection instead of missing semantic completion", async () => {
+  it.each([false, true])("preserves structured provider failure even when its message mentions a model (recoverable=%s)", async (recoverable) => {
     const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
     const close = vi.fn(async () => {});
     const session: NativeSession = {
       identity: () => identity,
       async capabilities() { return capabilities; },
-      async *events() { yield runnerEvent(1, "turn.failed", { error: { code: "RUNTIME", message: "There's an issue with the selected model (custom-model). It may not exist or you may not have access to it." } }); },
+      async *events() { yield runnerEvent(1, "turn.failed", { error: { code: "RUNTIME", recoverable, message: "There's an issue with the selected model (custom-model). It may not exist or you may not have access to it." } }); },
       async startTurn() { return { turnId: "turn-recovery" }; },
       async result() { return null; },
       async snapshot() { return { backendKind: "mock", sessionId: "driver-recovery", identity, providerSessionId: "provider-recovery", cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }; },
@@ -807,9 +807,9 @@ describe("executeNativeSession recovery", () => {
       async completeRun() {},
     };
     const result = executeNativeSession({ input, backend, controlPlane: port, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" });
-    await expect(result).rejects.toThrow("native_provider_model_rejected: There's an issue with the selected model (custom-model)");
+    await expect(result).rejects.toThrow("There's an issue with the selected model (custom-model)");
     await expect(result).rejects.toMatchObject({
-      code: "native_provider_terminal_failed", providerCode: "RUNTIME", recoverable: false,
+      code: "native_provider_terminal_failed", providerCode: "RUNTIME", recoverable,
     });
     expect(close).toHaveBeenCalled();
   });
