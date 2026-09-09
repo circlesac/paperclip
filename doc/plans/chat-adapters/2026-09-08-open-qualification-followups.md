@@ -7,6 +7,48 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+Latest live checkpoint (September 9, 00:17 UTC): `1b81b6a39` is pushed.
+Server 63 is PID 45413 on **127.0.0.1:3137**, not 3103. Other worktrees' test
+processes repeatedly occupied 3103, so servers 61 and 62 selected 3108. Both
+were stopped gracefully through their exact live handles while idle. The
+dedicated server's bound port and completed startup are verified. Private
+Tailscale Board HTTPS still uses the same hostname, now forwarding to 3137.
+The existing public webhook-only proxy remains on 3104 and now targets 3137;
+its public ports, host/path restrictions and Funnel exposure are unchanged.
+Do not operate on another worktree's listener or use 3103 for this instance.
+
+The user logged Eigenjoy back into Discord. A new root in Clawd general created
+thread `1547036525059907626` and task CHA-29. Run
+`29d19d67-9591-469d-ada3-f72261b732d0` accepted its result, then failed physical
+close after 36 seconds; automatic finalization subsequently committed it. The
+provider still shows failure, not the requested checklist. Follow-up run
+`6b6f6db4-7d3b-4b40-beb7-f385cb610cbc` and Slack run
+`c848f62a-ec8b-449b-8652-119819842ae5` were blocked by the cleanup-domain
+quarantine. Slack root is `1788912694.890079`, task CHA-30. No Slack B was sent.
+This is a failed live A/B journey, not a FIFO pass or acceptable UX.
+
+Two defects are being isolated in parallel. Discord generated an edit event
+454ms after the root despite unchanged text and no edited timestamp; a real
+adapter probe reproduces this with thread-only metadata. The exact live wire
+payload was not retained, so that trigger is an inference. The accepted-result
+close also queues a second synchronous interrupt before shutdown; it can wait
+longer than the outer close deadline. Preserve all current source and native
+evidence; do not clear the quarantine or rerun an already accepted result.
+
+The earlier Telegram continuation also failed safely. Epoch 0 retired, but the
+next provider resume had no rollout in its copied home: only three journals,
+not the required provider history, had been copied. The new failed staging
+directory is `cleanup-BufsxY`; its missing epoch-1 retirement must not be
+replaced by a later process-absence guess. James owns bounded provider-home
+copy and exact-child-completion regressions. Epicurus owns the new close
+failure; Boole owns the metadata-only Discord edit regression. Media-routing
+and separate retry-identity fixes passed root's combined full integration:
+**576/576**, zero skips, on `chat_adapters_media_identity_20260909_full01`
+(278.67s). Focused physical retry tests passed 20/20, retry service cases
+39/39, media service cases 16/16, and real-adapter/hydration/error cases 107/107.
+Server typechecking passed. These fixes are being committed independently;
+the moving home-copy, close and Discord metadata repairs are not included.
+
 Newest release evidence (September 9, 00:04 UTC): the ownership admission gate
 is fixed and independently reviewed. A genuine red test reproduced commands
 starting before the spawned-process receipt committed; a second reproduced a

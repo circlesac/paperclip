@@ -85,6 +85,7 @@ import type {
   ChatSdkMessageTrigger,
   ChatSdkRuntime,
 } from "../services/chat-sdk-runtime.js";
+import { createChatSdkEndpointRuntime } from "../services/chat-sdk-runtime.js";
 import { issueService } from "../services/issues.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { NativeChatAttachmentReadScope } from "../services/native-runtime/chat-attachment-read.js";
@@ -15201,6 +15202,202 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .where(eq(issueAttachments.companyId, fixture.companyId)),
     ).resolves.toHaveLength(1);
   });
+
+  it.each(["captioned", "file_only"] as const)(
+    "preserves a Teams personal %s attachment omission after losing its live download closure",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const first = await configuredTeamsEndpoint(fixture, {
+        storage: storage.storage,
+        deferWebhookProcessing: true,
+        scheduleDeferredWork: () => undefined,
+      });
+      const { endpoint } = first;
+      const configuration = first.runtime.configurations.get(endpoint.id)!;
+      const pinned = createChatSdkEndpointRuntime({
+        ...configuration,
+        callbacks: { onMessage() {} },
+        logger: "silent",
+      });
+      const sourceUrl =
+        "https://contoso.sharepoint.com/download?signature=never-persist-this";
+      const caption =
+        mode === "captioned" ? "Inspect only this exact new file" : "";
+      const parsed = pinned.parseMicrosoftTeamsMessage({
+        id: `teams-personal-unavailable-${mode}`,
+        type: "message",
+        text: caption,
+        timestamp: new Date().toISOString(),
+        serviceUrl: "https://smba.trafficmanager.net/amer/",
+        from: { id: "29:personal-file-user", name: "Personal File User" },
+        conversation: {
+          id: `a:personal-unavailable-${mode}`,
+          conversationType: "personal",
+          tenantId:
+            configuration.providerConfig.provider === "microsoft-teams"
+              ? configuration.providerConfig.credentials.appTenantId
+              : undefined,
+        },
+        attachments: [
+          {
+            contentType: "application/vnd.microsoft.teams.file.download.info",
+            contentUrl:
+              "https://contoso.sharepoint.com/Documents/current-plan.txt",
+            name: "current-plan.txt",
+            content: {
+              downloadUrl: sourceUrl,
+              fileType: "txt",
+              uniqueId: "current-file",
+            },
+          },
+        ],
+      });
+      expect(parsed?.attachments).toHaveLength(1);
+      expect(parsed!.attachments[0]!.mimeType).toBe("text/plain");
+      expect(
+        pinned.attachmentRecoveryDescriptor(parsed!.attachments[0]!),
+      ).toBeNull();
+      const fetchData = vi.fn(async () => {
+        throw new Error("Live closure must not survive restart");
+      });
+      parsed!.attachments[0]!.fetchData = fetchData;
+      const descriptor = vi
+        .spyOn(
+          first.runtime.endpoints.get(endpoint.id)!,
+          "attachmentRecoveryDescriptor",
+        )
+        .mockImplementation((attachment) => {
+          expect(pinned.attachmentRecoveryDescriptor(attachment)).toBeNull();
+          return null;
+        });
+      const sourceThread = makeThread({
+        id: parsed!.threadId,
+        channelId: parsed!.threadId,
+        isDM: true,
+        name: "Personal attachment recovery",
+      });
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        await deliverMessage({
+          callbacks: first.callbacks,
+          endpointId: endpoint.id,
+          provider: "microsoft-teams",
+          thread: sourceThread.thread,
+          message: parsed!,
+          trigger: "direct_message",
+        });
+        const [received] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id));
+        expect(received).toMatchObject({ state: "received", attempts: 0 });
+        expect(received!.normalizedEvent).toMatchObject({
+          message: {
+            attachments: [
+              {
+                name: "current-plan.txt",
+                mimeType: "text/plain",
+                recovery: null,
+              },
+            ],
+          },
+        });
+        expect(JSON.stringify(received!.normalizedEvent)).not.toMatch(
+          /signature|never-persist-this|downloadUrl|sharepoint/,
+        );
+        expect(first.wakeup).not.toHaveBeenCalled();
+        await first.service.shutdown();
+        // The fixture restarts after the provider reorder window, without
+        // changing the receipt, source metadata, or recovery descriptor.
+        await db
+          .update(chatDeliveries)
+          .set({ nextAttemptAt: new Date(0) })
+          .where(eq(chatDeliveries.id, received!.id));
+        const nextRuntime = new FakeChatSdkRuntime();
+        const replace = nextRuntime.replaceEndpoint.bind(nextRuntime);
+        vi.spyOn(nextRuntime, "replaceEndpoint").mockImplementation(
+          async (options) => {
+            const runtime = await replace(options);
+            const thread = runtime.thread.bind(runtime);
+            vi.spyOn(runtime, "thread").mockImplementation((threadId) => ({
+              ...thread(threadId),
+              // Use the real adapter's personal/channel classification after restart.
+              isDM: pinned.getProviderAdapter().isDM!(threadId),
+            }));
+            return runtime;
+          },
+        );
+        restarted = createService(nextRuntime, undefined, {
+          storage: storage.storage,
+          scheduleDeferredWork: () => undefined,
+        });
+        await restarted.service.processPendingDeliveries();
+        const [processed] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.id, received!.id));
+        expect(processed).toMatchObject({
+          state: "processed",
+          redactedError:
+            "1 external attachment was omitted (download unavailable: 1)",
+        });
+        const [link] = await db
+          .select()
+          .from(chatMessageLinks)
+          .where(
+            and(
+              eq(chatMessageLinks.deliveryId, received!.id),
+              eq(chatMessageLinks.direction, "inbound"),
+            ),
+          );
+        const [comment] = await db
+          .select()
+          .from(issueComments)
+          .where(eq(issueComments.id, link!.commentId!));
+        expect(comment!.body).toBe(caption || "Shared 1 file.");
+        expect(restarted.wakeup).toHaveBeenCalledTimes(1);
+        expect(
+          restarted.wakeup.mock.calls[0]![1].contextSnapshot,
+        ).toMatchObject({
+          wakeCommentId: comment!.id,
+          externalAttachmentOmissions: [
+            { commentId: comment!.id, reasons: { download_unavailable: 1 } },
+          ],
+        });
+        const [intent] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.deliveryId, received!.id),
+              eq(chatActions.kind, "inbound_wakeup"),
+            ),
+          );
+        expect(intent!.payload).toMatchObject({
+          attachmentOmissionReasons: { download_unavailable: 1 },
+        });
+        await restarted.service.processPendingDeliveries();
+        expect(restarted.wakeup).toHaveBeenCalledTimes(1);
+        expect(fetchData).not.toHaveBeenCalled();
+        expect(storage.putFile).not.toHaveBeenCalled();
+        expect(
+          await db
+            .select({ id: issueAttachments.id })
+            .from(issueAttachments)
+            .where(eq(issueAttachments.companyId, fixture.companyId)),
+        ).toEqual([]);
+      } finally {
+        descriptor.mockRestore();
+        await first.service.shutdown();
+        await pinned.shutdown();
+        await retirePublicationFixture(
+          restarted?.service ?? first.service,
+          endpoint.id,
+        );
+      }
+    },
+  );
 
   it.each([
     { surface: "channel", mode: "immediate" },
@@ -33482,6 +33679,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         type: "audio",
       },
       {
+        contentType: "audio/mp4",
+        filename: "result.m4a",
+        type: "audio",
+      },
+      {
         contentType: "video/mp4",
         filename: "result.mp4",
         type: "video",
@@ -33538,6 +33740,122 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       })),
     );
     expect(posts.slice(1).every((post) => post.files === undefined)).toBe(true);
+  });
+
+  it("sends Telegram audio and video outside native format contracts as exact original documents", async () => {
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredTelegramEndpoint(fixture, { storage: storage.storage });
+    try {
+      const chatId = "77119913";
+      const dm = makeThread({
+        channelId: `telegram:${chatId}`,
+        id: `telegram:${chatId}`,
+        isDM: true,
+        name: "Telegram exact media files",
+      });
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "telegram",
+        thread: dm.thread,
+        message: makeMessage({
+          id: `${chatId}:1`,
+          text: "Return the original files",
+          userId: chatId,
+        }),
+        trigger: "direct_message",
+      });
+      await qualifySetupRoundTrip(service, endpoint.id, chatId);
+      await service.test(endpoint.id, "owner-user");
+      const [conversation] = await service.listConversations(endpoint.id);
+      const media = [
+        { mimeType: "audio/ogg", filename: "voice.ogg" },
+        { mimeType: "audio/wav", filename: "recording.wav" },
+        { mimeType: "audio/webm", filename: "recording.webm" },
+        { mimeType: "video/webm", filename: "clip.webm" },
+        { mimeType: "video/quicktime", filename: "clip.mov" },
+        { mimeType: "video/x-m4v", filename: "clip.m4v" },
+      ].map((item) => ({
+        ...item,
+        body: Buffer.from(`original:${item.mimeType}:\u0000exact bytes\n`),
+      }));
+      const attachmentIds: string[] = [];
+      for (const item of media) {
+        const stored = await storage.storage.putFile({
+          companyId: fixture.companyId,
+          namespace: `issues/${conversation!.issueId}`,
+          originalFilename: item.filename,
+          contentType: item.mimeType,
+          body: item.body,
+        });
+        const attachment = await issueService(db).createAttachment({
+          issueId: conversation!.issueId,
+          provider: stored.provider,
+          objectKey: stored.objectKey,
+          contentType: stored.contentType,
+          byteSize: stored.byteSize,
+          sha256: stored.sha256,
+          originalFilename: stored.originalFilename,
+          createdByUserId: "owner-user",
+        });
+        attachmentIds.push(attachment.id);
+      }
+      const key = "telegram-nonnative-media-exact-originals";
+      await service.publishBoardMessage(
+        endpoint.id,
+        conversation!.id,
+        "Original media files",
+        key,
+        "owner-user",
+        attachmentIds,
+      );
+      const posts = runtime.endpoints.get(endpoint.id)!.posts;
+      const filePosts = posts.filter((post) => post.attachments?.length);
+      expect(filePosts).toHaveLength(media.length);
+      expect(filePosts).toEqual(
+        media.map((item) => ({
+          threadId: dm.thread.id,
+          text: `Shared ${item.filename}.`,
+          attachments: [
+            expect.objectContaining({
+              type: "file",
+              data: item.body,
+              mimeType: item.mimeType,
+              name: item.filename,
+              size: item.body.length,
+            }),
+          ],
+        })),
+      );
+      const publications = await db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.endpointId, endpoint.id));
+      const filePublications = publications.filter(
+        (row) => (row.payload.attachmentIds as unknown[] | undefined)?.length,
+      );
+      expect(filePublications).toHaveLength(media.length);
+      expect(
+        filePublications.every(
+          (row) => row.state === "published" && row.attempts === 1,
+        ),
+      ).toBe(true);
+      const postCount = posts.length;
+      await service.publishBoardMessage(
+        endpoint.id,
+        conversation!.id,
+        "Original media files",
+        key,
+        "owner-user",
+        attachmentIds,
+      );
+      await service.processPendingPublications();
+      expect(posts).toHaveLength(postCount);
+    } finally {
+      await retirePublicationFixture(service, endpoint.id);
+    }
   });
 
   it("publishes an agent's explicitly selected same-run Slack attachment after its response", async () => {
@@ -41741,6 +42059,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
   it.each([
     "settled",
+    "distinct_account",
+    "null_account",
+    "wrong_account",
+    "missing_account",
+    "malformed_account",
+    "missing_thread",
     "older_warm_run",
     "committed_marker",
     "foreign_marker",
@@ -41757,6 +42081,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     "retries only the original pre-provider Telegram request after exact cleanup: %s",
     async (mode) => {
       const context = await committedChatResponseRecoveryFixture("telegram");
+      const providerAccount =
+        mode === "null_account"
+          ? null
+          : mode === "distinct_account"
+            ? "retained-backend-account"
+            : "same-retained-thread";
+      const checkpointAccount =
+        mode === "wrong_account"
+          ? "another-account"
+          : mode === "missing_account"
+            ? undefined
+            : mode === "malformed_account" ? 123 : providerAccount;
       const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
       const directory = mkdtempSync(
         path.join(os.tmpdir(), "paperclip-chat-cleanup-retry-"),
@@ -41890,10 +42226,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           runnerProfileJson: {
             nativeExecutionInput: inputFor(runId),
             sessionCheckpoint: {
-              providerSessionId:
+              sessionId:
                 mode === "wrong_thread"
                   ? "another-thread"
-                  : "same-retained-thread",
+                  : mode === "missing_thread"
+                    ? undefined
+                    : "same-retained-thread",
+              providerSessionId: checkpointAccount,
               identity: {
                 companyId: context.fixture.companyId,
                 issueId: context.issue.id,
@@ -41990,6 +42329,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               schema: "paperclip.runner.codex-provider-state.v1",
               lifecycle: "prepared",
               threadId: "same-retained-thread",
+              providerSessionId: providerAccount,
               activeProviderTurnId: null,
               config: { provider: "codex", driver: "codex_app_server" },
               pendingEvents: [],
@@ -42096,6 +42436,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(eq(heartbeatRuns.id, runId));
         if (
           mode === "settled" ||
+          mode === "distinct_account" ||
+          mode === "null_account" ||
           mode === "older_warm_run" ||
           mode === "committed_marker"
         ) {
@@ -42147,6 +42489,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   it.each([
     "bootstrap",
     "checkpoint",
+    "distinct_account",
+    "null_account",
+    "wrong_account",
+    "missing_account",
+    "malformed_account",
+    "wrong_thread",
+    "missing_thread",
     "missing_coordinator",
     "retryable",
     "leased",
@@ -42162,6 +42511,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     "requires terminal-safe native ownership for an exact chat retry: %s",
     async (kind) => {
       const context = await failedChatRetryFixture("telegram");
+      const hasCheckpoint = [
+        "checkpoint", "distinct_account", "null_account", "wrong_account",
+        "missing_account", "malformed_account", "wrong_thread", "missing_thread",
+      ].includes(kind);
+      const providerAccount =
+        kind === "null_account"
+          ? null
+          : kind === "distinct_account"
+            ? "retry-backend-account"
+            : "exact-retry-thread";
+      const checkpointAccount =
+        kind === "wrong_account"
+          ? "another-account"
+          : kind === "missing_account"
+            ? undefined
+            : kind === "malformed_account" ? 123 : providerAccount;
       const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
       let stateDirectory: string | null = null;
       try {
@@ -42230,10 +42595,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
                 ? {}
                 : {
                     nativeExecutionInput,
-                    ...(kind === "checkpoint"
+                    ...(hasCheckpoint
                       ? {
                           sessionCheckpoint: {
-                            providerSessionId: "exact-retry-thread",
+                            sessionId:
+                              kind === "wrong_thread"
+                                ? "another-thread"
+                                : kind === "missing_thread"
+                                  ? undefined
+                                  : "exact-retry-thread",
+                            providerSessionId: checkpointAccount,
                           },
                         }
                       : {}),
@@ -42263,12 +42634,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               recoveryMode:
                 kind === "ambiguous"
                   ? "ambiguous_state"
-                  : kind === "checkpoint"
+                  : hasCheckpoint
                     ? "exact_checkpoint_resume"
                     : "bootstrap_retry",
-              checkpointExists: kind === "checkpoint",
+              checkpointExists: hasCheckpoint,
               providerEventsExist: false,
-              providerSessionEstablished: kind === "checkpoint",
+              providerSessionEstablished: hasCheckpoint,
             },
           });
         if (kind === "late_provider_event")
@@ -42280,7 +42651,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             eventType: "session.started",
             payload: {},
           });
-        if (kind === "checkpoint") {
+        if (hasCheckpoint) {
           stateDirectory = mkdtempSync(
             path.join(os.tmpdir(), "paperclip-chat-retry-checkpoint-"),
           );
@@ -42340,6 +42711,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               schema: "paperclip.runner.codex-provider-state.v1",
               lifecycle: "prepared",
               threadId: "exact-retry-thread",
+              providerSessionId: providerAccount,
               activeProviderTurnId: null,
               config: { provider: "codex", driver: "codex_app_server" },
               pendingEvents: [],
@@ -42363,7 +42735,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             initiatedByUserId: "owner-user",
           }),
         );
-        if (kind === "bootstrap" || kind === "checkpoint") {
+        // A null account without existing provider-session evidence remains
+        // conservatively ineligible for the exhausted-run recovery lane.
+        if (["bootstrap", "checkpoint", "distinct_account"].includes(kind)) {
           const staged = await attempt;
           await expect(
             context.service.processFailedChatRunRetry(staged.actionId),

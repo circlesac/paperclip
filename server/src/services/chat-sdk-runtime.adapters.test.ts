@@ -2212,21 +2212,42 @@ describe("Chat SDK published adapter integration", () => {
       const cases = [
         ["image", "image/png", "result.png"],
         ["audio", "audio/mpeg", "result.mp3"],
+        ["audio", "audio/mp4", "result.m4a"],
         ["video", "video/mp4", "result.mp4"],
         ["file", "text/plain", "result.txt"],
+        ["file", "audio/ogg", "voice.ogg"],
+        ["file", "audio/wav", "recording.wav"],
+        ["file", "audio/webm", "recording.webm"],
+        ["file", "video/webm", "clip.webm"],
+        ["file", "video/quicktime", "clip.mov"],
+        ["file", "video/x-m4v", "clip.m4v"],
       ] as const;
       for (const [type, mimeType, name] of cases) {
+        const bytes = Buffer.from(`original:${mimeType}:\u0000exact bytes\n`);
         await adapter.postMessage("telegram:77112233", {
           markdown: `Shared ${name}.`,
-          attachments: [{ data: Buffer.from(type), mimeType, name, type }],
+          attachments: [{ data: bytes, mimeType, name, type }],
         });
+        const multipart = providerFetch.mock.calls.at(-1)?.[1]?.body;
+        expect(multipart).toBeInstanceOf(FormData);
+        const field =
+          type === "file" ? "document" : type === "image" ? "photo" : type;
+        const uploaded = (multipart as FormData).get(field);
+        expect(uploaded).toBeInstanceOf(File);
+        expect((uploaded as File).name).toBe(name);
+        expect((uploaded as File).type).toBe(mimeType);
+        expect(Buffer.from(await (uploaded as File).arrayBuffer())).toEqual(
+          bytes,
+        );
       }
 
       expect(methods).toEqual([
         "sendPhoto",
         "sendAudio",
+        "sendAudio",
         "sendVideo",
         "sendDocument",
+        ...Array<string>(6).fill("sendDocument"),
       ]);
       expect(
         providerFetch.mock.calls.every(

@@ -2593,3 +2593,60 @@ receipts. Its SHA-256 is
 strict code-signature verification, normal TypeScript build, package no-emit
 checks and server typechecking passed. This section records release evidence,
 not live physical settlement; controlled idle deployment follows.
+
+### Separate retry identities and media-format preservation
+
+Failed native retry now checks the checkpoint's provider thread (`sessionId`)
+separately from its backend account/session (`providerSessionId`). Real
+distinct-account positives failed before the repair, while wrong/missing
+identity negatives exposed inappropriate acceptance. Both physical helpers
+now check exact independent identities without relaxing process, lease, source,
+generation or cleanup-receipt proof. Ordinary checkpoints without existing
+provider-session evidence remain conservatively denied.
+
+Telegram preselects document upload for accepted audio/video formats outside
+its native contracts (OGG, WAV, WebM, QuickTime and M4V). MP3/M4A audio and MP4
+video retain native presentation. Tests verify original bytes, name and MIME,
+including the pinned adapter's actual multipart method. No ambiguous upload is
+replayed using an alternate method. Teams personal files whose safe recovery
+descriptor cannot survive restart now retain bounded metadata and an explicit
+current-input `download_unavailable` omission. Signed URLs remain unpersisted
+and unfetched; file-only messages no longer become empty messages. This does
+not claim native Teams outbound upload or live tenant qualification.
+
+Verification: the fresh complete integration suite passed **576/576**, zero
+skips, in 278.67s on `chat_adapters_media_identity_20260909_full01`. Focused
+retry integration passed 39/39, physical evidence 20/20, media integration
+16/16, and published-adapter/hydration/classification tests 107/107. Server
+typechecking and diff checks passed. These are code-contract and integration
+results, not live end-to-end proof of the changed media cases.
+
+### September 9 live continuation: Discord and Slack remain unqualified
+
+The user signed Eigenjoy back into Discord. New root `1547036525059907626`
+created exactly one provider thread and task CHA-29. Its first run accepted a
+result, then physical close failed after 36 seconds. Discord showed a failure
+notice; its follow-up and Slack root `1788912694.890079` were subsequently
+blocked by the runtime cleanup domain. No second Slack request was sent.
+Screenshots and rendered Board inspection confirmed the poor experience.
+
+An unchanged-text Discord update was also recorded 454ms after the first root,
+with no edited timestamp. A pinned-handler probe reproduces this on metadata
+changes; the exact live wire payload was not retained, so thread-creation
+causality is inferred. Independently, accepted-result shutdown can block in a
+redundant cooperative interrupt before exact process termination. Dedicated
+regressions and repairs are in progress; current evidence is preserved.
+
+The earlier Telegram cleanup attempt now identifies missing copied provider
+history: the new private home lacked the retained rollout. Its failed epoch
+also lacks a durable retirement receipt. Neither later process absence nor
+another server restart grants recovery authority. Bounded home-copy and joined
+termination work remain separate from the media/identity commit.
+
+The live instance moved to dedicated loopback port **3137** after unrelated
+worktree tests repeatedly took 3103 and caused automatic port fallback.
+Server 63's PID 45413 and completed startup on 3137 were verified. The existing
+private Tailscale Board URL is unchanged and now targets 3137; the existing
+public webhook-only proxy on 3104 also targets 3137. Public host/path/method
+restrictions and Funnel ports remain unchanged. No other worktree was stopped
+or edited.

@@ -9851,7 +9851,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         binding?.agentId === run.agentId &&
         binding?.runId === run.id &&
         binding?.sessionId === run.nativeSessionId &&
-        typeof checkpoint?.providerSessionId === "string"
+        typeof checkpoint?.sessionId === "string" &&
+        checkpoint.sessionId.trim().length > 0 &&
+        (checkpoint.providerSessionId == null ||
+          (typeof checkpoint.providerSessionId === "string" &&
+            checkpoint.providerSessionId.trim().length > 0))
       ) {
         const predecessors = await tx
           .select()
@@ -9921,7 +9925,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             receipt.requestId.length > 0 &&
             receipt.nativeSessionId === run.nativeSessionId &&
             receipt.runnerInstanceId === predecessor.runnerInstanceId &&
-            receipt.providerSessionId === checkpoint.providerSessionId &&
+            // The cleanup receipt identifies the provider thread. The
+            // checkpoint's providerSessionId is the separate backend account.
+            receipt.providerSessionId === checkpoint.sessionId &&
             typeof receipt.settledFingerprint === "string" &&
             /^[a-f0-9]{64}$/.test(receipt.settledFingerprint) &&
             typeof receipt.sourceFingerprint === "string" &&
@@ -9942,7 +9948,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               retiredOwner: {
                 predecessor,
                 receipt,
-                providerSessionId: checkpoint.providerSessionId,
+                providerSessionId: checkpoint.sessionId,
+                providerBackendSessionId: checkpoint.providerSessionId ?? null,
               },
             };
           }
@@ -10066,6 +10073,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           nativeSessionId: run.nativeSessionId!,
           runnerInstanceId: retiredOwner.predecessor.runnerInstanceId!,
           providerSessionId: retiredOwner.providerSessionId,
+          providerBackendSessionId: retiredOwner.providerBackendSessionId,
           processPid: run.processPid!,
           processGroupId: run.processGroupId!,
           receipt: retiredOwner.receipt,
@@ -10079,6 +10087,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (
       !run.nativeSessionId ||
       !run.runnerInstanceId ||
+      (checkpoint?.providerSessionId != null &&
+        (typeof checkpoint.providerSessionId !== "string" ||
+          checkpoint.providerSessionId.trim().length === 0)) ||
       !nativeFailedRunRetryStateIsSafe({
         execution: run.runnerProfileJson?.nativeExecutionInput,
         companyId,
@@ -10090,6 +10101,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         processPid: run.processPid,
         processGroupId: run.processGroupId,
         providerSessionId:
+          typeof checkpoint?.sessionId === "string"
+            ? checkpoint.sessionId
+            : null,
+        providerBackendSessionId:
           typeof checkpoint?.providerSessionId === "string"
             ? checkpoint.providerSessionId
             : null,
@@ -14414,22 +14429,28 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const externalId = normalized.principal?.externalId;
     if (typeof providerMessageId !== "string" || typeof externalId !== "string")
       return null;
-    const referenceOnlyTeamsAttachments =
-      endpointRuntime.provider === "microsoft-teams" && !thread.isDM;
+    const isTeams = endpointRuntime.provider === "microsoft-teams";
+    const referenceOnlyTeamsAttachments = isTeams && !thread.isDM;
     const storedAttachments = normalized.message?.attachments ?? [];
     const attachments = (
-      referenceOnlyTeamsAttachments
-        ? storedAttachments.slice(0, 20)
-        : storedAttachments
+      isTeams ? storedAttachments.slice(0, 20) : storedAttachments
     )
       .map((attachment) => {
         if (!attachment || typeof attachment !== "object") return null;
-        if (referenceOnlyTeamsAttachments) {
-          // Non-personal Teams attachments deliberately have no recovery
-          // locator. Preserve only bounded audit metadata across deferred
-          // admission/restart, so both the reference-only task comment and
-          // its unavailable-current-file notice survive. Even a legacy
-          // locator must never turn this surface into a download capability.
+        const rehydrated =
+          !referenceOnlyTeamsAttachments && attachment.recovery
+            ? endpointRuntime.rehydrateAttachment(attachment.recovery, {
+                threadId: thread.id,
+                messageId: providerMessageId,
+              })
+            : null;
+        if (rehydrated) return rehydrated;
+        if (isTeams) {
+          // Non-personal references and personal files whose safe download
+          // capability did not survive restart still belong to this input.
+          // Keep bounded metadata so ingestion records an explicit omission;
+          // never persist bearer URLs or fabricate a download capability.
+          // Even a legacy locator cannot enable non-personal downloads.
           return {
             type: "file",
             name:
@@ -14451,12 +14472,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 : undefined,
           } as Attachment;
         }
-        return attachment.recovery
-          ? endpointRuntime.rehydrateAttachment(attachment.recovery, {
-              threadId: thread.id,
-              messageId: providerMessageId,
-            })
-          : null;
+        return null;
       })
       .filter((attachment): attachment is Attachment => Boolean(attachment));
     const message = {
@@ -26717,11 +26733,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
   function telegramAttachmentForUpload(file: FileUpload): Attachment {
     const mimeType = file.mimeType?.toLowerCase() ?? "application/octet-stream";
-    const type: Attachment["type"] = mimeType.startsWith("image/")
+    const contentType = normalizeContentType(mimeType);
+    // Telegram's native audio player accepts MP3/M4A and its video method
+    // accepts MPEG4. Other allowed formats still travel losslessly as
+    // documents; choose before I/O, never replay an uncertain media send.
+    const type: Attachment["type"] = contentType.startsWith("image/")
       ? "image"
-      : mimeType.startsWith("audio/")
+      : contentType === "audio/mpeg" || contentType === "audio/mp4"
         ? "audio"
-        : mimeType.startsWith("video/")
+        : contentType === "video/mp4"
           ? "video"
           : "file";
     const data =

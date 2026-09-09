@@ -2847,6 +2847,11 @@ describe("retained native cleanup activation", () => {
 describe("explicit failed native retry physical evidence", () => {
   it.each([
     "suspended",
+    "distinct_account",
+    "null_account",
+    "wrong_account",
+    "missing_account",
+    "missing_thread",
     "ready",
     "wrong_run",
     "wrong_runner",
@@ -2894,6 +2899,18 @@ describe("explicit failed native retry physical evidence", () => {
       .digest("hex");
     const root = join(stateBase, key);
     const bootstrap = kind.includes("bootstrap");
+    const providerAccount = kind === "null_account" ? null : "backend-account";
+    const expectedAccount =
+      kind === "wrong_account"
+        ? "another-account"
+        : kind === "missing_account" ? null : providerAccount;
+    const expectedThread =
+      kind === "wrong_thread"
+        ? "different-thread"
+        : kind === "missing_thread" ? "" : "exact-thread";
+    const retryable = ["suspended", "distinct_account", "null_account"].includes(
+      kind,
+    );
     try {
       const identity = {
         runId: execution.binding.runId,
@@ -2932,6 +2949,7 @@ describe("explicit failed native retry physical evidence", () => {
             schema: "paperclip.runner.codex-provider-state.v1",
             lifecycle: "prepared",
             threadId: "exact-thread",
+            providerSessionId: providerAccount,
             activeProviderTurnId:
               kind === "active_provider" ? "old-turn" : null,
             ambiguousTurnStartPending: kind === "ambiguous_provider",
@@ -2956,23 +2974,24 @@ describe("explicit failed native retry physical evidence", () => {
         );
       }
       const before = await readdir(stateBase);
-      expect(
-        nativeFailedRunRetryStateIsSafe({
-          execution,
-          ...execution.binding,
-          nativeSessionId: execution.session.normalizedSessionId!,
-          runnerInstanceId:
-            kind === "wrong_runner" ? "another-runner" : "runner-retry",
-          processPid: kind === "live_pid" ? process.pid : null,
-          providerSessionId:
-            kind === "wrong_thread" ? "different-thread" : "exact-thread",
-          processGroupId: null,
-          recoveryMode: bootstrap
-            ? "bootstrap_retry"
-            : "exact_checkpoint_resume",
-          allowVerifiedBackup: false,
-        }),
-      ).toBe(kind === "suspended" || kind === "bootstrap");
+      const retryInput = {
+        execution,
+        ...execution.binding,
+        nativeSessionId: execution.session.normalizedSessionId!,
+        runnerInstanceId:
+          kind === "wrong_runner" ? "another-runner" : "runner-retry",
+        processPid: kind === "live_pid" ? process.pid : null,
+        providerSessionId: expectedThread,
+        providerBackendSessionId: expectedAccount,
+        processGroupId: null,
+        recoveryMode: bootstrap
+          ? "bootstrap_retry" as const
+          : "exact_checkpoint_resume" as const,
+        allowVerifiedBackup: false,
+      };
+      expect.soft(nativeFailedRunRetryStateIsSafe(retryInput)).toBe(
+        retryable || kind === "bootstrap",
+      );
       if (!bootstrap && kind !== "symlink") {
         const files = [
           "control-plane/control-plane-state.json",
@@ -3014,14 +3033,14 @@ describe("explicit failed native retry physical evidence", () => {
           nativeSessionId: execution.session.normalizedSessionId!,
           runnerInstanceId:
             kind === "wrong_runner" ? "foreign-runner" : "runner-retry",
-          providerSessionId:
-            kind === "wrong_thread" ? "foreign-thread" : "exact-thread",
+          providerSessionId: expectedThread,
+          providerBackendSessionId: expectedAccount,
           processPid: kind === "live_pid" ? process.pid : 99_999_999,
           processGroupId: 99_999_999,
           receipt,
         };
         expect(nativePreProviderRetryAfterCleanupStateIsSafe(input)).toBe(
-          kind === "suspended",
+          retryable,
         );
         expect(
           nativePreProviderRetryAfterCleanupStateIsSafe({

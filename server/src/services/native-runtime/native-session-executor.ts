@@ -2653,6 +2653,7 @@ export function nativeFailedRunRetryStateIsSafe(input: {
   nativeSessionId: string;
   runnerInstanceId: string;
   providerSessionId: string | null;
+  providerBackendSessionId: string | null;
   processPid: number | null;
   processGroupId: number | null;
   recoveryMode: "bootstrap_retry" | "exact_checkpoint_resume";
@@ -2798,7 +2799,8 @@ export function nativeFailedRunRetryStateIsSafe(input: {
     });
     return (
       !!input.providerSessionId &&
-      providerIdentity.providerSessionId === input.providerSessionId
+      providerIdentity.providerSessionId === input.providerSessionId &&
+      providerIdentity.providerBackendSessionId === input.providerBackendSessionId
     );
   } catch {
     return false;
@@ -2814,6 +2816,7 @@ export function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
   companyId: string; issueId: string; agentId: string;
   failedRunId: string; retiredRunId: string; nativeSessionId: string;
   runnerInstanceId: string; providerSessionId: string;
+  providerBackendSessionId: string | null;
   processPid: number; processGroupId: number;
   receipt: Record<string, unknown>;
 }): boolean {
@@ -2835,6 +2838,7 @@ export function nativePreProviderRetryAfterCleanupStateIsSafe(input: {
         execution: retired, companyId: input.companyId, issueId: input.issueId, agentId: input.agentId,
         runId: input.retiredRunId, nativeSessionId: input.nativeSessionId, runnerInstanceId: input.runnerInstanceId,
         providerSessionId: input.providerSessionId, processPid: input.processPid, processGroupId: input.processGroupId,
+        providerBackendSessionId: input.providerBackendSessionId,
         recoveryMode: "exact_checkpoint_resume", allowVerifiedBackup: false,
       })) return false;
     const root = scopedRunnerdStateRoot(retired);
