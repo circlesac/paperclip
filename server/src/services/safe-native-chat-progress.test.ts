@@ -34,6 +34,8 @@ describe("safe native chat progress", () => {
     "semantic_tool.input",
     "semantic_tool.result",
     "provider.notice",
+    "harness.diagnostic",
+    "paperclip.provider_startup.v1",
     "run.result.proposed",
     "run.terminal",
     "runtime_request.completed",

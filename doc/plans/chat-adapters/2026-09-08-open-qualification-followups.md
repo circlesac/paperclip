@@ -7,6 +7,26 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 01:19 UTC: the Mac remains locked. Parallel code work continues
+on forward-only provider startup fencing: persist launch intent and exact child
+facts before RPCs, retain failed-startup evidence through command failure, and
+deny an untracked replacement launch after restart. James owns implementation;
+Epicurus independently reviews failure ordering and authority boundaries. This
+must not unlock historical Discord/Telegram retries or treat direct-child exit
+as proof of whole-process-tree retirement. Boole is making the successful,
+side-effect-free public ingress probe reproducible as an opt-in diagnostic.
+
+The latest pre-slice full chat integration run passed **578/578**, zero skips,
+on fresh `chat_adapters_startup_audit_20260909_full01` (93.99 seconds). Added
+publication-boundary coverage then passed **12/12** selected cases (572 filtered)
+and **51/51** unit cases: private startup diagnostics do not produce or suppress
+external progress across all five providers, including Teams personal/channel.
+Those fixtures prove publication privacy, not authenticated startup ownership
+or a live Teams connection. Current route probes returned the expected invalid-
+signature HTTP 401 through both public relay address families; no new live
+deliveries, runs or publications were created. Historical Slack HTTP error is
+still unlocalized; no host sleep transition occurred in its bounded window.
+
 Current deployment (September 9, 01:09 UTC): server **66**, PID **61423**,
 handle **47172**, is healthy on **127.0.0.1:3137**, loaded code `807e2ace2`.
 The private Tailscale Board URL and webhook-only proxy are unchanged. Server 65

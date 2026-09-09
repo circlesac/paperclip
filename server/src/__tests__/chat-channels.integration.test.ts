@@ -45302,6 +45302,78 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     },
   );
 
+  it.each([
+    ["slack", "91", "channel"],
+    ["github", "92", "channel"],
+    ["discord", "93", "channel"],
+    ["telegram", "94", "personal"],
+    ["microsoft-teams", "95", "channel"],
+    ["microsoft-teams", "96", "personal"],
+  ] as const)(
+    "keeps provider startup diagnostics private on %s fixture %s (%s)",
+    async (provider, suffix, surface) => {
+      const context = await safeNativeProgressFixture(provider, suffix, surface);
+      try {
+        const run = await context.createRun("startup recovery");
+        // This is a publication-boundary fixture, not proof that a provider
+        // startup receipt is authentic or that any process has retired.
+        const phases = ["intent", "spawned", "initialization_failed"];
+        await db.insert(heartbeatRunEvents).values(
+          phases.map((phase, index) => ({
+            companyId: context.fixture.companyId,
+            agentId: context.fixture.assignedAgentId,
+            runId: run.runId,
+            seq: index + 1,
+            eventType: "harness.diagnostic",
+            message: "PRIVATE provider startup evidence",
+            payload: {
+              code: "paperclip.provider_startup.v1",
+              phase,
+              launchId: "PRIVATE-STARTUP-LAUNCH",
+              requestedThreadId: "PRIVATE-REQUESTED-THREAD",
+              authenticatedThreadId: null,
+              directChildExitObserved: phase === "initialization_failed",
+            },
+            createdAt: new Date(run.baseCreatedAt.getTime() + 30_000 + index),
+          })),
+        );
+        await expect(
+          enqueueChatRunMilestones(db, { since: new Date(0) }),
+        ).resolves.toBe(0);
+        await expect(
+          context.service.processPendingPublications(100),
+        ).resolves.toBe(0);
+        expect(context.providerRuntime.posts).toHaveLength(1);
+        expect(context.providerRuntime.edits).toHaveLength(0);
+
+        // Private diagnostics must neither generate progress nor suppress a
+        // later real, allowlisted progress event in the same run.
+        await context.addEvent(run, "item.completed", 4);
+        await expect(
+          enqueueChatRunMilestones(db, { since: new Date(0) }),
+        ).resolves.toBe(1);
+        await context.service.processPendingPublications(100);
+        expect(context.providerRuntime.posts).toHaveLength(1);
+        expect(context.providerRuntime.edits).toEqual([
+          {
+            threadId: context.thread.thread.id,
+            messageId: "outbound-1",
+            text: "Maya is making progress…",
+          },
+        ]);
+        const publications = await db
+          .select({ payload: chatPublications.payload })
+          .from(chatPublications)
+          .where(eq(chatPublications.conversationId, context.conversation.id));
+        expect(JSON.stringify(publications)).not.toMatch(
+          /PRIVATE|provider_startup|harness\.diagnostic|launchId|requestedThreadId|directChildExitObserved/,
+        );
+      } finally {
+        await context.service.shutdown();
+      }
+    },
+  );
+
   it("enforces the native progress cadence boundary and one publication per phase", async () => {
     const context = await safeNativeProgressFixture("telegram", "8");
     const run = await context.createRun("cadence boundaries");
