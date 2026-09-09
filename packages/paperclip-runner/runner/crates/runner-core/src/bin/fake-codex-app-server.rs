@@ -556,8 +556,18 @@ fn send_runtime_request_flood(
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let state_path =
-        PathBuf::from(argument(&args, "--state-file").ok_or("--state-file is required")?);
+    let state_path = if args
+        .iter()
+        .any(|value| value == "--state-file-in-codex-home")
+    {
+        PathBuf::from(std::env::var("CODEX_HOME")?).join("fake-codex-state.json")
+    } else {
+        PathBuf::from(argument(&args, "--state-file").ok_or("--state-file is required")?)
+    };
+    let reject_missing_resume_state = args
+        .iter()
+        .any(|value| value == "--require-existing-resume-state")
+        && !state_path.exists();
     let call_log = argument(&args, "--call-log").map(PathBuf::from);
     let emit_question = args.iter().any(|value| value == "--emit-question");
     let emit_runtime_question = args.iter().any(|value| value == "--runtime-question");
@@ -686,6 +696,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .any(|value| value == "--omit-ambiguous-turn-started");
     let fail_after_thread_read = args.iter().any(|value| value == "--fail-after-thread-read");
     let fail_first_interrupt = args.iter().any(|value| value == "--fail-first-interrupt");
+    let ignore_repeated_interrupt = args
+        .iter()
+        .any(|value| value == "--ignore-repeated-interrupt");
     let accept_interrupt_without_terminal_once = args
         .iter()
         .any(|value| value == "--accept-interrupt-without-terminal-once");
@@ -925,6 +938,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             }
             "thread/resume" => {
+                if reject_missing_resume_state {
+                    send(json!({"id": id, "error": {
+                        "code": -32600,
+                        "message": "no rollout found for thread id"
+                    }}))?;
+                    continue;
+                }
                 if require_external_sandbox
                     && (message.pointer("/params/sandbox") != Some(&json!("danger-full-access"))
                         || message.pointer("/params/permissions").is_some())
@@ -1375,6 +1395,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "turn/interrupt" => {
                 interrupt_count += 1;
+                if ignore_repeated_interrupt && interrupt_count > 1 {
+                    continue;
+                }
                 if fail_first_interrupt && interrupt_count == 1 {
                     send(json!({
                         "id": id,

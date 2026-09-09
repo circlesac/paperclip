@@ -1928,6 +1928,7 @@ async function settleRetainedRunnerdSessionOwned(
   const bounded = async <T>(
     operation: Promise<T>,
     expiresAt = deadline,
+    cleanup = false,
   ): Promise<T> => {
     const retained =
       retainedMaintenanceOperations.get(root) ?? new Set<Promise<unknown>>();
@@ -1954,8 +1955,10 @@ async function settleRetainedRunnerdSessionOwned(
           };
           timer = setTimeout(fail, Math.max(0, expiresAt - Date.now()));
           abort = fail;
-          input.signal?.addEventListener("abort", abort, { once: true });
-          if (input.signal?.aborted) fail();
+          if (!cleanup) {
+            input.signal?.addEventListener("abort", abort, { once: true });
+            if (input.signal?.aborted) fail();
+          }
         }),
       ]);
     } finally {
@@ -2233,8 +2236,15 @@ async function settleRetainedRunnerdSessionOwned(
       epochCompleted = true;
     } finally {
       rejectSpawnAdmission(failure ?? maintenanceDenied());
-      if (handle && !exited)
+      if (handle && !exited) {
         await waitForProcess(handle, 250).catch(() => undefined);
+        // waitForProcess rejects when it dispatches SIGKILL, before the exact
+        // child's exit notification necessarily arrives. Join that existing
+        // completion separately; a kill attempt never stands in for proof.
+        await bounded(handle.completion, Date.now() + 1_000, true).catch(
+          () => undefined,
+        );
+      }
       await core.stop();
       // Do not mistake a bounded wait/kill attempt for retirement. Only the
       // exact child's settled completion plus absence of its entire group can
@@ -2255,6 +2265,7 @@ async function settleRetainedRunnerdSessionOwned(
               finalFingerprint: readMaintenanceState(root).fingerprint,
             }),
             Date.now() + 1_000,
+            true,
           );
         } catch (error) {
           failure ??= error;

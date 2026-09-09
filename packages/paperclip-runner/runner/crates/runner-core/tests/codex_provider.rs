@@ -3664,6 +3664,172 @@ fn durable_stop_does_not_reopen_an_unprepared_or_closed_executor() {
 }
 
 #[test]
+fn durable_stop_settles_pending_semantic_tools_without_a_courtesy_interrupt() {
+    let directory = temporary_directory("stop-pending-semantic-tool");
+    let config = provider_config(&directory, &["--require-dynamic-tool", "--emit-tool-call"]);
+    let runner_config = durable_config(&directory);
+    let mut executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({
+                "provider": config,
+                "authorizedTools": task_context_tool_set(),
+            }),
+        ))
+        .unwrap();
+    executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Hold this semantic call."}),
+        ))
+        .unwrap();
+    let input = wait_for_executor_event(&mut executor, "semantic_tool.input");
+    let stopped = executor
+        .execute(&command("stop", 4, "turn.stop", json!({})))
+        .unwrap();
+    assert_eq!(stopped.result["providerExitConfirmed"], true);
+    let result = wait_for_executor_event(&mut executor, "semantic_tool.result");
+    assert_eq!(result.payload["semantic_tool"]["outcome"], "failed");
+    assert_eq!(
+        result.payload["semantic_tool"]["callId"],
+        input.payload["semantic_tool"]["callId"]
+    );
+    assert_eq!(
+        result.payload["semantic_tool"]["correlation"],
+        input.payload["semantic_tool"]["correlation"]
+    );
+    assert!(executor
+        .execute(&command(
+            "late-result",
+            5,
+            "semantic_tool.result",
+            json!({
+                "callId": "semantic-call-1", "operationId": "get_task_context",
+                "result": {"ok": true}, "isError": false,
+            })
+        ))
+        .is_err());
+    assert_eq!(call_count(&directory, "turn/interrupt"), 0);
+    assert_eq!(call_count(&directory, "thread/start"), 1);
+    assert_eq!(call_count(&directory, "turn/start"), 1);
+    let state: Value =
+        serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["lifecycle"], "prepared");
+    assert!(state["toolBridge"]["pending"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn durable_stop_does_not_wait_for_a_repeated_interrupt_acknowledgement() {
+    let directory = temporary_directory("stop-after-interrupt-acknowledgement");
+    let config = provider_config(&directory, &["--hold-turn", "--ignore-repeated-interrupt"]);
+    let mut provider = serde_json::to_value(config).unwrap();
+    provider["kind"] = json!("codex");
+    let runner_config = durable_config(&directory);
+    let mut executor =
+        NativeProviderCommandExecutor::with_runner_config(&directory, &runner_config);
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": provider}),
+        ))
+        .unwrap();
+    let opened = executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    let provider_pid = opened.result["processId"].as_u64().unwrap();
+    executor
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Keep the exact turn until interrupted."}),
+        ))
+        .unwrap();
+    let interrupted = executor
+        .execute(&command("interrupt", 4, "turn.interrupt", json!({})))
+        .unwrap();
+    assert_eq!(interrupted.result["status"], "interrupt_requested");
+    // Mirror the actual producer ordering: the first RPC was acknowledged and
+    // the provider has aborted, but the runner has not polled its terminal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let state: Value =
+            serde_json::from_slice(&fs::read(directory.join("fake-state.json")).unwrap()).unwrap();
+        if state["activeTurnId"].is_null() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first interrupt did not settle provider turn"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let state_path = directory.join("codex-provider-state.json");
+    let before: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(before["activeProviderTurnId"], "provider-turn-1");
+    assert_eq!(call_count(&directory, "turn/interrupt"), 1);
+    let started = std::time::Instant::now();
+    let stopped = executor
+        .execute(&command("stop", 5, "turn.stop", json!({})))
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(stopped.result["status"], "stopped");
+    assert_eq!(stopped.result["providerExitConfirmed"], true);
+    for id in [provider_pid.to_string(), format!("-{provider_pid}")] {
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .args(["-0", "--", &id])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "exact provider PID and private group must be absent"
+        );
+    }
+    let prepared: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(prepared["lifecycle"], "prepared");
+    assert_eq!(prepared["threadId"], before["threadId"]);
+    assert_eq!(
+        prepared["providerProcessGeneration"],
+        before["providerProcessGeneration"]
+    );
+    assert_eq!(prepared["pendingEvents"], before["pendingEvents"]);
+    assert!(prepared["activeProviderTurnId"].is_null());
+    assert_eq!(call_count(&directory, "thread/start"), 1);
+    assert_eq!(call_count(&directory, "thread/resume"), 0);
+    assert_eq!(call_count(&directory, "turn/start"), 1);
+    let interrupt_calls = call_count(&directory, "turn/interrupt");
+    executor.shutdown().unwrap();
+    drop(executor);
+    fs::remove_dir_all(directory).unwrap();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "definitive stop waited on a redundant courtesy RPC: {elapsed:?}"
+    );
+    assert_eq!(
+        interrupt_calls, 1,
+        "stop must not ask an already interrupted provider again"
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn durable_stop_prepares_a_turn_that_ended_before_provider_resume() {
     assert_durable_stop_prepares_resumed_provider(true);
@@ -3810,7 +3976,8 @@ fn assert_durable_stop_prepares_resumed_provider(ended_before_resume: bool) {
     );
     assert_eq!(
         call_count(&directory, "turn/interrupt"),
-        usize::from(!ended_before_resume)
+        0,
+        "definitive stop must not wait for a courtesy interrupt RPC"
     );
     resumed
         .execute(&command("drain", 6, "runner.drain", json!({})))

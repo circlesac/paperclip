@@ -31,6 +31,7 @@ import type {
 import { completeRetainedNativeSessionCleanup, executeNativeSession } from "../native-session-runtime.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
+import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
 
 import {
   NATIVE_RUNTIME_ASSET_SCHEMA,
@@ -89,6 +90,9 @@ it.each([
   { alreadyEnded: true, appendFailure: false, epochFailure: "spawned" },
   { alreadyEnded: true, appendFailure: false, epochFailure: "retired" },
   { alreadyEnded: true, appendFailure: false, holdSpawned: true },
+  { alreadyEnded: true, appendFailure: false, homeScoped: true },
+  { alreadyEnded: true, appendFailure: false, homeScoped: true, missingHome: true },
+  { alreadyEnded: true, appendFailure: false, homeScoped: true, missingHome: true, unknownExit: true },
   {
     alreadyEnded: true,
     appendFailure: false,
@@ -96,7 +100,7 @@ it.each([
     terminalReplay: true,
   },
 ])(
-  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned)",
+  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned/$homeScoped/$missingHome/$unknownExit)",
   async ({
     alreadyEnded,
     appendFailure,
@@ -104,6 +108,9 @@ it.each([
     epochFailure,
     terminalReplay,
     holdSpawned,
+    homeScoped,
+    missingHome,
+    unknownExit,
   }) => {
     const fixtureRunner = defaultCapabilityRunnerdBinary();
     const directory = await mkdtemp(join(tmpdir(), "runnerd-maintenance-"));
@@ -129,6 +136,9 @@ it.each([
       ? { PATH: bin, HOME: home, CODEX_HOME: home }
       : undefined;
     const calls = join(directory, "calls.log");
+    const fakeState = homeScoped
+      ? join(original, "codex-home/fake-codex-state.json")
+      : join(directory, "fake.json");
     const identity = {
       runnerInstanceId: "runner-maintenance",
       environmentLeaseId: "lease-maintenance",
@@ -142,8 +152,9 @@ it.each([
       codexCommand: bareCodex ? "codex" : fakeCodex,
       environment,
       codexArgs: [
-        "--state-file",
-        join(directory, "fake.json"),
+        ...(homeScoped
+          ? ["--state-file-in-codex-home", "--require-existing-resume-state"]
+          : ["--state-file", fakeState]),
         "--call-log",
         calls,
         "--hold-turn",
@@ -184,10 +195,10 @@ it.each([
       });
       if (alreadyEnded) {
         const providerState = JSON.parse(
-          await readFile(join(directory, "fake.json"), "utf8"),
+          await readFile(fakeState, "utf8"),
         );
         await writeFile(
-          join(directory, "fake.json"),
+          fakeState,
           JSON.stringify({ ...providerState, activeTurnId: null }),
         );
       }
@@ -202,7 +213,7 @@ it.each([
       builder.queueCommand("turn.stop", {
         reason: "interrupted original close",
       });
-      builder.queueCommand("runner.suspend", {});
+      if (!missingHome) builder.queueCommand("runner.suspend", {});
       // Match the retained production split: runner-owned unacknowledged
       // output plus another full provider-owned prefix behind the old suspend.
       const runnerFile = join(original, "runner/runner-state.json");
@@ -259,6 +270,8 @@ it.each([
       }
       await writeFile(providerFile, JSON.stringify(providerBefore));
       await cp(original, copy, { recursive: true });
+      const originalProviderHome = homeScoped ? await readFile(fakeState) : null;
+      if (missingHome) await rm(join(copy, "codex-home/fake-codex-state.json"));
       const files = [
         "control-plane/control-plane-state.json",
         "runner/runner-state.json",
@@ -292,7 +305,9 @@ it.each([
         },
         backend: {
           kind: "codex",
-          name: epochFailure
+          name: missingHome
+            ? `maintenance-test-missing-home-${Boolean(unknownExit)}`
+            : epochFailure
             ? `maintenance-test-${epochFailure}`
             : appendFailure
               ? "maintenance-test-failure"
@@ -507,6 +522,102 @@ it.each([
           await drain;
           if (interruption === "timeout") vi.useRealTimers();
         }
+      }
+      if (missingHome) {
+        const launch = durableControlPlane.spawnRunner;
+        const completions: Promise<unknown>[] = [];
+        let releaseExit!: () => void;
+        const exitGate = new Promise<void>((resolveExit) => {
+          releaseExit = resolveExit;
+        });
+        const launchSpy = vi
+          .spyOn(durableControlPlane, "spawnRunner")
+          .mockImplementation((options) => {
+            const handle = launch(options);
+            const completion = handle.completion.then(async (result) => {
+              // Model delayed delivery of the exact child's exit notification;
+              // dispatching a kill is not itself a durable retirement receipt.
+              if (unknownExit) await exitGate;
+              else
+                await new Promise((resolveExit) => setTimeout(resolveExit, 750));
+              return result;
+            });
+            completions.push(completion);
+            return { ...handle, completion };
+          });
+        authorize.mockImplementation(async () => {
+          const current = JSON.parse(
+            await readFile(join(copy, files[0]!), "utf8"),
+          );
+          if (
+            current.commands.some(
+              (command: { status: string }) => command.status === "failed",
+            )
+          )
+            throw new Error("native_cleanup_maintenance_unproven");
+        });
+        try {
+          await expect(settleRetainedRunnerdSession(input)).rejects.toThrow(
+            "native_cleanup_maintenance_unproven",
+          );
+          if (unknownExit) {
+            expect(
+              recordEpoch.mock.calls.some(
+                ([receipt]) => receipt.phase === "retired",
+              ),
+            ).toBe(false);
+            expect(retainedRunnerdMaintenanceIsIdle(copy)).toBe(false);
+          }
+        } finally {
+          launchSpy.mockRestore();
+          releaseExit();
+          await Promise.allSettled(completions);
+          await drainRetainedRunnerdMaintenanceOperations();
+        }
+        const receipts = recordEpoch.mock.calls.map(([receipt]) => receipt);
+        const launched = receipts.filter(
+          (receipt) => receipt.phase === "spawned",
+        );
+        expect(launched.length).toBeGreaterThan(0);
+        for (const spawned of launched) {
+          const retired = receipts.find(
+            (receipt) =>
+              receipt.phase === "retired" &&
+              receipt.launchId === spawned.launchId,
+          );
+          if (unknownExit) expect(retired).toBeUndefined();
+          else
+            expect(retired).toMatchObject({
+              pid: spawned.pid,
+              processGroupAbsent: true,
+            });
+          expect(dead(Number(spawned.pid))).toBe(true);
+          expect(dead(-Number(spawned.pid))).toBe(true);
+        }
+        const failed = JSON.parse(await readFile(join(copy, files[0]!), "utf8"));
+        expect(
+          failed.commands.some(
+            (command: {
+              type: string;
+              result?: { result?: { message?: string } };
+            }) =>
+              command.type === "turn.stop" &&
+              command.result?.result?.message?.includes("no rollout found"),
+          ),
+        ).toBe(true);
+        expect(await readFile(fakeState)).toEqual(originalProviderHome);
+        expect(
+          await Promise.all(files.map((file) => readFile(join(original, file)))),
+        ).toEqual(bytes);
+        await expect(execute()).rejects.toMatchObject({
+          code: "native_session_cleanup_quarantined",
+        });
+        expect(start).toHaveBeenCalledOnce();
+        const methods = (await readFile(calls, "utf8")).trim().split("\n");
+        expect(methods.filter((method) => method === "turn/start")).toHaveLength(
+          1,
+        );
+        return;
       }
       if (appendFailure) {
         const failure = new Error(

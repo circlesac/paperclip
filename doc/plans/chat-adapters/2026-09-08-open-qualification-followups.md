@@ -7,6 +7,28 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+Latest verification (September 9, 00:34 UTC): the definitive stop no longer
+issues a second cooperative interrupt. Its genuine regression failed after
+30.04 seconds before the fix. Rust verification passed 239 library cases,
+72 provider cases (one existing helper ignored in that target, run separately
+and passed), 10 native-wrapper cases, and five focused stop cases. Bounded
+provider-home preservation and exact-child-completion changes passed 223
+executor and 100 transport cases, server/package typechecks, and independent
+review. Root built and staged the normal optimized runner, SHA-256
+`4acf2d1dbe99a6202d07b6d0be73b469ebf153103cda2bbd097e5e4233fcd57a`,
+verified its strict signature, and ran all 12 real-process maintenance cases
+against that default artifact (51.26 seconds, no debug override). It is not yet
+deployed: server 63 still runs the earlier loaded code. Historical BufsxY is
+still operator-required; the new proof does not manufacture its missing exit
+receipt. Discord's metadata-only source-update repair remains in progress.
+
+The user is signed into Discord and the session works. A separate Board-to-
+Discord media journey succeeded: newly uploaded image and document, explicit
+Send to channel, then actual image and text preview in the provider thread.
+The three publication parts completed once each in 2.1 seconds without another
+agent run. Root is finishing UI tests for inline upload and a misleading
+in-flight delivery warning. This is not an agent-response/recovery pass.
+
 Latest live checkpoint (September 9, 00:17 UTC): `1b81b6a39` is pushed.
 Server 63 is PID 45413 on **127.0.0.1:3137**, not 3103. Other worktrees' test
 processes repeatedly occupied 3103, so servers 61 and 62 selected 3108. Both
@@ -65,9 +87,8 @@ Slack's exact active bot `U0C05EDC10R` is still a member of private test channel
 `C0BUT55N9RV`: authenticated provider reads confirmed membership and three
 members. The browser's one-member display and similarly named app suggestion
 are not grounds to change access. Refresh and select the exact current bot.
-Discord's Eigenjoy browser session currently requires login again; the saved
-1Password item is visible, but CLI authorization was dismissed. No bot token
-rotation or provider access changes have been made.
+Discord's Eigenjoy browser session was restored by the user and verified live.
+No bot token rotation or provider access changes have been made.
 
 Newest evidence (23:55 UTC): the browser is available again. Root retried the
 original GitHub B run `38dfc3ec-4fa7-4ed4-8563-7650dfce3d47` through its Board

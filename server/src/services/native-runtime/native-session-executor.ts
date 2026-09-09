@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import type {
   AdapterExecutionResult,
@@ -1896,6 +1897,202 @@ export async function appendRetainedNativeCleanupEvent(
   });
 }
 
+function cleanupProviderHomeSnapshot(home: string, content: boolean) {
+  const entries: Array<{
+    path: string;
+    directory: boolean;
+    dev: number;
+    ino: number;
+    size: number;
+    mtimeMs: number;
+    ctimeMs: number;
+    sha256?: string;
+  }> = [];
+  let bytes = 0;
+  const visit = (relative: string, depth: number) => {
+    if (depth > 32 || entries.length >= MAX_REMOTE_CHECKPOINT_ENTRIES)
+      throw new Error("native_cleanup_maintenance_unproven");
+    const path = resolve(home, relative);
+    const metadata = lstatSync(path);
+    if (
+      metadata.isSymbolicLink() ||
+      (!metadata.isFile() && !metadata.isDirectory())
+    )
+      throw new Error("native_cleanup_maintenance_unproven");
+    const entry = {
+      path: relative,
+      directory: metadata.isDirectory(),
+      dev: metadata.dev,
+      ino: metadata.ino,
+      size: metadata.isDirectory() ? 0 : metadata.size,
+      mtimeMs: metadata.mtimeMs,
+      ctimeMs: metadata.ctimeMs,
+    };
+    entries.push(entry);
+    if (entry.directory) {
+      const directory = opendirSync(path);
+      const children: string[] = [];
+      try {
+        for (
+          let child = directory.readSync();
+          child !== null;
+          child = directory.readSync()
+        ) {
+          if (
+            !relative &&
+            (
+              CODEX_HOME_NON_PERSISTENT_ENTRIES as readonly string[]
+            ).includes(child.name)
+          )
+            continue;
+          if (
+            children.length + entries.length >=
+            MAX_REMOTE_CHECKPOINT_ENTRIES
+          )
+            throw new Error("native_cleanup_maintenance_unproven");
+          children.push(child.name);
+        }
+      } finally {
+        directory.closeSync();
+      }
+      for (const name of children.sort())
+        visit(relative ? `${relative}/${name}` : name, depth + 1);
+    } else {
+      bytes += metadata.size;
+      if (bytes > MAX_REMOTE_CHECKPOINT_EXPANDED_BYTES)
+        throw new Error("native_cleanup_maintenance_unproven");
+      if (content) {
+        const value = readBoundedNativeFile(
+          path,
+          metadata.size,
+          "native_cleanup_maintenance_unproven",
+        );
+        (entry as (typeof entries)[number]).sha256 = createHash("sha256")
+          .update(value)
+          .digest("hex");
+      }
+    }
+    const after = lstatSync(path);
+    if (
+      after.dev !== metadata.dev ||
+      after.ino !== metadata.ino ||
+      after.mtimeMs !== metadata.mtimeMs ||
+      after.ctimeMs !== metadata.ctimeMs ||
+      after.size !== metadata.size
+    )
+      throw new Error("native_cleanup_maintenance_unproven");
+  };
+  visit("", 0);
+  return {
+    entries,
+    bytes,
+    metadataFingerprint: nativeSha256(
+      entries.map(({ sha256: _sha, ...entry }) => entry),
+    ),
+    fingerprint: content
+      ? nativeSha256(
+          entries.map(({ path, directory, size, sha256 }) => ({
+            path,
+            directory,
+            size,
+            ...(sha256 ? { sha256 } : {}),
+          })),
+        )
+      : null,
+  };
+}
+
+function copyCleanupProviderHome(
+  source: string,
+  destination: string,
+  snapshot: ReturnType<typeof cleanupProviderHomeSnapshot>,
+) {
+  for (const entry of snapshot.entries) {
+    const target = resolve(destination, entry.path);
+    if (entry.directory) mkdirSync(target, { mode: 0o700 });
+    else {
+      const value = readBoundedNativeFile(
+        resolve(source, entry.path),
+        entry.size,
+        "native_cleanup_maintenance_unproven",
+      );
+      if (createHash("sha256").update(value).digest("hex") !== entry.sha256)
+        throw new Error("native_cleanup_maintenance_unproven");
+      writeFileSync(target, value, { flag: "wx", mode: 0o600 });
+    }
+  }
+  if (
+    cleanupProviderHomeSnapshot(source, false).metadataFingerprint !==
+      snapshot.metadataFingerprint ||
+    cleanupProviderHomeSnapshot(destination, true).fingerprint !==
+      snapshot.fingerprint
+  )
+    throw new Error("native_cleanup_maintenance_unproven");
+}
+
+function assertCleanupProviderHomePaths(
+  home: string,
+  canonicalHome: string,
+  threadId: string,
+) {
+  const snapshot = cleanupProviderHomeSnapshot(home, true);
+  const rollouts = snapshot.entries.filter(
+    (entry) =>
+      !entry.directory &&
+      entry.path.startsWith("sessions/") &&
+      entry.path.endsWith(`-${threadId}.jsonl`),
+  );
+  if (rollouts.length !== 1)
+    throw new Error("native_cleanup_maintenance_unproven");
+  const rollout = rollouts[0]!;
+  const bytes = readBoundedNativeFile(
+    resolve(home, rollout.path),
+    rollout.size,
+    "native_cleanup_maintenance_unproven",
+  );
+  const newline = bytes.indexOf(10);
+  if (newline < 0 || newline > 64 * 1024)
+    throw new Error("native_cleanup_maintenance_unproven");
+  const first = record(
+    JSON.parse(bytes.subarray(0, newline).toString("utf8")),
+  );
+  if (
+    first.type !== "session_meta" ||
+    record(first.payload).id !== threadId
+  )
+    throw new Error("native_cleanup_maintenance_unproven");
+  // Only inspect the NEW private copy. SQLite may consult its copied WAL/SHM.
+  // The pinned provider repairs a stale canonical path by finding this local
+  // rollout. An existing quarantine/foreign path must never be resumed.
+  const sqlite = resolve(home, "state_5.sqlite");
+  if (
+    snapshot.entries.some(
+      (entry) =>
+        /^state_\d+\.sqlite$/.test(entry.path) &&
+        entry.path !== "state_5.sqlite",
+    )
+  )
+    throw new Error("native_cleanup_maintenance_unproven");
+  if (!existsSync(sqlite)) return;
+  const database = new DatabaseSync(sqlite, { readOnly: true });
+  try {
+    const row = database
+      .prepare("SELECT rollout_path FROM threads WHERE id = ?")
+      .get(threadId);
+    if (
+      !row ||
+      typeof row.rollout_path !== "string" ||
+      ![
+        resolve(home, rollout.path),
+        resolve(canonicalHome, rollout.path),
+      ].includes(row.rollout_path)
+    )
+      throw new Error("native_cleanup_maintenance_unproven");
+  } finally {
+    database.close();
+  }
+}
+
 /** Exact local cleanup only: the accepted result and original quarantine are
  * never rewritten. A failed/interrupted maintenance attempt is retained for
  * inspection, not retried from an older snapshot with unknown process owners. */
@@ -1927,6 +2124,7 @@ export async function reconcileRetainedNativeSessionCleanup(
     root: string;
     emptyRoot: ReturnType<typeof cleanupCanonicalVacancy>;
     source: ReturnType<typeof cleanupStateSnapshot>;
+    providerHome: ReturnType<typeof cleanupProviderHomeSnapshot>;
     copySource: {
       directory: string;
       snapshot: ReturnType<typeof cleanupStateSnapshot>;
@@ -2156,6 +2354,10 @@ export async function reconcileRetainedNativeSessionCleanup(
         snapshot: ReturnType<typeof cleanupStateSnapshot>;
         requestId: string;
       } | null = null;
+      const providerHome = cleanupProviderHomeSnapshot(
+        resolve(quarantine, "codex-home"),
+        true,
+      );
       const maintenanceHistory = coordinator.recoveryHistory.filter(
         (event) => event.kind === "native_cleanup_maintenance",
       );
@@ -2259,6 +2461,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         root,
         emptyRoot,
         source,
+        providerHome,
         copySource,
         providerPid: provider.processId,
         providerSessionId: provider.providerSessionId,
@@ -2303,6 +2506,10 @@ export async function reconcileRetainedNativeSessionCleanup(
       executingRunnerdSessionScopes.get(reservedScope) !== leaseOwner ||
       cleanupStateSnapshot(owned.quarantine).fingerprint !==
         owned.source.fingerprint ||
+      cleanupProviderHomeSnapshot(
+        resolve(owned.quarantine, "codex-home"),
+        false,
+      ).metadataFingerprint !== owned.providerHome.metadataFingerprint ||
       (owned.copySource &&
         (!retainedRunnerdMaintenanceIsIdle(owned.copySource.directory) ||
           cleanupStateSnapshot(owned.copySource.directory).fingerprint !==
@@ -2362,6 +2569,17 @@ export async function reconcileRetainedNativeSessionCleanup(
       );
       chmodSync(resolve(copy, file), 0o600);
     }
+    copyCleanupProviderHome(
+      resolve(owned.quarantine, "codex-home"),
+      resolve(copy, "codex-home"),
+      owned.providerHome,
+    );
+    assertCleanupProviderHomePaths(
+      resolve(copy, "codex-home"),
+      resolve(owned.root, "codex-home"),
+      owned.providerSessionId,
+    );
+    await authorize();
     await appendMaintenanceHistory({
       kind: "native_cleanup_maintenance",
       version: 1,
@@ -2370,6 +2588,8 @@ export async function reconcileRetainedNativeSessionCleanup(
       sourceFingerprint:
         owned.copySource?.snapshot.fingerprint ?? owned.source.fingerprint,
       stagingName: basename(copy),
+      providerHomeFingerprint: owned.providerHome.fingerprint,
+      providerHomeBytes: owned.providerHome.bytes,
     });
     const proof = await settleRetainedRunnerdSession({
       requestId: leaseOwner,
@@ -2420,6 +2640,22 @@ export async function reconcileRetainedNativeSessionCleanup(
     });
     // Commit intent before the filesystem handoff. A crash can then be
     // distinguished from an unattempted quarantine; never replay its source.
+    if (
+      cleanupProviderHomeSnapshot(
+        resolve(owned.quarantine, "codex-home"),
+        true,
+      ).fingerprint !== owned.providerHome.fingerprint
+    )
+      throw denied();
+    assertCleanupProviderHomePaths(
+      resolve(copy, "codex-home"),
+      resolve(owned.root, "codex-home"),
+      owned.providerSessionId,
+    );
+    const settledHome = cleanupProviderHomeSnapshot(
+      resolve(copy, "codex-home"),
+      true,
+    );
     const emptyRootArchive = owned.emptyRoot
       ? `${basename(owned.root)}.empty-before-cleanup.${leaseOwner}`
       : null;
@@ -2432,6 +2668,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         requestId: leaseOwner,
         sourceFingerprint: proof.sourceFingerprint,
         settledFingerprint: proof.settledFingerprint,
+        settledProviderHomeFingerprint: settledHome.fingerprint,
         stagingName: basename(copy),
         ...(emptyRootArchive
           ? { emptyRootArchive, emptyRoot: owned.emptyRoot }
@@ -2451,6 +2688,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         requestId: leaseOwner,
         sourceFingerprint: proof.sourceFingerprint,
         settledFingerprint: proof.settledFingerprint,
+        settledProviderHomeFingerprint: settledHome.fingerprint,
       }),
       { flag: "wx", mode: 0o600 },
     );
@@ -2483,6 +2721,11 @@ export async function reconcileRetainedNativeSessionCleanup(
         .then((rows) => rows[0]);
       if (!current || current.phase !== "committed") throw denied();
       await authorize();
+      if (
+        cleanupProviderHomeSnapshot(resolve(copy, "codex-home"), false)
+          .metadataFingerprint !== settledHome.metadataFingerprint
+      )
+        throw denied();
       if (emptyRootArchive) {
         const archive = resolve(runnerdStateBase(), emptyRootArchive);
         if (lstatSync(archive, { throwIfNoEntry: false })) throw denied();
@@ -2505,6 +2748,7 @@ export async function reconcileRetainedNativeSessionCleanup(
               requestId: leaseOwner,
               sourceFingerprint: proof.sourceFingerprint,
               settledFingerprint: proof.settledFingerprint,
+              settledProviderHomeFingerprint: settledHome.fingerprint,
               nativeSessionId: owned.run.nativeSessionId,
               runnerInstanceId: owned.run.runnerInstanceId,
               providerSessionId: owned.providerSessionId,
@@ -2515,6 +2759,11 @@ export async function reconcileRetainedNativeSessionCleanup(
         })
         .where(eq(nativeRunFinalizations.runId, owned.run.id));
     });
+    if (
+      cleanupProviderHomeSnapshot(resolve(owned.root, "codex-home"), true)
+        .fingerprint !== settledHome.fingerprint
+    )
+      throw denied();
     completeRetainedNativeSessionCleanup(proof);
     rmSync(resolve(owned.root, CLEANUP_ACTIVATION_FILE));
     return { status: "settled", runId: input.runId };
@@ -2616,6 +2865,20 @@ async function assertCleanupActivationCommitted(
       entry.requestId === marker.requestId,
   );
   const snapshot = cleanupStateSnapshot(root);
+  if (
+    marker.settledProviderHomeFingerprint !== undefined ||
+    receipt?.settledProviderHomeFingerprint !== undefined
+  ) {
+    if (
+      typeof marker.settledProviderHomeFingerprint !== "string" ||
+      !/^[0-9a-f]{64}$/.test(marker.settledProviderHomeFingerprint) ||
+      receipt?.settledProviderHomeFingerprint !==
+        marker.settledProviderHomeFingerprint ||
+      cleanupProviderHomeSnapshot(resolve(root, "codex-home"), true)
+        .fingerprint !== marker.settledProviderHomeFingerprint
+    )
+      throw new NativeSessionCleanupQuarantinedError();
+  }
   if (
     coordinator?.phase !== "committed" ||
     receipt?.phase !== "settled" ||

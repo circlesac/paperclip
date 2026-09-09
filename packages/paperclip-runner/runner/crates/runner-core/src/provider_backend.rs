@@ -2412,14 +2412,13 @@ impl CodexCommandExecutor {
         }
         let provider_turn_id = state.and_then(|state| state.active_provider_turn_id.clone());
 
-        // The cooperative interrupt is useful to the provider, but its RPC
-        // acknowledgement is not proof that an active turn stopped. A
-        // controller issues turn.stop only while closing a run whose result is
-        // already durable, so terminate the exact process generation before
-        // publishing the provider state as attachable by a successor run.
+        // Unlike turn.interrupt, turn.stop is the definitive physical cleanup
+        // boundary. A courtesy RPC can wait longer than the controller's close
+        // budget, especially after an earlier interrupt already aborted the
+        // provider turn but its terminal frame has not been polled. Terminate
+        // the exact owned generation without another cooperative interrupt.
         // Resume may discover that the old turn already ended; its newly
         // resumed process still needs the same exit and prepared-state proof.
-        let interrupt_accepted = provider_turn_id.is_some() && self.interrupt_turn(reason).is_ok();
         let provider_shutdown_failed = self
             .provider
             .as_mut()
@@ -2472,7 +2471,7 @@ impl CodexCommandExecutor {
             "status": if provider_turn_id.is_some() { "stopped" } else { "already_settled" },
             "providerTurnId": provider_turn_id,
             "reason": reason,
-            "interruptAccepted": interrupt_accepted,
+            "interruptAccepted": false,
             "providerExitConfirmed": true,
         })))
     }

@@ -8,6 +8,7 @@ import {
   rename,
   rm,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
@@ -31,6 +32,7 @@ import {
   type PrpEvent,
 } from "@paperclipai/paperclip-runner";
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { nativeSha256 } from "./canonical.js";
 import {
   NativeSessionCleanupQuarantinedError,
@@ -2108,6 +2110,17 @@ const execution = {
 describe("retained native cleanup activation", () => {
   it.each([
     "settled",
+    "provider_home",
+    "home_symlink",
+    "home_oversized",
+    "home_foreign_path",
+    "home_stale_foreign_path",
+    "home_wrong_thread",
+    "home_unknown_db",
+    "home_changed_source",
+    "home_changed_staging",
+    "home_changed_during_commit",
+    "home_duplicate_rollout",
     "live_owner",
     "foreign_event",
     "maintenance_failure",
@@ -2137,6 +2150,17 @@ describe("retained native cleanup activation", () => {
     const directory = await mkdtemp(
       join(tmpdir(), "paperclip-maintenance-activation-"),
     );
+    let providerHomeDatabase: DatabaseSync | undefined;
+    const preservedHomeFiles = [
+      "sessions/rollout-exact-thread.jsonl",
+      "state_5.sqlite",
+      "state_5.sqlite-wal",
+      "state_5.sqlite-shm",
+      "traces/provider.log",
+      "auth.json",
+      "config.toml",
+    ];
+    let preservedHomeBytes: Buffer[] | null = null;
     const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
     process.env.PAPERCLIP_RUNNER_STATE_DIR = directory;
     const canonical = (value: unknown): string =>
@@ -2416,7 +2440,12 @@ describe("retained native cleanup activation", () => {
           where: () => {
             Object.assign(coordinator, values);
             return Object.assign(Promise.resolve([]), {
-              returning: async () => [{ runId: run.id }],
+              returning: async () => {
+                const prepared = (values.recoveryHistory as Array<Record<string, unknown>> | undefined)?.at(-1);
+                if (mode === "home_changed_staging" && prepared?.phase === "activation_prepared")
+                  await writeFile(join(directory, String(prepared.stagingName), "codex-home/sessions/rollout-exact-thread.jsonl"), "changed-staging\n");
+                return [{ runId: run.id }];
+              },
             });
           },
         }),
@@ -2426,6 +2455,9 @@ describe("retained native cleanup activation", () => {
         const before = structuredClone(coordinator);
         try {
           const result = await operation(db as unknown as Db);
+          if (mode === "home_changed_during_commit" &&
+              (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(-1)?.phase === "settled")
+            await writeFile(join(root, "codex-home/sessions/rollout-exact-thread.jsonl"), "changed-after-activation\n");
           if (
             mode === "epoch_commit_failure" &&
             (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(
@@ -2536,6 +2568,105 @@ describe("retained native cleanup activation", () => {
       );
       for (const [file, data] of source)
         await writeFile(join(quarantine, file), JSON.stringify(data));
+      await mkdir(join(quarantine, "codex-home/sessions"), {
+        recursive: true,
+      });
+      await writeFile(
+        join(quarantine, "codex-home/sessions/rollout-exact-thread.jsonl"),
+        JSON.stringify({
+          type: "session_meta",
+          payload: { id: "exact-thread" },
+        }) + "\n",
+      );
+      providerHomeDatabase = new DatabaseSync(
+        join(quarantine, "codex-home/state_5.sqlite"),
+      );
+      providerHomeDatabase.exec(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+      );
+      providerHomeDatabase
+        .prepare("INSERT INTO threads VALUES (?, ?)")
+        .run(
+          "exact-thread",
+          join(root, "codex-home/sessions/rollout-exact-thread.jsonl"),
+        );
+      if (mode === "home_symlink")
+        await symlink(
+          join(directory, "outside-home"),
+          join(quarantine, "codex-home/foreign-link"),
+        );
+      if (mode === "home_oversized") {
+        await writeFile(join(quarantine, "codex-home/oversized"), "");
+        await truncate(
+          join(quarantine, "codex-home/oversized"),
+          64 * 1024 * 1024 + 1,
+        );
+      }
+      if (mode === "home_foreign_path")
+        providerHomeDatabase
+          .prepare("UPDATE threads SET rollout_path = ?")
+          .run(
+            join(
+              quarantine,
+              "codex-home/sessions/rollout-exact-thread.jsonl",
+            ),
+          );
+      if (mode === "home_stale_foreign_path")
+        providerHomeDatabase
+          .prepare("UPDATE threads SET rollout_path = ?")
+          .run(
+            join(
+              directory,
+              "foreign-missing-home/sessions/rollout-exact-thread.jsonl",
+            ),
+          );
+      if (mode === "home_wrong_thread")
+        await writeFile(
+          join(
+            quarantine,
+            "codex-home/sessions/rollout-exact-thread.jsonl",
+          ),
+          JSON.stringify({
+            type: "session_meta",
+            payload: { id: "foreign-thread" },
+          }) + "\n",
+        );
+      if (mode === "home_unknown_db")
+        await writeFile(
+          join(quarantine, "codex-home/state_99.sqlite"),
+          "unsupported-version",
+        );
+      if (mode === "home_duplicate_rollout")
+        await writeFile(
+          join(
+            quarantine,
+            "codex-home/sessions/duplicate-exact-thread.jsonl",
+          ),
+          JSON.stringify({
+            type: "session_meta",
+            payload: { id: "exact-thread" },
+          }) + "\n",
+        );
+      if (mode === "provider_home") {
+        await mkdir(join(quarantine, "codex-home/traces"));
+        await writeFile(
+          join(quarantine, "codex-home/traces/provider.log"),
+          "retained-provider-trace\n",
+        );
+        await writeFile(
+          join(quarantine, "codex-home/auth.json"),
+          "MUST-NOT-COPY",
+        );
+        await writeFile(
+          join(quarantine, "codex-home/config.toml"),
+          "MUST-NOT-COPY",
+        );
+        preservedHomeBytes = await Promise.all(
+          preservedHomeFiles.map((file) =>
+            readFile(join(quarantine, "codex-home", file)),
+          ),
+        );
+      }
       let legacyBytes: string[] | null = null;
       if (legacy) {
         // This suite isolates filesystem/lease orchestration. The real pure
@@ -2589,6 +2720,33 @@ describe("retained native cleanup activation", () => {
       state.retireCleanup.mockReset();
       state.cleanup.mockImplementation(async (input) => {
         await input.authorize();
+        if (mode === "home_changed_source") {
+          await writeFile(
+            join(
+              quarantine,
+              "codex-home/sessions/rollout-exact-thread.jsonl",
+            ),
+            "changed-source\n",
+          );
+          await input.authorize();
+        }
+        if (mode === "provider_home") {
+          for (const file of [
+            "sessions/rollout-exact-thread.jsonl",
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "traces/provider.log",
+          ])
+            expect(
+              await readFile(
+                join(input.stateDirectory, "codex-home", file),
+              ),
+            ).toEqual(await readFile(join(quarantine, "codex-home", file)));
+          for (const file of ["auth.json", "config.toml"])
+            await expect(
+              access(join(input.stateDirectory, "codex-home", file)),
+            ).rejects.toMatchObject({ code: "ENOENT" });
+        }
         if (legacy) {
           expect(input.stateDirectory).not.toBe(legacyDirectory);
           expect(
@@ -2710,6 +2868,8 @@ describe("retained native cleanup activation", () => {
         expect(cleanupEnvironment).not.toHaveProperty("CODEX_API_KEY");
       }
       const ineligible = [
+        "home_symlink",
+        "home_oversized",
         "legacy_busy_copy",
         "legacy_bad_proof",
         "legacy_extra_attempt",
@@ -2727,6 +2887,7 @@ describe("retained native cleanup activation", () => {
         "wrong_provider_account",
       ].includes(mode);
       const succeeds = [
+        "provider_home",
         "legacy_copy",
         "settled",
         "activation_commit_stalled",
@@ -2745,7 +2906,24 @@ describe("retained native cleanup activation", () => {
           source.map(([file]) => readFile(join(quarantine, file), "utf8")),
         ),
       ).toEqual(original);
-      expect(state.cleanup).toHaveBeenCalledTimes(ineligible ? 0 : 1);
+      if (preservedHomeBytes)
+        expect(
+          await Promise.all(
+            preservedHomeFiles.map((file) =>
+              readFile(join(quarantine, "codex-home", file)),
+            ),
+          ),
+        ).toEqual(preservedHomeBytes);
+      const deniedBeforeLaunch = [
+        "home_foreign_path",
+        "home_stale_foreign_path",
+        "home_wrong_thread",
+        "home_unknown_db",
+        "home_duplicate_rollout",
+      ].includes(mode);
+      expect(state.cleanup).toHaveBeenCalledTimes(
+        ineligible || deniedBeforeLaunch ? 0 : 1,
+      );
       expect(state.retireCleanup).toHaveBeenCalledTimes(succeeds ? 1 : 0);
       expect(coordinator.phase).toBe("committed");
       expect(coordinator.resultId).toBe("result");
@@ -2772,6 +2950,18 @@ describe("retained native cleanup activation", () => {
       }
       if (succeeds) {
         await access(root);
+        const history = coordinator.recoveryHistory as Array<
+          Record<string, unknown>
+        >;
+        const prepared = history.find(
+          (entry) => entry.phase === "activation_prepared",
+        )!;
+        expect(prepared.settledProviderHomeFingerprint).toMatch(
+          /^[0-9a-f]{64}$/,
+        );
+        expect(history.at(-1)?.settledProviderHomeFingerprint).toBe(
+          prepared.settledProviderHomeFingerprint,
+        );
         if (legacy) {
           expect(
             await Promise.all(
@@ -2800,6 +2990,14 @@ describe("retained native cleanup activation", () => {
           "activation_prepared",
           "settled",
         ]);
+      } else if (mode === "home_changed_staging") {
+        await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
+        expect((coordinator.recoveryHistory as Array<Record<string, unknown>>).at(-1)?.phase).toBe("operator_required");
+      } else if (mode === "home_changed_during_commit") {
+        expect((coordinator.recoveryHistory as Array<Record<string, unknown>>).at(-1)?.phase).toBe("settled");
+        await access(join(root, "cleanup-activation.json"));
+        await expect(createRunnerdBackend({ db: db as unknown as Db, execution, runnerInstanceId: "successor-runner" }))
+          .rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
       } else if (mode === "activation_commit_failure") {
         // Simulate a fresh caller after the in-memory reservation ended.
         // The canonical directory must not look reusable without its
@@ -2834,6 +3032,7 @@ describe("retained native cleanup activation", () => {
         await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
       }
     } finally {
+      providerHomeDatabase?.close();
       proofSpy.mockRestore();
       state.maintenanceIdle.mockReset().mockReturnValue(true);
       releaseCommit();
