@@ -7,6 +7,25 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 00:38 UTC: the composed chat integration suite passes **578/578**
+on fresh `chat_adapters_discord_upload_20260909_full01` (121.61 seconds), zero
+skips. Discord's pinned Gateway repair suppresses metadata-only updates only
+with complete, exact old/new authored snapshots. Attachment-only revisions
+remain distinct, and real edits still invalidate exact native attachment
+read/reuse. The adapter/runtime/hydration cohort passes 152/152 and server
+typechecking passes; independent review found no blocker. Inline upload and
+pending-send feedback fixes are pushed as `8adc6c8a5`, with browser 22/22 plus
+final changed cohort 5/5, UI unit/draft 26/26, types and token gates passing.
+
+Next deploy the frozen combined code as server 64, then qualify fresh native
+Discord/Slack turns. Do not conflate those with recovery of the old failed
+turns: read-only audit found Discord's exact completed owner remains at a
+nonempty canonical root, which current maintenance refuses before archival.
+James has a narrow evidence-preserving archive-under-lease plan, awaiting
+root's post-deployment GO. Telegram BufsxY still lacks an exact epoch-1 exit
+receipt; no safe automatic retry is currently supported. Never manually move
+either source directory or rerun the accepted answers.
+
 Latest verification (September 9, 00:34 UTC): the definitive stop no longer
 issues a second cooperative interrupt. Its genuine regression failed after
 30.04 seconds before the fix. Rust verification passed 239 library cases,

@@ -152,7 +152,7 @@ index 8cd0ed50d2c4971cffe75dd86c12764d837ab8cc..339bfbca42bd06e4a94e0d73f253f28f
 -export { DiscordAdapter, type DiscordAdapterConfig, DiscordComponentType, type DiscordComponentTypeValue, DiscordContentFormat, DiscordFormatConverter, type DiscordInteractionFlagsContext, DiscordInteractionResponseFlag, type DiscordInteractionResponseFlags, DiscordFormatConverter as DiscordMarkdownConverter, DiscordMessageFlag, type DiscordMessageFlagValue, type DiscordMessageFlags, type DiscordThreadId, type DiscordWebhookVerifier, cardToDiscordPayload, cardToFallbackText, createDiscordAdapter, decodeDiscordCustomId, encodeDiscordCustomId };
 +export { DiscordAdapter, type DiscordAdapterConfig, DiscordComponentType, type DiscordComponentTypeValue, DiscordContentFormat, DiscordFormatConverter, type DiscordGatewayEvent, type DiscordInteractionFlagsContext, DiscordInteractionResponseFlag, type DiscordInteractionResponseFlags, DiscordFormatConverter as DiscordMarkdownConverter, DiscordMessageFlag, type DiscordMessageFlagValue, type DiscordMessageFlags, type DiscordThreadAdmissionContext, type DiscordThreadId, type DiscordWebhookVerifier, cardToDiscordPayload, cardToFallbackText, createDiscordAdapter, decodeDiscordCustomId, encodeDiscordCustomId };
 diff --git a/dist/index.js b/dist/index.js
-index a42b61d58aa05c553cad8544090284070973cf0a..7e9e7bbb674f075b1656a9313e9afa625562d4c4 100644
+index a42b61d58aa05c553cad8544090284070973cf0a..505f917fa08219e5b22f5c8d628c12be5b910625 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -1,5 +1,6 @@
@@ -1287,7 +1287,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..7e9e7bbb674f075b1656a9313e9afa62
        id: message.id,
        threadId,
        text: content.text,
-@@ -2684,8 +3095,8 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2684,9 +3095,18 @@ var DiscordAdapter = class _DiscordAdapter {
        ),
        raw: {
          id: message.id,
@@ -1296,9 +1296,19 @@ index a42b61d58aa05c553cad8544090284070973cf0a..7e9e7bbb674f075b1656a9313e9afa62
 +        channel_id: message.channelId,
 +        guild_id: message.guildId || "@me",
          content: message.content,
++        // Stable authored attachment identity, including forwarded snapshots.
++        // CDN URLs rotate independently of edits and must not enter durable
++        // lifecycle revisions or metadata-only update comparisons.
++        attachments: content.attachments.map((attachment) => ({
++          id: typeof attachment.id === "string" ? attachment.id : null,
++          filename: typeof attachment.name === "string" ? attachment.name : null,
++          content_type: typeof attachment.contentType === "string" ? attachment.contentType : null,
++          size: typeof attachment.size === "number" && Number.isFinite(attachment.size) ? attachment.size : null
++        })),
          author: {
            id: message.author.id,
-@@ -2696,19 +3107,100 @@ var DiscordAdapter = class _DiscordAdapter {
+           username: message.author.username
+@@ -2696,19 +3116,113 @@ var DiscordAdapter = class _DiscordAdapter {
        // Add isMention flag for the chat handlers
        isMention: isMentioned
      });
@@ -1315,6 +1325,19 @@ index a42b61d58aa05c553cad8544090284070973cf0a..7e9e7bbb674f075b1656a9313e9afa62
 +    const threadId = this.gatewayThreadId(message);
 +    const next = this.gatewayChatMessage(message, threadId);
 +    const previous = previousMessage?.author ? this.gatewayChatMessage(previousMessage, threadId) : void 0;
++    // MESSAGE_UPDATE also carries thread creation, pins, reactions and embeds.
++    // Only a complete snapshot of this exact source can prove no authored
++    // change. Unknown/partial history remains conservative; file-only edits
++    // must not be hidden merely because editedAt or text did not change.
++    if (previous && previousMessage.partial === false && message.partial === false &&
++        previousMessage.id === message.id &&
++        previousMessage.channelId === message.channelId &&
++        previousMessage.guildId === message.guildId &&
++        previousMessage.author.id === message.author.id &&
++        previous.text === next.text &&
++        JSON.stringify(previous.raw.attachments) === JSON.stringify(next.raw.attachments)) {
++      return;
+     }
 +    await this.processGatewayWithRetry(
 +      () => this.chat.processMessageUpdated({
 +        adapter: this,
@@ -1396,7 +1419,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..7e9e7bbb674f075b1656a9313e9afa62
 +          error: discordErrorSummary(error)
 +        });
 +      }
-     }
++    }
 +    return false;
    }
    /**
@@ -1407,7 +1430,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..7e9e7bbb674f075b1656a9313e9afa62
      if (!this.chat) {
        return;
      }
-@@ -2716,7 +3208,7 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2716,7 +3230,7 @@ var DiscordAdapter = class _DiscordAdapter {
      const channelId = reaction.message.channelId;
      const isInThread = reaction.message.channel?.isThread?.();
      let parentChannelId = channelId;
@@ -1416,7 +1439,7 @@ index a42b61d58aa05c553cad8544090284070973cf0a..7e9e7bbb674f075b1656a9313e9afa62
      if (isInThread && reaction.message.channel?.parentId) {
        discordThreadId = channelId;
        parentChannelId = reaction.message.channel.parentId;
-@@ -2748,10 +3240,11 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2748,10 +3262,11 @@ var DiscordAdapter = class _DiscordAdapter {
          message_id: reaction.message.id,
          channel_id: reaction.message.channelId,
          guild_id: reaction.message.guildId,

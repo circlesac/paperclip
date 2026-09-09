@@ -261,6 +261,163 @@ describe("Paperclip Discord adapter patch", () => {
     );
   });
 
+  it.each(["thread", "pin", "embed", "reaction", "url", "timestamp"])(
+    "ignores a Discord %s-only update with a complete unchanged source snapshot",
+    async (kind) => {
+      const { adapter, chat, client, handlers } = harness();
+      await adapter.initialize(chat as never);
+      (
+        adapter as unknown as {
+          setupLegacyGatewayHandlers(
+            client: unknown,
+            closing: () => boolean,
+          ): void;
+        }
+      ).setupLegacyGatewayHandlers(client, () => false);
+      const file = {
+        id: "file-1",
+        name: "source.png",
+        contentType: "image/png",
+        size: 123,
+        url: "https://cdn.discordapp.com/attachments/channel/file/source.png?ex=old",
+      };
+      const previous = gatewayMessage({
+        content: "unchanged request",
+        editedAt: null,
+        attachments: new Map([[file.id, file]]),
+      });
+      const next = gatewayMessage({
+        ...previous,
+        ...(kind === "thread"
+          ? { flags: 32, thread: { id: previous.id } }
+          : {}),
+        ...(kind === "pin" ? { pinned: true } : {}),
+        ...(kind === "embed" ? { embeds: [{ title: "Fetched preview" }] } : {}),
+        ...(kind === "reaction" ? { reactions: new Map([["eyes", 1]]) } : {}),
+        ...(kind === "url"
+          ? {
+              attachments: new Map([
+                [
+                  file.id,
+                  {
+                    ...file,
+                    url: "https://cdn.discordapp.com/attachments/channel/file/source.png?ex=renewed",
+                  },
+                ],
+              ]),
+            }
+          : {}),
+        ...(kind === "timestamp"
+          ? { editedAt: new Date("2026-09-06T12:02:00Z") }
+          : {}),
+      });
+      await handlers.get("messageUpdate")?.(previous, next);
+      expect(chat.processMessageUpdated).not.toHaveBeenCalled();
+      expect(chat.handleIncomingMessage).not.toHaveBeenCalled();
+      expect(chat.processMessageDeleted).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    "text",
+    "file_add",
+    "file_remove",
+    "file_id",
+    "file_name",
+    "file_type",
+    "file_size",
+    "file_order",
+    "forwarded_text",
+    "forwarded_file",
+    "partial_previous",
+    "unknown_previous",
+    "different_message",
+    "different_channel",
+    "different_guild",
+  ])(
+    "preserves a Discord %s update even when editedAt is unchanged",
+    async (kind) => {
+      const { adapter, chat, client, handlers } = harness();
+      await adapter.initialize(chat as never);
+      (
+        adapter as unknown as {
+          setupLegacyGatewayHandlers(
+            client: unknown,
+            closing: () => boolean,
+          ): void;
+        }
+      ).setupLegacyGatewayHandlers(client, () => false);
+      const file = {
+        id: "file-1",
+        name: "source.txt",
+        contentType: "text/plain",
+        size: 123,
+        url: "https://cdn.discordapp.com/attachments/channel/file/source.txt?ex=SECRET",
+      };
+      const second = { ...file, id: "file-2" };
+      const previous = gatewayMessage({
+        content: "unchanged request",
+        editedAt: null,
+        attachments: new Map([
+          [file.id, file],
+          [second.id, second],
+        ]),
+      });
+      const next = gatewayMessage({ ...previous });
+      if (kind === "text") next.content = "actual edit";
+      if (kind === "file_add")
+        next.attachments = new Map([
+          ...previous.attachments,
+          ["file-3", { ...file, id: "file-3" }],
+        ]);
+      if (kind === "file_remove") next.attachments = new Map();
+      if (kind === "file_order")
+        next.attachments = new Map([
+          [second.id, second],
+          [file.id, file],
+        ]);
+      for (const [testKind, key, value] of [
+        ["file_id", "id", "replacement"],
+        ["file_name", "name", "renamed.txt"],
+        ["file_type", "contentType", "application/pdf"],
+        ["file_size", "size", 124],
+      ] as const) {
+        if (kind === testKind)
+          next.attachments = new Map([
+            [file.id, { ...file, [key]: value }],
+            [second.id, second],
+          ]);
+      }
+      if (kind === "forwarded_text")
+        next.messageSnapshots = new Map([
+          [
+            "forward",
+            { content: "new forwarded request", attachments: new Map() },
+          ],
+        ]);
+      if (kind === "forwarded_file")
+        next.messageSnapshots = new Map([
+          ["forward", { content: "", attachments: new Map([[file.id, file]]) }],
+        ]);
+      if (kind === "partial_previous") previous.partial = true;
+      if (kind === "unknown_previous")
+        Object.assign(previous, { partial: undefined });
+      if (kind === "different_message") previous.id = "other-message";
+      if (kind === "different_channel") previous.channelId = "other-channel";
+      if (kind === "different_guild") previous.guildId = "other-guild";
+      await handlers.get("messageUpdate")?.(previous, next);
+      expect(chat.processMessageUpdated).toHaveBeenCalledTimes(1);
+      const delivered = chat.processMessageUpdated.mock.calls[0]![0] as {
+        message: { raw: Record<string, unknown> };
+      };
+      expect(delivered.message.raw.attachments).toBeInstanceOf(Array);
+      expect(JSON.stringify(delivered.message.raw)).not.toContain("SECRET");
+      expect(JSON.stringify(delivered.message.raw)).not.toContain(
+        "cdn.discordapp.com",
+      );
+    },
+  );
+
   it("reconstructs the created thread for root-message edits and deletes", async () => {
     const { adapter, chat, client, handlers } = harness();
     await adapter.initialize(chat as never);

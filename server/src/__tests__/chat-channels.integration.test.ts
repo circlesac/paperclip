@@ -86,6 +86,7 @@ import type {
   ChatSdkRuntime,
 } from "../services/chat-sdk-runtime.js";
 import { createChatSdkEndpointRuntime } from "../services/chat-sdk-runtime.js";
+import { createDiscordAdapter } from "@chat-adapter/discord";
 import { issueService } from "../services/issues.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { NativeChatAttachmentReadScope } from "../services/native-runtime/chat-attachment-read.js";
@@ -38916,6 +38917,409 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ),
     );
   });
+
+  it.each(["metadata_only", "file_revisions"] as const)(
+    "preserves exact Discord source authority through registered Gateway %s updates",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const storage = createStorageService();
+      const { callbacks, endpoint, runtime, service, wakeup, cancelRun } =
+        await configuredDiscordEndpoint(fixture, { storage: storage.storage });
+      const guildId = "1457808928258658549";
+      const channelId = "333333333333333333";
+      const messageId = "555555555555555688";
+      const userId = "444444444444444444";
+      const threadId = `discord:${guildId}:${channelId}:${messageId}`;
+      const handlers = new Map<
+        string,
+        (...args: unknown[]) => Promise<void> | void
+      >();
+      const logger = {
+        child: () => logger,
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      };
+      const adapter = createDiscordAdapter({
+        applicationId: "123456789012345678",
+        botToken: "discord-fixture-token",
+        webhookVerifier: async () => false,
+        logger,
+      });
+      const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+      const processMessageUpdated = vi.fn(
+        async (event: {
+          message: Message;
+          previousMessage?: Message;
+          threadId: string;
+        }) => {
+          await callbacks.onMessageUpdated!({
+            endpointId: endpoint.id,
+            provider: "discord",
+            thread: providerRuntime.thread(event.threadId) as unknown as Thread,
+            message: event.message,
+            previousMessage: event.previousMessage,
+          });
+        },
+      );
+      const processMessageDeleted = vi.fn(
+        async (event: Record<string, unknown>) => {
+          await callbacks.onMessageDeleted!({
+            endpointId: endpoint.id,
+            provider: "discord",
+            event: event as never,
+          });
+        },
+      );
+      await adapter.initialize({
+        processMessageUpdated,
+        processMessageDeleted,
+      } as never);
+      const gateway = adapter as unknown as {
+        setupLegacyGatewayHandlers(
+          client: unknown,
+          closing: () => boolean,
+        ): void;
+        gatewayChatMessage(
+          message: unknown,
+          threadId: string,
+          mentioned?: boolean,
+        ): Message;
+      };
+      gateway.setupLegacyGatewayHandlers(
+        {
+          user: { id: "123456789012345678" },
+          ws: { handlePacket: () => false },
+          on(
+            event: string,
+            handler: (...args: unknown[]) => Promise<void> | void,
+          ) {
+            handlers.set(event, handler);
+            return this;
+          },
+        },
+        () => false,
+      );
+      const fileBody = Buffer.from("The exact original Discord source.\n");
+      const sourceFile = {
+        id: "original-file",
+        name: "original.txt",
+        contentType: "text/plain",
+        size: fileBody.length,
+        url: "https://cdn.discordapp.com/attachments/333333333333333333/555555555555555689/original.txt?ex=ORIGINAL_PRIVATE",
+      };
+      const original = {
+        id: messageId,
+        channelId,
+        guildId,
+        partial: false,
+        content: "@maya keep this exact original request authoritative",
+        attachments: new Map<string, Record<string, unknown>>([
+          [sourceFile.id, sourceFile],
+        ]),
+        messageSnapshots: new Map(),
+        channel: { isThread: () => false, parentId: null },
+        author: { id: userId, username: "ada", displayName: "Ada", bot: false },
+        createdAt: new Date(),
+        editedAt: null,
+      };
+      let runId: string | undefined;
+      const workspaceRoot = mkdtempSync(
+        path.join(os.tmpdir(), "discord-source-update-"),
+      );
+      let reader: NativeChatAttachmentReadScope | undefined;
+      try {
+        const message = gateway.gatewayChatMessage(original, threadId, true);
+        // Substitute only transport bytes, not normalization or admission.
+        message.attachments[0]!.fetchData = vi.fn(async () => fileBody);
+        await expect(
+          callbacks.onDiscordRootMentionAdmission!({
+            endpointId: endpoint.id,
+            guildId,
+            channelId,
+            messageId,
+            message,
+            threadId,
+            userId,
+          }),
+        ).resolves.toBe(false);
+        const [delivery] = await db
+          .select({ id: chatDeliveries.id })
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              eq(chatDeliveries.providerEventId, `${threadId}:${messageId}`),
+            ),
+          );
+        expect(delivery).toBeDefined();
+        await service.processPendingDeliveries(25, delivery.id);
+        await qualifySetupRoundTrip(service, endpoint.id, userId);
+        await service.test(endpoint.id, "owner-user");
+        const [conversation] = await service.listConversations(endpoint.id);
+        const contextSnapshot = await chatWakeContext({
+          endpointId: endpoint.id,
+          issueId: conversation.issueId,
+          provider: "discord",
+          providerMessageId: messageId,
+        });
+        runId = randomUUID();
+        const binding = {
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          issueId: conversation.issueId,
+          runId,
+        };
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          status: "running",
+          runtimeMode: "native",
+          nativeIssueId: conversation.issueId,
+          contextSnapshot: {
+            ...contextSnapshot,
+            paperclipHarnessCheckedOut: true,
+            paperclipWake: {
+              checkedOutByHarness: true,
+              externalChatProvider: "discord",
+              issue: { id: conversation.issueId, workMode: "standard" },
+              commentIds: contextSnapshot.wakeCommentIds,
+            },
+          },
+        });
+        await db
+          .update(issues)
+          .set({ executionRunId: runId, status: "in_progress" })
+          .where(eq(issues.id, conversation.issueId));
+        const authority = () =>
+          resolveChatRunPresentationAuthorizationReason(db, {
+            companyId: fixture.companyId,
+            issueId: conversation.issueId,
+            runId: runId!,
+          });
+        await expect(authority()).resolves.toBe("allow_chat_run_presentation");
+        const [attachment] = await issueService(db).listAttachments(
+          conversation.issueId,
+        );
+        expect(attachment).toBeDefined();
+        const selection = {
+          sourceCommentId: attachment.issueCommentId!,
+          attachmentId: attachment.id,
+        };
+        reader = new NativeChatAttachmentReadScope({
+          db,
+          binding,
+          workspaceRoot,
+          executionTargetKind: "local",
+          storage: storage.storage,
+        });
+        const tools = new PaperclipRunnerToolAuthority(db, {
+          ...binding,
+          workspaceRoot,
+          storage: storage.storage,
+          chatAttachmentReadScope: reader,
+        });
+        await expect(
+          tools.execute({
+            tool: "list_chat_attachments",
+            callId: "before-update",
+            arguments: { sourceCommentId: selection.sourceCommentId },
+          }),
+        ).resolves.toMatchObject({
+          attachments: [expect.objectContaining(selection)],
+        });
+        const commentsBefore = await db
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation.issueId));
+        const wakesBefore = wakeup.mock.calls.length;
+        const reactionsBefore = providerRuntime.reactions.length;
+        const postsBefore = providerRuntime.posts.length;
+        if (mode === "metadata_only") {
+          const threadCreated = {
+            ...original,
+            flags: 32,
+            thread: { id: messageId },
+            pinned: true,
+            embeds: [{ title: "Link preview" }],
+          };
+          await handlers.get("messageUpdate")!(original, threadCreated);
+          await handlers.get("messageUpdate")!(original, threadCreated);
+          expect(processMessageUpdated).not.toHaveBeenCalled();
+          expect(
+            await db
+              .select({ id: chatDeliveries.id })
+              .from(chatDeliveries)
+              .where(
+                and(
+                  eq(chatDeliveries.endpointId, endpoint.id),
+                  eq(chatDeliveries.eventKind, "message_updated"),
+                ),
+              ),
+          ).toEqual([]);
+          expect(
+            await db
+              .select({ id: issueComments.id })
+              .from(issueComments)
+              .where(eq(issueComments.issueId, conversation.issueId)),
+          ).toEqual(commentsBefore);
+          expect(wakeup).toHaveBeenCalledTimes(wakesBefore);
+          expect(cancelRun).not.toHaveBeenCalled();
+          expect(providerRuntime.reactions).toHaveLength(reactionsBefore);
+          expect(providerRuntime.posts).toHaveLength(postsBefore);
+          await expect(
+            tools.execute({
+              tool: "list_chat_attachments",
+              callId: "after-metadata",
+              arguments: { sourceCommentId: selection.sourceCommentId },
+            }),
+          ).resolves.toMatchObject({
+            attachments: [expect.objectContaining(selection)],
+          });
+          await expect(authority()).resolves.toBe(
+            "allow_chat_run_presentation",
+          );
+          await db
+            .update(heartbeatRuns)
+            .set({ status: "succeeded", finishedAt: new Date() })
+            .where(eq(heartbeatRuns.id, runId));
+          const comment = await addSelectedChatFinal({
+            agentId: fixture.assignedAgentId,
+            body: "Exact source answer remains deliverable.",
+            companyId: fixture.companyId,
+            issueId: conversation.issueId,
+            runId,
+          });
+          await service.processPendingPublications();
+          await service.processPendingPublications();
+          expect(
+            providerRuntime.posts.filter(
+              (post) =>
+                post.text === "Exact source answer remains deliverable.",
+            ),
+          ).toHaveLength(1);
+          expect(
+            await db
+              .select({
+                state: chatPublications.state,
+                attempts: chatPublications.attempts,
+              })
+              .from(chatPublications)
+              .where(eq(chatPublications.commentId, comment.id)),
+          ).toEqual([{ state: "published", attempts: 1 }]);
+        } else {
+          const firstFile = {
+            id: "attachment-1",
+            name: "source.txt",
+            contentType: "text/plain",
+            size: 123,
+            url: "https://cdn.discordapp.com/attachments/channel/file/source.txt?ex=NEVER_PERSIST",
+          };
+          const secondFile = { ...firstFile, id: "attachment-2" };
+          const snapshots = [
+            original,
+            { ...original, attachments: new Map([[firstFile.id, firstFile]]) },
+            {
+              ...original,
+              attachments: new Map([[secondFile.id, secondFile]]),
+            },
+            { ...original, attachments: new Map() },
+          ];
+          for (let index = 1; index < snapshots.length; index += 1) {
+            await handlers.get("messageUpdate")!(
+              snapshots[index - 1],
+              snapshots[index],
+            );
+            await handlers.get("messageUpdate")!(
+              snapshots[index - 1],
+              snapshots[index],
+            );
+          }
+          expect(processMessageUpdated).toHaveBeenCalledTimes(6);
+          const lifecycle = await db
+            .select()
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.endpointId, endpoint.id),
+                eq(chatDeliveries.eventKind, "message_updated"),
+              ),
+            );
+          expect(lifecycle).toHaveLength(3);
+          expect(lifecycle.every((row) => row.state === "processed")).toBe(
+            true,
+          );
+          expect(
+            new Set(lifecycle.map((row) => row.providerEventId)).size,
+          ).toBe(3);
+          expect(JSON.stringify(lifecycle)).not.toContain("NEVER_PERSIST");
+          expect(JSON.stringify(lifecycle)).not.toContain("cdn.discordapp.com");
+          await expect(
+            tools.execute({
+              tool: "read_chat_attachment",
+              callId: "edited-source-read",
+              arguments: selection,
+            }),
+          ).rejects.toThrow("paperclip_runner_chat_attachment_source_denied");
+          await expect(
+            tools.execute({
+              tool: "reuse_chat_attachment",
+              callId: "edited-source-reuse",
+              arguments: {
+                ...selection,
+                title: "Do not reuse",
+                idempotencyKey: "edited-source-reuse",
+              },
+            }),
+          ).rejects.toThrow("paperclip_runner_chat_attachment_source_denied");
+          expect(storage.putFile).toHaveBeenCalledTimes(1);
+          const textEdit = {
+            ...original,
+            content: "actual changed request",
+            editedAt: new Date(),
+          };
+          await handlers.get("messageUpdate")!(original, textEdit);
+          await handlers.get("messageDelete")!(textEdit);
+          expect(processMessageDeleted).toHaveBeenCalledTimes(1);
+          const allLifecycle = await db
+            .select({
+              eventKind: chatDeliveries.eventKind,
+              state: chatDeliveries.state,
+            })
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.endpointId, endpoint.id),
+                inArray(chatDeliveries.eventKind, [
+                  "message_updated",
+                  "message_deleted",
+                ]),
+              ),
+            );
+          expect(allLifecycle).toHaveLength(5);
+          expect(allLifecycle.every((row) => row.state === "processed")).toBe(
+            true,
+          );
+        }
+      } finally {
+        await reader?.close();
+        if (runId) {
+          await db
+            .update(heartbeatRuns)
+            .set({ status: "succeeded", finishedAt: new Date() })
+            .where(eq(heartbeatRuns.id, runId));
+          await db
+            .update(issues)
+            .set({ executionRunId: null })
+            .where(eq(issues.executionRunId, runId));
+        }
+        await retirePublicationFixture(service, endpoint.id);
+        rmSync(workspaceRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("records message edits and deletes durably and deduplicates lifecycle callbacks", async () => {
     const fixture = await seedCompany();
