@@ -806,7 +806,11 @@ describe("executeNativeSession recovery", () => {
       async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
       async completeRun() {},
     };
-    await expect(executeNativeSession({ input, backend, controlPlane: port, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" })).rejects.toThrow("native_provider_model_rejected: There's an issue with the selected model (custom-model)");
+    const result = executeNativeSession({ input, backend, controlPlane: port, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" });
+    await expect(result).rejects.toThrow("native_provider_model_rejected: There's an issue with the selected model (custom-model)");
+    await expect(result).rejects.toMatchObject({
+      code: "native_provider_terminal_failed", providerCode: "RUNTIME", recoverable: false,
+    });
     expect(close).toHaveBeenCalled();
   });
 

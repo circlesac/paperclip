@@ -377,6 +377,7 @@ describe("Codex protocol integrity propagation", () => {
           runtimeIdentity: { processId: process.pid },
         }),
       );
+      await commandResult("session.goal.get", { goal: null });
       await commandResult("turn.start", {
         providerTurnId: "composed-provider-turn",
       });

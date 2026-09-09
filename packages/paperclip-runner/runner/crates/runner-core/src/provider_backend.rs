@@ -3470,7 +3470,7 @@ impl CodexCommandExecutor {
                             "code": diagnostic["code"], "recoverable": false,
                             "message": diagnostic["message"], "error": diagnostic }),
                     })?;
-                    state.extend_terminal_events(terminal_events(state, "turn.failed"))?;
+                    state.extend_terminal_events(terminal_events(state, "turn.failed", None))?;
                     // Commit the authoritative failure before best-effort provider cleanup.
                     self.save_state()?;
                     if let Some(mut provider) = self.provider.take() {
