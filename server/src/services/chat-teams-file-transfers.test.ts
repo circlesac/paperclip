@@ -494,6 +494,141 @@ suite(
       expect(f.opts.uploadRequest).not.toHaveBeenCalled();
     });
 
+    it("reads exact conflict cancellation readiness without authorization, mutation or provider work", async () => {
+      const f = await fixture();
+      await f.service().process(f.a.companyId, f.created.id);
+      await f.service().recordConsent(await f.event());
+      await f.service().recordConsent(await f.event("decline"));
+      const before = await f.read();
+      const input = {
+        companyId: f.a.companyId,
+        endpointId: f.a.endpointId,
+        conversationId: f.a.conversationId,
+        publicationId: f.a.publicationId,
+        version: before.version,
+      };
+      const authorizations = vi.mocked(f.opts.authorize).mock.calls.length;
+      await expect(f.service().canCancelConflict(input)).resolves.toBe(true);
+      for (const key of [
+        "companyId",
+        "endpointId",
+        "conversationId",
+        "publicationId",
+      ] as const)
+        await expect(
+          f.service().canCancelConflict({ ...input, [key]: randomUUID() }),
+        ).resolves.toBe(false);
+      await expect(
+        f
+          .service()
+          .canCancelConflict({ ...input, version: before.version - 1 }),
+      ).resolves.toBe(false);
+      expect(await f.read()).toEqual(before);
+      expect(f.opts.authorize).toHaveBeenCalledTimes(authorizations);
+      expect(f.opts.postConsent).toHaveBeenCalledTimes(1);
+      expect(f.opts.loadBytes).not.toHaveBeenCalled();
+      expect(f.opts.uploadRequest).not.toHaveBeenCalled();
+      expect(f.opts.postFileInfo).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      "bad authority",
+      "bad private binding",
+      "missing quarantine",
+      "future quarantine",
+      "unknown reason",
+      "unrelated expired owner",
+    ] as const)(
+      "does not offer conflict cancellation for %s evidence",
+      async (fault) => {
+        const f = await fixture();
+        await f.service().process(f.a.companyId, f.created.id);
+        await f.service().recordConsent(await f.event());
+        await f.service().recordConsent(await f.event("decline"));
+        const row = await f.read();
+        const privateState = structuredClone(row.privateState) as Record<
+          string,
+          unknown
+        >;
+        const patch: Partial<typeof chatTeamsFileTransfers.$inferInsert> = {};
+        if (fault === "bad authority") patch.authorityDigest = "0".repeat(64);
+        if (fault === "bad private binding") {
+          privateState.binding = {};
+          patch.privateState = privateState;
+        }
+        if (fault === "missing quarantine") {
+          delete privateState.quarantine;
+          patch.privateState = privateState;
+        }
+        if (fault === "future quarantine") {
+          privateState.quarantine = {
+            ...(privateState.quarantine as Record<string, unknown>),
+            fromVersion: row.version,
+          };
+          patch.privateState = privateState;
+        }
+        if (fault === "unknown reason") patch.reason = "unrecognized_conflict";
+        if (fault === "unrelated expired owner") {
+          patch.attemptId = randomUUID();
+          patch.attemptExpiresAt = new Date(Date.now() - 1_000);
+        }
+        await db
+          .update(chatTeamsFileTransfers)
+          .set(patch)
+          .where(eq(chatTeamsFileTransfers.id, row.id));
+        const before = await f.read();
+        await expect(
+          f.service().canCancelConflict({
+            companyId: f.a.companyId,
+            endpointId: f.a.endpointId,
+            conversationId: f.a.conversationId,
+            publicationId: f.a.publicationId,
+            version: before.version,
+          }),
+        ).resolves.toBe(false);
+        expect(await f.read()).toEqual(before);
+        expect(f.opts.postConsent).toHaveBeenCalledTimes(1);
+        expect(f.opts.uploadRequest).not.toHaveBeenCalled();
+        expect(f.opts.postFileInfo).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["missing expiry", "orphaned expiry"] as const)(
+      "rejects %s ownership at the database boundary before it can affect conflict readiness",
+      async (fault) => {
+        const f = await fixture();
+        await f.service().process(f.a.companyId, f.created.id);
+        await f.service().recordConsent(await f.event());
+        await f.service().recordConsent(await f.event("decline"));
+        const before = await f.read();
+        await expect(
+          db
+            .update(chatTeamsFileTransfers)
+            .set(
+              fault === "missing expiry"
+                ? { attemptId: randomUUID() }
+                : { attemptExpiresAt: new Date(Date.now() - 1_000) },
+            )
+            .where(eq(chatTeamsFileTransfers.id, before.id)),
+        ).rejects.toMatchObject({
+          cause: {
+            code: "23514",
+            constraint_name: "chat_teams_file_transfers_attempt_check",
+          },
+        });
+        expect(await f.read()).toEqual(before);
+        await expect(
+          f.service().canCancelConflict({
+            companyId: f.a.companyId,
+            endpointId: f.a.endpointId,
+            conversationId: f.a.conversationId,
+            publicationId: f.a.publicationId,
+            version: before.version,
+          }),
+        ).resolves.toBe(true);
+      },
+    );
+
     it("preserves ambiguity after lost PUT or file-info ACK and never blindly retries", async () => {
       for (const stage of ["upload", "file_info"] as const) {
         const f = await fixture();
@@ -1288,6 +1423,15 @@ suite(
         const conflict = await f.read();
         expect(conflict.phase).toBe("conflict");
         expect(conflict.attemptId).not.toBeNull();
+        const readiness = (version: number) =>
+          f.service().canCancelConflict({
+            companyId: f.a.companyId,
+            endpointId: f.a.endpointId,
+            conversationId: f.a.conversationId,
+            publicationId: f.a.publicationId,
+            version,
+          });
+        expect(await readiness(conflict.version)).toBe(false);
         const cancel = (version: number) =>
           db.transaction((tx) =>
             f.service().resolveInTransaction(tx, {
@@ -1304,10 +1448,13 @@ suite(
         expect((await work).phase).toBe("conflict");
         expect((await f.read()).consentMessageId).toBeNull();
         f.advance(91_000);
+        expect(await readiness(conflict.version)).toBe(true);
         await f.service().expireAndRecover(f.a.companyId);
         const expired = await f.read();
         expect(expired.phase).toBe("conflict");
         expect(expired.attemptId).toBeNull();
+        expect(await readiness(expired.version)).toBe(true);
+        expect(await readiness(conflict.version)).toBe(false);
         expect(await cancel(expired.version)).toMatchObject({
           phase: "cancelled",
           fileDelivered: false,

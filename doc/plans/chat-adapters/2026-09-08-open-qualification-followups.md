@@ -120,7 +120,7 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
-**Latest working-tree checkpoint:** Teams personal-file output is now wired to
+**Latest pushed checkpoint (`693cfa888`):** Teams personal-file output is now wired to
 the real service: source-derived recipient authority, atomic Board intent,
 authenticated callback, staged worker, public receipt projection and audited
 stage/version resolution. Root has not restarted server 72 or applied the new
@@ -133,6 +133,26 @@ passes 690/690 on a fresh database (134.68 seconds). The browser suite passes
 2/2. Root inspected the waiting/mixed
 receipt screenshots and shortened the repeated pre-send explanation in a
 retained receipt. This is not live Teams consent/file qualification.
+
+Current follow-up: the review reproduced a conflict-state liveness gap where
+Activity offered no action although the protocol could safely cancel. A
+read-only, exact-scoped proof now offers only cancellation after ownership is
+cleared or coherently expired; the versioned resolver remains authoritative.
+Fresh protocol/projection tests pass 90/90, composed tests 39/39 and existing
+UI/API tests 84/84. The combined follow-up passes the full 711-case suite.
+
+Discord automatic registration is now composed with configure, resume and
+runtime reconciliation in the working tree. Five root service tests pass,
+including a process-reconstructed unknown POST settled by GET without reposting,
+automatic upgrade, an external namespace conflict, and healthy Gateway
+preservation on optional registration failure. The native command handler
+passes 15 cases, the durable ownership/helper cohort 61, and the final combined
+integration run 711/711 (142.31 seconds). Root runtime/helper tests pass 119/119
+and the deterministic browser suite 31/31. The first full run's three fixture
+isolation failures were fixed; its single Slack socket error did not reproduce
+in isolation or the corrected run and is not claimed as a repaired provider bug.
+Deployment remains separate from these checks. The Mac lock prevents live UI
+qualification; the most recent inventory was checked again this turn.
 
 Pushed `f5698f533` isolates Teams expiry recovery and adds guarded Discord
 command registration groundwork. Pushed `aacd4963f` adds the opt-in awaited

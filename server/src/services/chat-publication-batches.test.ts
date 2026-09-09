@@ -236,4 +236,29 @@ describe("truthful file publication batch projections", () => {
       ),
     ).toEqual([]);
   });
+
+  it("offers only cancellation for an exact independently verified conflict version", () => {
+    const projected = projectChatFileTransfer(
+      part("file", "delivery_unknown"),
+      transfer({ phase: "conflict", version: 7 }),
+    );
+    expect(
+      chatFileTransferResolutionActions(projected, {
+        publicationId: "file",
+        version: 7,
+      }),
+    ).toEqual(["cancel"]);
+    for (const proof of [
+      undefined,
+      { publicationId: "other", version: 7 },
+      { publicationId: "file", version: 6 },
+    ])
+      expect(chatFileTransferResolutionActions(projected, proof)).toEqual([]);
+    expect(
+      chatFileTransferResolutionActions(
+        { ...projected, state: "published" },
+        { publicationId: "file", version: 7 },
+      ),
+    ).toEqual([]);
+  });
 });

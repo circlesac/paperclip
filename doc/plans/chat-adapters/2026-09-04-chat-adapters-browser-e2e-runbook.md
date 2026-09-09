@@ -799,7 +799,42 @@ Run C3, C5, and C6, then verify specifically:
 - file receive/send is bounded and type checked; persisted attachment recovery accepts only Discord CDN hosts and never stores authorization headers or the bot token;
 - user message edits produce one correction audit event, and deletes produce a tombstone even when Discord supplies only a partial cached message;
 - long output, provider rate limits, and an ambiguous outbound failure follow the shared publication/outbox rules;
-- Paperclip does not advertise or require a Discord slash command, modal, ephemeral response, or proactive DM that it has not implemented.
+- native question forms use Discord modals; command/private-response capability is advertised only after confirmed registration, and proactive DMs are not advertised.
+
+### DC4a — Automatic native session commands
+
+Implementation is under qualification; deterministic tests do not replace this
+live journey. Discord global commands can work in bot DMs as well as guilds,
+and the bot install scope includes command authorization. No extra endpoint
+toggle or user-install scope is required. See Discord's
+[application-command contract](https://docs.discord.com/developers/interactions/application-commands).
+
+1. On the existing dedicated bot, verify `/paperclip status`, `/paperclip new`
+   and `/paperclip close` appear after automatic registration. Existing unrelated
+   app commands must remain unchanged. Record the provider command ID, not tokens.
+2. In an active task thread, invoke status. Only the invoking user should see
+   the status response; no agent run or ordinary publication should be created.
+3. Invoke close. The initial private response acknowledges processing, then
+   reports that the request was recorded. It must not claim closure before the
+   durable public control confirmation is delivered. Check one confirmation,
+   one conversation transition, and no duplicate after a repeated interaction receipt.
+4. Invoke new in a guild thread: receive new-root guidance, with no replacement
+   task bound to that thread. In an allowed DM, invoke new, wait for confirmation,
+   then send a message and verify exactly one new task generation.
+5. Disable the DM/channel reach or revoke the mapped identity before a queued
+   invocation completes. Expect a private denial and no task mutation. Verify an
+   old interaction cannot operate on a newer DM generation or credential epoch.
+6. During a controlled command-registration refresh failure, ordinary mentions
+   and thread replies must keep their healthy Gateway connection. Commands deny
+   while their registration is unconfirmed; unknown registration writes reconcile
+   by GET, not blind repost. Keep provider responses private according to the
+   [interaction response contract](https://docs.discord.com/developers/interactions/receiving-and-responding).
+
+The app-global ownership marker survives local company/endpoint deletion to
+prevent an old uncertain registration from silently authorizing a new endpoint.
+It retains public app/opaque owner identifiers only, not credentials or content.
+Reusing an archived bot does not implicitly transfer its command ownership;
+ordinary mention setup remains usable while command ownership is unresolved.
 
 ### DC5 — DMs and identity
 
@@ -861,9 +896,9 @@ Slack Socket Mode and Telegram polling receive separate instance-admin smoke tes
 | Streaming/progress       | Native stream, else post/edit | Coarse comment edit                 | Bounded post/edit; no native streaming  | Bounded post/edit; no native streaming        | Throttled post/edit; optional DM draft  |
 | Rich cards               | Block Kit                     | GFM + Paperclip link                | Discord embed                           | Adaptive Card                                 | Formatted text/inline keyboard          |
 | Buttons/selections       | Native                        | Fallback link                       | Native Gateway interaction              | Native card action                            | Inline keyboard                         |
-| Modal/form               | Native modal                  | Fallback link                       | Sequential prompt/link fallback         | Task module                                   | Sequential prompt/link fallback         |
-| Commands                 | Registered slash command      | Text mention vocabulary only        | Mention/message vocabulary              | Card/message vocabulary                       | `/new`, `/status`, `/close`             |
-| Files                    | Native send/receive           | Inbound URL text + safe output link | Native send/receive                     | Authenticated Paperclip link on every surface | Native media/document                   |
+| Modal/form               | Native modal                  | Fallback link                       | Native modal                            | Task module                                   | Sequential prompt/link fallback         |
+| Commands                 | Registered slash command      | Text mention vocabulary only        | Registered `/paperclip status/new/close` | Card/message vocabulary                       | `/new`, `/status`, `/close`             |
+| Files                    | Native send/receive           | Inbound URL text + safe output link | Native send/receive                     | Personal consent delivery; task link elsewhere | Native media/document                   |
 | DM                       | Native                        | Unsupported                         | Native                                  | Personal scope                                | Native                                  |
 | Ephemeral/private denial | Ephemeral, then DM/text       | Safe public text/link               | DM, then safe text                      | Targeted, then DM/text                        | DM, then safe text                      |
 | Edit/delete audit        | Correction/tombstone          | Correction/tombstone                | Correction/tombstone                    | Correction/tombstone where delivered          | Correction/tombstone where delivered    |

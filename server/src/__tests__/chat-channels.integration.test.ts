@@ -41,6 +41,7 @@ import {
   chatActions,
   chatConversations,
   chatDeliveries,
+  chatDiscordCommandOwners,
   chatEndpointLeases,
   chatEndpointResources,
   chatEndpoints,
@@ -1995,6 +1996,329 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       throw new Error("Fake runtime did not receive Discord callbacks");
     return { ...context, endpoint, callbacks };
   }
+
+  describe("Discord automatic command registration", () => {
+    async function retireRegistrationFixture(
+      service: ChatChannelService,
+      endpointId: string,
+    ) {
+      try {
+        const owners = await db
+          .select()
+          .from(chatDiscordCommandOwners)
+          .where(eq(chatDiscordCommandOwners.endpointId, endpointId));
+        await service.configure(endpointId, { action: "remove" }, "owner-user");
+        expect((await service.get(endpointId))?.status).toBe("archived");
+        // Removal retires only this fixture's runtime; immutable application
+        // ownership stays available to the no-adoption/tombstone checks.
+        expect(
+          await db
+            .select()
+            .from(chatDiscordCommandOwners)
+            .where(eq(chatDiscordCommandOwners.endpointId, endpointId)),
+        ).toEqual(owners);
+      } finally {
+        await service.shutdown();
+      }
+    }
+
+    async function registrationFixture(
+      mode: "success" | "unavailable" | "unknown" = "success",
+    ) {
+      const fixture = await seedCompany();
+      const applicationId = uniqueDiscordApplicationId();
+      const guildId = "1457808928258658549";
+      const baseFetch = fakeDiscordFetch(applicationId);
+      const commandUrl = `https://discord.com/api/v10/applications/${applicationId}/commands`;
+      let commands: Record<string, unknown>[] = [
+        {
+          id: "888888888888888881",
+          application_id: applicationId,
+          version: "888888888888888882",
+          type: 1,
+          name: "other",
+          description: "Existing application command",
+        },
+      ];
+      let unavailable = mode === "unavailable";
+      let endpointId: string;
+      const calls: string[] = [];
+      const providerFetch = vi.fn(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          if (String(input) !== commandUrl) return baseFetch(input);
+          const method = init?.method ?? "GET";
+          calls.push(method);
+          if (method === "GET")
+            return Response.json(commands, { status: unavailable ? 503 : 200 });
+          expect(method).toBe("POST");
+          const [intent] = await db
+            .select()
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.endpointId, endpointId),
+                eq(chatActions.kind, "discord_command_registration"),
+              ),
+            );
+          expect(intent?.payload.registration).toMatchObject({
+            phase: "attempted",
+            scope: { applicationId, guildId },
+          });
+          expect(intent?.status).not.toBe("processed");
+          const definition = JSON.parse(String(init?.body)) as Record<
+            string,
+            unknown
+          >;
+          const command = {
+            ...definition,
+            id: "888888888888888883",
+            application_id: applicationId,
+            version: "888888888888888884",
+          };
+          commands = [...commands, command];
+          if (mode === "unknown")
+            throw new Error("private registration transport failure");
+          return Response.json(command);
+        },
+      ) as unknown as typeof globalThis.fetch;
+      const context = createService(new FakeChatSdkRuntime(), providerFetch);
+      const endpoint = await context.service.create(
+        fixture.companyId,
+        {
+          provider: "discord",
+          assignedAgentId: fixture.assignedAgentId,
+          name: "Discord command registration",
+        },
+        "owner-user",
+      );
+      endpointId = endpoint.id;
+      const credentials = {
+        applicationId,
+        guildId,
+        botToken: "discord-registration-private-token",
+      };
+      const configure = () =>
+        context.service.configure(
+          endpointId,
+          { action: "configure", credentials },
+          "owner-user",
+        );
+      const makeDue = () =>
+        db
+          .update(chatActions)
+          .set({
+            result: sql`${chatActions.result} || '{"retryAt":"2000-01-01T00:00:00.000Z"}'::jsonb`,
+          })
+          .where(
+            and(
+              eq(chatActions.endpointId, endpointId),
+              eq(chatActions.kind, "discord_command_registration"),
+            ),
+          );
+      return {
+        ...context,
+        fixture,
+        endpoint,
+        credentials,
+        calls,
+        providerFetch,
+        configure,
+        makeDue,
+        available: (value = true) => {
+          unavailable = !value;
+        },
+        commandRows: () => commands,
+        replaceCommands: (next: Record<string, unknown>[]) => {
+          commands = next;
+        },
+      };
+    }
+
+    it("persists registration before enabling the runtime and preserves unrelated commands", async () => {
+      const f = await registrationFixture();
+      try {
+        await f.configure();
+        const connected = await f.service.get(f.endpoint.id);
+        expect(connected?.capabilities).toMatchObject({
+          slashCommands: true,
+          ephemeralMessages: true,
+        });
+        expect(
+          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
+        ).toBeTypeOf("function");
+        expect(f.calls).toEqual(["GET", "POST"]);
+        expect(f.commandRows().map((row) => row.name)).toEqual([
+          "other",
+          "paperclip",
+        ]);
+        const [registration] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, f.endpoint.id),
+              eq(chatActions.kind, "discord_command_registration"),
+            ),
+          );
+        expect(registration?.status).toBe("processed");
+        expect(registration?.payload.registration).toMatchObject({
+          phase: "registered",
+        });
+        expect(JSON.stringify(registration)).not.toContain(
+          f.credentials.botToken,
+        );
+        await f.service.reconcileProviderRuntimes();
+        expect(f.calls).toEqual(["GET", "POST"]);
+      } finally {
+        await retireRegistrationFixture(f.service, f.endpoint.id);
+      }
+    });
+
+    it("keeps mention setup usable on registration failure and upgrades automatically when due", async () => {
+      const f = await registrationFixture("unavailable");
+      try {
+        await f.configure();
+        expect((await f.service.get(f.endpoint.id))?.status).toBe("verifying");
+        expect(
+          (await f.service.get(f.endpoint.id))?.capabilities.slashCommands,
+        ).toBe(false);
+        expect(
+          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
+        ).toBeUndefined();
+        f.available();
+        await f.makeDue();
+        await f.service.reconcileProviderRuntimes();
+        expect(
+          (await f.service.get(f.endpoint.id))?.capabilities.slashCommands,
+        ).toBe(true);
+        expect(
+          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
+        ).toBeTypeOf("function");
+        expect(f.calls).toEqual(["GET", "GET", "POST"]);
+      } finally {
+        await retireRegistrationFixture(f.service, f.endpoint.id);
+      }
+    });
+
+    it("reconstructs an uncertain registration by GET without repeating the provider write", async () => {
+      const f = await registrationFixture("unknown");
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        await f.configure();
+        expect(
+          (await f.service.get(f.endpoint.id))?.capabilities.slashCommands,
+        ).toBe(false);
+        expect(
+          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
+        ).toBeUndefined();
+        await f.service.shutdown();
+        await f.makeDue();
+        restarted = createService(new FakeChatSdkRuntime(), f.providerFetch);
+        await restarted.service.reconcileProviderRuntimes();
+        expect(
+          (await restarted.service.get(f.endpoint.id))?.capabilities
+            .slashCommands,
+        ).toBe(true);
+        expect(
+          restarted.runtime.configurations.get(f.endpoint.id)?.callbacks
+            .onSlashCommand,
+        ).toBeTypeOf("function");
+        expect(f.calls).toEqual(["GET", "POST", "GET"]);
+      } finally {
+        try {
+          await retireRegistrationFixture(
+            restarted?.service ?? f.service,
+            f.endpoint.id,
+          );
+        } finally {
+          await f.service.shutdown();
+        }
+      }
+    });
+
+    it("preserves a healthy Discord Gateway when a due command refresh returns 503", async () => {
+      const f = await registrationFixture();
+      try {
+        await f.configure();
+        const original = f.runtime.endpoints.get(f.endpoint.id);
+        expect(original).toBeDefined();
+        const originalCallbacks = f.runtime.configurations.get(
+          f.endpoint.id,
+        )!.callbacks;
+        expect(originalCallbacks.onMessage).toBeTypeOf("function");
+        expect(originalCallbacks.onSlashCommand).toBeTypeOf("function");
+        const shutdown = vi.spyOn(original!, "shutdown");
+        const targetRestart = vi.fn(async () => {
+          throw new Error(
+            "Healthy Gateway must not restart for command maintenance",
+          );
+        });
+        f.runtime.initializeHook = async (endpointId) => {
+          if (endpointId === f.endpoint.id) await targetRestart();
+        };
+        f.available(false);
+        await f.makeDue();
+        await f.service.reconcileProviderRuntimes();
+        expect(f.runtime.endpoints.get(f.endpoint.id)).toBe(original);
+        expect(f.runtime.configurations.get(f.endpoint.id)?.callbacks).toBe(
+          originalCallbacks,
+        );
+        expect(shutdown).not.toHaveBeenCalled();
+        expect(targetRestart).not.toHaveBeenCalled();
+        expect(
+          (await f.service.get(f.endpoint.id))?.capabilities,
+        ).toMatchObject({ slashCommands: false, ephemeralMessages: false });
+        expect(f.calls).toEqual(["GET", "POST", "GET"]);
+        await f.service.reconcileProviderRuntimes();
+        expect(f.calls).toEqual(["GET", "POST", "GET"]);
+        expect(f.runtime.endpoints.get(f.endpoint.id)).toBe(original);
+        expect(shutdown).not.toHaveBeenCalled();
+        expect(targetRestart).not.toHaveBeenCalled();
+      } finally {
+        await retireRegistrationFixture(f.service, f.endpoint.id);
+      }
+    });
+
+    it("retains the Gateway after an external command namespace conflict without overwriting it", async () => {
+      const f = await registrationFixture();
+      try {
+        await f.configure();
+        const original = f.runtime.endpoints.get(f.endpoint.id);
+        expect(original).toBeDefined();
+        const callbacks = f.runtime.configurations.get(
+          f.endpoint.id,
+        )!.callbacks;
+        const shutdown = vi.spyOn(original!, "shutdown");
+        f.replaceCommands(
+          f
+            .commandRows()
+            .map((command) =>
+              command.name === "paperclip"
+                ? { ...command, description: "Owned by another integration" }
+                : command,
+            ),
+        );
+        await f.makeDue();
+        await f.service.reconcileProviderRuntimes();
+        expect(
+          (await f.service.get(f.endpoint.id))?.capabilities.slashCommands,
+        ).toBe(false);
+        expect(f.runtime.endpoints.get(f.endpoint.id)).toBe(original);
+        expect(f.runtime.configurations.get(f.endpoint.id)?.callbacks).toBe(
+          callbacks,
+        );
+        expect(callbacks.onMessage).toBeTypeOf("function");
+        expect(callbacks.onSlashCommand).toBeTypeOf("function");
+        expect(shutdown).not.toHaveBeenCalled();
+        expect(f.calls).toEqual(["GET", "POST", "GET"]);
+        expect(f.commandRows()[1]?.description).toBe(
+          "Owned by another integration",
+        );
+      } finally {
+        await retireRegistrationFixture(f.service, f.endpoint.id);
+      }
+    });
+  });
 
   async function deliverMessage(input: {
     callbacks: CreateChatSdkEndpointRuntimeOptions["callbacks"];
@@ -38198,6 +38522,812 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
   });
 
+  describe("Discord native commands with durable service authority", () => {
+    const guildId = "1457808928258658549";
+    const channelId = "333333333333333333";
+    const externalUserId = "444444444444444419";
+    const rootMessageId = "555555555555555619";
+    const registeredCommandId = "888888888888888819";
+    let interactionSequence = 0n;
+
+    async function commandFixture() {
+      const fixture = await seedCompany();
+      const applicationId = uniqueDiscordApplicationId();
+      let holdWork = false;
+      const queued: Array<() => void> = [];
+      const remoteCommands: Array<Record<string, unknown>> = [];
+      const registrationCalls: string[] = [];
+      const providerFetch: typeof globalThis.fetch = async (input, init) => {
+        if (
+          new URL(String(input)).pathname ===
+          `/api/v10/applications/${applicationId}/commands`
+        ) {
+          const method = init?.method ?? "GET";
+          registrationCalls.push(method);
+          if (method === "GET") return Response.json(remoteCommands);
+          if (method !== "POST")
+            throw new Error("Unexpected fixture command request");
+          const definition = JSON.parse(String(init?.body));
+          const command = {
+            ...definition,
+            id: registeredCommandId,
+            application_id: applicationId,
+            version: "999999999999999919",
+          };
+          remoteCommands.push(command);
+          return Response.json(command);
+        }
+        return fakeDiscordFetch(applicationId)(input);
+      };
+      const context = createService(new FakeChatSdkRuntime(), providerFetch, {
+        scheduleDeferredWork(task) {
+          if (holdWork) queued.push(task);
+          else setImmediate(task);
+        },
+      });
+      const endpoint = await context.service.create(
+        fixture.companyId,
+        {
+          provider: "discord",
+          assignedAgentId: fixture.assignedAgentId,
+          name: "Discord command fixture",
+        },
+        "owner-user",
+      );
+      const identityAdapter = createDiscordAdapter({
+        applicationId,
+        botToken: "synthetic-identity-only",
+        webhookVerifier: async () => false,
+      });
+      context.runtime.initializeHook = async (endpointId) => {
+        if (endpointId !== endpoint.id) return;
+        const current = context.runtime.get(endpointId)!;
+        const original = current.thread.bind(current);
+        // Real pinned source IDs, with data transport only still mocked.
+        current.thread = (threadId) => ({
+          ...original(threadId),
+          channelId: identityAdapter.channelIdFromThreadId(threadId),
+          isDM: threadId.startsWith("discord:@me:"),
+        });
+      };
+      await context.service.configure(
+        endpoint.id,
+        {
+          action: "configure",
+          credentials: { applicationId, botToken: "discord-secret", guildId },
+        },
+        "owner-user",
+      );
+      const initialCallbacks = context.runtime.configurations.get(
+        endpoint.id,
+      )!.callbacks;
+      if (!initialCallbacks.onDiscordRootMentionAdmission)
+        throw new Error("Discord root fixture callback unavailable");
+      const threadId = `discord:${guildId}:${channelId}:${rootMessageId}`;
+      await initialCallbacks.onDiscordRootMentionAdmission({
+        endpointId: endpoint.id,
+        guildId,
+        channelId,
+        messageId: rootMessageId,
+        message: {
+          ...makeMessage({
+            id: rootMessageId,
+            text: "@maya investigate the command fixture",
+            mentioned: true,
+            userId: externalUserId,
+          }),
+          threadId,
+        } as Message,
+        threadId,
+        userId: externalUserId,
+      });
+      const delivery = await db
+        .select()
+        .from(chatDeliveries)
+        .where(
+          and(
+            eq(chatDeliveries.endpointId, endpoint.id),
+            eq(chatDeliveries.providerEventId, `${threadId}:${rootMessageId}`),
+          ),
+        )
+        .then((rows) => rows[0]);
+      if (!delivery) throw new Error("Discord command setup delivery absent");
+      await context.service.processPendingDeliveries(25, delivery.id);
+      await qualifySetupRoundTrip(context.service, endpoint.id, externalUserId);
+      await context.service.test(endpoint.id, "owner-user");
+      await context.service.reconcileProviderRuntimes();
+      const callbacks = context.runtime.configurations.get(
+        endpoint.id,
+      )!.callbacks;
+      if (!callbacks.onSlashCommand)
+        throw new Error("Registered Discord command callback unavailable");
+      const [conversation] = await context.service.listConversations(
+        endpoint.id,
+      );
+      if (!conversation) throw new Error("Discord command conversation absent");
+      const principal = await db
+        .select()
+        .from(chatExternalPrincipals)
+        .where(
+          and(
+            eq(chatExternalPrincipals.companyId, fixture.companyId),
+            eq(chatExternalPrincipals.provider, "discord"),
+            eq(chatExternalPrincipals.providerAccountId, guildId),
+            eq(chatExternalPrincipals.externalId, externalUserId),
+          ),
+        )
+        .then((rows) => rows[0]);
+      if (!principal) throw new Error("Discord command principal absent");
+      const intent = await context.service.createLinkIntent(
+        endpoint.id,
+        principal.id,
+        1800,
+      );
+      await context.service.confirmIdentityLink(
+        new URL(intent.confirmationUrl).searchParams.get("token")!,
+        "owner-user",
+      );
+      const scope = {
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        applicationId,
+        guildId,
+      };
+      expect(
+        registrationCalls.filter((method) => method === "POST"),
+      ).toHaveLength(1);
+      holdWork = true;
+      const pinnedRuntimes: Array<
+        ReturnType<typeof createChatSdkEndpointRuntime>
+      > = [];
+      async function parser() {
+        const pinned = createChatSdkEndpointRuntime({
+          ...context.runtime.configurations.get(endpoint.id)!,
+          callbacks: {
+            onMessage() {},
+            onSlashCommand: callbacks.onSlashCommand,
+          },
+          enableDiscordGateway: false,
+          logger: "silent",
+        });
+        pinnedRuntimes.push(pinned);
+        await pinned.initialize();
+        return pinned.getProviderAdapter() as unknown as {
+          handleGatewayInteraction(input: unknown): Promise<void>;
+        };
+      }
+      const adapter = await parser();
+      const interaction = (
+        command: "status" | "new" | "close",
+        overrides: Record<string, unknown> = {},
+      ) => ({
+        id: (
+          ((BigInt(Date.now()) - 1420070400000n) << 22n) +
+          interactionSequence++
+        ).toString(),
+        applicationId,
+        commandId: registeredCommandId,
+        commandName: "paperclip",
+        commandType: 1,
+        type: 2,
+        version: 1,
+        context: 0,
+        guildId,
+        channelId: rootMessageId,
+        channel: { id: rootMessageId, parentId: channelId, type: 11 },
+        authorizingIntegrationOwners: { guildId, userId: null },
+        user: {
+          id: externalUserId,
+          username: "operator",
+          globalName: "Operator",
+          bot: false,
+          discriminator: "0",
+        },
+        options: { data: [{ name: command, type: 1 }] },
+        createdTimestamp: Date.now(),
+        token: "synthetic-command-interaction-token",
+        isChatInputCommand: () => true,
+        isModalSubmit: () => false,
+        isMessageComponent: () => false,
+        deferReply: vi.fn(async () => undefined),
+        editReply: vi.fn(async () => undefined),
+        deferred: false,
+        replied: false,
+        ...overrides,
+      });
+      const actions = () =>
+        db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.kind, "discord_native_command"),
+            ),
+          )
+          .orderBy(asc(chatActions.createdAt));
+      const publications = () =>
+        db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, endpoint.id),
+              like(chatPublications.idempotencyKey, "control:%"),
+            ),
+          );
+      return {
+        ...context,
+        fixture,
+        endpoint,
+        callbacks,
+        conversation,
+        applicationId,
+        principal,
+        scope,
+        adapter,
+        parser,
+        interaction,
+        actions,
+        publications,
+        queued,
+        async close() {
+          try {
+            await Promise.all(
+              pinnedRuntimes.map((pinned) => pinned.shutdown()),
+            );
+          } finally {
+            await retirePublicationFixture(context.service, endpoint.id);
+          }
+        },
+      };
+    }
+
+    it("returns private status, keeps guild new as guidance, and closes only after a real public control receipt", async () => {
+      const f = await commandFixture();
+      try {
+        const wakeCount = f.wakeup.mock.calls.length;
+        const status = f.interaction("status");
+        await f.adapter.handleGatewayInteraction(status);
+        expect(status.deferReply).toHaveBeenCalledWith({ flags: 64 });
+        expect(status.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining(f.conversation.issueIdentifier!),
+            allowedMentions: { parse: [] },
+          }),
+        );
+        expect(await f.publications()).toHaveLength(0);
+        const newCommand = f.interaction("new");
+        await f.adapter.handleGatewayInteraction(newCommand);
+        expect(newCommand.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("new Discord thread"),
+          }),
+        );
+        expect(await f.publications()).toHaveLength(0);
+        const close = f.interaction("close");
+        await f.adapter.handleGatewayInteraction(close);
+        expect(close.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("recorded"),
+          }),
+        );
+        const [publication] = await f.publications();
+        expect(publication).toMatchObject({
+          state: "pending",
+          conversationId: f.conversation.id,
+          issueId: f.conversation.issueId,
+        });
+        expect(publication.idempotencyKey).toMatch(/^control:close:/);
+        expect(
+          (
+            await db
+              .select()
+              .from(chatConversations)
+              .where(eq(chatConversations.id, f.conversation.id))
+          )[0]?.state,
+        ).toBe("active");
+        expect(await f.actions()).toHaveLength(3);
+        expect(f.wakeup).toHaveBeenCalledTimes(wakeCount);
+        await f.service.processPendingPublications(100);
+        expect((await f.publications())[0]).toMatchObject({
+          state: "published",
+        });
+        expect(
+          (
+            await db
+              .select()
+              .from(chatConversations)
+              .where(eq(chatConversations.id, f.conversation.id))
+          )[0]?.state,
+        ).toBe("completed");
+        // Fresh adapter removes only process-local ACK suppression. The real
+        // service must replay the exact durable action, not stage another close
+        // or infer a replacement conversation from its now-completed target.
+        const replayAdapter = await f.parser();
+        const replay = f.interaction("close", { id: close.id });
+        await replayAdapter.handleGatewayInteraction(replay);
+        expect(replay.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("recorded"),
+          }),
+        );
+        expect(await f.actions()).toHaveLength(3);
+        expect(await f.publications()).toHaveLength(1);
+        expect(await f.service.listConversations(f.endpoint.id)).toHaveLength(
+          1,
+        );
+        expect(JSON.stringify(await f.actions())).not.toContain(
+          "synthetic-command-interaction-token",
+        );
+      } finally {
+        await f.close();
+      }
+    });
+
+    it.each([
+      "missing owner",
+      "unconfirmed registration",
+      "disabled capability",
+      "altered origin fence",
+      "viewer",
+      "disabled reach",
+      "disabled connection",
+      "stale generation",
+      "replaced Gateway lease",
+    ] as const)(
+      "denies a previously accepted command after %s without another action or public receipt",
+      async (reason) => {
+        const f = await commandFixture();
+        try {
+          const first = f.interaction("status");
+          await f.adapter.handleGatewayInteraction(first);
+          expect(first.editReply).toHaveBeenCalledWith(
+            expect.objectContaining({
+              content: expect.stringContaining(f.conversation.issueIdentifier!),
+            }),
+          );
+          const before = await f.actions();
+          expect(before).toHaveLength(1);
+          const current = await db
+            .select()
+            .from(chatEndpoints)
+            .where(eq(chatEndpoints.id, f.endpoint.id))
+            .then((rows) => rows[0]!);
+          if (reason === "missing owner")
+            await db
+              .delete(chatDiscordCommandOwners)
+              .where(
+                eq(chatDiscordCommandOwners.applicationId, f.applicationId),
+              );
+          if (reason === "unconfirmed registration")
+            await db
+              .update(chatActions)
+              .set({ result: { outcome: "unknown" } })
+              .where(
+                and(
+                  eq(chatActions.endpointId, f.endpoint.id),
+                  eq(chatActions.kind, "discord_command_registration"),
+                ),
+              );
+          if (reason === "disabled capability")
+            await db
+              .update(chatEndpoints)
+              .set({
+                capabilities: { ...current.capabilities, slashCommands: false },
+              })
+              .where(eq(chatEndpoints.id, current.id));
+          if (reason === "altered origin fence")
+            await db
+              .update(chatActions)
+              .set({
+                payload: {
+                  ...before[0]!.payload,
+                  runtimeFence: {
+                    ...(before[0]!.payload.runtimeFence as object),
+                    generation: 999999,
+                  },
+                },
+              })
+              .where(eq(chatActions.id, before[0]!.id));
+          if (reason === "viewer")
+            await db
+              .update(companyMemberships)
+              .set({ membershipRole: "viewer" })
+              .where(
+                and(
+                  eq(companyMemberships.companyId, f.fixture.companyId),
+                  eq(companyMemberships.principalId, "owner-user"),
+                ),
+              );
+          if (reason === "disabled reach")
+            await db
+              .update(chatEndpointResources)
+              .set({ enabled: false })
+              .where(
+                and(
+                  eq(chatEndpointResources.endpointId, f.endpoint.id),
+                  eq(chatEndpointResources.providerResourceId, channelId),
+                ),
+              );
+          if (reason === "disabled connection")
+            await db
+              .update(toolConnections)
+              .set({ enabled: false })
+              .where(eq(toolConnections.id, current.connectionId));
+          if (reason === "stale generation")
+            await db
+              .update(chatEndpoints)
+              .set({
+                setup: {
+                  ...current.setup,
+                  runtimeGeneration:
+                    Number(current.setup.runtimeGeneration ?? 0) + 1,
+                },
+              })
+              .where(eq(chatEndpoints.id, current.id));
+          if (reason === "replaced Gateway lease")
+            await db
+              .update(chatEndpointLeases)
+              .set({ token: randomUUID() })
+              .where(
+                and(
+                  eq(chatEndpointLeases.endpointId, f.endpoint.id),
+                  eq(chatEndpointLeases.leaseKey, "discord_gateway_runtime"),
+                ),
+              );
+          const afterRevocation = await f.actions();
+          const replay = f.interaction("status", { id: first.id });
+          await (await f.parser()).handleGatewayInteraction(replay);
+          expect(replay.deferReply).toHaveBeenCalledExactlyOnceWith({
+            flags: 64,
+          });
+          expect(replay.editReply).toHaveBeenCalledExactlyOnceWith(
+            expect.objectContaining({
+              content: expect.stringContaining("not available"),
+            }),
+          );
+          expect(await f.actions()).toEqual(afterRevocation);
+          expect(await f.publications()).toHaveLength(0);
+        } finally {
+          await f.close();
+        }
+      },
+    );
+
+    it("serializes simultaneous exact close deliveries and denies a changed command or registered ID", async () => {
+      const f = await commandFixture();
+      try {
+        const first = f.interaction("close");
+        const duplicate = f.interaction("close", { id: first.id });
+        const other = await f.parser();
+        await Promise.all([
+          f.adapter.handleGatewayInteraction(first),
+          other.handleGatewayInteraction(duplicate),
+        ]);
+        for (const command of [first, duplicate])
+          expect(command.editReply).toHaveBeenCalledWith(
+            expect.objectContaining({
+              content: expect.stringContaining("recorded"),
+            }),
+          );
+        const before = await f.actions();
+        expect(before).toHaveLength(1);
+        expect(await f.publications()).toHaveLength(1);
+        const changed = f.interaction("new", { id: first.id });
+        await (await f.parser()).handleGatewayInteraction(changed);
+        expect(changed.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("not available"),
+          }),
+        );
+        const changedActor = f.interaction("close", {
+          id: first.id,
+          user: {
+            id: "444444444444444420",
+            username: "other",
+            bot: false,
+            discriminator: "0",
+          },
+        });
+        await (await f.parser()).handleGatewayInteraction(changedActor);
+        expect(changedActor.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("not available"),
+          }),
+        );
+        const unregistered = f.interaction("close", {
+          commandId: "888888888888888820",
+        });
+        await (await f.parser()).handleGatewayInteraction(unregistered);
+        expect(unregistered.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("not available"),
+          }),
+        );
+        expect(await f.actions()).toEqual(before);
+        expect(await f.publications()).toHaveLength(1);
+      } finally {
+        await f.close();
+      }
+    });
+
+    it("records DM new once and never applies its old replay to a replacement conversation", async () => {
+      const f = await commandFixture();
+      try {
+        const dmId = "666666666666666619";
+        const dmThreadId = `discord:@me:${dmId}`;
+        const thread = f.runtime
+          .get(f.endpoint.id)!
+          .thread(dmThreadId) as unknown as Thread;
+        const message = (id: string, text: string) =>
+          ({
+            ...makeMessage({ id, text, userId: externalUserId }),
+            threadId: dmThreadId,
+          }) as Message;
+        const receive = async (id: string, text: string) => {
+          await f.callbacks.onMessage({
+            endpointId: f.endpoint.id,
+            provider: "discord",
+            trigger: "direct_message",
+            thread,
+            message: message(id, text),
+          });
+          const delivery = await db
+            .select()
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.endpointId, f.endpoint.id),
+                eq(chatDeliveries.providerEventId, `${dmThreadId}:${id}`),
+              ),
+            )
+            .then((rows) => rows[0]);
+          if (!delivery) throw new Error("DM fixture delivery absent");
+          await f.service.processPendingDeliveries(25, delivery.id);
+          expect(
+            await db
+              .select({
+                state: chatDeliveries.state,
+                error: chatDeliveries.redactedError,
+              })
+              .from(chatDeliveries)
+              .where(eq(chatDeliveries.id, delivery.id)),
+          ).toEqual([expect.objectContaining({ state: "processed" })]);
+        };
+        await receive("555555555555555620", "Investigate the original DM task");
+        const old = await db
+          .select()
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.endpointId, f.endpoint.id),
+              eq(chatConversations.externalThreadId, dmThreadId),
+            ),
+          )
+          .then((rows) => rows[0]!);
+        expect(old).toMatchObject({
+          state: "active",
+          isDirectMessage: true,
+          sessionGeneration: 1,
+        });
+        const dm = {
+          context: 1,
+          guildId: null,
+          channelId: dmId,
+          channel: { id: dmId, type: 1 },
+          authorizingIntegrationOwners: { guildId: "0", userId: null },
+        };
+        const next = f.interaction("new", dm);
+        await f.adapter.handleGatewayInteraction(next);
+        expect(next.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("recorded"),
+          }),
+        );
+        expect((await f.publications())[0]).toMatchObject({
+          state: "pending",
+          conversationId: old.id,
+        });
+        await f.service.processPendingPublications(100);
+        expect((await f.publications())[0]).toMatchObject({
+          state: "published",
+        });
+        await receive("555555555555555621", "Start the replacement DM task");
+        const conversations = await db
+          .select()
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.endpointId, f.endpoint.id),
+              eq(chatConversations.externalThreadId, dmThreadId),
+            ),
+          )
+          .orderBy(asc(chatConversations.sessionGeneration));
+        expect(conversations).toHaveLength(2);
+        expect(conversations[0]).toMatchObject({
+          id: old.id,
+          state: "completed",
+          sessionGeneration: 1,
+        });
+        expect(conversations[1]).toMatchObject({
+          state: "active",
+          sessionGeneration: 2,
+        });
+        expect(conversations[1]!.issueId).not.toBe(old.issueId);
+        const wakeCount = f.wakeup.mock.calls.length;
+        const replay = f.interaction("new", { ...dm, id: next.id });
+        await (await f.parser()).handleGatewayInteraction(replay);
+        expect(replay.editReply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("recorded"),
+          }),
+        );
+        expect(await f.actions()).toHaveLength(1);
+        expect(await f.publications()).toHaveLength(1);
+        expect(
+          (
+            await db
+              .select()
+              .from(chatConversations)
+              .where(eq(chatConversations.id, conversations[1]!.id))
+          )[0]?.state,
+        ).toBe("active");
+        expect(f.wakeup).toHaveBeenCalledTimes(wakeCount);
+      } finally {
+        await f.close();
+      }
+    });
+
+    it.each(["retired runtime", "replaced lease"] as const)(
+      "acknowledges privately before a blocked DB wait but denies %s before commit",
+      async (loss) => {
+        const f = await commandFixture();
+        let release = () => {};
+        let blocker: Promise<unknown> | undefined;
+        let delivery: Promise<void> | undefined;
+        try {
+          const current = await db
+            .select()
+            .from(chatEndpoints)
+            .where(eq(chatEndpoints.id, f.endpoint.id))
+            .then((rows) => rows[0]!);
+          let locked = () => {};
+          const acquired = new Promise<void>((resolve) => {
+            locked = resolve;
+          });
+          const held = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          blocker = db.transaction(async (tx) => {
+            await tx
+              .select()
+              .from(toolConnections)
+              .where(eq(toolConnections.id, current.connectionId))
+              .for("no key update");
+            locked();
+            await held;
+          });
+          await acquired;
+          const command = f.interaction("close");
+          delivery = f.adapter.handleGatewayInteraction(command);
+          await expect.poll(() => command.deferReply.mock.calls.length).toBe(1);
+          await expect
+            .poll(async () => {
+              try {
+                await db.transaction(async (tx) => {
+                  await tx
+                    .select()
+                    .from(chatEndpoints)
+                    .where(eq(chatEndpoints.id, f.endpoint.id))
+                    .for("no key update", { noWait: true });
+                });
+                return false;
+              } catch (error) {
+                const code =
+                  (error as { code?: unknown; cause?: { code?: unknown } })
+                    .cause?.code ?? (error as { code?: unknown }).code;
+                if (code !== "55P03") throw error;
+                return true;
+              }
+            })
+            .toBe(true);
+          expect(command.editReply).not.toHaveBeenCalled();
+          if (loss === "retired runtime")
+            await f.runtime.removeEndpoint(f.endpoint.id);
+          else
+            await db
+              .update(chatEndpointLeases)
+              .set({ token: randomUUID() })
+              .where(
+                and(
+                  eq(chatEndpointLeases.endpointId, f.endpoint.id),
+                  eq(chatEndpointLeases.leaseKey, "discord_gateway_runtime"),
+                ),
+              );
+          release();
+          await blocker;
+          await delivery;
+          expect(command.editReply).toHaveBeenCalledExactlyOnceWith(
+            expect.objectContaining({
+              content: expect.stringContaining("not available"),
+            }),
+          );
+          expect(await f.actions()).toHaveLength(0);
+          expect(await f.publications()).toHaveLength(0);
+          expect(
+            (
+              await db
+                .select()
+                .from(chatConversations)
+                .where(eq(chatConversations.id, f.conversation.id))
+            )[0]?.state,
+          ).toBe("active");
+        } finally {
+          release();
+          try {
+            await blocker;
+            await delivery;
+          } finally {
+            await f.close();
+          }
+        }
+      },
+    );
+
+    it("rolls back staged public control when the durable command receipt fails", async () => {
+      const f = await commandFixture();
+      const functionName = `discord_command_failure_${randomUUID().replaceAll("-", "")}`;
+      const triggerName = `${functionName}_trigger`;
+      try {
+        // Synthetic PostgreSQL fault after the outbox insert, scoped only to
+        // this endpoint. Provider error text must never become private content.
+        await db.execute(
+          sql.raw(
+            `CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.endpoint_id = '${f.endpoint.id}'::uuid AND NEW.kind = 'discord_native_command' THEN RAISE EXCEPTION 'PRIVATE-COMMAND-PERSISTENCE-DETAIL'; END IF; RETURN NEW; END $$`,
+          ),
+        );
+        await db.execute(
+          sql.raw(
+            `CREATE TRIGGER ${triggerName} BEFORE INSERT ON chat_actions FOR EACH ROW EXECUTE FUNCTION ${functionName}()`,
+          ),
+        );
+        const close = f.interaction("close");
+        await f.adapter.handleGatewayInteraction(close);
+        expect(close.deferReply).toHaveBeenCalledExactlyOnceWith({ flags: 64 });
+        expect(close.editReply).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            content: expect.stringContaining("could not be confirmed"),
+          }),
+        );
+        expect(JSON.stringify(close.editReply.mock.calls)).not.toContain(
+          "PRIVATE-COMMAND",
+        );
+        expect(await f.actions()).toHaveLength(0);
+        expect(await f.publications()).toHaveLength(0);
+        expect(
+          (
+            await db
+              .select()
+              .from(chatConversations)
+              .where(eq(chatConversations.id, f.conversation.id))
+          )[0]?.state,
+        ).toBe("active");
+      } finally {
+        try {
+          await db.execute(
+            sql.raw(`DROP TRIGGER IF EXISTS ${triggerName} ON chat_actions`),
+          );
+          await db.execute(
+            sql.raw(`DROP FUNCTION IF EXISTS ${functionName}()`),
+          );
+        } finally {
+          await f.close();
+        }
+      }
+    });
+  });
+
   it("turns a Slack slash command into a new native thread and one Paperclip task", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, runtime, service } =
@@ -57466,6 +58596,127 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(context.consentCards).toHaveLength(1);
         expect(context.uploadRequest).toHaveBeenCalledTimes(1);
         expect(context.fileCards).toHaveLength(1);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+
+    it("offers only exact conflict cancellation after valid Teams consent receipts disagree", async () => {
+      const context = await teamsFileAuthorityFixture();
+      try {
+        const { publication } = await beginTeamsBoardTransfer(context);
+        const wakeCount = context.wakeup.mock.calls.length;
+        await expect(context.dispatchConsent("accept")).resolves.toEqual({
+          status: 200,
+        });
+        await expect(context.dispatchConsent("decline")).resolves.toEqual({
+          status: 403,
+        });
+        const [conflict] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.publicationId, publication.id));
+        expect(conflict).toMatchObject({
+          phase: "conflict",
+          attemptId: null,
+          attemptExpiresAt: null,
+        });
+        const app = routesApp(db, context.fixture.companyId, context.service);
+        const before = await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.commentId, publication.commentId!));
+        const activity = await request(app)
+          .get(`/api/chat-endpoints/${context.endpoint.id}/activity`)
+          .expect(200);
+        const item = activity.body.find(
+          (row: { id: string }) => row.id === publication.id,
+        );
+        expect(item).toMatchObject({
+          status: "delivery_unknown",
+          replayable: false,
+          resolutionActions: ["cancel"],
+          fileTransfer: { phase: "conflict", version: conflict!.version },
+        });
+        expect(JSON.stringify(activity.body)).not.toMatch(
+          /PRIVATE-UPLOAD-CANARY|pcfc_|ciphertext|fixture\.sharepoint/,
+        );
+        expect(
+          await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.publicationId, publication.id)),
+        ).toEqual([conflict]);
+        expect(
+          await db
+            .select()
+            .from(chatPublications)
+            .where(eq(chatPublications.commentId, publication.commentId!)),
+        ).toEqual(before);
+        const path = `/api/chat-endpoints/${context.endpoint.id}/publications/${publication.id}/resolve`;
+        const hint = { phase: "conflict", version: conflict!.version };
+        for (const action of ["mark_delivered", "retry_anyway"])
+          await request(app)
+            .post(path)
+            .send({ action, fileTransfer: hint })
+            .expect(409);
+        await request(app)
+          .post(path)
+          .send({ action: "cancel", fileTransfer: hint })
+          .expect(204);
+        await request(app)
+          .post(path)
+          .send({ action: "cancel", fileTransfer: hint })
+          .expect(409);
+        const [cancelled] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.publicationId, publication.id));
+        expect(cancelled).toMatchObject({
+          phase: "cancelled",
+          reason: "operator_cancelled_conflict",
+          version: conflict!.version + 1,
+          fileInfoMessageId: null,
+        });
+        expect(
+          await context.service.getPublicationBatchStatus(
+            context.endpoint.id,
+            context.conversation.id,
+            publication.id,
+          ),
+        ).toMatchObject({
+          published: 1,
+          cancelled: 1,
+          settled: 2,
+          canDismiss: true,
+        });
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.uploadRequest).not.toHaveBeenCalled();
+        expect(context.fileCards).toHaveLength(0);
+        expect(context.wakeup).toHaveBeenCalledTimes(wakeCount);
+        await expect(
+          db
+            .select()
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.companyId, context.fixture.companyId),
+                eq(activityLog.entityId, publication.id),
+                eq(activityLog.action, "chat.publication_cancel"),
+              ),
+            ),
+        ).resolves.toEqual([
+          expect.objectContaining({
+            actorType: "user",
+            actorId: "owner-user",
+            details: expect.objectContaining({
+              previousPhase: "conflict",
+              previousVersion: conflict!.version,
+              nextPhase: "cancelled",
+              duplicateRiskAcknowledged: false,
+            }),
+          }),
+        ]);
       } finally {
         await retirePublicationFixture(context.service, context.endpoint.id);
       }

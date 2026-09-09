@@ -141,6 +141,7 @@ export function projectChatPublicationBatch(
 
 export function chatFileTransferResolutionActions(
   part: ChatPublicationSummary,
+  verifiedConflict?: { publicationId: string; version: number },
 ): Array<"mark_delivered" | "retry_anyway" | "cancel"> {
   if (part.state !== "delivery_unknown" || !part.fileTransfer) return [];
   switch (part.fileTransfer.phase) {
@@ -149,6 +150,11 @@ export function chatFileTransferResolutionActions(
     case "consent_unknown":
     case "upload_unknown":
       return ["cancel"];
+    case "conflict":
+      return verifiedConflict?.publicationId === part.id &&
+        verifiedConflict.version === part.fileTransfer.version
+        ? ["cancel"]
+        : [];
     default:
       return [];
   }

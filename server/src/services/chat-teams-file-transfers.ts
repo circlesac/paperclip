@@ -1000,6 +1000,96 @@ export function teamsFileTransferService(
       );
     });
   }
+
+  /** Read-only UI readiness, not resolution authority. The resolver repeats its
+   * exact version and ownership checks under lock. Never expose private proof. */
+  async function canCancelConflict(input: {
+    companyId: string;
+    endpointId: string;
+    conversationId: string;
+    publicationId: string;
+    version: number;
+  }): Promise<boolean> {
+    if (
+      ![
+        input.companyId,
+        input.endpointId,
+        input.conversationId,
+        input.publicationId,
+      ].every((id) => z.uuid().safeParse(id).success) ||
+      !Number.isSafeInteger(input.version) ||
+      input.version < 1
+    )
+      return false;
+    try {
+      const [selected] = await db
+        .select({ transfer: chatTeamsFileTransfers })
+        .from(chatTeamsFileTransfers)
+        .innerJoin(
+          chatPublications,
+          and(
+            eq(chatPublications.id, chatTeamsFileTransfers.publicationId),
+            eq(chatPublications.companyId, chatTeamsFileTransfers.companyId),
+            eq(chatPublications.endpointId, chatTeamsFileTransfers.endpointId),
+            eq(
+              chatPublications.conversationId,
+              chatTeamsFileTransfers.conversationId,
+            ),
+            eq(chatPublications.issueId, chatTeamsFileTransfers.issueId),
+          ),
+        )
+        .where(
+          and(
+            eq(chatTeamsFileTransfers.companyId, input.companyId),
+            eq(chatTeamsFileTransfers.endpointId, input.endpointId),
+            eq(chatTeamsFileTransfers.conversationId, input.conversationId),
+            eq(chatTeamsFileTransfers.publicationId, input.publicationId),
+            eq(chatTeamsFileTransfers.phase, "conflict"),
+            eq(chatTeamsFileTransfers.version, input.version),
+          ),
+        )
+        .limit(1);
+      const row = selected?.transfer;
+      if (!row || authorityHash(authority(row)) !== row.authorityDigest)
+        return false;
+      const { state } = await decoded(row);
+      const quarantine = state.quarantine;
+      if (
+        !quarantine ||
+        quarantine.fromVersion >= row.version ||
+        ![
+          "consent_sending",
+          "consent_unknown",
+          "awaiting_consent",
+          "upload_pending",
+          "uploading",
+          "upload_unknown",
+          "file_info_pending",
+          "file_info_sending",
+          "file_info_unknown",
+        ].includes(quarantine.fromPhase) ||
+        !["conflicting_consent_receipt", "wrong_scope"].includes(
+          row.reason ?? "",
+        )
+      )
+        return false;
+      // An orphaned/indeterminate owner is not an expired owner. Only exact
+      // cleared ownership or a coherent elapsed lease makes cancellation ready.
+      return (
+        (row.attemptId === null && row.attemptExpiresAt === null) ||
+        Boolean(
+          row.attemptId &&
+          row.attemptExpiresAt &&
+          row.attemptId === quarantine.attemptId &&
+          row.attemptExpiresAt.toISOString() === quarantine.attemptExpiresAt &&
+          row.attemptExpiresAt.getTime() <= now().getTime(),
+        )
+      );
+    } catch {
+      return false;
+    }
+  }
+
   /** Caller owns Board authorization, credential lease, audit, and paired public
    * publication update in THIS transaction. No nested transaction or effects. */
   async function resolveInTransaction(
@@ -1080,6 +1170,7 @@ export function teamsFileTransferService(
     get,
     expireAndRecover,
     cancel,
+    canCancelConflict,
     resolveInTransaction,
   };
 }

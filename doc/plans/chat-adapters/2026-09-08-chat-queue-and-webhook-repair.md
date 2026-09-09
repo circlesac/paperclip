@@ -3834,3 +3834,79 @@ provider/model/transfer responses, not native Teams UI. Focused UI tests pass
 **96/96**, OpenAPI/batch tests **44/44**; shared/server/UI types and token gates
 pass. Existing broad workspace harness failures are not reclassified as passed.
 Server 72, its live database and its qualified runner were not changed.
+
+### September 9: post-composition review and Discord activation in progress
+
+The 690-case Teams composition was committed and pushed as `693cfa888`.
+A subsequent bounded review found a real conflict-state recovery gap: the
+protocol supports safe cancellation, but Activity returned no resolution
+actions. An authentic conflicting-consent fixture reproduced this before the
+fix (`teams-conflict-cancel-red01-0909.log`). Read-only proof now checks exact
+scope/version, the stored private binding and quarantine provenance, and
+coherent cleared/elapsed ownership before offering only Cancel. Mutation still
+requires the existing locked, audited resolution path. Fresh protocol/projection
+tests pass 90/90, Board/projection composition 39/39, and existing UI/API tests
+84/84. The composed cancellation performs no upload, final-card POST or wake,
+records one operator audit and allows the settled mixed batch to be dismissed.
+
+Discord service registration now has four root composition cases passing on
+`chat_discord_registration_root_20260909_01` (6.70 seconds), with mocked provider
+HTTP and real registration persistence. Setup commits attempted intent before
+provider POST and enables the command callback only after its durable receipt.
+Registration failures leave mention/thread setup usable; a later due reconcile
+upgrades it. A reconstructed unknown write is resolved by GET only. A changed
+external namespace disables command admission without overwriting that command.
+Review also identified that downgrading this additive capability must not tear
+down a healthy Gateway. A previously installed callback stays present and
+denies against current durable authority; only enabling a missing handler
+requires rebuilding the runtime. The five-case root registration cohort passes
+on fresh `chat_discord_registration_retention_20260909_final01` (6.54 seconds),
+including failed-refresh and namespace-conflict preservation of the exact
+original runtime and callbacks. Plain server types pass.
+
+The durable ownership store and its adjacent helper/parser tests pass 61/61
+on fresh `chat_discord_registration_20260909_protocol02`. Generated migration
+0258 adds only an instance-wide public app/opaque owner-ID tombstone, without
+cascading foreign keys or credentials. Company deletion cannot erase an
+uncertain write and implicitly grant a new command owner. Provider-admin races
+outside this local fence remain an explicit limitation. DB build, fresh
+migration chain and snapshot consistency check pass. This is working-tree
+evidence, not live Discord slash-command qualification; the parallel native
+command handler cohort is still being completed.
+
+The native handler's final bounded cohort passes 15/15 against the actual
+installed adapter/SDK/runtime and real service persistence (provider ports
+mocked). It covers private status, guild new guidance, DM new-generation
+isolation, exact-origin replay, current permission/registration/capability
+denial, a runtime/lease lost during a database wait, and rollback when the
+command receipt cannot be inserted. Root then formatted only changed ranges.
+Plain server types and 119 runtime/helper tests pass on the formatted source.
+The deterministic Board browser suite passes 31/31 again on fresh
+`chat_commands_browser_20260909_root01` (2.8 minutes), without retries.
+
+The first combined run is **707 passed / 4 failed**, not green:
+`chat-command-full-root-0909.log`, fresh
+`chat_commands_full_20260909_root01`, 151.08 seconds. The five new registration
+fixtures stayed eligible after runtime shutdown, polluting a later test's
+exact global Gateway inventory and causing three cascading assertions. The
+fixture cleanup is being corrected without weakening those assertions. The
+fourth failure is an existing Slack ambiguous-retry test's `socket hang up`;
+its cause is still being checked. No deployment or broad-suite completion is
+claimed from this run.
+
+After fixture-only cleanup, the corrected full run passes **711/711**, no skips,
+on fresh `chat_commands_full_20260909_root02` (142.31 seconds), recorded in
+`chat-command-full-corrected-root-0909.log`. Its service SHA256 is
+`0565ab9d494822c022d37449a89b54a0df9f95b84acf6861d3241dcca61cbf57`,
+integration SHA256 `c121c1e49acd2c0d41f75e0ab24515ab0e92fefbc93e6cfa1ec484985d6d2e1b`.
+The five registration plus three existing Gateway cases also pass together
+on a fresh database with their original global assertions intact. The Slack
+retry case passed independently (7.14 seconds) and in the corrected full run;
+no Slack production change was made and the one socket failure's exact cause
+has not been established. Keep its failure log as potential harness-flake
+evidence instead of describing it as a repaired provider bug.
+
+All nine new/modified standalone command, transfer and projection source/test
+files pass Prettier. Shared service/integration additions were range-formatted;
+their existing whole-file formatting debt is not claimed fixed. No lockfile,
+runner binary or wireframe image changed. Deployment remains a separate step.

@@ -199,3 +199,4 @@ export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { runIdentityContexts } from "./run_identity_contexts.js";
 export { chatTeamsFileTransfers } from "./chat_teams_file_transfers.js";
+export { chatDiscordCommandOwners } from "./chat_discord_command_owners.js";
