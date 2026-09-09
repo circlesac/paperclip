@@ -51,6 +51,15 @@ import {
 import type { StateAdapter } from "chat";
 import { normalizeTelegramVideoNoteAttachments } from "./chat-telegram-video-note.js";
 import {
+  installTeamsFileConsentHook,
+  parseTeamsFileConsentCard,
+  parseTeamsUploadedFileCard,
+  type buildTeamsFileConsentCard,
+  type buildTeamsUploadedFileCard,
+  type TeamsConsentApp,
+  type TeamsFileConsentEvent,
+} from "./chat-teams-file-consent.js";
+import {
   githubAttachmentLocator,
   githubAttachmentCommentFetch,
   githubAttachmentDiagnosticCode,
@@ -393,6 +402,14 @@ export interface ChatSdkRuntimeCallbacks {
     event: DiscordGatewayCallbackEvent,
   ): Promise<void> | void;
   onAction?(event: ChatSdkCallbackEvent<ActionEvent>): Promise<void> | void;
+  /** Optional personal-chat file lane; "recorded" is not file delivery. */
+  onTeamsFileConsent?(
+    event: ChatSdkCallbackEvent<TeamsFileConsentEvent>,
+  ):
+    | Promise<"recorded" | "ignored" | "denied">
+    | "recorded"
+    | "ignored"
+    | "denied";
   onMessageDeleted?(
     event: ChatSdkCallbackEvent<MessageDeletedEvent>,
   ): Promise<void> | void;
@@ -590,7 +607,12 @@ interface TeamsApiClientInternals {
 }
 
 interface TeamsAdapterInternals {
-  app?: { api: TeamsApiClientInternals; id?: unknown };
+  app?: {
+    api: TeamsApiClientInternals;
+    id?: unknown;
+    on?: TeamsConsentApp["on"];
+    send?: (conversationId: string, activity: unknown) => Promise<unknown>;
+  };
   chat?: {
     getState(): {
       get(key: string): Promise<unknown>;
@@ -599,6 +621,7 @@ interface TeamsAdapterInternals {
   };
   decodeThreadId?: (threadId: string) => {
     conversationId?: unknown;
+    conversationType?: unknown;
     serviceUrl?: unknown;
   };
   cacheUserContext?: (activity: unknown) => void;
@@ -610,6 +633,11 @@ interface TeamsAdapterInternals {
     threadId: string,
     serviceUrl: unknown,
   ) => Promise<void>;
+  paperclipSendFileCard?: (
+    threadId: string,
+    kind: "consent" | "file_info",
+    card: unknown,
+  ) => Promise<{ id: string }>;
   [key: string]: unknown;
 }
 
@@ -684,6 +712,7 @@ function trustedTeamsServiceUrl(
 export function scopeMicrosoftTeamsEgress(
   adapter: Adapter,
   configuredApiUrl?: string,
+  enableFileConsent = false,
 ): Adapter {
   const teams = adapter as unknown as TeamsAdapterInternals;
   if (!teams.app?.api) {
@@ -865,6 +894,7 @@ export function scopeMicrosoftTeamsEgress(
   const withThreadServiceUrl = async <T>(
     threadId: string,
     operation: () => Promise<T>,
+    requireRoute = false,
   ): Promise<T> => {
     const decoded = teams.decodeThreadId!(threadId);
     if (typeof decoded.conversationId !== "string" || !decoded.conversationId) {
@@ -875,11 +905,85 @@ export function scopeMicrosoftTeamsEgress(
     const persistedServiceUrl = await teams.chat
       ?.getState()
       .get(teamsConversationRouteStateKey(decoded.conversationId));
+    if (
+      requireRoute &&
+      persistedServiceUrl == null &&
+      decoded.serviceUrl == null
+    ) {
+      throw new TeamsServiceUrlValidationError(
+        "Teams file destination is missing its verified route",
+      );
+    }
     return await withServiceUrl(
       persistedServiceUrl ?? decoded.serviceUrl ?? defaultApi.serviceUrl,
       operation,
     );
   };
+
+  if (enableFileConsent) {
+    if (
+      typeof teams.app.send !== "function" ||
+      typeof teams.app.on !== "function"
+    ) {
+      throw new TeamsAdapterCompatibilityError(
+        "file-consent App hooks are unavailable",
+      );
+    }
+    teams.paperclipSendFileCard = async (threadId, kind, input) => {
+      const card =
+        kind === "consent"
+          ? parseTeamsFileConsentCard(input)
+          : kind === "file_info"
+            ? parseTeamsUploadedFileCard(input)
+            : null;
+      if (!card)
+        throw new TeamsAdapterCompatibilityError("invalid file-card shape");
+      const decoded = teams.decodeThreadId!(threadId);
+      // Never infer personal scope from a missing type or conversation prefix.
+      if (
+        decoded.conversationType !== "personal" ||
+        typeof decoded.conversationId !== "string" ||
+        !decoded.conversationId ||
+        decoded.conversationId.length > 1024 ||
+        /[\x00-\x20\x7f]/.test(decoded.conversationId) ||
+        /;messageid=/i.test(decoded.conversationId)
+      ) {
+        throw new TeamsServiceUrlValidationError(
+          "Teams file cards require an exact personal conversation",
+        );
+      }
+      return await withThreadServiceUrl(
+        threadId,
+        async () => {
+          let result: unknown;
+          try {
+            // Direct App attachment send is deliberately inside the same route
+            // ALS as ordinary thread operations. Thread.post would turn these
+            // provider-native cards into AdaptiveCards.
+            result = await teams.app!.send!(decoded.conversationId as string, {
+              type: "message",
+              attachments: [card],
+            });
+          } catch {
+            // Provider errors may contain private card contexts. No implicit
+            // retry: an uncertain POST remains caller-owned durable evidence.
+            throw new Error("Teams file-card send result is unknown");
+          }
+          if (
+            !isRecord(result) ||
+            typeof result.id !== "string" ||
+            !result.id ||
+            result.id.length > 1024 ||
+            /[\x00-\x20\x7f]/.test(result.id)
+          ) {
+            throw new Error("Teams file-card send receipt is unproven");
+          }
+          return { id: result.id };
+        },
+        true,
+      );
+    };
+  }
 
   teams.paperclipRecordThreadServiceUrl = async (
     threadId: string,
@@ -1061,6 +1165,7 @@ function createProviderAdapter(
       return scopeMicrosoftTeamsEgress(
         createTeamsAdapter(adapterConfig),
         config.credentials.apiUrl,
+        typeof callbacks.onTeamsFileConsent === "function",
       );
     }
     case "telegram": {
@@ -1526,6 +1631,7 @@ export class ChatSdkEndpointRuntime {
   private readonly discordGuildId: string | null;
   private readonly discordGatewayEnabled: boolean;
   private readonly githubAttachmentAppAuthority: boolean;
+  private readonly teamsFileConsentEnabled: boolean;
   private discordGatewayAbort: AbortController | null = null;
   private discordGatewayTask: Promise<void> | null = null;
   private discordGatewayFatal = false;
@@ -1535,6 +1641,9 @@ export class ChatSdkEndpointRuntime {
     this.endpointId = options.endpointId;
     this.provider = options.providerConfig.provider;
     this.sdkAdapterKey = adapterKey(this.provider);
+    this.teamsFileConsentEnabled =
+      this.provider === "microsoft-teams" &&
+      typeof options.callbacks.onTeamsFileConsent === "function";
     this.githubAttachmentAppAuthority =
       options.providerConfig.provider === "github" &&
       "appId" in options.providerConfig.credentials &&
@@ -1618,6 +1727,47 @@ export class ChatSdkEndpointRuntime {
           ? "discord_gateway"
           : undefined,
     );
+    if (this.teamsFileConsentEnabled) {
+      const app = (this.adapter as unknown as TeamsAdapterInternals).app;
+      if (
+        !app ||
+        typeof app.on !== "function" ||
+        !this.microsoftTeamsTenantId ||
+        options.providerConfig.provider !== "microsoft-teams"
+      ) {
+        throw new TeamsAdapterCompatibilityError(
+          "file-consent requires a configured tenant and App hook",
+        );
+      }
+      const callback = options.callbacks.onTeamsFileConsent!;
+      installTeamsFileConsentHook(app as TeamsConsentApp, {
+        companyId: this.companyId,
+        endpointId: this.endpointId,
+        tenantId: this.microsoftTeamsTenantId,
+        botAppId: options.providerConfig.credentials.appId,
+        onConsent: async (event) => {
+          const attempt = this.webhookIngress.getStore();
+          const promise = Promise.resolve().then(() =>
+            callback({
+              endpointId: this.endpointId,
+              provider: this.provider,
+              event,
+            }),
+          );
+          if (!attempt) return await promise;
+          attempt.callbackPromises.add(promise);
+          try {
+            return await promise;
+          } catch (error) {
+            if (attempt.callbackError === undefined)
+              attempt.callbackError = error;
+            throw error;
+          } finally {
+            attempt.callbackPromises.delete(promise);
+          }
+        },
+      });
+    }
   }
 
   async initialize(): Promise<void> {
@@ -1866,6 +2016,37 @@ export class ChatSdkEndpointRuntime {
       }
       await acceptedActivityRecorder.call(this.adapter, raw);
     }
+  }
+
+  async sendTeamsFileConsentCard(
+    threadId: string,
+    card: ReturnType<typeof buildTeamsFileConsentCard>,
+  ): Promise<{ id: string }> {
+    return await this.sendTeamsFileCard(threadId, "consent", card);
+  }
+
+  async sendTeamsUploadedFileCard(
+    threadId: string,
+    card: ReturnType<typeof buildTeamsUploadedFileCard>,
+  ): Promise<{ id: string }> {
+    return await this.sendTeamsFileCard(threadId, "file_info", card);
+  }
+
+  private async sendTeamsFileCard(
+    threadId: string,
+    kind: "consent" | "file_info",
+    card: unknown,
+  ): Promise<{ id: string }> {
+    const teams = this.adapter as unknown as TeamsAdapterInternals;
+    if (
+      !this.teamsFileConsentEnabled ||
+      typeof teams.paperclipSendFileCard !== "function"
+    ) {
+      throw new TeamsAdapterCompatibilityError(
+        "file-consent runtime is not enabled",
+      );
+    }
+    return await teams.paperclipSendFileCard(threadId, kind, card);
   }
 
   channel(channelId: string): Channel {

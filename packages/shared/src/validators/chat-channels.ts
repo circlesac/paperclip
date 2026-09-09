@@ -5,6 +5,7 @@ import {
   CHAT_DELIVERY_STATES,
   CHAT_ENDPOINT_STATUSES,
   CHAT_EVENT_KINDS,
+  CHAT_FILE_TRANSFER_PHASES,
   CHAT_IDENTITY_LINK_STATUSES,
   CHAT_PRINCIPAL_KINDS,
   CHAT_PROVIDERS,
@@ -156,6 +157,13 @@ export const publishChatPublicationSchema = z.union([
 export const resolveChatPublicationSchema = z
   .object({
     action: z.enum(["mark_delivered", "retry_anyway", "cancel"]),
+    fileTransfer: z
+      .object({
+        phase: z.enum(CHAT_FILE_TRANSFER_PHASES),
+        version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

@@ -504,8 +504,9 @@ export const chatPublications = pgTable(
   (table) => [
     check(
       "chat_publications_state_check",
-      sql`${table.state} in ('pending', 'streaming', 'published', 'retry', 'delivery_unknown', 'failed', 'cancelled')`,
+      sql`${table.state} in ('pending', 'streaming', 'published', 'retry', 'delivery_unknown', 'failed', 'cancelled', 'awaiting_consent')`,
     ),
+    uniqueIndex("chat_publications_company_id_uq").on(table.companyId, table.id),
     index("chat_publications_work_idx").on(table.state, table.nextAttemptAt),
     uniqueIndex("chat_publications_idempotency_uq").on(
       table.companyId,

@@ -1786,6 +1786,13 @@
       "when": 1788880065244,
       "tag": "0256_chat_interaction_wakeup_provenance",
       "breakpoints": true
+    },
+    {
+      "idx": 257,
+      "version": "7",
+      "when": 1788930085103,
+      "tag": "0257_brave_living_mummy",
+      "breakpoints": true
     }
   ]
 }

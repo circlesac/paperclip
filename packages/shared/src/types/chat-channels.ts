@@ -63,6 +63,7 @@ export type ChatDeliveryState = (typeof CHAT_DELIVERY_STATES)[number];
 
 export const CHAT_PUBLICATION_STATES = [
   "pending",
+  "awaiting_consent",
   "streaming",
   "published",
   "retry",
@@ -71,6 +72,40 @@ export const CHAT_PUBLICATION_STATES = [
   "cancelled",
 ] as const;
 export type ChatPublicationState = (typeof CHAT_PUBLICATION_STATES)[number];
+
+export const CHAT_FILE_TRANSFER_PHASES = [
+  "consent_pending",
+  "consent_sending",
+  "consent_unknown",
+  "awaiting_consent",
+  "upload_pending",
+  "uploading",
+  "upload_unknown",
+  "file_info_pending",
+  "file_info_sending",
+  "file_info_unknown",
+  "delivered",
+  "declined",
+  "expired",
+  "cancelled",
+  "conflict",
+] as const;
+export type ChatFileTransferPhase = (typeof CHAT_FILE_TRANSFER_PHASES)[number];
+
+/** Closed presentation only: never provider URLs, credentials or private state. */
+export interface ChatFileTransferSummary {
+  provider: "microsoft-teams";
+  phase: ChatFileTransferPhase;
+  filename: string;
+  expiresAt?: string | null;
+  /** Monotonic durable row revision, not a schema version. */
+  version: number;
+}
+
+export type ChatFileTransferResolutionPrecondition = Pick<
+  ChatFileTransferSummary,
+  "phase" | "version"
+>;
 
 export const CHAT_CONVERSATION_STATES = [
   "active",
@@ -357,13 +392,24 @@ export interface ChatPublicationSummary {
   redactedError?: string | null;
   nextAttemptAt?: string | null;
   publishedAt?: string | null;
+  fileTransfer?: ChatFileTransferSummary;
 }
 
 export interface ChatPublicationBatchStatus {
-  /** First blocking part, or the final part when the entire batch is published. */
+  /** First unresolved part; a terminal nonpublished part for mixed outcomes. */
   publication: ChatPublicationSummary;
   total: number;
   published: number;
+  /** Additive during rolling upgrades; missing settlement proof is not permission to dismiss. */
+  parts?: ChatPublicationSummary[];
+  awaitingConsent?: number;
+  declined?: number;
+  expired?: number;
+  /** Excludes declined and expired. */
+  cancelled?: number;
+  /** published + declined + expired + cancelled, never failed or uncertain. */
+  settled?: number;
+  canDismiss?: boolean;
 }
 
 export interface ChatActivityItem {
@@ -381,6 +427,7 @@ export interface ChatActivityItem {
   createdAt: string;
   replayable?: boolean;
   resolutionActions?: Array<"mark_delivered" | "retry_anyway" | "cancel">;
+  fileTransfer?: ChatFileTransferSummary;
 }
 
 export interface ExternalChannelBindingSummary {

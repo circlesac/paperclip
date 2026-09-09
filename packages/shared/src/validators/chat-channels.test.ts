@@ -3,6 +3,8 @@ import {
   configureChatEndpointSchema,
   microsoftTeamsCredentialIdSchema,
   resolveChatActionSchema,
+  resolveChatPublicationSchema,
+  chatPublicationStateSchema,
 } from "./chat-channels.js";
 
 describe("Microsoft Teams chat credential validation", () => {
@@ -65,6 +67,37 @@ describe("Microsoft Teams chat credential validation", () => {
 });
 
 describe("chat provider-action resolution validation", () => {
+  it("accepts consent waiting and a closed versioned file-stage precondition", () => {
+    expect(chatPublicationStateSchema.parse("awaiting_consent")).toBe(
+      "awaiting_consent",
+    );
+    const request = {
+      action: "cancel",
+      fileTransfer: { phase: "upload_unknown", version: 3 },
+    };
+    expect(resolveChatPublicationSchema.parse(request)).toEqual(request);
+    expect(resolveChatPublicationSchema.parse({ action: "cancel" })).toEqual({
+      action: "cancel",
+    });
+  });
+  it.each([
+    { phase: "upload_unknown", version: 0 },
+    { phase: "upload_unknown", version: 1.5 },
+    { phase: "upload_unknown", version: Number.MAX_SAFE_INTEGER + 1 },
+    { phase: "new_unreviewed_phase", version: 1 },
+    { phase: "upload_unknown" },
+    { phase: "upload_unknown", version: 1, uploadUrl: "private" },
+  ])(
+    "rejects malformed file-stage resolution preconditions %#",
+    (fileTransfer) => {
+      expect(
+        resolveChatPublicationSchema.safeParse({
+          action: "cancel",
+          fileTransfer,
+        }).success,
+      ).toBe(false);
+    },
+  );
   it.each(["mark_delivered", "retry_anyway", "cancel"] as const)(
     "accepts the explicit %s resolution",
     (action) => {

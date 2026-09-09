@@ -147,11 +147,15 @@ the next implementation pass:
   implement the consent callbacks. The new inactive helper/actual-SDK hook
   foundation passes root **81/81**, the owner's egress cohort **119/119**, and
   plain server types. It protects upload capability privacy, exact bytes and
-  receipts, and uncertain delivery. Actual encrypted early-accept buffering,
-  restart recovery, consent-waiting publication state, worker and UI/batch
-  integration are still required before activation. The early-accept test is
-  in-memory only. Channel/group files retain their documented fallback; do not
-  infer broader authority.
+  receipts, and uncertain delivery. The subsequent durable protocol now has
+  encrypted early-accept buffering, restart restoration, versioned stage
+  resolution and same-transaction projection hooks. Its fresh PostgreSQL
+  cohort passes **115/115**, including a reproduced publication/transfer lock
+  inversion and a conflicting callback during an owned card send. The original
+  81-case foundation did not prove these durable properties. Worker/source
+  integration and tenant qualification are still required before activation.
+  Channel/group files retain their documented fallback; do not infer broader
+  authority.
 
 Root owns shared verification, documentation, Git and deployment. Server 72
 loads the committed Discord/Telegram implementations at `739750c15`;
@@ -160,6 +164,56 @@ Teams durable transfer, schema, safe batch UI/API and optional runtime hooks
 are now being implemented in parallel without activation. Root owns shared
 service integration and migration review. Browser control still reports Mac
 locked. Preserve all parallel edits; no lockfile or PR work is part of this pass.
+
+**In-flight Teams activation checkpoint (after server 72 startup):**
+
+- Durable-transfer owner: new `chat_teams_file_transfers` table and transfer
+  service/tests, private encrypted event/capability restoration, early callbacks
+  and versioned I/O receipts. Source comment/attachment IDs retain evidence
+  without preventing normal deletion; each later effect must recheck the source.
+- Runtime owner: optional authenticated consent callback and narrowly typed
+  native consent/file-info sends inside the existing regional service-URL scope.
+  No service registration or generic Adaptive Card conversion.
+- UI/contracts owner: `awaiting_consent`, safe per-part transfer summaries,
+  disjoint settled/outcome counts, whole-batch dismissal and version/phase
+  preconditions. New fields are additive for rolling compatibility. Missing
+  settlement evidence must keep the send identity, not unlock a duplicate send.
+- Root next: connect API projections and stage-aware audited resolution, then
+  current personal-recipient admission, worker intents/results and restart
+  integration. An accepted consent card or PUT is never a published file.
+
+Generated migration `0257_brave_living_mummy.sql` includes the new table,
+publication company/ID unique index and `awaiting_consent` CHECK. Root moved
+the generated parent unique-index creation before its dependent foreign key.
+DB safety/types/build and a complete fresh migration chain passed on
+`chat_teams_transfers_schema_20260909_root01`; table and CHECK were inspected.
+This has **not** been applied to the live database. It is a passive schema and
+protocol slice, not runtime activation. Logs:
+`teams-file-transfer-db-build-0909.log` and
+`teams-file-transfer-fresh-schema-root-0909.log`. The optional actual-SDK runtime
+hook and strictly personal file-card methods pass **25/25**; their seven-file
+cohort passes **223/223**. These use synthetic JWT/provider transport, not a
+live tenant. The runtime hook stays unregistered until current recipient/source
+authority is connected to the worker.
+
+Root's read-only API projections and generic replay/resolution safety guards
+pass **19/19** on fresh `chat_teams_projection_20260909_03`. A deliberately
+wrong-conversation transfer first reproduced an Activity/batch disagreement;
+the exact-scope join fixes it. These are seeded-state API proofs, not native
+file delivery. The final UI cohort passes **101/101**, types/token gates pass,
+and the two consent-specific browser cases pass **2/2** (13.9 seconds) on fresh
+`chat_teams_consent_browser_20260909_03`. Browser publication responses are
+mocked; actual task/file-upload controls and reload behavior are exercised.
+No complete new 660-case server or 31-case browser run has been claimed.
+
+Next integration boundaries are explicit: preserve a minimal authenticated
+personal-recipient proof on new Teams deliveries, bind it to the current
+processed delivery/principal/conversation generation, supply current source and
+permission checks to every file stage, and atomically project real receipts.
+The generic publication resolver currently refuses all transfer rows rather
+than mislabel a consent card or PUT as delivered; dedicated stage resolution
+must replace that guard before the new UI actions are activated. A card/file
+send timeout does not prove that the provider request was cancelled.
 
 The September 9 browser inventory still reports the Mac lock screen,
 not a Discord login failure. Loopback/private health is ready on server 72; the

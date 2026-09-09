@@ -2,9 +2,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { z } from "zod";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { guardedRemoteHttpFetch } from "./remote-http-fetch.js";
+import { getSecretProvider } from "../secrets/provider-registry.js";
 
-// Foundation only: no publication worker, durable capability storage or runtime
-// registration is enabled here. Callers must reauthorize current source, actor,
+// Protocol building blocks only: no publication worker or runtime registration
+// is enabled here. The private codec authenticates persisted capabilities, while
+// callers must reauthorize current source, actor,
 // endpoint and policy, and persist each I/O intent/result under their own lease.
 // Provider contracts (commercial personal chats, no Graph authorization added):
 // https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/bots-filesv4
@@ -82,6 +84,103 @@ export function parseTeamsFileConsentBinding(
 
 function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+const privateContextSchema = z
+  .object({
+    companyId: z.uuid(),
+    endpointId: z.uuid(),
+    transferId: z.uuid(),
+    authorityDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+export type TeamsFilePrivateContext = z.infer<typeof privateContextSchema>;
+export type TeamsFileCiphertext = Record<string, unknown>;
+
+async function sealPrivate(
+  context: TeamsFilePrivateContext,
+  purpose: string,
+  value: unknown,
+): Promise<TeamsFileCiphertext> {
+  const parsed = privateContextSchema.safeParse(context);
+  if (!parsed.success) throw new Error("Invalid Teams private state");
+  try {
+    const prepared = await getSecretProvider("local_encrypted").createSecret({
+      value: JSON.stringify({
+        schema: "paperclip.teams.file-private.v1",
+        context: parsed.data,
+        purpose,
+        value,
+      }),
+    });
+    return prepared.material;
+  } catch {
+    throw new Error("Teams private state could not be sealed");
+  }
+}
+
+async function openPrivate(
+  context: TeamsFilePrivateContext,
+  purpose: string,
+  material: TeamsFileCiphertext,
+): Promise<unknown> {
+  try {
+    const parsedContext = privateContextSchema.parse(context);
+    // Bound even corrupted database material before passing it to the provider.
+    if (Buffer.byteLength(JSON.stringify(material)) > 128 * 1024)
+      throw new Error();
+    const plaintext = await getSecretProvider("local_encrypted").resolveVersion(
+      { material, externalRef: null },
+    );
+    if (Buffer.byteLength(plaintext) > 64 * 1024) throw new Error();
+    const envelope = z
+      .object({
+        schema: z.literal("paperclip.teams.file-private.v1"),
+        context: privateContextSchema,
+        purpose: z.string(),
+        value: z.unknown(),
+      })
+      .strict()
+      .parse(JSON.parse(plaintext));
+    if (
+      envelope.purpose !== purpose ||
+      digest(envelope.context) !== digest(parsedContext)
+    )
+      throw new Error();
+    return envelope.value;
+  } catch {
+    throw new Error("Teams private state could not be restored");
+  }
+}
+
+export async function sealTeamsFileConsentBinding(
+  context: TeamsFilePrivateContext,
+  binding: TeamsFileConsentBinding,
+) {
+  const parsed = parseTeamsFileConsentBinding(binding);
+  if (
+    !parsed ||
+    parsed.companyId !== context.companyId ||
+    parsed.endpointId !== context.endpointId
+  )
+    throw new Error("Invalid Teams private binding");
+  return sealPrivate(context, "binding", parsed);
+}
+
+export async function restoreTeamsFileConsentBinding(
+  context: TeamsFilePrivateContext,
+  material: TeamsFileCiphertext,
+) {
+  const binding = parseTeamsFileConsentBinding(
+    await openPrivate(context, "binding", material),
+  );
+  if (
+    !binding ||
+    binding.companyId !== context.companyId ||
+    binding.endpointId !== context.endpointId
+  )
+    throw new Error("Invalid Teams private binding");
+  return binding;
 }
 
 export type TeamsFileConsentPhase =
@@ -238,7 +337,7 @@ type UploadInfo = z.infer<typeof uploadInfoSchema>;
 
 // Instances originate only in our authenticated App router hook. The private
 // fields intentionally do not survive JSON, spreading, inspection or structured
-// clone. Future restart support must decrypt a bound private provider-state
+// clone. Restart support must decrypt a bound private provider-state
 // record, not reconstruct a capability from action/publication JSON.
 class UploadCapability {
   #info: UploadInfo;
@@ -258,6 +357,55 @@ class UploadCapability {
   }
   toJSON() {
     return undefined;
+  }
+  async seal(
+    context: TeamsFilePrivateContext,
+    binding: TeamsFileConsentBinding,
+  ) {
+    if (
+      !this.matches(binding) ||
+      context.companyId !== binding.companyId ||
+      context.endpointId !== binding.endpointId
+    )
+      throw new Error("Invalid Teams upload binding");
+    return sealPrivate(context, "upload", {
+      bindingDigest: digest(binding),
+      info: this.#info,
+      confirmed: this.#confirmed,
+      putStarted: this.#putStarted,
+    });
+  }
+  static async restore(
+    context: TeamsFilePrivateContext,
+    binding: TeamsFileConsentBinding,
+    material: TeamsFileCiphertext,
+  ) {
+    if (
+      context.companyId !== binding.companyId ||
+      context.endpointId !== binding.endpointId
+    )
+      throw new Error("Invalid Teams upload binding");
+    const value = z
+      .object({
+        bindingDigest: z.string(),
+        info: uploadInfoSchema,
+        confirmed: z.boolean(),
+        putStarted: z.boolean(),
+      })
+      .strict()
+      .parse(await openPrivate(context, "upload", material));
+    if (
+      value.bindingDigest !== digest(binding) ||
+      value.info.name !== binding.filename ||
+      typeof sharePointUrl(value.info.uploadUrl) === "string" ||
+      typeof sharePointUrl(value.info.contentUrl, true) === "string" ||
+      (value.confirmed && !value.putStarted)
+    )
+      throw new Error("Invalid Teams upload state");
+    const result = new UploadCapability(value.info, binding);
+    result.#confirmed = value.confirmed;
+    result.#putStarted = value.putStarted;
+    return result;
   }
   matches(binding: TeamsFileConsentBinding): boolean {
     return this.#bindingDigest === digest(binding);
@@ -426,6 +574,83 @@ class ConsentEvent {
   isHookEvent() {
     return this.#authentic;
   }
+  async seal(
+    context: TeamsFilePrivateContext,
+    binding: TeamsFileConsentBinding,
+  ) {
+    if (
+      !consentEventMatches(this, binding) ||
+      context.companyId !== binding.companyId ||
+      context.endpointId !== binding.endpointId
+    )
+      throw new Error("Invalid Teams consent scope");
+    return sealPrivate(context, "response", {
+      bindingDigest: digest(binding),
+      activityId: this.activityId,
+      action: this.action,
+      replyToId: this.replyToId,
+      upload: this.#upload,
+    });
+  }
+  receiptDigest() {
+    return digest({
+      activityId: this.activityId,
+      action: this.action,
+      replyToId: this.replyToId,
+      upload: this.#upload,
+    });
+  }
+  static async restore(
+    context: TeamsFilePrivateContext,
+    binding: TeamsFileConsentBinding,
+    material: TeamsFileCiphertext,
+  ) {
+    if (
+      context.companyId !== binding.companyId ||
+      context.endpointId !== binding.endpointId
+    )
+      throw new Error("Invalid Teams consent scope");
+    const value = z
+      .object({
+        bindingDigest: z.string(),
+        activityId: opaqueId,
+        action: z.enum(["accept", "decline"]),
+        replyToId: opaqueId.nullable(),
+        upload: z.union([
+          uploadInfoSchema,
+          z.enum(["invalid_upload_info", "unsupported_upload_host"]),
+          z.null(),
+        ]),
+      })
+      .strict()
+      .parse(await openPrivate(context, "response", material));
+    if (
+      value.bindingDigest !== digest(binding) ||
+      (value.action === "decline" && value.upload !== null)
+    )
+      throw new Error("Invalid Teams response state");
+    if (
+      value.upload &&
+      typeof value.upload !== "string" &&
+      (typeof sharePointUrl(value.upload.uploadUrl) === "string" ||
+        typeof sharePointUrl(value.upload.contentUrl, true) === "string")
+    )
+      throw new Error("Invalid Teams response state");
+    return new ConsentEvent(
+      binding.companyId,
+      binding.endpointId,
+      binding.tenantId,
+      binding.botAppId,
+      value.activityId,
+      binding.conversationId,
+      binding.userId,
+      binding.aadObjectId,
+      value.action,
+      binding.token,
+      value.replyToId,
+      value.upload,
+    );
+  }
   bindUpload(
     binding: TeamsFileConsentBinding,
   ): UploadCapability | UrlRejection {
@@ -452,6 +677,98 @@ class ConsentEvent {
   }
 }
 export type TeamsFileConsentEvent = ConsentEvent;
+
+function consentEventMatches(
+  event: TeamsFileConsentEvent,
+  binding: TeamsFileConsentBinding,
+): boolean {
+  try {
+    return (
+      event instanceof ConsentEvent &&
+      event.isHookEvent() &&
+      (
+        [
+          "companyId",
+          "endpointId",
+          "tenantId",
+          "botAppId",
+          "conversationId",
+          "userId",
+          "aadObjectId",
+          "token",
+        ] as const
+      ).every((key) => event[key] === binding[key])
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Restoration is ONLY for ciphertext loaded from the exact locked transfer row.
+// The context authenticates the complete current authority digest, not a caller
+// supplied public action or a normalized provider payload.
+export async function sealTeamsFileConsentEvent(
+  context: TeamsFilePrivateContext,
+  binding: TeamsFileConsentBinding,
+  event: TeamsFileConsentEvent,
+) {
+  if (!consentEventMatches(event, binding))
+    throw new Error("Invalid Teams consent scope");
+  return event.seal(context, binding);
+}
+export async function restoreTeamsFileConsentEvent(
+  context: TeamsFilePrivateContext,
+  binding: TeamsFileConsentBinding,
+  material: TeamsFileCiphertext,
+) {
+  try {
+    return await ConsentEvent.restore(context, binding, material);
+  } catch {
+    throw new Error("Teams response state could not be restored");
+  }
+}
+export async function sealTeamsFileUpload(
+  context: TeamsFilePrivateContext,
+  binding: TeamsFileConsentBinding,
+  upload: TeamsFileUploadCapability,
+) {
+  if (!(upload instanceof UploadCapability))
+    throw new Error("Invalid Teams upload state");
+  return upload.seal(context, binding);
+}
+export async function restoreTeamsFileUpload(
+  context: TeamsFilePrivateContext,
+  binding: TeamsFileConsentBinding,
+  material: TeamsFileCiphertext,
+) {
+  try {
+    return await UploadCapability.restore(context, binding, material);
+  } catch {
+    throw new Error("Teams upload state could not be restored");
+  }
+}
+
+/** A branded exact callback proves only that its issued card reached this user.
+ * A durable send intent must precede accepting this alternative receipt. */
+export function bindEarlyTeamsFileConsent(input: {
+  event: TeamsFileConsentEvent;
+  stored: unknown;
+  current: unknown;
+  phase: "consent_sending" | "consent_unknown";
+  now: number;
+}): TeamsConsentDecision {
+  if (input.phase !== "consent_sending" && input.phase !== "consent_unknown")
+    return { ok: false, reason: "not_awaiting_consent" };
+  // No invented provider ID: explicit callback receipt is a separate variant.
+  return bindTeamsFileConsent({
+    ...input,
+    phase: "awaiting_consent",
+    cardReceipt: {
+      kind: "authenticated_callback",
+      activityId: input.event.activityId,
+    },
+  });
+}
 export interface TeamsConsentApp {
   on(
     event: "file.consent.accept" | "file.consent.decline",
@@ -468,7 +785,7 @@ export interface TeamsFileConsentHookOptions {
   // A response may precede the consent-card POST receipt or follow a lost POST
   // ACK. Persist that exact authenticated response in private encrypted state
   // for reconciliation; not_awaiting_consent is NOT permission to discard it or
-  // resend the card. This foundation does not implement that durable storage.
+  // resend the card. The durable transfer service owns that receipt transaction.
   onConsent(
     event: TeamsFileConsentEvent,
   ): Promise<"recorded" | "ignored" | "denied">;
@@ -585,7 +902,8 @@ export function bindTeamsFileConsent(input: {
   stored: unknown;
   current: unknown;
   phase: TeamsFileConsentPhase;
-  cardMessageId: string;
+  cardMessageId?: string;
+  cardReceipt?: { kind: "authenticated_callback"; activityId: string };
   now: number;
 }): TeamsConsentDecision {
   const stored = parseTeamsFileConsentBinding(input.stored);
@@ -599,22 +917,13 @@ export function bindTeamsFileConsent(input: {
     return { ok: false, reason: "expired" };
   const event = input.event;
   if (
-    !(event instanceof ConsentEvent) ||
-    !event.isHookEvent() ||
-    (
-      [
-        "companyId",
-        "endpointId",
-        "tenantId",
-        "botAppId",
-        "conversationId",
-        "userId",
-        "aadObjectId",
-        "token",
-      ] as const
-    ).some((key) => event[key] !== stored[key]) ||
-    !opaqueId.safeParse(input.cardMessageId).success ||
-    (event.replyToId !== null && event.replyToId !== input.cardMessageId)
+    !consentEventMatches(event, stored) ||
+    (input.cardReceipt
+      ? input.cardMessageId !== undefined ||
+        input.cardReceipt.kind !== "authenticated_callback" ||
+        input.cardReceipt.activityId !== event.activityId
+      : !opaqueId.safeParse(input.cardMessageId).success ||
+        (event.replyToId !== null && event.replyToId !== input.cardMessageId))
   )
     return { ok: false, reason: "wrong_scope" };
   if (event.action === "decline")
@@ -807,6 +1116,69 @@ function sameDriveItemId(actual: string, expected: string): boolean {
       guid.test(expected) &&
       actual.toLowerCase() === expected.toLowerCase())
   );
+}
+
+/** Closed native attachment-card projections for the scoped runtime sender. */
+export function parseTeamsFileConsentCard(
+  input: unknown,
+): ReturnType<typeof buildTeamsFileConsentCard> | null {
+  const parsed = z
+    .object({
+      contentType: z.literal(
+        "application/vnd.microsoft.teams.card.file.consent",
+      ),
+      name: filename,
+      content: z
+        .object({
+          description: z.literal(
+            "Allow Paperclip to upload this file to your OneDrive.",
+          ),
+          sizeInBytes: z
+            .number()
+            .int()
+            .positive()
+            .max(Math.min(MAX_ATTACHMENT_BYTES, 60 * 1024 * 1024 - 1)),
+          acceptContext: contextSchema.extend({ action: z.literal("accept") }),
+          declineContext: contextSchema.extend({
+            action: z.literal("decline"),
+          }),
+        })
+        .strict(),
+    })
+    .strict()
+    .safeParse(input);
+  if (
+    !parsed.success ||
+    parsed.data.content.acceptContext.token !==
+      parsed.data.content.declineContext.token
+  )
+    return null;
+  return parsed.data;
+}
+
+export function parseTeamsUploadedFileCard(
+  input: unknown,
+): ReturnType<typeof buildTeamsUploadedFileCard> | null {
+  const parsed = z
+    .object({
+      contentType: z.literal("application/vnd.microsoft.teams.card.file.info"),
+      name: filename,
+      contentUrl: z.string().max(MAX_URL_LENGTH),
+      content: z
+        .object({
+          uniqueId: opaqueId,
+          fileType: z.string().regex(/^[a-zA-Z0-9]{1,16}$/),
+        })
+        .strict(),
+    })
+    .strict()
+    .safeParse(input);
+  if (
+    !parsed.success ||
+    typeof sharePointUrl(parsed.data.contentUrl, true) === "string"
+  )
+    return null;
+  return parsed.data;
 }
 
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
