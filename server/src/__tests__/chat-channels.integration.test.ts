@@ -97,6 +97,7 @@ import type {
 } from "../services/chat-sdk-runtime.js";
 import { createChatSdkEndpointRuntime } from "../services/chat-sdk-runtime.js";
 import { createDiscordAdapter } from "@chat-adapter/discord";
+import * as discordQuestionForms from "../services/chat-discord-question-forms.js";
 import { issueService } from "../services/issues.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { NativeChatAttachmentReadScope } from "../services/native-runtime/chat-attachment-read.js";
@@ -166,7 +167,7 @@ type TestDb = ReturnType<typeof createDb>;
 
 class FakeEndpointRuntime {
   readonly initialize = vi.fn(async () => {
-    await this.initializeHook?.();
+    await this.initializeHook?.(this.options.endpointId);
   });
   readonly shutdown = vi.fn(async () => undefined);
   readonly posts: Array<{
@@ -232,7 +233,7 @@ class FakeEndpointRuntime {
   constructor(
     private readonly options: CreateChatSdkEndpointRuntimeOptions,
     private readonly attachmentBodies: Map<string, Buffer>,
-    private readonly initializeHook?: () => Promise<void>,
+    private readonly initializeHook?: (endpointId: string) => Promise<void>,
   ) {}
 
   get provider() {
@@ -618,7 +619,7 @@ class FakeChatSdkRuntime {
     string,
     CreateChatSdkEndpointRuntimeOptions
   >();
-  initializeHook: (() => Promise<void>) | undefined;
+  initializeHook: ((endpointId: string) => Promise<void>) | undefined;
   replaceCount = 0;
 
   constructor(readonly attachmentBodies: Map<string, Buffer> = new Map()) {}
@@ -25687,6 +25688,842 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await service.shutdown();
     }
   });
+
+  it.each(["identical", "different"])(
+    "opens and corrects an actual Discord modal through current service authority exactly once (%s concurrent answers)",
+    async (concurrentMode) => {
+      const fixture = await seedCompany();
+      let holdConcurrentAnswers = false;
+      let answerWaiters = 0;
+      let releaseAnswers!: () => void;
+      const answersReady = new Promise<void>((resolve) => {
+        releaseAnswers = resolve;
+      });
+      const { callbacks, endpoint, runtime, service, wakeup } =
+        await configuredDiscordEndpoint(fixture, {
+          questionResolutionPersistBarrier: async () => {
+            if (!holdConcurrentAnswers) return;
+            if (++answerWaiters === 2) releaseAnswers();
+            await answersReady;
+          },
+        });
+      let pinned: ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
+      let cleanupSpy: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        const guildId = "1457808928258658549";
+        const channelId = "333333333333333333";
+        const rootMessageId = "555555555555555615";
+        const externalUserId = "444444444444444415";
+        const threadId = `discord:${guildId}:${channelId}:${rootMessageId}`;
+        if (
+          !callbacks.onDiscordRootMentionAdmission ||
+          !callbacks.onAction ||
+          !callbacks.onModalSubmit
+        )
+          throw new Error("Discord callbacks unavailable");
+        await callbacks.onDiscordRootMentionAdmission({
+          endpointId: endpoint.id,
+          guildId,
+          channelId,
+          messageId: rootMessageId,
+          message: {
+            ...makeMessage({
+              id: rootMessageId,
+              text: "@maya collect deployment details",
+              mentioned: true,
+              userId: externalUserId,
+            }),
+            threadId,
+          } as Message,
+          threadId,
+          userId: externalUserId,
+        });
+        const delivery = await db
+          .select()
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              eq(
+                chatDeliveries.providerEventId,
+                `${threadId}:${rootMessageId}`,
+              ),
+            ),
+          )
+          .then((rows) => rows[0]);
+        if (!delivery) throw new Error("Discord delivery absent");
+        await service.processPendingDeliveries(25, delivery.id);
+        await qualifySetupRoundTrip(service, endpoint.id, externalUserId);
+        await service.test(endpoint.id, "owner-user");
+        const [conversation] = await service.listConversations(endpoint.id);
+        const active = await service.get(endpoint.id);
+        if (!conversation || !active.providerAccountId)
+          throw new Error("Discord setup incomplete");
+        expect(active.capabilities.modals).toBe(true);
+        const linkedUserId = `discord-modal-${randomUUID()}`;
+        const now = new Date();
+        await db
+          .insert(authUsers)
+          .values({
+            id: linkedUserId,
+            name: "Discord Modal Operator",
+            email: `${linkedUserId}@example.com`,
+            emailVerified: true,
+            createdAt: now,
+            updatedAt: now,
+          });
+        await db
+          .insert(companyMemberships)
+          .values({
+            companyId: fixture.companyId,
+            principalType: "user",
+            principalId: linkedUserId,
+            status: "active",
+            membershipRole: "operator",
+          });
+        const principal = await db
+          .select()
+          .from(chatExternalPrincipals)
+          .where(
+            and(
+              eq(chatExternalPrincipals.companyId, fixture.companyId),
+              eq(chatExternalPrincipals.provider, "discord"),
+              eq(
+                chatExternalPrincipals.providerAccountId,
+                active.providerAccountId,
+              ),
+              eq(chatExternalPrincipals.externalId, externalUserId),
+            ),
+          )
+          .then((rows) => rows[0]);
+        if (!principal) throw new Error("Discord principal absent");
+        const intent = await service.createLinkIntent(
+          endpoint.id,
+          principal.id,
+          1800,
+        );
+        const linkToken = new URL(intent.confirmationUrl).searchParams.get(
+          "token",
+        )!;
+        await service.confirmIdentityLink(linkToken, linkedUserId);
+        const onAction = vi.fn(callbacks.onAction);
+        const onModalSubmit = vi.fn(callbacks.onModalSubmit);
+        const configuration = runtime.configurations.get(endpoint.id)!;
+        pinned = createChatSdkEndpointRuntime({
+          ...configuration,
+          callbacks: { onMessage() {}, onAction, onModalSubmit },
+          enableDiscordGateway: false,
+          logger: "silent",
+        });
+        await pinned.initialize();
+        const adapter = pinned.getProviderAdapter() as unknown as {
+          handleGatewayInteraction(input: unknown): Promise<void>;
+          fetchMessage(...args: unknown[]): Promise<unknown>;
+          buildMessagePayload(input: unknown): {
+            payload: Record<string, unknown>;
+          };
+        };
+        // Provider HTTP/socket are the only transport doubles; modal source,
+        // typed callback, token authorization, answers and wake ledger are real.
+        adapter.fetchMessage = vi.fn().mockResolvedValue(null);
+        const sourceRunId = randomUUID();
+        await db
+          .insert(heartbeatRuns)
+          .values({
+            id: sourceRunId,
+            companyId: fixture.companyId,
+            agentId: fixture.assignedAgentId,
+            status: "succeeded",
+            contextSnapshot: {
+              issueId: conversation.issueId,
+              taskId: conversation.issueId,
+              source: "automation",
+            },
+          });
+        const interaction = await issueThreadInteractionService(db).create(
+          { id: conversation.issueId, companyId: fixture.companyId },
+          {
+            kind: "ask_user_questions",
+            continuationPolicy: "wake_assignee",
+            sourceRunId,
+            title: "Deployment details",
+            payload: {
+              version: 1,
+              title: "Deployment details",
+              questions: [
+                {
+                  id: "environment",
+                  prompt: "Environment",
+                  selectionMode: "single",
+                  required: true,
+                  allowOther: false,
+                  options: [
+                    { id: "staging", label: "Staging" },
+                    { id: "production", label: "Production" },
+                  ],
+                },
+                {
+                  id: "note",
+                  prompt: "Release note",
+                  selectionMode: "single",
+                  required: true,
+                  allowOther: true,
+                  options: [
+                    {
+                      id: "__paperclip_text__",
+                      label: "Type an answer",
+                      freeText: true,
+                    },
+                  ],
+                },
+              ],
+              questionSet: {
+                schema: "paperclip.question_set.v1",
+                title: "Deployment details",
+                questions: [
+                  {
+                    id: "environment",
+                    prompt: "Environment",
+                    required: true,
+                    answerMode: "single_select",
+                    options: [
+                      { id: "staging", label: "Staging" },
+                      { id: "production", label: "Production" },
+                    ],
+                  },
+                  {
+                    id: "note",
+                    prompt: "Release note",
+                    required: true,
+                    answerMode: "text",
+                    textValidation: { minLength: 3, maxLength: 4000 },
+                  },
+                ],
+              },
+            },
+          },
+          { agentId: fixture.assignedAgentId, runId: sourceRunId },
+        );
+        await service.processPendingPublications(1000);
+        const publication = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.endpointId, endpoint.id),
+              eq(chatPublications.issueId, conversation.issueId),
+            ),
+          )
+          .then((rows) =>
+            rows.find((row) => row.payload.interactionId === interaction.id),
+          );
+        if (!publication?.providerMessageId)
+          throw new Error("Discord question not published");
+        const open = publication.payload.card?.actions?.find(
+          (action) =>
+            action.type === "callback" && action.actionId.startsWith("pcf:"),
+        );
+        if (!open || open.type !== "callback")
+          throw new Error("Native Discord form was not projected");
+        type NativeModal = {
+          custom_id: string;
+          title: string;
+          components: Array<{
+            type: number;
+            label: string;
+            component: {
+              type: number;
+              custom_id: string;
+              max_length?: number;
+              value?: string;
+              options?: Array<{
+                label: string;
+                value: string;
+                default?: boolean;
+              }>;
+            };
+          }>;
+        };
+        const click = (
+          customId: string,
+          id: string,
+          message = publication.providerMessageId!,
+        ) => ({
+          applicationId: "123456789012345678",
+          channel: { id: rootMessageId, parentId: channelId, type: 11 },
+          channelId: rootMessageId,
+          componentType: 2,
+          customId,
+          guildId,
+          id,
+          type: 3,
+          version: 1,
+          isChatInputCommand: () => false,
+          isMessageComponent: () => true,
+          isModalSubmit: () => false,
+          message: { id: message },
+          token: "synthetic-modal-token-never-persist",
+          user: {
+            id: externalUserId,
+            username: "operator",
+            globalName: "Operator",
+            bot: false,
+          },
+          showModal: vi
+            .fn<(modal: NativeModal) => Promise<void>>()
+            .mockResolvedValue(undefined),
+          deferUpdate: vi.fn().mockResolvedValue(undefined),
+          reply: vi.fn().mockResolvedValue(undefined),
+        });
+        const first = click(
+          `${open.actionId}\n${interaction.id}`,
+          "777777777777777720",
+        );
+        wakeup.mockClear();
+        await adapter.handleGatewayInteraction(first);
+        expect(first.showModal).toHaveBeenCalledOnce();
+        expect(first.deferUpdate).not.toHaveBeenCalled();
+        const duplicateOpen = click(
+          `${open.actionId}\n${interaction.id}`,
+          first.id,
+        );
+        await adapter.handleGatewayInteraction(duplicateOpen);
+        expect(duplicateOpen.showModal).not.toHaveBeenCalled();
+        expect(duplicateOpen.deferUpdate).not.toHaveBeenCalled();
+        expect(duplicateOpen.reply).not.toHaveBeenCalled();
+        const uncertainOpen = click(
+          `${open.actionId}\n${interaction.id}`,
+          "777777777777777729",
+        );
+        uncertainOpen.showModal.mockRejectedValue(
+          new Error("synthetic lost modal response"),
+        );
+        await adapter.handleGatewayInteraction(uncertainOpen);
+        expect(uncertainOpen.showModal).toHaveBeenCalledOnce();
+        expect(uncertainOpen.deferUpdate).not.toHaveBeenCalled();
+        const uncertainReplay = click(
+          `${open.actionId}\n${interaction.id}`,
+          uncertainOpen.id,
+        );
+        await adapter.handleGatewayInteraction(uncertainReplay);
+        expect(uncertainReplay.showModal).not.toHaveBeenCalled();
+        expect(uncertainReplay.deferUpdate).not.toHaveBeenCalled();
+        expect(uncertainReplay.reply).not.toHaveBeenCalled();
+        const modal = first.showModal.mock.calls[0]![0];
+        expect(modal.components).toHaveLength(2);
+        const select = modal.components.find(
+          (field) => field.component.type === 3,
+        )!.component;
+        const text = modal.components.find(
+          (field) => field.component.type === 4,
+        )!.component;
+        expect(text.max_length).toBe(4000);
+        const stagingValue = select.options!.find(
+          (option) => option.label === "Staging",
+        )!.value;
+        const submission = (
+          id: string,
+          note: string,
+          customId = modal.custom_id,
+        ) => ({
+          ...click(customId, id),
+          type: 5,
+          isMessageComponent: () => false,
+          isModalSubmit: () => true,
+          components: [
+            {
+              type: 18,
+              component: {
+                type: 3,
+                customId: select.custom_id,
+                values: [stagingValue],
+              },
+            },
+            {
+              type: 18,
+              component: { type: 4, customId: text.custom_id, value: note },
+            },
+          ],
+        });
+        const invalid = submission("777777777777777721", "");
+        await adapter.handleGatewayInteraction(invalid);
+        expect(onModalSubmit).toHaveBeenCalledOnce();
+        expect(onModalSubmit.mock.calls[0]![0].event.relatedThread?.id).toBe(
+          threadId,
+        );
+        expect(invalid.showModal).not.toHaveBeenCalled();
+        expect(invalid.reply).toHaveBeenCalledOnce();
+        const correction = invalid.reply.mock.calls[0]![0] as {
+          content: string;
+          flags: number;
+          components: Array<{ components: Array<{ custom_id: string }> }>;
+        };
+        expect(correction.content).toContain("Release note");
+        expect(correction.content).not.toContain(text.custom_id);
+        expect(correction.flags).toBe(64);
+        const reopenId = correction.components[0]!.components[0]!.custom_id;
+        expect(reopenId).toMatch(/^pcfr:[\w-]{43}$/);
+        const readState = () =>
+          db
+            .select()
+            .from(chatSdkState)
+            .where(eq(chatSdkState.endpointId, endpoint.id));
+        const invalidState = await readState();
+        expect(JSON.stringify(invalidState)).not.toContain(first.token);
+        expect(
+          invalidState.filter((row) =>
+            row.stateKey.startsWith("discord-question-correction:"),
+          ),
+        ).toHaveLength(1);
+
+        // The correction button belongs to a different ephemeral message. It
+        // must reauthorize the original published source and current actor.
+        await db
+          .update(companyMemberships)
+          .set({ membershipRole: "viewer" })
+          .where(
+            and(
+              eq(companyMemberships.companyId, fixture.companyId),
+              eq(companyMemberships.principalId, linkedUserId),
+            ),
+          );
+        const denied = click(
+          reopenId,
+          "777777777777777722",
+          "888888888888888888",
+        );
+        await adapter.handleGatewayInteraction(denied);
+        expect(denied.showModal).not.toHaveBeenCalled();
+        expect(denied.deferUpdate).not.toHaveBeenCalled();
+        expect(denied.reply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            flags: 64,
+            content: expect.stringContaining("no longer available"),
+          }),
+        );
+        await db
+          .update(companyMemberships)
+          .set({ membershipRole: "operator" })
+          .where(
+            and(
+              eq(companyMemberships.companyId, fixture.companyId),
+              eq(companyMemberships.principalId, linkedUserId),
+            ),
+          );
+        const wrongThread = click(
+          reopenId,
+          "777777777777777730",
+          "888888888888888888",
+        );
+        wrongThread.channelId = "555555555555555999";
+        wrongThread.channel.id = wrongThread.channelId;
+        await adapter.handleGatewayInteraction(wrongThread);
+        expect(wrongThread.showModal).not.toHaveBeenCalled();
+        expect(wrongThread.deferUpdate).not.toHaveBeenCalled();
+        const wrongActor = click(
+          reopenId,
+          "777777777777777731",
+          "888888888888888888",
+        );
+        wrongActor.user.id = "444444444444444999";
+        await adapter.handleGatewayInteraction(wrongActor);
+        expect(wrongActor.showModal).not.toHaveBeenCalled();
+        await db
+          .update(chatPublications)
+          .set({ providerMessageId: "999999999999999999" })
+          .where(eq(chatPublications.id, publication.id));
+        const changedSource = click(
+          reopenId,
+          "777777777777777732",
+          "888888888888888888",
+        );
+        await adapter.handleGatewayInteraction(changedSource);
+        expect(changedSource.showModal).not.toHaveBeenCalled();
+        expect(changedSource.deferUpdate).not.toHaveBeenCalled();
+        await db
+          .update(chatPublications)
+          .set({ providerMessageId: publication.providerMessageId })
+          .where(eq(chatPublications.id, publication.id));
+        const reopened = click(
+          reopenId,
+          "777777777777777723",
+          "888888888888888888",
+        );
+        await adapter.handleGatewayInteraction(reopened);
+        expect(reopened.showModal).toHaveBeenCalledOnce();
+        expect(reopened.deferUpdate).not.toHaveBeenCalled();
+        const edited = reopened.showModal.mock.calls[0]![0];
+        expect(
+          edited.components[0]!.component.options?.find(
+            (option) => option.default,
+          )?.value,
+        ).toBe(stagingValue);
+        expect(edited.components[1]!.component.value).toBe("");
+        expect(edited.custom_id.split(":").slice(0, 2).join(":")).toBe(
+          modal.custom_id.split(":").slice(0, 2).join(":"),
+        );
+        const corrected = submission(
+          "777777777777777724",
+          "Ship safely",
+          edited.custom_id,
+        );
+        corrected.message.id = "888888888888888888";
+        const competingOpen = click(
+          `${open.actionId}\n${interaction.id}`,
+          "777777777777777734",
+        );
+        await adapter.handleGatewayInteraction(competingOpen);
+        expect(competingOpen.showModal).toHaveBeenCalledOnce();
+        const competingText =
+          concurrentMode === "identical" ? "Ship safely" : "Ship Friday";
+        const competing = submission(
+          "777777777777777735",
+          competingText,
+          competingOpen.showModal.mock.calls[0]![0].custom_id,
+        );
+        cleanupSpy = vi
+          .spyOn(discordQuestionForms, "deleteDiscordQuestionFormCorrection")
+          .mockRejectedValueOnce(new Error("synthetic draft cleanup failure"));
+        holdConcurrentAnswers = true;
+        await Promise.all([
+          adapter.handleGatewayInteraction(corrected),
+          adapter.handleGatewayInteraction(competing),
+        ]);
+        expect(answerWaiters).toBe(2);
+        expect(cleanupSpy).toHaveBeenCalledTimes(
+          concurrentMode === "identical" ? 2 : 1,
+        );
+        const [answered] = await db
+          .select()
+          .from(issueThreadInteractions)
+          .where(eq(issueThreadInteractions.id, interaction.id));
+        const winnerText = (
+          answered!.result as {
+            answers: Array<{ questionId: string; otherText?: string }>;
+          }
+        ).answers.find((answer) => answer.questionId === "note")!.otherText!;
+        expect(["Ship safely", competingText]).toContain(winnerText);
+        for (const [callback, submittedText] of [
+          [corrected, "Ship safely"],
+          [competing, competingText],
+        ] as const) {
+          expect(callback.reply).toHaveBeenCalledOnce();
+          expect(callback.reply.mock.calls[0]![0].content).toBe(
+            submittedText === winnerText
+              ? "Your response was received."
+              : "This response was not accepted. Open the linked Paperclip task or reopen the question to try again.",
+          );
+        }
+        expect(answered).toMatchObject({
+          status: "answered",
+          resolvedByUserId: linkedUserId,
+          result: {
+            answers: [
+              { questionId: "environment", optionIds: ["staging"] },
+              { questionId: "note", optionIds: [], otherText: winnerText },
+            ],
+          },
+        });
+        await vi.waitFor(async () => {
+          const [response] = await db
+            .select()
+            .from(issueQuestionResponseDeliveries)
+            .where(
+              eq(issueQuestionResponseDeliveries.interactionId, interaction.id),
+            );
+          expect(response?.status).toBe("fallback_queued");
+        });
+        const continuationWakeCount = wakeup.mock.calls.filter(
+          ([, options]) =>
+            options.contextSnapshot?.source === "issue.interaction.respond",
+        ).length;
+        expect(continuationWakeCount).toBe(1);
+        expect(
+          (await readState()).filter((row) =>
+            row.stateKey.startsWith("discord-question-correction:"),
+          ),
+        ).toHaveLength(concurrentMode === "identical" ? 0 : 1);
+        const duplicate = submission(
+          "777777777777777725",
+          winnerText,
+          edited.custom_id,
+        );
+        await adapter.handleGatewayInteraction(duplicate);
+        expect(
+          onModalSubmit.mock.calls.at(-1)![0].event.relatedThread,
+        ).toBeUndefined();
+        expect(duplicate.reply).toHaveBeenCalledWith(
+          expect.objectContaining({ content: "Your response was received." }),
+        );
+        expect(
+          (await readState()).filter((row) =>
+            row.stateKey.startsWith("discord-question-correction:"),
+          ),
+        ).toHaveLength(0);
+        expect(
+          wakeup.mock.calls.filter(
+            ([, options]) =>
+              options.contextSnapshot?.source === "issue.interaction.respond",
+          ),
+        ).toHaveLength(1);
+        const differentAnswer = submission(
+          "777777777777777733",
+          "Ship something else",
+          edited.custom_id,
+        );
+        await adapter.handleGatewayInteraction(differentAnswer);
+        expect(differentAnswer.reply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("not accepted"),
+            flags: 64,
+          }),
+        );
+        expect(differentAnswer.reply.mock.calls[0]![0]).not.toHaveProperty(
+          "components",
+        );
+        expect(
+          wakeup.mock.calls.filter(
+            ([, options]) =>
+              options.contextSnapshot?.source === "issue.interaction.respond",
+          ),
+        ).toHaveLength(1);
+        const stale = click(
+          reopenId,
+          "777777777777777726",
+          "888888888888888888",
+        );
+        await adapter.handleGatewayInteraction(stale);
+        expect(stale.showModal).not.toHaveBeenCalled();
+        expect(stale.deferUpdate).not.toHaveBeenCalled();
+        const unknown = submission(
+          "777777777777777727",
+          "Ship safely",
+          `pcfs:${"Z".repeat(22)}:${randomUUID()}`,
+        );
+        await adapter.handleGatewayInteraction(unknown);
+        expect(unknown.reply).toHaveBeenCalledWith(
+          expect.objectContaining({
+            content: expect.stringContaining("not accepted"),
+            flags: 64,
+          }),
+        );
+        expect(unknown.reply.mock.calls[0]![0]).not.toHaveProperty(
+          "components",
+        );
+        // Scheduler is simulated: this proves wake_fallback exactly once, not a
+        // model turn or a live Discord login/modal interaction.
+      } finally {
+        releaseAnswers();
+        cleanupSpy?.mockRestore();
+        try {
+          await pinned?.shutdown();
+        } finally {
+          await retirePublicationFixture(service, endpoint.id);
+        }
+      }
+    },
+  );
+
+  it.each([
+    "warm",
+    "cold",
+    "failed initialization",
+    "stale generation",
+    "disabled connection",
+  ])(
+    "automatically enables native modals for an existing Discord endpoint after %s runtime qualification",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const configured = await configuredDiscordEndpoint(fixture);
+      const { endpoint } = configured;
+      let { runtime, service } = configured;
+      try {
+        const [current] = await db
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, endpoint.id));
+        await db
+          .update(chatEndpoints)
+          .set({ capabilities: { ...current!.capabilities, modals: false } })
+          .where(eq(chatEndpoints.id, endpoint.id));
+        const [before] = await db
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, endpoint.id));
+        const [connectionBefore] = await db
+          .select()
+          .from(toolConnections)
+          .where(eq(toolConnections.id, before!.connectionId));
+        const resourcesBefore = await db
+          .select()
+          .from(chatEndpointResources)
+          .where(eq(chatEndpointResources.endpointId, endpoint.id));
+        const instance = runtime.endpoints.get(endpoint.id);
+        if (mode !== "warm") {
+          const config = runtime.configurations.get(
+            endpoint.id,
+          )!.providerConfig;
+          if (config.provider !== "discord")
+            throw new Error("Discord configuration absent");
+          await service.shutdown();
+          ({ runtime, service } = createService(
+            new FakeChatSdkRuntime(),
+            fakeDiscordFetch(
+              config.credentials.applicationId,
+            ) as typeof globalThis.fetch,
+          ));
+        }
+        let targetInitializations = 0;
+        if (mode === "failed initialization")
+          runtime.initializeHook = async (initializingEndpointId) => {
+            if (initializingEndpointId !== endpoint.id) return;
+            targetInitializations += 1;
+            throw new Error("synthetic initialization failed");
+          };
+        if (mode === "stale generation")
+          runtime.initializeHook = async (initializingEndpointId) => {
+            if (initializingEndpointId !== endpoint.id) return;
+            targetInitializations += 1;
+            await db
+              .update(chatEndpoints)
+              .set({
+                setup: {
+                  ...before!.setup,
+                  runtimeGeneration:
+                    Number(before!.setup.runtimeGeneration ?? 0) + 1,
+                },
+              })
+              .where(eq(chatEndpoints.id, endpoint.id));
+          };
+        if (mode === "disabled connection")
+          runtime.initializeHook = async (initializingEndpointId) => {
+            if (initializingEndpointId !== endpoint.id) return;
+            targetInitializations += 1;
+            await db
+              .update(toolConnections)
+              .set({ enabled: false })
+              .where(eq(toolConnections.id, before!.connectionId));
+          };
+        await service.reconcileProviderRuntimes();
+        if (mode !== "warm" && mode !== "cold")
+          expect(targetInitializations).toBe(1);
+        const [after] = await db
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, endpoint.id));
+        expect(after!.capabilities.modals).toBe(
+          mode === "warm" || mode === "cold",
+        );
+        expect({
+          ...after,
+          updatedAt: before!.updatedAt,
+          capabilities: before!.capabilities,
+          ...(mode === "stale generation" ? { setup: before!.setup } : {}),
+        }).toEqual(before);
+        const [connectionAfter] = await db
+          .select()
+          .from(toolConnections)
+          .where(eq(toolConnections.id, before!.connectionId));
+        expect({
+          ...connectionAfter,
+          updatedAt: connectionBefore!.updatedAt,
+          ...(mode === "disabled connection"
+            ? { enabled: connectionBefore!.enabled }
+            : {}),
+        }).toEqual(connectionBefore);
+        expect(
+          await db
+            .select()
+            .from(chatEndpointResources)
+            .where(eq(chatEndpointResources.endpointId, endpoint.id)),
+        ).toEqual(resourcesBefore);
+        if (mode === "warm")
+          expect(runtime.endpoints.get(endpoint.id)).toBe(instance);
+        if (mode === "warm" || mode === "cold")
+          expect(
+            runtime.configurations.get(endpoint.id)!.callbacks.onModalSubmit,
+          ).toBeTypeOf("function");
+      } finally {
+        try {
+          await service.shutdown();
+        } finally {
+          await db
+            .update(chatEndpoints)
+            .set({ status: "paused" })
+            .where(eq(chatEndpoints.id, endpoint.id));
+        }
+      }
+    },
+  );
+
+  it.each(["retired runtime", "replaced runtime", "changed credentials"])(
+    "does not enable Discord modals after a connection-lock wait with %s",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const { endpoint, runtime, service } =
+        await configuredDiscordEndpoint(fixture);
+      let reconciliation: Promise<unknown> | undefined;
+      try {
+        const [before] = await db
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, endpoint.id));
+        await db
+          .update(chatEndpoints)
+          .set({ capabilities: { ...before!.capabilities, modals: false } })
+          .where(eq(chatEndpoints.id, endpoint.id));
+        const original = runtime.get(endpoint.id);
+        expect(original).not.toBeNull();
+        await db.transaction(async (tx) => {
+          await tx
+            .select()
+            .from(toolConnections)
+            .where(eq(toolConnections.id, before!.connectionId))
+            .for("no key update");
+          const [backend] = (await tx.execute(
+            sql`select pg_backend_pid() as pid`,
+          )) as unknown as Array<{ pid: number }>;
+          reconciliation = service.reconcileProviderRuntimes();
+          await vi.waitFor(async () => {
+            const [state] = (await db.execute(sql`select exists (
+              select 1 from pg_stat_activity where ${backend!.pid} = any(pg_blocking_pids(pid))
+            ) as waiting`)) as unknown as Array<{ waiting: boolean }>;
+            expect(state!.waiting).toBe(true);
+          });
+          // The actual upgrade has already qualified this runtime and now
+          // waits for this exact connection lock. No provider call is mocked.
+          if (mode === "changed credentials") {
+            await tx
+              .update(toolConnections)
+              .set({ credentialSecretRefs: [] })
+              .where(eq(toolConnections.id, before!.connectionId));
+          } else {
+            await runtime.removeEndpoint(endpoint.id);
+            if (mode === "replaced runtime") {
+              await runtime.replaceEndpoint(
+                runtime.configurations.get(endpoint.id)!,
+              );
+              expect(runtime.get(endpoint.id)).not.toBe(original);
+            }
+          }
+        });
+        await reconciliation;
+        const [after] = await db
+          .select()
+          .from(chatEndpoints)
+          .where(eq(chatEndpoints.id, endpoint.id));
+        expect(after!.capabilities.modals).toBe(false);
+        expect({
+          ...after,
+          updatedAt: before!.updatedAt,
+          capabilities: before!.capabilities,
+        }).toEqual(before);
+      } finally {
+        await reconciliation?.catch(() => undefined);
+        await retirePublicationFixture(service, endpoint.id);
+      }
+    },
+  );
 
   it("orders rapid Discord replies by provider time before waking one task", async () => {
     const fixture = await seedCompany();

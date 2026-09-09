@@ -1232,7 +1232,7 @@ describe("Paperclip Discord adapter patch", () => {
         threadId: "discord:1457808928258658549:channel-1:thread-1",
         value: "yes",
       }),
-      undefined,
+      { onOpenModal: expect.any(Function) },
     );
     expect(logger.warn).toHaveBeenCalledWith(
       "Retrying Discord Gateway event after processing error",

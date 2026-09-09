@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AskUserQuestionsInteraction } from "@paperclipai/shared";
 import { modalToAdaptiveCard } from "@chat-adapter/teams/modals";
+import { modalToDiscordPayload } from "@chat-adapter/discord";
 import {
   buildChatQuestionFormModal,
   chatQuestionFormActionRecords,
@@ -98,6 +99,97 @@ function interaction(
 }
 
 describe("chat question forms", () => {
+  it("keeps Discord's 4000-character contract explicit without changing legacy provider limits", () => {
+    const current = interaction();
+    current.payload.questionSet!.questions[1]!.textValidation = {
+      minLength: 1,
+      maxLength: 4000,
+    };
+    const legacy = createChatQuestionFormDraft(current)!;
+    expect(legacy.fields[1]).toMatchObject({ maxLength: 3000 });
+    const native = createChatQuestionFormDraft(current, {
+      nativeProvider: "discord",
+    })!;
+    expect(native.fields[1]).toMatchObject({ maxLength: 4000 });
+    const record = chatQuestionFormActionRecords(native, {
+      companyId: current.companyId,
+      endpointId: "endpoint",
+      conversationId: "conversation",
+      publicationId: "publication",
+    })[1]!;
+    const payload = parseChatQuestionFormSubmitTokenPayload(record.payload)!;
+    expect(payload.nativeProvider).toBe("discord");
+    expect(
+      parseChatQuestionFormSubmitTokenPayload({
+        ...record.payload,
+        nativeProvider: undefined,
+      }),
+    ).toBeNull();
+    const modal = buildChatQuestionFormModal(
+      current,
+      native.submitActionId,
+      payload,
+    )!;
+    expect(
+      modalToDiscordPayload(modal, "11111111-1111-4111-8111-111111111111"),
+    ).toMatchObject({
+      components: [{ type: 18 }, { type: 18, component: { max_length: 4000 } }],
+    });
+  });
+
+  it.each([25, 26])(
+    "supports one Discord select with %i options only when it fits natively",
+    (count) => {
+      const current = interaction();
+      current.payload.questions = [current.payload.questions[0]!];
+      current.payload.questions[0]!.options = Array.from(
+        { length: count },
+        (_, index) => ({ id: `option-${index}`, label: `Option ${index}` }),
+      );
+      current.payload.questionSet!.questions = [
+        {
+          id: "environment",
+          prompt: "Where should I deploy?",
+          required: true,
+          answerMode: "single_select",
+          options: current.payload.questions[0]!.options.map(
+            ({ id, label }) => ({ id, label }),
+          ),
+        },
+      ];
+      expect(createChatQuestionFormDraft(current)).toBeNull();
+      const draft = createChatQuestionFormDraft(current, {
+        nativeProvider: "discord",
+      });
+      if (count === 26) expect(draft).toBeNull();
+      else expect(draft?.fields).toHaveLength(1);
+    },
+  );
+
+  it.each([5, 6])(
+    "preserves all %i questions or selects explicit non-modal fallback",
+    (count) => {
+      const current = interaction();
+      current.payload.questions = Array.from({ length: count }, (_, index) => ({
+        ...current.payload.questions[1]!,
+        id: `note-${index}`,
+      }));
+      current.payload.questionSet!.questions = current.payload.questions.map(
+        (question) => ({
+          id: question.id,
+          prompt: question.prompt,
+          required: true,
+          answerMode: "text" as const,
+        }),
+      );
+      const draft = createChatQuestionFormDraft(current, {
+        nativeProvider: "discord",
+      });
+      if (count === 6) expect(draft).toBeNull();
+      else expect(draft?.fields).toHaveLength(5);
+    },
+  );
+
   function invalidFormFixture() {
     const current = interaction();
     const now = new Date();

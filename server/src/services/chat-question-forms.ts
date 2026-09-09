@@ -61,6 +61,7 @@ export type ChatQuestionFormField =
   ChatQuestionFormTextField | ChatQuestionFormSelectField;
 
 export interface ChatQuestionFormDraft {
+  nativeProvider?: "discord";
   expiresAt: string;
   fields: ChatQuestionFormField[];
   interactionId: string;
@@ -77,6 +78,7 @@ export interface ChatQuestionFormOpenTokenPayload {
 }
 
 export interface ChatQuestionFormSubmitTokenPayload {
+  nativeProvider?: "discord";
   expiresAt: string;
   fields: ChatQuestionFormField[];
   formActionId: string;
@@ -253,12 +255,15 @@ function formKind(
  */
 export function createChatQuestionFormDraft(
   interaction: AskUserQuestionsInteraction,
-  options: { now?: Date } = {},
+  options: { now?: Date; nativeProvider?: "discord" } = {},
 ): ChatQuestionFormDraft | null {
+  const maxTextLength =
+    options.nativeProvider === "discord" ? 4000 : MAX_NATIVE_TEXT_LENGTH;
   if (
     interaction.status !== "pending" ||
     interaction.payload.questions.length === 0 ||
-    interaction.payload.questions.length > MAX_NATIVE_FORM_QUESTIONS
+    interaction.payload.questions.length >
+      (options.nativeProvider === "discord" ? 5 : MAX_NATIVE_FORM_QUESTIONS)
   ) {
     return null;
   }
@@ -268,7 +273,12 @@ export function createChatQuestionFormDraft(
     kind: formKind(interaction, question),
   }));
   if (classified.some(({ kind }) => kind === null)) return null;
-  if (classified.length === 1 && classified[0]?.kind === "single_select") {
+  if (
+    classified.length === 1 &&
+    classified[0]?.kind === "single_select" &&
+    (options.nativeProvider !== "discord" ||
+      classified[0].question.options.length <= 12)
+  ) {
     return null;
   }
 
@@ -277,7 +287,11 @@ export function createChatQuestionFormDraft(
     const fieldId = opaqueToken(FIELD_PREFIX);
     if (kind === "single_select") {
       const options = question.options.filter((option) => !option.freeText);
-      if (options.length === 0 || options.length > MAX_NATIVE_SELECT_OPTIONS) {
+      if (
+        options.length === 0 ||
+        options.length >
+          (maxTextLength === 4000 ? 25 : MAX_NATIVE_SELECT_OPTIONS)
+      ) {
         return null;
       }
       fields.push({
@@ -297,14 +311,15 @@ export function createChatQuestionFormDraft(
     const validation = source?.textValidation;
     const canonicalMax = validation?.maxLength ?? 100_000;
     const canonicalMin = validation?.minLength ?? 0;
-    if (canonicalMin > MAX_NATIVE_TEXT_LENGTH) return null;
+    if (options.nativeProvider === "discord" && canonicalMax < 1) return null;
+    if (canonicalMin > maxTextLength) return null;
     fields.push({
       fieldId,
       kind: "text",
       questionId: question.id,
       required: question.required !== false,
       minLength: canonicalMin,
-      maxLength: Math.min(canonicalMax, MAX_NATIVE_TEXT_LENGTH),
+      maxLength: Math.min(canonicalMax, maxTextLength),
       inputType: validation?.inputType ?? "text",
       ...(validation?.minimum !== undefined
         ? { minimum: validation.minimum }
@@ -317,6 +332,9 @@ export function createChatQuestionFormDraft(
 
   const now = options.now ?? new Date();
   return {
+    ...(options.nativeProvider
+      ? { nativeProvider: options.nativeProvider }
+      : {}),
     expiresAt: new Date(
       now.getTime() + CHAT_QUESTION_FORM_TOKEN_TTL_MS,
     ).toISOString(),
@@ -361,6 +379,9 @@ export function chatQuestionFormActionRecords(
         interactionId: draft.interactionId,
         formActionId: draft.submitActionId,
         fields: draft.fields,
+        ...(draft.nativeProvider
+          ? { nativeProvider: draft.nativeProvider }
+          : {}),
         expiresAt: draft.expiresAt,
       } satisfies ChatQuestionFormSubmitTokenPayload,
     },
@@ -384,7 +405,10 @@ export function parseChatQuestionFormOpenTokenPayload(
   return value as unknown as ChatQuestionFormOpenTokenPayload;
 }
 
-function parseFormField(value: unknown): ChatQuestionFormField | null {
+function parseFormField(
+  value: unknown,
+  maxTextLength = MAX_NATIVE_TEXT_LENGTH,
+): ChatQuestionFormField | null {
   if (
     !isRecord(value) ||
     !isOpaqueToken(value.fieldId, FIELD_PREFIX) ||
@@ -401,7 +425,7 @@ function parseFormField(value: unknown): ChatQuestionFormField | null {
       typeof value.maxLength !== "number" ||
       !Number.isSafeInteger(value.maxLength) ||
       value.maxLength < value.minLength ||
-      value.maxLength > MAX_NATIVE_TEXT_LENGTH ||
+      value.maxLength > maxTextLength ||
       !["text", "number", "integer"].includes(String(value.inputType)) ||
       (value.minimum !== undefined &&
         (typeof value.minimum !== "number" ||
@@ -450,6 +474,8 @@ export function parseChatQuestionFormSubmitTokenPayload(
   if (
     !isRecord(value) ||
     value.version !== 1 ||
+    (value.nativeProvider !== undefined &&
+      value.nativeProvider !== "discord") ||
     typeof value.publicationId !== "string" ||
     typeof value.interactionId !== "string" ||
     !isChatQuestionFormSubmitActionId(value.formActionId) ||
@@ -457,18 +483,34 @@ export function parseChatQuestionFormSubmitTokenPayload(
     !Number.isFinite(Date.parse(value.expiresAt)) ||
     !Array.isArray(value.fields) ||
     value.fields.length === 0 ||
-    value.fields.length > MAX_NATIVE_FORM_QUESTIONS
+    value.fields.length >
+      (value.nativeProvider === "discord" ? 5 : MAX_NATIVE_FORM_QUESTIONS)
   ) {
     return null;
   }
-  const fields = value.fields.map(parseFormField);
+  const fields = value.fields.map((field) =>
+    parseFormField(
+      field,
+      value.nativeProvider === "discord" ? 4000 : MAX_NATIVE_TEXT_LENGTH,
+    ),
+  );
   if (fields.some((field) => field === null)) return null;
+  if (
+    value.nativeProvider === "discord" &&
+    fields.some(
+      (field) => field?.kind === "single_select" && field.options.length > 25,
+    )
+  )
+    return null;
   const fieldIds = new Set(fields.map((field) => field!.fieldId));
   const questionIds = new Set(fields.map((field) => field!.questionId));
   if (fieldIds.size !== fields.length || questionIds.size !== fields.length) {
     return null;
   }
   return {
+    ...(value.nativeProvider === "discord"
+      ? { nativeProvider: "discord" as const }
+      : {}),
     version: 1,
     publicationId: value.publicationId,
     interactionId: value.interactionId,
@@ -503,7 +545,11 @@ export function buildChatQuestionFormModal(
     const question = canonicalQuestion(interaction, field.questionId);
     if (!question || formKind(interaction, question) !== field.kind)
       return null;
-    const label = boundedLabel(question.prompt, 2_000) || "Response";
+    const label =
+      boundedLabel(
+        question.prompt,
+        payload.nativeProvider === "discord" ? 45 : 2_000,
+      ) || "Response";
     if (field.kind === "text") {
       children.push(
         TextInput({
@@ -513,7 +559,12 @@ export function buildChatQuestionFormModal(
           multiline: field.inputType === "text",
           optional: !field.required,
           ...(question.helpText
-            ? { placeholder: boundedLabel(question.helpText, 150) }
+            ? {
+                placeholder: boundedLabel(
+                  question.helpText,
+                  payload.nativeProvider === "discord" ? 100 : 150,
+                ),
+              }
             : {}),
         }),
       );
@@ -551,7 +602,7 @@ export function buildChatQuestionFormModal(
     title:
       boundedLabel(
         interaction.payload.title ?? interaction.title ?? "Input needed",
-        24,
+        payload.nativeProvider === "discord" ? 45 : 24,
       ) || "Input needed",
     submitLabel:
       boundedLabel(interaction.payload.submitLabel ?? "Submit", 24) || "Submit",

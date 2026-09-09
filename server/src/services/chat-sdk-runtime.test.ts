@@ -25,7 +25,7 @@ vi.mock("@chat-adapter/discord", () => ({
       paperclipCompatibilityRevision:
         config.botToken === "unpatched-discord"
           ? undefined
-          : "paperclip-discord-v5",
+          : "paperclip-discord-v6",
       async ensureRootThread(
         channelId: string,
         messageId: string,

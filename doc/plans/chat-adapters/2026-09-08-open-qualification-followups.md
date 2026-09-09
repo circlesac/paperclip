@@ -129,13 +129,15 @@ the next implementation pass:
   bytes after restart and current access revocation; adjacent parser/adapter/photo
   checks: 114/114; plain server TypeScript passed before the concurrent Discord
   edits. The new Telegram path is not yet deployed or live qualified.
-- **Discord native forms:** the installed adapter has no modal-open method and
-  ignores native modal submissions; Paperclip also gates forms to Slack/Teams.
-  Discord supports native text/select modals with existing Gateway credentials.
-  Renderer/open/submit support, current source/actor authorization, duplicate
-  handling and an actor-scoped correction/reopen flow are being implemented.
-  A modal submission cannot itself open another Discord modal. Owner: native
-  interaction agent. Capability flags stay truthful until this is complete.
+- **Discord native forms:** v6 now implements native text/select open/submit,
+  current source/actor authorization, identical/conflicting duplicate handling
+  and actor-scoped private correction/reopen. Existing endpoints automatically
+  gain the capability after current runtime qualification. Actual lock-wait
+  regressions cover retired/replaced runtimes and changed credential refs.
+  Root's final full service run passes **641/641**; seven focused files pass
+  **165/165**, including actual discord.js wire serialization. Provider I/O and
+  scheduler remain simulated; real modal UI and native continuation still need
+  live qualification. A modal submission cannot itself open another modal.
 - **Teams personal file output:** existing bot credentials can support native
   consent/upload without new Graph permissions; the pinned adapter does not
   implement the consent callbacks. The new inactive helper/actual-SDK hook
@@ -338,7 +340,17 @@ It is not combined server→real-provider recovery proof. Only local Codex
 surviving-runner, remote/listen and missing-independent-checkpoint cases remain
 unsupported and fail closed.
 
-Latest frozen-foundation chat integration **631/631**, zero skips, ran on fresh
+Latest final Discord workflow integration **641/641**, zero skips, ran on fresh
+`chat_discord_modal_final_20260909_root02` (123.87 seconds). Root's focused
+seven-file cohort passes **165/165** and plain server TypeScript passes.
+The first full attempt passed 637/638 because a fixture's unscoped initialization
+hook changed the target generation before its own initialization. The hook is
+now endpoint-scoped with an exact invocation assertion; the negative capability
+assertion is unchanged. Three separate real lock-wait bugs were reproduced and
+fixed. Source hashes and exact simulated-vs-live boundaries are in the permanent
+log. New Teams durable-integration work is separate and not covered by that run.
+
+The preceding frozen-foundation chat integration **631/631**, zero skips, ran on fresh
 `chat_modal_telegram_foundation_20260909_root01` (119.53 seconds). It includes
 the Telegram video-note repair and Discord's modal transport foundation with
 capability still off, not the subsequent Discord service/correction workflow.

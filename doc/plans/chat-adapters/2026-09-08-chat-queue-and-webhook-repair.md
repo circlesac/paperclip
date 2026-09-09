@@ -3641,3 +3641,70 @@ must be connected. The early-accept test retains an in-memory event only; it
 does not prove restart durability. Channel/group files retain their existing
 fallback without new Graph permissions. Eligible-tenant live qualification
 remains outstanding. No provider request or server restart occurred here.
+
+### September 9: Discord native form workflow and concurrency qualification
+
+The v6 pinned adapter implements native text/select modal opening and submission,
+with closed rendering limits and opaque Paperclip action IDs. Discord interaction
+tokens are kept out of persisted Chat SDK context. A failed or ambiguous modal
+open cannot receive a second success acknowledgment or automatic resend.
+Duplicate open attempts remain unconfirmed rather than fabricating success.
+
+The real service now checks current endpoint, source publication, thread,
+principal and interaction before opening or accepting a form. Invalid answers
+produce a private correction action with actor-scoped, expiring retained values.
+Reopening checks the original published source again. Canonical acceptance is
+durable before correction cleanup; a cleanup failure cannot relabel an accepted
+answer. Identical duplicate/concurrent submissions return the existing receipt;
+different answers on the same token are rejected instead of claiming acceptance.
+Only one canonical answer and one fallback continuation wake are recorded.
+
+Existing connected Discord endpoints gain modal support after successful pinned
+runtime initialization without reconnecting or changing reach, agent or secrets.
+Review reproduced three actual lock-wait races: runtime retirement, runtime
+replacement and credential-ref changes could enable a stale capability. The
+upgrade now rechecks the locked active/enabled connection, its credential
+fingerprint, exact runtime instance and Gateway ownership immediately before
+updating the capability. The three negative cases went RED→GREEN. Later form
+admission was already fenced; this repair makes capability qualification truthful.
+
+The first root full run passed **637/638** (125.57 seconds;
+`discord-modal-final-full-root-0909.log`). Its stale-generation test hook ran on
+every eligible fixture endpoint and set the target's fixed next generation before
+the target initialized. The hook now receives and checks the actual endpoint ID
+and asserts one target invocation. The negative capability assertion was not
+relaxed. Final focused service/upgrade/lock cases pass **10/10** on a fresh
+database, and the owner's adjacent cohort passes **272/272**.
+
+Root independently passes **165/165** in seven files (6.91 seconds;
+`discord-modal-final-units-root02-0909.log`) and plain server TypeScript.
+Four tests instantiate the actual installed discord.js button/modal interaction
+classes and real response methods, substituting only REST responses. They cover
+the exact modern Label payload, snake-case input normalization, private response,
+failed-open single-response behavior and token-free SDK state. The composed
+service tests use actual adapter/Chat SDK/runtime with real PostgreSQL; Discord
+transport and the scheduler remain simulated. They stop at `wake_fallback`,
+not a native model continuation or a live modal.
+
+Final semantic source hashes before the independent full rerun:
+
+- Service: `fa8de8cda1dcaba55be5d3cc6204786c225dfc62f047baccd253d7a759487b5f`.
+- Integration: `0ff54fd645d1919325b01929836f20cb786a4d2cb7cf5ddff884b58dfd31fce3`.
+- Runtime: `303fff465c815b32b572a2f13bfef6325cb13cdcdcbf8b8ca869e48887541045`.
+- Patch: `e1ffaf4879f4646c73b531e8310f64fe58ce81b3fbba2c4dbf007a2dcd471e2b`.
+
+Root verified both patch targets with an explicit repository-relative
+`git apply --check --directory` against the untouched upstream reconstruction.
+A plain apply check run inside the ignored scratch folder skipped both files;
+that earlier zero exit code was not valid patch-application evidence. No shared
+package store or other checkout was changed. The CI-owned lockfile is unchanged;
+local patch materialization is not fresh-install/release proof.
+
+The final independent full run passes **641/641**, zero skips/failures, on
+fresh `chat_discord_modal_final_20260909_root02` (123.87 seconds;
+`discord-modal-final-full-root02-0909.log`). It includes the final lock guards,
+scoped fixture repair and composed Discord form workflow at the hashes above.
+Root also independently passes the two unchanged egress suites **38/38**
+(855 ms; `teams-file-egress-root-0909.log`), complementing its 81-case inactive
+Teams foundation run. No real provider browser action was possible: the latest
+inventory still reports Mac locked, not a Discord login failure.

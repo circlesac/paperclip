@@ -185,6 +185,15 @@ import {
   verifyDiscordBot,
 } from "./chat-discord.js";
 import {
+  deleteDiscordQuestionFormCorrection,
+  discordQuestionFormCorrectionModal,
+  discordQuestionFormDenialResponse,
+  discordQuestionFormThreadId,
+  isDiscordQuestionFormCorrectionId,
+  loadDiscordQuestionFormCorrection,
+  retainDiscordQuestionFormCorrection,
+} from "./chat-discord-question-forms.js";
+import {
   parseSlackSessionStop,
   setSlackSessionStatus,
   slackSessionStatusForPublication,
@@ -493,7 +502,7 @@ const CAPABILITIES: Record<ChatProvider, ChatAdapterCapabilities> = {
     files: true,
     cards: true,
     actions: true,
-    modals: false,
+    modals: true,
     // The root mention/thread path is automatic. Paperclip does not register a
     // Discord application command yet, so do not advertise an unusable command.
     slashCommands: false,
@@ -7142,7 +7151,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   ? (event) => handleAction(event, context)
                   : undefined,
               onModalSubmit:
-                record.endpoint.capabilities.modals === true
+                record.endpoint.capabilities.modals === true ||
+                record.endpoint.provider === "discord"
                   ? (event) => handleModalSubmit(event, context)
                   : undefined,
               onMessageDeleted: (event) => handleMessageDeleted(event, context),
@@ -7257,7 +7267,69 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const record = await endpointRecord(row.endpointId);
       if (!record) continue;
       try {
-        await runtimeFor(record.endpoint, { requireDiscordOwnership: true });
+        const instance = await runtimeFor(record.endpoint, {
+          requireDiscordOwnership: true,
+        });
+        const context = runtimeContexts.get(instance as object);
+        if (
+          CAPABILITIES.discord.modals &&
+          context &&
+          runtime.get(row.endpointId) === instance
+        ) {
+          // Existing connected endpoints acquire the new implementation
+          // capability only after the pinned runtime initialized successfully.
+          // No reconnect, policy/reach change, credential rotation, or runtime
+          // generation change is needed: its Discord handler is registered
+          // even while the persisted capability remains disabled.
+          await db.transaction(async (tx) => {
+            const current = await runtimeCallbackEndpoint(
+              tx,
+              row.endpointId,
+              context,
+              ["verifying", "active", "attention"],
+            );
+            if (
+              !current ||
+              current.provider !== "discord" ||
+              current.capabilities.modals === true ||
+              runtime.get(row.endpointId) !== instance
+            )
+              return;
+            const connection = await tx
+              .select({
+                enabled: toolConnections.enabled,
+                status: toolConnections.status,
+                refs: toolConnections.credentialSecretRefs,
+              })
+              .from(toolConnections)
+              .where(
+                and(
+                  eq(toolConnections.companyId, current.companyId),
+                  eq(toolConnections.id, current.connectionId),
+                ),
+              )
+              .for("no key update")
+              .then((rows) => rows[0]);
+            if (
+              !connection?.enabled ||
+              connection.status !== "active" ||
+              credentialFingerprint(connection.refs) !==
+                context.credentialFingerprint ||
+              runtime.get(row.endpointId) !== instance ||
+              !discordGatewayRuntimeIsCurrent(row.endpointId, context)
+            )
+              return;
+            await tx
+              .update(chatEndpoints)
+              .set({ capabilities: { ...current.capabilities, modals: true } })
+              .where(
+                and(
+                  eq(chatEndpoints.companyId, current.companyId),
+                  eq(chatEndpoints.id, current.id),
+                ),
+              );
+          });
+        }
         local += 1;
       } catch (error) {
         if (isDiscordGatewayNotOwnedError(error)) {
@@ -17466,6 +17538,40 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     ) {
       return deny({ principalId: principal.principal.id });
     }
+    const isCorrection = isDiscordQuestionFormCorrectionId(
+      event.event.actionId,
+    );
+    const correction =
+      isCorrection &&
+      event.provider === "discord" &&
+      event.transport === "discord_gateway"
+        ? await loadDiscordQuestionFormCorrection(
+            persistence,
+            {
+              companyId: record.endpoint.companyId,
+              endpointId: record.endpoint.id,
+            },
+            event.event.actionId,
+            {
+              principalId: principal.principal.id,
+              userId: principal.userId,
+              externalUserId: event.event.user.userId,
+            },
+            event.event.threadId,
+          )
+        : null;
+    if (
+      isCorrection &&
+      (!correction ||
+        discordQuestionFormThreadId(event.event.raw) !== event.event.threadId)
+    )
+      return deny({ principalId: principal.principal.id });
+    // The private correction handle selects the original publication, never
+    // the new ephemeral error message. It does not bypass any current source,
+    // destination, actor, open-token, or pending-interaction check below.
+    const sourceActionId = correction?.openActionId ?? event.event.actionId;
+    const sourceMessageId =
+      correction?.providerMessageId ?? event.event.messageId;
     const actionBinding = await db
       .select()
       .from(chatActions)
@@ -17478,12 +17584,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             "question_form_open",
             "confirmation_response",
           ]),
-          eq(chatActions.providerActionId, event.event.actionId),
+          eq(chatActions.providerActionId, sourceActionId),
         ),
       )
       .then((rows) => (rows.length === 1 ? rows[0]! : null));
     const originalPublicationId = actionBinding?.payload.publicationId;
     const actionInteractionId = actionBinding?.payload.interactionId;
+    if (
+      correction &&
+      (actionBinding?.kind !== "question_form_open" ||
+        actionBinding.conversationId !== correction.conversationId ||
+        originalPublicationId !== correction.publicationId ||
+        actionInteractionId !== correction.interactionId ||
+        actionBinding.payload.formActionId !== correction.submitActionId)
+    )
+      return deny({ principalId: principal.principal.id });
     if (
       !actionBinding?.conversationId ||
       typeof originalPublicationId !== "string" ||
@@ -17552,12 +17667,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           inArray(chatPublications.state, ["published", "delivery_unknown"]),
           or(
             isNull(chatPublications.providerMessageId),
-            eq(chatPublications.providerMessageId, event.event.messageId),
+            eq(chatPublications.providerMessageId, sourceMessageId),
           ),
         ),
       )
       .then((rows) => rows[0] ?? null);
     if (!originalPublication) return deny(safelyKnown);
+    if (
+      correction &&
+      (originalPublication.state !== "published" ||
+        originalPublication.providerMessageId !== correction.providerMessageId)
+    )
+      return deny(safelyKnown);
     if (!originalPublication.providerMessageId) {
       const reconciledPublication = await db.transaction(async (tx) => {
         const current = await tx
@@ -17663,11 +17784,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           eq(chatMessageLinks.companyId, record.endpoint.companyId),
           eq(chatMessageLinks.endpointId, record.endpoint.id),
           eq(chatMessageLinks.conversationId, conversation.id),
-          eq(chatMessageLinks.providerMessageId, event.event.messageId),
+          eq(chatMessageLinks.providerMessageId, sourceMessageId),
           eq(chatMessageLinks.direction, "outbound"),
           eq(chatPublications.issueId, conversation.issueId),
           eq(chatPublications.state, "published"),
-          eq(chatPublications.providerMessageId, event.event.messageId),
+          eq(chatPublications.providerMessageId, sourceMessageId),
         ),
       )
       .then((rows) => (rows.length === 1 ? rows[0]! : null));
@@ -17707,12 +17828,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
     if (
       !payload.interactionId ||
-      (event.provider !== "telegram" &&
+      (!correction &&
+        event.provider !== "telegram" &&
         event.event.value !== payload.interactionId) ||
       !payload.card?.actions?.some(
         (action) =>
-          action.type === "callback" &&
-          action.actionId === event.event.actionId,
+          action.type === "callback" && action.actionId === sourceActionId,
       )
     ) {
       return deny(safelyKnown);
@@ -17729,6 +17850,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return deny(safelyKnown);
     }
     if (interaction.status !== "pending") {
+      if (correction) return deny(safelyKnown);
       const completedAction = await db
         .select()
         .from(chatActions)
@@ -17988,8 +18110,16 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     if (interaction.kind !== "ask_user_questions") {
       return deny(safelyKnown);
     }
-    if (isChatQuestionFormOpenActionId(event.event.actionId)) {
-      if (event.provider !== "slack" && event.provider !== "microsoft-teams") {
+    if (isChatQuestionFormOpenActionId(sourceActionId)) {
+      if (
+        event.provider !== "slack" &&
+        event.provider !== "microsoft-teams" &&
+        !(
+          event.provider === "discord" &&
+          event.transport === "discord_gateway" &&
+          record.endpoint.capabilities.modals === true
+        )
+      ) {
         return deny(safelyKnown);
       }
       await options.questionFormOpenAuthorizationBarrier?.();
@@ -18020,7 +18150,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             endpointId: record.endpoint.id,
             conversationId: conversation.id,
             interaction,
-            openActionId: event.event.actionId,
+            openActionId: sourceActionId,
           });
           if (!resolved || resolved.publicationId !== issued.publication.id) {
             return { kind: "denied" as const };
@@ -18056,6 +18186,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         });
         if (preflight.kind === "denied") return deny(safelyKnown);
         if (preflight.kind === "duplicate") {
+          if (event.provider === "discord") {
+            // A prior attempt may have consumed Discord's single response.
+            // A fresh handler has no showModal closure state for that attempt;
+            // do not turn its processing/failed receipt into a success ACK.
+            throw Object.assign(
+              new Error("Discord modal response was already attempted"),
+              { code: "chat_discord_gateway_modal_response_indeterminate" },
+            );
+          }
           await recordCurrentMicrosoftTeamsRoute(
             record.endpoint,
             runtimeContext,
@@ -18077,8 +18216,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // trigger. The final Paperclip authorization snapshot above commits
         // before transport starts so provider latency never holds endpoint,
         // destination, identity-link, or membership row locks.
+        const modal = correction
+          ? discordQuestionFormCorrectionModal(
+              preflight.resolved.modal,
+              correction,
+            )
+          : preflight.resolved.modal;
+        if (!modal) return deny(safelyKnown);
         providerAttempted = true;
-        const opened = await event.event.openModal(preflight.resolved.modal);
+        const opened = await event.event.openModal(modal);
         if (!opened) {
           await recordModalOpenFailure(
             record.endpoint,
@@ -18087,6 +18233,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             { ...safelyKnown, attemptActionId, resource },
             new Error("Provider did not confirm the modal open"),
           );
+          if (event.provider === "discord") return deny(safelyKnown);
           return;
         }
         if (attemptActionId) {
@@ -18122,6 +18269,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           { ...safelyKnown, attemptActionId, resource },
           error,
         );
+        if (event.provider === "discord") return deny(safelyKnown);
         // The provider attempt is now a durable, non-replayable Activity row.
         // Acknowledge the callback so Chat SDK does not turn a definite denial
         // or an ambiguous modal open into a duplicate retry loop.
@@ -18420,7 +18568,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       record.endpoint.status !== "active" ||
       record.endpoint.provider !== event.provider ||
       record.endpoint.capabilities.modals !== true ||
-      (event.provider !== "slack" && event.provider !== "microsoft-teams")
+      (event.provider !== "slack" &&
+        event.provider !== "microsoft-teams" &&
+        !(
+          event.provider === "discord" && event.transport === "discord_gateway"
+        ))
     ) {
       const staleRecord =
         record ??
@@ -18432,7 +18584,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           code: "chat_modal_runtime_not_current",
         });
       }
-      return chatQuestionFormDenialResponse();
+      return event.provider === "discord"
+        ? discordQuestionFormDenialResponse()
+        : chatQuestionFormDenialResponse();
     }
     const deny = async (
       code: string,
@@ -18446,7 +18600,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         code,
         ...safelyKnown,
       });
-      return chatQuestionFormDenialResponse(payload);
+      return event.provider === "discord"
+        ? discordQuestionFormDenialResponse()
+        : chatQuestionFormDenialResponse(payload);
     };
     const loaded = await loadChatQuestionFormSubmissionToken(db, {
       callbackId: event.event.callbackId,
@@ -18469,6 +18625,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .then((rows) => rows[0] ?? null);
     if (
       !conversation ||
+      (event.provider === "discord" &&
+        discordQuestionFormThreadId(event.event.raw) !==
+          conversation.externalThreadId) ||
       (event.event.relatedThread &&
         (event.provider === "microsoft-teams"
           ? !sameTeamsThreadIdentity(
@@ -18543,7 +18702,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           eq(chatPublications.issueId, conversation.issueId),
           eq(chatPublications.id, loaded.publicationId),
           eq(chatPublications.state, "published"),
-          event.event.relatedMessage
+          event.provider !== "discord" && event.event.relatedMessage
             ? eq(
                 chatPublications.providerMessageId,
                 event.event.relatedMessage.id,
@@ -18553,7 +18712,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
       .then((rows) => rows[0] ?? null);
     const providerMessageId =
-      event.event.relatedMessage?.id ??
+      (event.provider === "discord"
+        ? undefined
+        : event.event.relatedMessage?.id) ??
       originalPublication?.providerMessageId ??
       null;
     if (!originalPublication || !providerMessageId) {
@@ -18629,6 +18790,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const interaction = (
       await issueThreadInteractionService(db).listForIssue(conversation.issueId)
     ).find((candidate) => candidate.id === loaded.interactionId);
+    const discordReplayAnswersMatch = (
+      resolved: typeof interaction,
+    ): boolean => {
+      if (event.provider !== "discord") return true;
+      if (
+        resolved?.kind !== "ask_user_questions" ||
+        resolved.status !== "answered"
+      )
+        return false;
+      // Parse only for comparison after current token/source/actor checks.
+      // This local pending projection cannot reopen or resolve an interaction.
+      const submitted = validateChatQuestionFormSubmission({
+        callbackId: event.event.callbackId,
+        privateMetadata: event.event.privateMetadata,
+        interaction: { ...resolved, status: "pending" },
+        payload: loaded.payload,
+        values: event.event.values,
+      });
+      return (
+        submitted.ok &&
+        JSON.stringify(submitted.answers) ===
+          JSON.stringify(resolved.result?.answers)
+      );
+    };
     const isExactProcessedReplay = (
       current: Awaited<ReturnType<typeof loadChatQuestionFormSubmissionToken>>,
     ) =>
@@ -18644,7 +18829,38 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       current.interactionId === loaded.interactionId &&
       current.principalId === principal.principal.id &&
       current.result?.code === "question_form_answered" &&
-      current.result?.interactionId === loaded.interactionId;
+      current.result?.interactionId === loaded.interactionId &&
+      discordReplayAnswersMatch(interaction);
+    const acceptedResponse = async (): Promise<ModalResponse> => {
+      if (event.provider === "discord") {
+        try {
+          await deleteDiscordQuestionFormCorrection(
+            persistence,
+            {
+              companyId: record.endpoint.companyId,
+              endpointId: record.endpoint.id,
+            },
+            {
+              principalId: principal.principal.id,
+              userId: principal.userId!,
+              externalUserId: event.event.user.userId,
+            },
+            loaded.payload.formActionId,
+          );
+        } catch {
+          // The answer receipt is already committed. Cleanup is retryable on
+          // exact replay/expiry access and cannot relabel an accepted answer.
+          logger.warn(
+            {
+              endpointId: record.endpoint.id,
+              code: "discord_question_correction_cleanup_failed",
+            },
+            "Discord correction draft cleanup will be retried",
+          );
+        }
+      }
+      return { action: "clear" };
+    };
     if (loaded.status === "processed") {
       if (!isExactProcessedReplay(loaded)) {
         return deny(
@@ -18664,7 +18880,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           event.event.raw,
         );
       }
-      return { action: "clear" };
+      return acceptedResponse();
     }
     if (
       !interaction ||
@@ -18715,7 +18931,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             event.event.raw,
           );
         }
-        return { action: "clear" };
+        return acceptedResponse();
       }
       return deny(
         "chat_modal_interaction_not_pending",
@@ -18735,6 +18951,91 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     });
     if (!validation.ok) {
       if (validation.code === "invalid_form") {
+        if (event.provider === "discord") {
+          const openAction = payload.card?.actions?.find(
+            (action) =>
+              action.type === "callback" &&
+              isChatQuestionFormOpenActionId(action.actionId),
+          );
+          const openActionId =
+            openAction?.type === "callback" ? openAction.actionId : null;
+          if (!openActionId) return deny("chat_modal_open_token_not_current");
+          try {
+            return await db.transaction(async (tx) => {
+              await requireCurrentExternalActionAuthorization(tx, {
+                conversationId: conversation.id,
+                endpointId: record.endpoint.id,
+                expectedUserId: principal.userId!,
+                principalId: principal.principal.id,
+                runtimeContext,
+              });
+              const pending = await tx
+                .select({ id: issueThreadInteractions.id })
+                .from(issueThreadInteractions)
+                .where(
+                  and(
+                    eq(
+                      issueThreadInteractions.companyId,
+                      record.endpoint.companyId,
+                    ),
+                    eq(issueThreadInteractions.issueId, conversation.issueId),
+                    eq(issueThreadInteractions.id, interaction.id),
+                    eq(issueThreadInteractions.status, "pending"),
+                  ),
+                )
+                .for("update")
+                .then((rows) => rows[0]);
+              const resolved = pending
+                ? await resolveChatQuestionFormOpen(tx, {
+                    companyId: record.endpoint.companyId,
+                    endpointId: record.endpoint.id,
+                    conversationId: conversation.id,
+                    interaction,
+                    openActionId,
+                  })
+                : null;
+              if (
+                !resolved ||
+                resolved.submitActionId !== loaded.payload.formActionId ||
+                resolved.publicationId !== originalPublication.id
+              )
+                throw denialError();
+              return retainDiscordQuestionFormCorrection(
+                createChatSdkStatePersistence(tx as unknown as Db),
+                {
+                  companyId: record.endpoint.companyId,
+                  endpointId: record.endpoint.id,
+                },
+                {
+                  principalId: principal.principal.id,
+                  userId: principal.userId!,
+                  externalUserId: event.event.user.userId,
+                  conversationId: conversation.id,
+                  publicationId: originalPublication.id,
+                  providerMessageId,
+                  threadId: conversation.externalThreadId,
+                  interactionId: interaction.id,
+                  openActionId,
+                  submitActionId: resolved.submitActionId,
+                  parentExpiresAt: loaded.payload.expiresAt,
+                  modal: resolved.modal,
+                  values: event.event.values,
+                  fieldErrors: validation.fieldErrors,
+                },
+              );
+            });
+          } catch (error) {
+            if (
+              isExternalActionAuthorizationChange(error) ||
+              (error &&
+                typeof error === "object" &&
+                "status" in error &&
+                error.status === 403)
+            )
+              return deny("chat_modal_correction_not_authorized");
+            throw error;
+          }
+        }
         return chatQuestionFormValidationResponse({
           provider: event.provider,
           callbackId: event.event.callbackId,
@@ -18880,7 +19181,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             tx,
           );
         });
-        return chatQuestionFormDenialResponse(loaded.payload);
+        return event.provider === "discord"
+          ? discordQuestionFormDenialResponse()
+          : chatQuestionFormDenialResponse(loaded.payload);
       }
       const settledRace = await db.transaction(async (tx) => {
         const currentInteraction = (
@@ -18917,7 +19220,31 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       scheduleMessageProcessing(async () => {
         await processPendingPublications();
       });
-      return { action: "clear" };
+      if (event.provider === "discord") {
+        const current = await loadChatQuestionFormSubmissionToken(db, {
+          callbackId: event.event.callbackId,
+          companyId: record.endpoint.companyId,
+          endpointId: record.endpoint.id,
+          includeProcessed: true,
+        });
+        const resolved = (
+          await issueThreadInteractionService(db).listForIssue(
+            conversation.issueId,
+          )
+        ).find((candidate) => candidate.id === interaction.id);
+        if (
+          current?.status !== "processed" ||
+          current.actionRowId !== loaded.actionRowId ||
+          current.principalId !== principal.principal.id ||
+          current.result?.code !== "question_form_answered" ||
+          current.result.interactionId !== interaction.id ||
+          resolved?.status !== "answered" ||
+          resolved.resolvedByUserId !== principal.userId ||
+          !discordReplayAnswersMatch(resolved)
+        )
+          return deny("chat_modal_resolution_committed_elsewhere");
+      }
+      return acceptedResponse();
     }
     if (event.event.relatedThread) {
       await recordCurrentMicrosoftTeamsRoute(
@@ -18930,7 +19257,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     scheduleMessageProcessing(async () => {
       await questionResponses.deliver(answered.id);
     });
-    return { action: "clear" };
+    return acceptedResponse();
   }
 
   async function latestSlackDmControlThreadId(

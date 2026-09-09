@@ -300,10 +300,16 @@ export async function enqueueIssueInteractionChatPublications(
     const formDraft =
       interaction.kind === "ask_user_questions" &&
       (endpoint.provider === "slack" ||
+        endpoint.provider === "discord" ||
         endpoint.provider === "microsoft-teams") &&
       endpoint.capabilities.actions === true &&
       endpoint.capabilities.modals === true
-        ? createChatQuestionFormDraft(interaction)
+        ? createChatQuestionFormDraft(
+            interaction,
+            endpoint.provider === "discord"
+              ? { nativeProvider: "discord" }
+              : {},
+          )
         : null;
     const supportsCallbacks =
       formDraft === null &&
