@@ -2919,5 +2919,15 @@ admission and provider publication behavior are unchanged.
 The diagnostic's TLS-debug guard also now rejects Node's underscore and
 `=true` tracing aliases before any request. All six injected regressions first
 failed, then passed; the final canary suite is **55/55**, with no real network
-traffic in those tests. Live verification of the logging repair follows its
-separate server deployment; these automated results are not a deployment claim.
+traffic in those tests.
+
+Root deployed `b2e44c5b6` separately as server **67**, PID **32112**, at
+01:39:36 UTC, keeping the existing normal runner artifact. Server 66 drained
+with zero interrupted runs and exited cleanly. Startup recovery and private
+Board health are ready. Repeating the single inert probe at 01:40:06–07 UTC
+returned HTTP 401 via public Funnel in **591.593ms** and the local proxy in
+**7.677ms**. The database again changed by **zero deliveries, runs and
+publications**; both generic HTTP warnings now contain only the placeholder
+webhook route and `reqBody: "[REDACTED]"`, not the observed raw Buffer bytes.
+This verifies the deployed logging fix without publishing any chat message.
+The new provider startup/attach fencing remains a separate, undeployed slice.

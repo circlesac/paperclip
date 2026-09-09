@@ -45,12 +45,14 @@ signature HTTP 401 through both public relay address families; no new live
 deliveries, runs or publications were created. Historical Slack HTTP error is
 still unlocalized; no host sleep transition occurred in its bounded window.
 
-Current deployment (September 9, 01:09 UTC): server **66**, PID **61423**,
-handle **47172**, is healthy on **127.0.0.1:3137**, loaded code `807e2ace2`.
-The private Tailscale Board URL and webhook-only proxy are unchanged. Server 65
-drained with zero interrupted runs and closed; server 66 startup recovery is
-ready. No new heartbeat was created and historical Discord/Telegram maintenance
-attempt counts stayed 1/2 respectively: the new path fix did not replay them.
+Current deployment (September 9, 01:39 UTC): server **67**, PID **32112**,
+handle **72874**, is healthy on **127.0.0.1:3137**, loaded code `b2e44c5b6`.
+The private Tailscale Board URL and webhook-only proxy are unchanged. Server 66
+drained with zero interrupted runs and closed; server 67 startup recovery is
+ready. Live inert public/proxy probes at 01:40 UTC returned HTTP 401 in
+591.593/7.677ms with zero new deliveries, runs or publications. Generic webhook
+logs now show the redacted route/body, not raw Buffer bytes. The startup-fencing
+Rust changes are not in this deployment.
 Normal staged runner remains SHA `4acf2d1dbe99a6202d07b6d0be73b469ebf153103cda2bbd097e5e4233fcd57a`.
 
 Next: once the user unlocks the Mac, run the same two-file native Discord/Slack
