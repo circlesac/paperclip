@@ -3127,3 +3127,25 @@ wrong company and receives **422 Issue does not belong to company**. Four real
 isolated-browser cases reproduce this, including wrong-prefix identifier links
 and both task interfaces. The loaded-task-company navigation/upload correction
 is in progress; it is not covered by the GitHub service tests above.
+
+The task-company correction now derives both upload IDs from the loaded task
+and the canonical route prefix from its visible company mapping. Placeholder
+or prior-task data cannot redirect or upload. Both interfaces, normal/uppercase
+UUID links and wrong-prefix identifier links pass **6/6** focused browser cases:
+the upload reaches the correct company/UUID, stored bytes match, and uploading
+does not create a comment. The original immediate-upload case also passed three
+consecutive repeats without an added wait.
+
+The first correction exposed a real transition failure (3/4 passing): the old
+UUID composer could open a chooser, then be replaced while canonical comments
+loaded, leaving no attachment and no HTTP request. The existing noninteractive
+header/loading surface now covers outgoing canonical-route/interface transitions.
+This does not block on selected-company state or weaken server company checks.
+Nonlegacy search/hash preservation and final organization selection are included
+in the broader rerun. UI types, all four styling gates and **48/48** focused
+cache/navigation/contract tests pass. Root reloaded the live canonical Discord
+task and visually verified its settled header, content and composer. That is
+not a live multi-company fallback or continuous transition recording.
+The final full deterministic chat browser cohort passed **29/29**, zero retries,
+in **2.8 minutes**, including the six new navigation/upload cases and preserved
+nonlegacy query/hash and selected-organization checks.

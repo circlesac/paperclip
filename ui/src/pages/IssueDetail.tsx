@@ -86,6 +86,7 @@ import {
   readIssueDetailLocationState,
   readIssueDetailBreadcrumb,
   readIssueDetailHeaderSeed,
+  withIssueDetailHeaderSeed,
   rememberIssueDetailLocationState,
   shouldArmIssueDetailInboxQuickArchive,
 } from "../lib/issueDetailBreadcrumb";
@@ -2774,8 +2775,11 @@ function IssueDetailActivityTab({
 }
 
 export function IssueDetail() {
-  const { issueId } = useParams<{ issueId: string }>();
-  const { selectedCompanyId } = useCompany();
+  const { issueId, companyPrefix } = useParams<{
+    issueId: string;
+    companyPrefix: string;
+  }>();
+  const { companies, selectedCompanyId } = useCompany();
   // Classic Task Interface remains the sole task-chat-vs-pre-chat switch from
   // master. Streamlined UI only layers the new task-detail presentation onto
   // master's default task-chat shell.
@@ -2888,6 +2892,7 @@ export function IssueDetail() {
   const {
     data: issue,
     isLoading,
+    isPlaceholderData,
     error,
   } = useQuery({
     ...getIssueDetailQueryOptions(queryClient, issueId!, {
@@ -2900,6 +2905,26 @@ export function IssueDetail() {
     }),
     enabled: !!issueId,
   });
+  // A cached header seed can paint during navigation, but must not redirect
+  // or upload against the previous task while the requested task is loading.
+  const loadedIssue =
+    !isPlaceholderData &&
+    !error &&
+    issue &&
+    issueId &&
+    (issue.id.toLowerCase() === issueId.toLowerCase() ||
+      issue.identifier?.toLowerCase() === issueId.toLowerCase())
+      ? issue
+      : null;
+  const loadedIssueCompany = loadedIssue
+    ? companies.find((company) => company.id === loadedIssue.companyId)
+    : undefined;
+  const taskRouteReady = Boolean(
+    loadedIssue &&
+      issueId === (loadedIssue.identifier ?? loadedIssue.id) &&
+      (!loadedIssueCompany || companyPrefix === loadedIssueCompany.issuePrefix) &&
+      !hasLegacyIssueDetailQuery(location.search),
+  );
   const resolvedCompanyId = issue?.companyId ?? selectedCompanyId;
   const externalObjectsState = useIssueExternalObjects(issue?.id ?? null);
   // A closed isolated workspace no longer blocks the composer. The server reopens
@@ -5069,8 +5094,13 @@ export function IssueDetail() {
 
   const uploadAttachment = useMutation({
     mutationFn: async (file: File) => {
-      if (!selectedCompanyId) throw new Error("No organization selected");
-      return issuesApi.uploadAttachment(selectedCompanyId, issueId!, file);
+      if (!loadedIssue)
+        throw new Error("Task details are still loading. Please try again.");
+      return issuesApi.uploadAttachment(
+        loadedIssue.companyId,
+        loadedIssue.id,
+        file,
+      );
     },
     onSuccess: () => {
       setAttachmentError(null);
@@ -5297,35 +5327,42 @@ export function IssueDetail() {
     if (main) main.scrollTop = 0;
   }, [issueId, navigationType]);
 
-  // Redirect to identifier-based URL if navigated via UUID
+  // Resolve external UUID links and wrong-prefix task links from the loaded
+  // task's company, not the organization that happened to be selected first.
   useEffect(() => {
+    if (!loadedIssue) return;
     const nextState = resolvedIssueDetailState ?? location.state;
-    if (issue?.identifier && issueId !== issue.identifier) {
-      rememberIssueDetailLocationState(
-        issue.identifier,
-        nextState,
-        location.search,
+    const taskCompany = loadedIssueCompany;
+    const canonicalRef = loadedIssue.identifier ?? loadedIssue.id;
+    const companyMismatch =
+      taskCompany && companyPrefix !== taskCompany.issuePrefix;
+    const legacyQuery = hasLegacyIssueDetailQuery(location.search);
+    if (issueId !== canonicalRef || companyMismatch || legacyQuery) {
+      rememberIssueDetailLocationState(canonicalRef, nextState, location.search);
+      const taskPath = createIssueDetailPath(canonicalRef);
+      navigate(
+        {
+          pathname: taskCompany
+            ? `/${taskCompany.issuePrefix}${taskPath}`
+            : taskPath,
+          search: legacyQuery ? "" : location.search,
+          hash: location.hash,
+        },
+        {
+          replace: true,
+          state: nextState,
+        },
       );
-      navigate(createIssueDetailPath(issue.identifier), {
-        replace: true,
-        state: nextState,
-      });
-      return;
-    }
-
-    if (issueId && hasLegacyIssueDetailQuery(location.search)) {
-      rememberIssueDetailLocationState(issueId, nextState, location.search);
-      navigate(createIssueDetailPath(issueId), {
-        replace: true,
-        state: nextState,
-      });
     }
   }, [
-    issue,
+    loadedIssue,
+    loadedIssueCompany,
+    companyPrefix,
     issueId,
     navigate,
     location.state,
     location.search,
+    location.hash,
     resolvedIssueDetailState,
   ]);
 
@@ -6475,6 +6512,22 @@ export function IssueDetail() {
     return <IssueDetailLoadingState headerSeed={issueHeaderSeed} />;
   if (error) return <p className="text-sm text-destructive">{error.message}</p>;
   if (!issue) return null;
+  // Do not expose a file chooser on the outgoing UUID/company/interface
+  // branch: its input can be detached before the chosen file is returned.
+  // Keep the existing metadata/header skeleton until the canonical view owns
+  // the interaction; comments may then load without another route-key change.
+  if (!taskRouteReady || !taskInterfaceSettingsLoaded)
+    return (
+      <IssueDetailLoadingState
+        headerSeed={
+          loadedIssue
+            ? readIssueDetailHeaderSeed(
+                withIssueDetailHeaderSeed(null, loadedIssue),
+              )
+            : issueHeaderSeed
+        }
+      />
+    );
 
   // Ancestors are returned oldest-first from the server (root at end, immediate parent at start)
   const ancestors = issue.ancestors ?? [];

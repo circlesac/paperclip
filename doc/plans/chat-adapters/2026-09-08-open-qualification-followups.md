@@ -7,6 +7,34 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 02:47 UTC: GitHub navigation is pushed as `e7f069603`; server 68
+still runs loaded `3a2a911bd` and normal runner `2400740c…`, not the pending
+protocol. Root independently repeated the 32 URL/stream units and server types.
+The multi-company task-link correction now passes **6/6** browser cases plus
+**3/3** immediate-upload repeats. The first UI correction was only 3/4: a file
+chooser on the outgoing UUID composer lost the selection when the canonical
+comments query replaced that composer. The existing header/loading surface now
+fences outgoing task-route/interface transitions, without test sleeps or a
+selected-company liveness gate. Full chat browser verification passed
+**29/29**, zero retries, in **2.8 minutes**. Root reloaded the live Discord task
+and verified its normal settled
+layout; this is not the pending GitHub provider-link deployment.
+
+Runner transition recovery is still moving. James owns packages/core/Rust and
+local plus stable routed old/new registration. Epicurus owns narrow executor
+pre-migration evidence preservation/admission and the vendor validator export.
+Do not treat a copied receipt as permission to restart or claim an unreachable
+synthetic restart fixture as end-to-end recovery. A real classifier-produced
+claim must reach the transport. Generic provider-ingress/listen provisioning
+needs explicit composite ownership and remains unsupported in this slice.
+The real heartbeat path rebinds the new run's checkpoint and carries prior
+runner ownership before warm attach; use that actual classifier path in composed
+tests. Do not substitute a manually invented restart claim. The current server
+pre-gate otherwise mistakes forward transition schema for indeterminate identity;
+its preservation/admission fix and tests are explicitly part of this work.
+No normal runner staging, server restart, historical quarantine surgery or PR
+tending until the composed source and authority boundaries are qualified.
+
 The GitHub omission-navigation slice is frozen: root full integration passed
 **610/610**, zero skips, on fresh `chat_adapters_gh_navigation_20260909_root01`
 (125.11 seconds); focused new cases **26/26** and server types pass. It appends
