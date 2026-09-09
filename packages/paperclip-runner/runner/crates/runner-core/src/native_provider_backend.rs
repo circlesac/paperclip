@@ -19,6 +19,13 @@ enum SelectedExecutor {
 }
 
 impl CommandExecutor for SelectedExecutor {
+    fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        match self {
+            Self::LocalFacade(executor) => executor.retained_events(),
+            Self::Acpx(executor) => executor.retained_events(),
+            Self::Managed(executor) => executor.retained_events(),
+        }
+    }
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
         match self {
             Self::LocalFacade(executor) => executor.execute(command),
@@ -165,6 +172,11 @@ impl NativeProviderCommandExecutor {
 }
 
 impl CommandExecutor for NativeProviderCommandExecutor {
+    fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        self.selected
+            .as_mut()
+            .map_or_else(|| Ok(Vec::new()), CommandExecutor::retained_events)
+    }
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
         self.select_recovery()?;
         if self.selected.is_none()

@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent, RejectedAcceptedTurn,
-    MAX_SETTLED_PROVIDER_TURN_IDS,
+    CodexProvider, CodexProviderConfig, CodexProviderEvent, ProviderStartupObservation,
+    ProviderStartupStage, RejectedAcceptedTurn, MAX_SETTLED_PROVIDER_TURN_IDS,
 };
 use crate::durable::{
     create_private_temporary_file, current_unix_ms, open_private_regular_file,
@@ -30,6 +30,7 @@ use crate::provider_bridge::{
 use crate::provider_events::{
     normalize_codex_notification, normalized_codex_terminal_event_type, NormalizedProviderEvent,
 };
+use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
 
 const PROVIDER_STATE_SCHEMA: &str = "paperclip.runner.codex-provider-state.v1";
 pub const CODEX_PROVIDER_STATE_FILE: &str = "codex-provider-state.json";
@@ -80,13 +81,151 @@ fn receipt_limit_deadline_after(timeout_ms: u64) -> Result<u64, DurableRunnerErr
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderEventIdentity {
     runner_instance_id: String,
     run_id: String,
     normalized_session_id: String,
     turn_id: String,
     item_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderStartupCommand {
+    command_id: String,
+    controller_seq: u64,
+    command_type: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderStartupTrigger {
+    Restore,
+    Ensure,
+    Rollover,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderStartupPhase {
+    Intent,
+    Spawned,
+    InitializationFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderStartupAttempt {
+    schema: String,
+    launch_id: String,
+    phase: ProviderStartupPhase,
+    trigger: ProviderStartupTrigger,
+    attempted_process_generation: u64,
+    origin: Option<ProviderEventIdentity>,
+    command: Option<ProviderStartupCommand>,
+    configuration_fingerprint: String,
+    requested_thread_id: Option<String>,
+    authenticated_thread_id: Option<String>,
+    process_id: Option<u32>,
+    process_group_id: Option<u32>,
+    failed_stage: Option<ProviderStartupStage>,
+    direct_child_exit_observed: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    process_tree_retired: bool,
+}
+
+impl ProviderStartupAttempt {
+    fn validate(&self) -> Result<(), DurableRunnerError> {
+        let identifier = |value: &str, limit: usize| {
+            !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+        };
+        let command_valid = self.command.as_ref().is_none_or(|command| {
+            Command {
+                schema: "paperclip.prp.command.v1".to_owned(),
+                command_id: command.command_id.clone(),
+                controller_seq: command.controller_seq,
+                command_type: command.command_type.clone(),
+                issued_at: "startup-origin".to_owned(),
+                deadline_at: None,
+                precondition: None,
+                payload: json!({}),
+            }
+            .validate()
+            .is_ok()
+        });
+        let has_process =
+            self.process_id.is_some_and(|pid| pid > 0) && self.process_id == self.process_group_id;
+        let no_process = self.process_id.is_none() && self.process_group_id.is_none();
+        let no_exit =
+            !self.direct_child_exit_observed && self.exit_code.is_none() && self.signal.is_none();
+        let exit_valid = if self.direct_child_exit_observed {
+            has_process
+                && (self.exit_code.is_some() ^ self.signal.is_some())
+                && self.signal.is_none_or(|signal| signal > 0)
+        } else {
+            no_exit
+        };
+        let phase_valid = match self.phase {
+            ProviderStartupPhase::Intent => no_process && no_exit && self.failed_stage.is_none(),
+            ProviderStartupPhase::Spawned => has_process && no_exit && self.failed_stage.is_none(),
+            ProviderStartupPhase::InitializationFailed => match self.failed_stage {
+                Some(ProviderStartupStage::Spawn) => no_process && no_exit,
+                Some(_) => has_process && exit_valid,
+                None => false,
+            },
+        };
+        if self.schema != "paperclip.provider_startup.v1"
+            || uuid::Uuid::parse_str(&self.launch_id).is_err()
+            || self.attempted_process_generation == 0
+            || self.authenticated_thread_id.is_some()
+            || self.process_tree_retired
+            || !phase_valid
+            || !command_valid
+            || !self
+                .configuration_fingerprint
+                .strip_prefix("sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+            || self
+                .requested_thread_id
+                .as_ref()
+                .is_some_and(|id| !identifier(id, 240))
+            || self.origin.as_ref().is_some_and(|origin| {
+                !identifier(&origin.runner_instance_id, 512)
+                    || !is_stable_id(&origin.run_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&origin.normalized_session_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&origin.turn_id, DURABLE_STABLE_ID_CHARS)
+                    || !is_stable_id(&origin.item_id, DURABLE_STABLE_ID_CHARS)
+            })
+        {
+            return Err(DurableRunnerError::invalid(
+                "invalid provider startup ownership fence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_startup_audit_event(event: &PolledEvent) -> bool {
+    event.event_type == "harness.diagnostic"
+        && event.payload.get("code") == Some(&json!("provider_startup_ownership"))
+        && event
+            .payload
+            .as_object()
+            .is_some_and(|payload| payload.len() == 2)
+        && event.payload.get("startup").is_some_and(|value| {
+            serde_json::from_value::<ProviderStartupAttempt>(value.clone()).is_ok_and(|attempt| {
+                attempt.validate().is_ok()
+                    && attempt.phase != ProviderStartupPhase::InitializationFailed
+            })
+        })
 }
 
 impl ProviderEventIdentity {
@@ -613,6 +752,8 @@ struct CodexProviderState {
     #[serde(default)]
     provider_process_generation: u64,
     #[serde(default)]
+    startup_attempt: Option<ProviderStartupAttempt>,
+    #[serde(default)]
     completed_turn_process_generation: Option<u64>,
     #[serde(default)]
     completed_provider_turn_id: Option<String>,
@@ -698,6 +839,7 @@ impl CodexProviderState {
             ambiguous_turn_start_pending: false,
             completed_turn_authoritative: false,
             provider_process_generation: 0,
+            startup_attempt: None,
             completed_turn_process_generation: None,
             completed_provider_turn_id: None,
             settled_provider_turn_ids: std::collections::BTreeSet::new(),
@@ -717,6 +859,9 @@ impl CodexProviderState {
     }
 
     fn validate(&self) -> Result<(), DurableRunnerError> {
+        if let Some(attempt) = &self.startup_attempt {
+            attempt.validate()?;
+        }
         self.config
             .validate()
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
@@ -1098,6 +1243,8 @@ pub struct CodexCommandExecutor {
     restore_checked: bool,
     restore_error: Option<DurableRunnerError>,
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
+    startup_command: Option<ProviderStartupCommand>,
+    startup_evidence_error: Option<DurableRunnerError>,
 }
 
 impl CodexCommandExecutor {
@@ -1110,6 +1257,8 @@ impl CodexCommandExecutor {
             restore_checked: false,
             restore_error: None,
             opencode_launch_profile: None,
+            startup_command: None,
+            startup_evidence_error: None,
         }
     }
 
@@ -1155,15 +1304,178 @@ impl CodexCommandExecutor {
         self.state_dir.join(CODEX_PROVIDER_STATE_FILE)
     }
 
-    fn restore(&mut self) -> Result<(), DurableRunnerError> {
-        if self.restore_checked {
-            return Ok(());
+    fn assert_startup_admitted(&self) -> Result<(), DurableRunnerError> {
+        if let Some(error) = &self.startup_evidence_error {
+            return Err(error.clone());
         }
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.startup_attempt.is_some())
+        {
+            return Err(DurableRunnerError::invalid(
+                "provider startup ownership remains unadmitted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn save_startup_fact(&mut self) -> Result<(), DurableRunnerError> {
+        let outcome = (|| {
+            let state = self
+                .state
+                .as_mut()
+                .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+            let attempt = state
+                .startup_attempt
+                .clone()
+                .ok_or_else(|| DurableRunnerError::invalid("provider startup intent missing"))?;
+            state.push_terminal_event(NormalizedProviderEvent {
+                event_type: "harness.diagnostic".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({"code":"provider_startup_ownership", "startup": attempt}),
+            })?;
+            self.save_state()
+        })();
+        if let Err(error) = &outcome {
+            self.startup_evidence_error = Some(error.clone());
+        }
+        outcome
+    }
+
+    fn begin_startup(
+        &mut self,
+        trigger: ProviderStartupTrigger,
+        generation: u64,
+    ) -> Result<(), DurableRunnerError> {
+        self.assert_startup_admitted()?;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+        let configuration = serde_json::to_vec(&state.config).map_err(|_| {
+            DurableRunnerError::invalid("provider startup configuration serialization failed")
+        })?;
+        state.startup_attempt = Some(ProviderStartupAttempt {
+            schema: "paperclip.provider_startup.v1".to_owned(),
+            launch_id: uuid::Uuid::new_v4().to_string(),
+            phase: ProviderStartupPhase::Intent,
+            trigger,
+            attempted_process_generation: generation,
+            origin: self.event_identity.clone(),
+            command: self.startup_command.clone(),
+            configuration_fingerprint: format!("sha256:{:x}", Sha256::digest(configuration)),
+            requested_thread_id: state.thread_id.clone(),
+            authenticated_thread_id: None,
+            process_id: None,
+            process_group_id: None,
+            failed_stage: None,
+            direct_child_exit_observed: false,
+            exit_code: None,
+            signal: None,
+            process_tree_retired: false,
+        });
+        self.save_startup_fact()
+    }
+
+    fn observe_startup(
+        &mut self,
+        observation: ProviderStartupObservation,
+    ) -> Result<(), DurableRunnerError> {
+        let attempt = self
+            .state
+            .as_mut()
+            .and_then(|state| state.startup_attempt.as_mut())
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup intent missing"))?;
+        match observation {
+            ProviderStartupObservation::Spawned {
+                process_id,
+                process_group_id,
+            } => {
+                attempt.phase = ProviderStartupPhase::Spawned;
+                attempt.process_id = Some(process_id);
+                attempt.process_group_id = Some(process_group_id);
+            }
+            ProviderStartupObservation::Failed { stage, child_exit } => {
+                attempt.phase = ProviderStartupPhase::InitializationFailed;
+                attempt.failed_stage = Some(stage);
+                attempt.direct_child_exit_observed = child_exit.is_some();
+                attempt.exit_code = child_exit.as_ref().and_then(|fact| fact.exit_code);
+                attempt.signal = child_exit.as_ref().and_then(|fact| fact.signal);
+            }
+        }
+        self.save_startup_fact()
+    }
+
+    fn start_observed_provider(
+        &mut self,
+        trigger: ProviderStartupTrigger,
+        generation: u64,
+    ) -> Result<CodexProvider, DurableRunnerError> {
+        let state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+        let profile = self.opencode_launch_profile.clone();
+        self.begin_startup(trigger, generation)?;
+        CodexProvider::start_with_tools_observed(
+            &state.config,
+            state.tool_bridge.authorized_tools().cloned(),
+            state.thread_id.as_deref(),
+            generation,
+            profile.as_ref(),
+            state.completion_contract.as_ref().map(|contract| {
+                (
+                    contract.revision.as_str(),
+                    contract.criterion_ids.as_slice(),
+                )
+            }),
+            &mut |observation| {
+                self.observe_startup(observation).map_err(|error| {
+                    crate::local_runner::LocalRunnerError::invalid(error.to_string())
+                })
+            },
+        )
+        .map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to start {} provider: {error}",
+                state.config.provider
+            ))
+        })
+    }
+
+    fn commit_startup_admission(&mut self) -> Result<(), DurableRunnerError> {
+        // Never clear the live fence until the authenticated provider state is
+        // fsynced. Failed persistence leaves the exact attempt unadmitted.
+        let mut next = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
+        next.startup_attempt = None;
+        self.persist_state(&next)?;
+        self.state = Some(next);
+        Ok(())
+    }
+
+    fn fail_started_provider(&mut self, provider: &mut CodexProvider) {
+        let child_exit = provider.retire_failed_startup();
+        let _ = self.observe_startup(ProviderStartupObservation::Failed {
+            stage: ProviderStartupStage::Admission,
+            child_exit,
+        });
+    }
+
+    fn restore(&mut self) -> Result<(), DurableRunnerError> {
         if let Some(error) = self.restore_error.as_ref() {
             return Err(error.clone());
         }
+        self.assert_startup_admitted()?;
+        if self.restore_checked {
+            return Ok(());
+        }
         match self.restore_once() {
             Ok(()) => {
+                self.assert_startup_admitted()?;
                 self.restore_checked = true;
                 Ok(())
             }
@@ -1222,7 +1534,8 @@ impl CodexCommandExecutor {
     }
 
     fn restore_provider_if_needed(&mut self) -> Result<(), DurableRunnerError> {
-        let Some(state) = self.state.as_ref() else {
+        self.assert_startup_admitted()?;
+        let Some(state) = self.state.clone() else {
             return Ok(());
         };
         if self.provider.is_some()
@@ -1266,75 +1579,64 @@ impl CodexCommandExecutor {
         let provider_epoch_requires_rollover = settled_provider_turn_ids.len()
             >= MAX_SETTLED_PROVIDER_TURN_IDS
             || !settled_provider_turn_filter.is_empty();
-        let mut provider = CodexProvider::start_with_tools_for_generation(
-            &state.config,
-            state.tool_bridge.authorized_tools().cloned(),
-            Some(&thread_id),
-            process_generation,
-            self.opencode_launch_profile.as_ref(),
-            state.completion_contract.as_ref().map(|contract| {
-                (
-                    contract.revision.as_str(),
-                    contract.criterion_ids.as_slice(),
-                )
-            }),
-        )
-        .map_err(|error| {
-            DurableRunnerError::invalid(format!(
-                "failed to resume {provider_name} provider: {error}"
-            ))
-        })?;
-        provider.enable_durable_tool_call_replays();
-        provider
-            .restore_settled_turn_identities(
-                settled_provider_turn_ids.iter().cloned(),
-                settled_provider_turn_filter.clone(),
-            )
+        let mut provider = self
+            .start_observed_provider(ProviderStartupTrigger::Restore, process_generation)
             .map_err(|error| {
                 DurableRunnerError::invalid(format!(
-                    "failed to restore local provider turn identities: {error}"
+                    "failed to resume {provider_name} provider: {error}"
                 ))
             })?;
-        let recovered_active_turn_id = provider.active_provider_turn_id().map(str::to_owned);
-        let recovered_turn_ended_with_result = active_provider_result_authoritative
-            && previous_active_turn_id.is_some()
-            && recovered_active_turn_id.is_none();
-        let legacy_epoch_is_ambiguous = (provider_epoch_requires_rollover
-            && (ambiguous_turn_start_pending || recovered_active_turn_id.is_some()))
-            || (tool_replay_history_blocks_admission
-                && (ambiguous_turn_start_pending
-                    || recovered_active_turn_id.is_some()
-                    || (previous_active_turn_id.is_some()
-                        && tool_receipt_epoch_has_active_receipts)));
-        if legacy_epoch_is_ambiguous {
-            // A saturated legacy epoch cannot prove that recovered work can
-            // be identified and settled exactly. Reap the resumed process
-            // generation and close the run instead of risking duplicate work.
-            let provider_reported_active = recovered_active_turn_id.is_some();
-            let provider_shutdown_failed = provider.shutdown().is_err();
-            drop(provider);
-            let state = self
-                .state
-                .as_mut()
-                .expect("Codex state remains available during legacy recovery");
-            state.provider_process_generation = process_generation;
-            state.settled_provider_turn_ids = settled_provider_turn_ids;
-            state.settled_provider_turn_filter = settled_provider_turn_filter;
-            state.active_provider_turn_id = None;
-            state.ambiguous_turn_start_pending = false;
-            state.completed_turn_authoritative = false;
-            state.completed_turn_process_generation = None;
-            state.completed_provider_turn_id = None;
-            state.receipt_limit_diagnostic_emitted = false;
-            state.receipt_limit_interrupt_pending = false;
-            state.receipt_limit_interrupt_accepted = false;
-            state.receipt_limit_interrupt_attempts = 0;
-            state.receipt_limit_interrupt_deadline_unix_ms = None;
-            state.active_provider_result_fingerprint = None;
-            state.active_provider_result_disposition = None;
-            state.last_agent_message = None;
-            state.lifecycle = "closed".to_owned();
-            let _ = state.push_terminal_event(NormalizedProviderEvent {
+        let admission = (|| -> Result<(), DurableRunnerError> {
+            provider.enable_durable_tool_call_replays();
+            provider
+                .restore_settled_turn_identities(
+                    settled_provider_turn_ids.iter().cloned(),
+                    settled_provider_turn_filter.clone(),
+                )
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to restore local provider turn identities: {error}"
+                    ))
+                })?;
+            let recovered_active_turn_id = provider.active_provider_turn_id().map(str::to_owned);
+            let recovered_turn_ended_with_result = active_provider_result_authoritative
+                && previous_active_turn_id.is_some()
+                && recovered_active_turn_id.is_none();
+            let legacy_epoch_is_ambiguous = (provider_epoch_requires_rollover
+                && (ambiguous_turn_start_pending || recovered_active_turn_id.is_some()))
+                || (tool_replay_history_blocks_admission
+                    && (ambiguous_turn_start_pending
+                        || recovered_active_turn_id.is_some()
+                        || (previous_active_turn_id.is_some()
+                            && tool_receipt_epoch_has_active_receipts)));
+            if legacy_epoch_is_ambiguous {
+                // A saturated legacy epoch cannot prove that recovered work can
+                // be identified and settled exactly. Reap the resumed process
+                // generation and close the run instead of risking duplicate work.
+                let provider_reported_active = recovered_active_turn_id.is_some();
+                let provider_shutdown_failed = provider.shutdown().is_err();
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during legacy recovery");
+                state.provider_process_generation = process_generation;
+                state.settled_provider_turn_ids = settled_provider_turn_ids;
+                state.settled_provider_turn_filter = settled_provider_turn_filter;
+                state.active_provider_turn_id = None;
+                state.ambiguous_turn_start_pending = false;
+                state.completed_turn_authoritative = false;
+                state.completed_turn_process_generation = None;
+                state.completed_provider_turn_id = None;
+                state.receipt_limit_diagnostic_emitted = false;
+                state.receipt_limit_interrupt_pending = false;
+                state.receipt_limit_interrupt_accepted = false;
+                state.receipt_limit_interrupt_attempts = 0;
+                state.receipt_limit_interrupt_deadline_unix_ms = None;
+                state.active_provider_result_fingerprint = None;
+                state.active_provider_result_disposition = None;
+                state.last_agent_message = None;
+                state.lifecycle = "closed".to_owned();
+                let _ = state.push_terminal_event(NormalizedProviderEvent {
                 event_type: "harness.diagnostic".to_owned(),
                 priority: EventPriority::P0,
                 payload: json!({
@@ -1347,51 +1649,51 @@ impl CodexCommandExecutor {
                     "providerShutdownFailed": provider_shutdown_failed,
                 }),
             });
-            self.save_state()?;
-            return Ok(());
-        }
-        if let Some(reused_provider_turn_id) = recovered_active_turn_id
-            .as_ref()
-            .filter(|provider_turn_id| {
-                settled_provider_turn_contains(
-                    &settled_provider_turn_ids,
-                    &settled_provider_turn_filter,
-                    provider_turn_id,
-                )
-            })
-            .cloned()
-        {
-            // The durable terminal ledger is authoritative. A resumed provider
-            // that reports one of those identities as active is contradictory
-            // and may still be mutating the workspace. Terminate that process
-            // generation and persist the run closed before exposing recovery
-            // to the controller; otherwise this path would reopen settled work.
-            let provider_shutdown_failed = provider.shutdown().is_err();
-            let state = self
-                .state
-                .as_mut()
-                .expect("Codex state remains available during recovery");
-            state.provider_process_generation = process_generation;
-            state.settled_provider_turn_ids = settled_provider_turn_ids;
-            state.settled_provider_turn_filter = settled_provider_turn_filter;
-            state.active_provider_turn_id = None;
-            state.ambiguous_turn_start_pending = false;
-            state.completed_turn_authoritative = false;
-            state.completed_turn_process_generation = None;
-            state.completed_provider_turn_id = None;
-            state.receipt_limit_diagnostic_emitted = false;
-            state.receipt_limit_interrupt_pending = false;
-            state.receipt_limit_interrupt_accepted = false;
-            state.receipt_limit_interrupt_attempts = 0;
-            state.receipt_limit_interrupt_deadline_unix_ms = None;
-            state.active_provider_result_fingerprint = None;
-            state.active_provider_result_disposition = None;
-            state.last_agent_message = None;
-            state.lifecycle = "closed".to_owned();
-            // Closing the provider is the safety boundary. Preserve that
-            // durable transition even when an already-full event backlog has
-            // no room for an additional diagnostic.
-            let _ = state.push_terminal_event(NormalizedProviderEvent {
+                self.save_state()?;
+                return Ok(());
+            }
+            if let Some(reused_provider_turn_id) = recovered_active_turn_id
+                .as_ref()
+                .filter(|provider_turn_id| {
+                    settled_provider_turn_contains(
+                        &settled_provider_turn_ids,
+                        &settled_provider_turn_filter,
+                        provider_turn_id,
+                    )
+                })
+                .cloned()
+            {
+                // The durable terminal ledger is authoritative. A resumed provider
+                // that reports one of those identities as active is contradictory
+                // and may still be mutating the workspace. Terminate that process
+                // generation and persist the run closed before exposing recovery
+                // to the controller; otherwise this path would reopen settled work.
+                let provider_shutdown_failed = provider.shutdown().is_err();
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during recovery");
+                state.provider_process_generation = process_generation;
+                state.settled_provider_turn_ids = settled_provider_turn_ids;
+                state.settled_provider_turn_filter = settled_provider_turn_filter;
+                state.active_provider_turn_id = None;
+                state.ambiguous_turn_start_pending = false;
+                state.completed_turn_authoritative = false;
+                state.completed_turn_process_generation = None;
+                state.completed_provider_turn_id = None;
+                state.receipt_limit_diagnostic_emitted = false;
+                state.receipt_limit_interrupt_pending = false;
+                state.receipt_limit_interrupt_accepted = false;
+                state.receipt_limit_interrupt_attempts = 0;
+                state.receipt_limit_interrupt_deadline_unix_ms = None;
+                state.active_provider_result_fingerprint = None;
+                state.active_provider_result_disposition = None;
+                state.last_agent_message = None;
+                state.lifecycle = "closed".to_owned();
+                // Closing the provider is the safety boundary. Preserve that
+                // durable transition even when an already-full event backlog has
+                // no room for an additional diagnostic.
+                let _ = state.push_terminal_event(NormalizedProviderEvent {
                 event_type: "harness.diagnostic".to_owned(),
                 priority: EventPriority::P0,
                 payload: json!({
@@ -1404,163 +1706,180 @@ impl CodexCommandExecutor {
                     "providerShutdownFailed": provider_shutdown_failed,
                 }),
             });
-            self.save_state()?;
-            return Ok(());
-        }
-        if ambiguous_turn_start_pending {
-            let recovered_turn_id = recovered_active_turn_id.as_deref().ok_or_else(|| {
+                self.save_state()?;
+                return Ok(());
+            }
+            if ambiguous_turn_start_pending {
+                let recovered_turn_id = recovered_active_turn_id.as_deref().ok_or_else(|| {
                 DurableRunnerError::invalid(
                     format!("cannot safely recover an ambiguous {provider_name} turn start without an active replacement turn"),
                 )
             })?;
-            if completed_provider_turn_id.as_deref() == Some(recovered_turn_id) {
-                return Err(DurableRunnerError::invalid(
+                if completed_provider_turn_id.as_deref() == Some(recovered_turn_id) {
+                    return Err(DurableRunnerError::invalid(
                     format!("ambiguous {provider_name} turn recovery reused the previously completed turn identity"),
                 ));
+                }
             }
-        }
-        provider
-            .restore_completed_turn_authority(
-                (completed_turn_authoritative || recovered_turn_ended_with_result)
-                    && recovered_active_turn_id.is_none()
-                    && !ambiguous_turn_start_pending,
-                if recovered_turn_ended_with_result {
-                    Some(process_generation)
-                } else {
-                    completed_turn_process_generation
-                },
-                if recovered_turn_ended_with_result {
-                    previous_active_turn_id.as_deref()
-                } else {
-                    completed_provider_turn_id.as_deref()
-                },
-            )
-            .map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "failed to restore local provider completion authority: {error}"
-                ))
-            })?;
-        if active_provider_result_authoritative
-            && recovered_active_turn_id.is_some()
-            && recovered_active_turn_id == previous_active_turn_id
-        {
             provider
+                .restore_completed_turn_authority(
+                    (completed_turn_authoritative || recovered_turn_ended_with_result)
+                        && recovered_active_turn_id.is_none()
+                        && !ambiguous_turn_start_pending,
+                    if recovered_turn_ended_with_result {
+                        Some(process_generation)
+                    } else {
+                        completed_turn_process_generation
+                    },
+                    if recovered_turn_ended_with_result {
+                        previous_active_turn_id.as_deref()
+                    } else {
+                        completed_provider_turn_id.as_deref()
+                    },
+                )
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to restore local provider completion authority: {error}"
+                    ))
+                })?;
+            if active_provider_result_authoritative
+                && recovered_active_turn_id.is_some()
+                && recovered_active_turn_id == previous_active_turn_id
+            {
+                provider
                 .mark_active_turn_result_authoritative()
                 .map_err(|error| {
                     DurableRunnerError::invalid(format!(
                         "failed to restore semantic result authority for the active {provider_name} turn: {error}"
                     ))
                 })?;
-        }
-        let resumed_provider_session_id = provider.provider_session_id().map(str::to_owned);
-        let resumed_process_id = provider.process_id();
-        {
-            let state = self
-                .state
-                .as_mut()
-                .expect("Codex state remains available during recovery");
-            state.provider_process_generation = process_generation;
-            state.provider_session_id = resumed_provider_session_id.clone();
-            state.settled_provider_turn_ids = settled_provider_turn_ids;
-            state.settled_provider_turn_filter = settled_provider_turn_filter;
-            state.push_terminal_event(NormalizedProviderEvent {
-                event_type: "session.resumed".to_owned(),
-                priority: EventPriority::P0,
-                payload: json!({
-                    "provider": provider_label,
-                    "providerSessionId": thread_id.clone(),
-                    "providerAccountSessionId": resumed_provider_session_id,
-                    "processId": resumed_process_id,
-                }),
-            })?;
-        }
-        self.provider = Some(provider);
-        if provider_had_exited
-            || ambiguous_turn_start_pending
-            || recovered_active_turn_id != previous_active_turn_id
-        {
-            let recovered_turn_ended =
-                previous_active_turn_id.is_some() && recovered_active_turn_id.is_none();
-            let identity = self.event_identity.clone();
-            let state = self
-                .state
-                .as_mut()
-                .expect("Codex state remains available during recovery");
-            if recovered_turn_ended {
-                if !provider_epoch_requires_rollover {
-                    state.settle_active_provider_turn_identity()?;
-                }
-                let settled = state
-                    .tool_bridge
-                    .settle_turn("provider_turn_terminated")
-                    .map_err(|error| {
-                        DurableRunnerError::invalid(format!(
-                            "failed to settle semantic tools during recovery: {error}"
-                        ))
-                    })?;
-                if !settled.is_empty() {
-                    let identity = identity.as_ref().ok_or_else(|| {
-                        DurableRunnerError::invalid(
-                            "Codex semantic tool events require the durable runner identity",
-                        )
-                    })?;
-                    for result in settled {
-                        state.push_terminal_event(semantic_result_event(identity, &result))?;
+            }
+            let resumed_provider_session_id = provider.provider_session_id().map(str::to_owned);
+            let resumed_process_id = provider.process_id();
+            {
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during recovery");
+                state.provider_process_generation = process_generation;
+                state.provider_session_id = resumed_provider_session_id.clone();
+                state.settled_provider_turn_ids = settled_provider_turn_ids;
+                state.settled_provider_turn_filter = settled_provider_turn_filter;
+                state.push_terminal_event(NormalizedProviderEvent {
+                    event_type: "session.resumed".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({
+                        "provider": provider_label,
+                        "providerSessionId": thread_id.clone(),
+                        "providerAccountSessionId": resumed_provider_session_id,
+                        "processId": resumed_process_id,
+                    }),
+                })?;
+            }
+            if provider_had_exited
+                || ambiguous_turn_start_pending
+                || recovered_active_turn_id != previous_active_turn_id
+            {
+                let recovered_turn_ended =
+                    previous_active_turn_id.is_some() && recovered_active_turn_id.is_none();
+                let identity = self.event_identity.clone();
+                let state = self
+                    .state
+                    .as_mut()
+                    .expect("Codex state remains available during recovery");
+                if recovered_turn_ended {
+                    if !provider_epoch_requires_rollover {
+                        state.settle_active_provider_turn_identity()?;
+                    }
+                    let settled = state
+                        .tool_bridge
+                        .settle_turn("provider_turn_terminated")
+                        .map_err(|error| {
+                            DurableRunnerError::invalid(format!(
+                                "failed to settle semantic tools during recovery: {error}"
+                            ))
+                        })?;
+                    if !settled.is_empty() {
+                        let identity = identity.as_ref().ok_or_else(|| {
+                            DurableRunnerError::invalid(
+                                "Codex semantic tool events require the durable runner identity",
+                            )
+                        })?;
+                        for result in settled {
+                            state.push_terminal_event(semantic_result_event(identity, &result))?;
+                        }
+                    }
+                    state.receipt_limit_diagnostic_emitted = false;
+                    state.receipt_limit_interrupt_pending = false;
+                    state.receipt_limit_interrupt_accepted = false;
+                    state.receipt_limit_interrupt_attempts = 0;
+                    state.receipt_limit_interrupt_deadline_unix_ms = None;
+                    if recovered_turn_ended_with_result {
+                        state.completed_turn_authoritative = true;
+                        state.completed_turn_process_generation = Some(process_generation);
+                        state.completed_provider_turn_id = previous_active_turn_id.clone();
                     }
                 }
-                state.receipt_limit_diagnostic_emitted = false;
-                state.receipt_limit_interrupt_pending = false;
-                state.receipt_limit_interrupt_accepted = false;
-                state.receipt_limit_interrupt_attempts = 0;
-                state.receipt_limit_interrupt_deadline_unix_ms = None;
-                if recovered_turn_ended_with_result {
-                    state.completed_turn_authoritative = true;
-                    state.completed_turn_process_generation = Some(process_generation);
-                    state.completed_provider_turn_id = previous_active_turn_id.clone();
-                }
-            }
-            state.reconcile_active_provider_turn(recovered_active_turn_id.clone());
-            let reconciled = NormalizedProviderEvent {
-                event_type: "session.reconciled".to_owned(),
-                priority: EventPriority::P0,
-                payload: json!({
-                    "provider": provider_label,
-                    "providerSessionId": thread_id,
-                    "previousProviderTurnId": previous_active_turn_id.clone(),
-                    "activeProviderTurnId": recovered_active_turn_id.clone(),
-                }),
-            };
-            if recovered_turn_ended {
-                state.push_terminal_event(reconciled)?;
-                if recovered_turn_ended_with_result {
-                    // The durable correlated tool receipt proves Paperclip
-                    // accepted this exact turn's semantic result before the
-                    // runner stopped observing provider output. Resume
-                    // finalization without inventing another provider turn.
-                    state.extend_terminal_events(terminal_events(state, "turn.completed"))?;
+                state.reconcile_active_provider_turn(recovered_active_turn_id.clone());
+                let reconciled = NormalizedProviderEvent {
+                    event_type: "session.reconciled".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({
+                        "provider": provider_label,
+                        "providerSessionId": thread_id,
+                        "previousProviderTurnId": previous_active_turn_id.clone(),
+                        "activeProviderTurnId": recovered_active_turn_id.clone(),
+                    }),
+                };
+                if recovered_turn_ended {
+                    state.push_terminal_event(reconciled)?;
+                    if recovered_turn_ended_with_result {
+                        // The durable correlated tool receipt proves Paperclip
+                        // accepted this exact turn's semantic result before the
+                        // runner stopped observing provider output. Resume
+                        // finalization without inventing another provider turn.
+                        state.extend_terminal_events(terminal_events(state, "turn.completed"))?;
+                    } else {
+                        // A turn that disappeared while runnerd was offline has no
+                        // trustworthy success notification to replay. Terminate it
+                        // conservatively so the controller cannot wait forever or
+                        // mistake an unknown outcome for success.
+                        state.push_terminal_event(NormalizedProviderEvent {
+                            event_type: "turn.failed".to_owned(),
+                            priority: EventPriority::P0,
+                            payload: json!({
+                                "provider": provider_label,
+                                "providerTurnId": previous_active_turn_id,
+                                "status": "failed",
+                                "providerTerminalObserved": false,
+                            }),
+                        })?;
+                        state.extend_terminal_events(terminal_events(state, "turn.failed"))?;
+                    }
                 } else {
-                    // A turn that disappeared while runnerd was offline has no
-                    // trustworthy success notification to replay. Terminate it
-                    // conservatively so the controller cannot wait forever or
-                    // mistake an unknown outcome for success.
-                    state.push_terminal_event(NormalizedProviderEvent {
-                        event_type: "turn.failed".to_owned(),
-                        priority: EventPriority::P0,
-                        payload: json!({
-                            "provider": provider_label,
-                            "providerTurnId": previous_active_turn_id,
-                            "status": "failed",
-                            "providerTerminalObserved": false,
-                        }),
-                    })?;
-                    state.extend_terminal_events(terminal_events(state, "turn.failed"))?;
+                    state.push_event(reconciled)?;
                 }
-            } else {
-                state.push_event(reconciled)?;
             }
+            if self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.lifecycle == "closed")
+            {
+                return Ok(());
+            }
+            self.commit_startup_admission()
+        })();
+        if admission.is_err()
+            || self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.lifecycle == "closed")
+        {
+            self.fail_started_provider(&mut provider);
+        } else {
+            self.provider = Some(provider);
         }
-        self.save_state()?;
-        Ok(())
+        admission
     }
 
     fn save_state(&self) -> Result<(), DurableRunnerError> {
@@ -1692,7 +2011,7 @@ impl CodexCommandExecutor {
     fn ensure_provider(&mut self) -> Result<&mut CodexProvider, DurableRunnerError> {
         self.restore_provider_if_needed()?;
         if self.provider.is_none() {
-            let state = self.state.as_ref().ok_or_else(|| {
+            let state = self.state.clone().ok_or_else(|| {
                 DurableRunnerError::invalid("Codex provider has not been prepared")
             })?;
             if state.lifecycle == "closed" {
@@ -1706,83 +2025,80 @@ impl CodexCommandExecutor {
                 .ok_or_else(|| DurableRunnerError::invalid("Codex process generation exhausted"))?;
             let (settled_provider_turn_ids, settled_provider_turn_filter) =
                 state.recovered_settled_provider_turn_ids()?;
-            let mut provider = CodexProvider::start_with_tools_for_generation(
-                &state.config,
-                state.tool_bridge.authorized_tools().cloned(),
-                state.thread_id.as_deref(),
-                process_generation,
-                self.opencode_launch_profile.as_ref(),
-                state.completion_contract.as_ref().map(|contract| {
-                    (
-                        contract.revision.as_str(),
-                        contract.criterion_ids.as_slice(),
+            let mut provider = self
+                .start_observed_provider(ProviderStartupTrigger::Ensure, process_generation)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
+                })?;
+            let admission = (|| -> Result<(), DurableRunnerError> {
+                provider.enable_durable_tool_call_replays();
+                provider
+                    .restore_settled_turn_identities(
+                        settled_provider_turn_ids.iter().cloned(),
+                        settled_provider_turn_filter.clone(),
                     )
-                }),
-            )
-            .map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
-            })?;
-            provider.enable_durable_tool_call_replays();
-            provider
-                .restore_settled_turn_identities(
-                    settled_provider_turn_ids.iter().cloned(),
-                    settled_provider_turn_filter.clone(),
-                )
-                .map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to restore Codex provider turn identities: {error}"
-                    ))
-                })?;
-            if state.lifecycle == "prepared" && provider.active_provider_turn_id().is_some() {
-                // A stopped checkpoint has no active work to inherit. Inspect
-                // the actual resumed thread before publishing this process or
-                // accepting any of its buffered tool calls under new authority.
-                let provider_shutdown_failed = provider.shutdown().is_err();
-                drop(provider);
-                let state = self
-                    .state
-                    .as_mut()
-                    .expect("prepared state remains available after provider start");
-                state.provider_process_generation = process_generation;
-                state.lifecycle = "closed".to_owned();
-                let _ = state.push_terminal_event(NormalizedProviderEvent {
-                    event_type: "harness.diagnostic".to_owned(),
-                    priority: EventPriority::P0,
-                    payload: json!({
-                        "code": "prepared_provider_checkpoint_has_active_work",
-                        "paperclipAccepted": false,
-                        "providerReportedActive": true,
-                        "providerShutdownFailed": provider_shutdown_failed,
-                    }),
-                });
-                self.save_state()?;
-                return Err(DurableRunnerError::invalid(
-                    "prepared provider checkpoint resumed unexpected active work",
-                ));
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to restore Codex provider turn identities: {error}"
+                        ))
+                    })?;
+                if state.lifecycle == "prepared" && provider.active_provider_turn_id().is_some() {
+                    // A stopped checkpoint has no active work to inherit. Inspect
+                    // the actual resumed thread before publishing this process or
+                    // accepting any of its buffered tool calls under new authority.
+                    let provider_shutdown_failed = provider.shutdown().is_err();
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("prepared state remains available after provider start");
+                    state.provider_process_generation = process_generation;
+                    state.lifecycle = "closed".to_owned();
+                    let _ = state.push_terminal_event(NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({
+                            "code": "prepared_provider_checkpoint_has_active_work",
+                            "paperclipAccepted": false,
+                            "providerReportedActive": true,
+                            "providerShutdownFailed": provider_shutdown_failed,
+                        }),
+                    });
+                    self.save_state()?;
+                    return Err(DurableRunnerError::invalid(
+                        "prepared provider checkpoint resumed unexpected active work",
+                    ));
+                }
+                provider
+                    .restore_completed_turn_authority(
+                        state.completed_turn_authoritative
+                            && provider.active_provider_turn_id().is_none(),
+                        state.completed_turn_process_generation,
+                        state.completed_provider_turn_id.as_deref(),
+                    )
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to restore Codex completion authority: {error}"
+                        ))
+                    })?;
+                {
+                    let state = self
+                        .state
+                        .as_mut()
+                        .expect("Codex state remains available after provider start");
+                    state.provider_process_generation = process_generation;
+                    state.thread_id = Some(provider.thread_id().to_owned());
+                    state.provider_session_id = provider.provider_session_id().map(str::to_owned);
+                    state.lifecycle = "session_open".to_owned();
+                    state.settled_provider_turn_ids = settled_provider_turn_ids;
+                    state.settled_provider_turn_filter = settled_provider_turn_filter;
+                }
+                self.commit_startup_admission()
+            })();
+            if let Err(error) = admission {
+                self.fail_started_provider(&mut provider);
+                return Err(error);
             }
-            provider
-                .restore_completed_turn_authority(
-                    state.completed_turn_authoritative
-                        && provider.active_provider_turn_id().is_none(),
-                    state.completed_turn_process_generation,
-                    state.completed_provider_turn_id.as_deref(),
-                )
-                .map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to restore Codex completion authority: {error}"
-                    ))
-                })?;
             self.provider = Some(provider);
-            {
-                let state = self
-                    .state
-                    .as_mut()
-                    .expect("Codex state remains available after provider start");
-                state.provider_process_generation = process_generation;
-                state.settled_provider_turn_ids = settled_provider_turn_ids;
-                state.settled_provider_turn_filter = settled_provider_turn_filter;
-            }
-            self.save_state()?;
         }
         self.provider
             .as_mut()
@@ -1827,13 +2143,14 @@ impl CodexCommandExecutor {
         // execute() restores the durable provider before dispatching run.attach.
         // An exact, settled restore can emit one session.resumed notice about
         // the prior provider session before the new run authority is attached.
-        // That lifecycle-only notice is safe to discard during rotation; every
-        // other pending provider event still blocks attachment so terminal,
-        // tool, and reconciliation data cannot be lost.
+        // That lifecycle-only notice is safe to discard during rotation. Closed
+        // startup audit facts are retained for the runner's old-authority ACK
+        // fence; other pending events still block attachment so terminal, tool,
+        // and reconciliation data cannot be lost.
         let only_recovery_notice_pending = next_state
             .pending_events
             .iter()
-            .all(|event| event.event_type == "session.resumed");
+            .all(|event| event.event_type == "session.resumed" || is_startup_audit_event(event));
         if next_state.thread_id.is_none()
             || next_state.lifecycle == "closed"
             || next_state.active_provider_turn_id.is_some()
@@ -1933,7 +2250,7 @@ impl CodexCommandExecutor {
                     })?
         } else if next_state.lifecycle == "prepared"
             && next_state.provider_process_generation > 0
-            && next_state.pending_events.is_empty()
+            && next_state.pending_events.iter().all(is_startup_audit_event)
         {
             // turn.stop deliberately terminates the exact old process and
             // retains a prepared, settled thread checkpoint. Rebind only its
@@ -1956,7 +2273,10 @@ impl CodexCommandExecutor {
             }
             self.provider = None;
         }
-        next_state.pending_events.clear();
+        // Successful startup facts remain owned by their original attempt.
+        // The runner must commit this retained FIFO before rotating authority;
+        // only the superseded informational restore notice is discarded.
+        next_state.pending_events.retain(is_startup_audit_event);
         next_state.lifecycle = if retained_provider {
             "session_open".to_owned()
         } else {
@@ -2130,18 +2450,31 @@ impl CodexCommandExecutor {
             ));
         }
 
+        let next_generation = self
+            .state
+            .as_ref()
+            .and_then(|state| state.provider_process_generation.checked_add(1))
+            .ok_or_else(|| DurableRunnerError::invalid("provider process generation exhausted"))?;
+        self.begin_startup(ProviderStartupTrigger::Rollover, next_generation)?;
         let (restart_result, process_generation, rejected_accepted_turn) = {
-            let provider = self.provider.as_mut().ok_or_else(|| {
+            let mut provider = self.provider.take().ok_or_else(|| {
                 DurableRunnerError::invalid(
                     "Codex provider identity epoch cannot rotate without an attached process",
                 )
             })?;
-            let restart_result = provider.restart_idle_identity_epoch();
-            (
+            let restart_result =
+                provider.restart_idle_identity_epoch_observed(&mut |observation| {
+                    self.observe_startup(observation).map_err(|error| {
+                        crate::local_runner::LocalRunnerError::invalid(error.to_string())
+                    })
+                });
+            let result = (
                 restart_result,
                 provider.process_generation(),
                 provider.take_rejected_accepted_turn(),
-            )
+            );
+            self.provider = Some(provider);
+            result
         };
         if let Err(error) = restart_result {
             if let Some(rejected_accepted_turn) = rejected_accepted_turn {
@@ -2158,33 +2491,41 @@ impl CodexCommandExecutor {
                 "failed to rotate the completed Codex identity epoch: {error}"
             )));
         };
-        let state = self
-            .state
-            .as_mut()
-            .expect("Codex state remains available during identity epoch rollover");
-        state.provider_process_generation = process_generation;
-        state.settled_provider_turn_ids.clear();
-        if let Some(completed_provider_turn_id) = state.completed_provider_turn_id.clone() {
-            // The replacement process restored this still-authoritative
-            // terminal into its fresh epoch. Mirror that one tombstone in the
-            // durable ledger until accepting replacement work revokes the
-            // completion authority.
-            state
-                .settled_provider_turn_ids
-                .insert(completed_provider_turn_id);
+        let admission = (|| {
+            let state = self
+                .state
+                .as_mut()
+                .expect("Codex state remains available during identity epoch rollover");
+            state.provider_process_generation = process_generation;
+            state.settled_provider_turn_ids.clear();
+            if let Some(completed_provider_turn_id) = state.completed_provider_turn_id.clone() {
+                // The replacement process restored this still-authoritative
+                // terminal into its fresh epoch. Mirror that one tombstone in the
+                // durable ledger until accepting replacement work revokes the
+                // completion authority.
+                state
+                    .settled_provider_turn_ids
+                    .insert(completed_provider_turn_id);
+            }
+            state.settled_provider_turn_filter = DurableReplayFilter::default();
+            if tool_rollover_required {
+                state
+                    .tool_bridge
+                    .rollover_replay_epoch_after_provider_restart()
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "failed to rotate Codex semantic tool replay authority: {error}"
+                        ))
+                    })?;
+            }
+            self.commit_startup_admission()
+        })();
+        if let Err(error) = admission {
+            if let Some(mut provider) = self.provider.take() {
+                self.fail_started_provider(&mut provider);
+            }
+            return Err(error);
         }
-        state.settled_provider_turn_filter = DurableReplayFilter::default();
-        if tool_rollover_required {
-            state
-                .tool_bridge
-                .rollover_replay_epoch_after_provider_restart()
-                .map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to rotate Codex semantic tool replay authority: {error}"
-                    ))
-                })?;
-        }
-        self.save_state()?;
         Ok(())
     }
 
@@ -3304,46 +3645,55 @@ impl CodexCommandExecutor {
 
 impl CommandExecutor for CodexCommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
-        self.restore()?;
-        match command.command_type.as_str() {
-            "run.prepare" => self.prepare(&command.payload),
-            "run.attach" => {
-                if self.state.is_none() && command.payload.get("provider").is_some() {
-                    self.prepare(&command.payload)?;
-                } else {
-                    self.attach_run(&command.payload)?;
+        self.startup_command = Some(ProviderStartupCommand {
+            command_id: command.command_id.clone(),
+            controller_seq: command.controller_seq,
+            command_type: command.command_type.clone(),
+        });
+        let outcome = (|| {
+            self.restore()?;
+            match command.command_type.as_str() {
+                "run.prepare" => self.prepare(&command.payload),
+                "run.attach" => {
+                    if self.state.is_none() && command.payload.get("provider").is_some() {
+                        self.prepare(&command.payload)?;
+                    } else {
+                        self.attach_run(&command.payload)?;
+                    }
+                    let mut execution = self.open_session()?;
+                    let provider = self
+                        .state
+                        .as_ref()
+                        .map(|state| state.config.provider.clone())
+                        .unwrap_or_else(|| "codex".to_owned());
+                    execution.events.push((
+                        "run.attached".to_owned(),
+                        EventPriority::P0,
+                        json!({"provider": provider}),
+                    ));
+                    Ok(execution)
                 }
-                let mut execution = self.open_session()?;
-                let provider = self
-                    .state
-                    .as_ref()
-                    .map(|state| state.config.provider.clone())
-                    .unwrap_or_else(|| "codex".to_owned());
-                execution.events.push((
-                    "run.attached".to_owned(),
-                    EventPriority::P0,
-                    json!({"provider": provider}),
-                ));
-                Ok(execution)
+                "session.open" => self.open_session(),
+                "turn.start" => self.start_turn(&command.payload),
+                "turn.steer" => self.steer_turn(&command.payload),
+                "turn.interrupt" | "run.cancel" => self.interrupt_turn(&command.command_type),
+                "turn.stop" => self.stop_turn_for_suspension(&command.command_type),
+                "request.resolve" => self.resolve_request(&command.payload),
+                "semantic_tool.result" => self.deliver_semantic_result(&command.payload),
+                "session.snapshot" => self.snapshot(&command.payload),
+                "session.close" | "session.destroy" => self.close_session(),
+                "runner.drain" | "runner.suspend" | "runner.shutdown" => {
+                    Ok(CommandExecution::result(json!({"status": "completed"})))
+                }
+                _ => Ok(CommandExecution::result(json!({
+                    "status": "rejected",
+                    "code": "provider_command_unavailable",
+                    "message": "the Codex provider does not implement this command in the current layer",
+                }))),
             }
-            "session.open" => self.open_session(),
-            "turn.start" => self.start_turn(&command.payload),
-            "turn.steer" => self.steer_turn(&command.payload),
-            "turn.interrupt" | "run.cancel" => self.interrupt_turn(&command.command_type),
-            "turn.stop" => self.stop_turn_for_suspension(&command.command_type),
-            "request.resolve" => self.resolve_request(&command.payload),
-            "semantic_tool.result" => self.deliver_semantic_result(&command.payload),
-            "session.snapshot" => self.snapshot(&command.payload),
-            "session.close" | "session.destroy" => self.close_session(),
-            "runner.drain" | "runner.suspend" | "runner.shutdown" => {
-                Ok(CommandExecution::result(json!({"status": "completed"})))
-            }
-            _ => Ok(CommandExecution::result(json!({
-                "status": "rejected",
-                "code": "provider_command_unavailable",
-                "message": "the Codex provider does not implement this command in the current layer",
-            }))),
-        }
+        })();
+        self.startup_command = None;
+        outcome
     }
 
     fn rotate_authority(&mut self, config: &DurableRunnerConfig) {
@@ -3352,6 +3702,13 @@ impl CommandExecutor for CodexCommandExecutor {
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
         self.poll_provider()?;
+        self.retained_events()
+    }
+
+    fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        if let Some(error) = &self.startup_evidence_error {
+            return Err(error.clone());
+        }
         Ok(self
             .state
             .as_ref()
@@ -3423,6 +3780,7 @@ impl CommandExecutor for CodexCommandExecutor {
         if self.state.is_none() {
             self.load_state_without_provider()?;
         }
+        self.assert_startup_admitted()?;
         let state = self.state.as_ref().ok_or_else(|| {
             DurableRunnerError::invalid(
                 "terminal delivery reconciliation requires retained provider state",
@@ -3441,6 +3799,164 @@ impl CommandExecutor for CodexCommandExecutor {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn startup_evidence_save_failure_cannot_become_an_empty_drain_or_admission() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-startup-write-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut executor = CodexCommandExecutor::new(&directory);
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("codex");
+        state.active_provider_turn_id = None;
+        state.lifecycle = "prepared".to_owned();
+        executor.state = Some(state);
+        executor
+            .begin_startup(ProviderStartupTrigger::Ensure, 1)
+            .unwrap();
+        let path = executor.state_path();
+        fs::rename(&path, directory.join("preserved-intent.json")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(executor
+            .observe_startup(ProviderStartupObservation::Spawned {
+                process_id: 123,
+                process_group_id: 123
+            })
+            .is_err());
+        assert!(executor.retained_events().is_err());
+        assert!(executor.assert_startup_admitted().is_err());
+        let intent: Value =
+            serde_json::from_slice(&fs::read(directory.join("preserved-intent.json")).unwrap())
+                .unwrap();
+        assert_eq!(intent["startupAttempt"]["phase"], "intent");
+        assert_eq!(intent["startupAttempt"]["processId"], Value::Null);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_phase_fields_are_closed_and_coherent() {
+        let mut attempt = ProviderStartupAttempt {
+            schema: "paperclip.provider_startup.v1".to_owned(),
+            launch_id: uuid::Uuid::new_v4().to_string(),
+            phase: ProviderStartupPhase::Intent,
+            trigger: ProviderStartupTrigger::Ensure,
+            attempted_process_generation: 1,
+            origin: None,
+            command: None,
+            configuration_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            requested_thread_id: None,
+            authenticated_thread_id: None,
+            process_id: None,
+            process_group_id: None,
+            failed_stage: None,
+            direct_child_exit_observed: false,
+            exit_code: None,
+            signal: None,
+            process_tree_retired: false,
+        };
+        attempt.validate().unwrap();
+        attempt.process_id = Some(123);
+        attempt.process_group_id = Some(123);
+        assert!(attempt.validate().is_err());
+        attempt.phase = ProviderStartupPhase::Spawned;
+        attempt.validate().unwrap();
+        attempt.direct_child_exit_observed = true;
+        assert!(attempt.validate().is_err());
+        attempt.phase = ProviderStartupPhase::InitializationFailed;
+        attempt.failed_stage = Some(ProviderStartupStage::Initialize);
+        assert!(attempt.validate().is_err());
+        attempt.signal = Some(15);
+        attempt.validate().unwrap();
+        attempt.exit_code = Some(0);
+        assert!(attempt.validate().is_err());
+        attempt.exit_code = None;
+        attempt.direct_child_exit_observed = false;
+        assert!(attempt.validate().is_err());
+        attempt.signal = None;
+        attempt.validate().unwrap(); // Unknown cleanup is truthful, not retirement.
+        attempt.origin = Some(ProviderEventIdentity {
+            runner_instance_id: "r".repeat(512),
+            run_id: "r".repeat(SHORT_STABLE_ID_CHARS),
+            normalized_session_id: "s".repeat(SHORT_STABLE_ID_CHARS),
+            turn_id: "t".repeat(DURABLE_STABLE_ID_CHARS),
+            item_id: "i".repeat(DURABLE_STABLE_ID_CHARS),
+        });
+        attempt.requested_thread_id = Some("t".repeat(240));
+        attempt.validate().unwrap();
+        attempt.origin.as_mut().unwrap().turn_id.push('x');
+        assert!(attempt.validate().is_err());
+        attempt.origin.as_mut().unwrap().turn_id.pop();
+        attempt.requested_thread_id.as_mut().unwrap().push('x');
+        assert!(attempt.validate().is_err());
+    }
+
+    #[test]
+    fn failed_authenticated_identity_commit_keeps_the_durable_startup_fence() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-startup-identity-commit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut executor = CodexCommandExecutor::new(&directory);
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        state.config.command = PathBuf::from("codex");
+        state.thread_id = None;
+        state.active_provider_turn_id = None;
+        state.lifecycle = "prepared".to_owned();
+        executor.state = Some(state);
+        executor
+            .begin_startup(ProviderStartupTrigger::Ensure, 1)
+            .unwrap();
+        executor
+            .observe_startup(ProviderStartupObservation::Spawned {
+                process_id: 123,
+                process_group_id: 123,
+            })
+            .unwrap();
+        let path = executor.state_path();
+        let preserved = directory.join("preserved-spawn.json");
+        fs::rename(&path, &preserved).unwrap();
+        fs::create_dir(&path).unwrap();
+        let state = executor.state.as_mut().unwrap();
+        state.thread_id = Some("authenticated-thread".to_owned());
+        state.provider_session_id = Some("authenticated-account".to_owned());
+        state.provider_process_generation = 1;
+        state.lifecycle = "session_open".to_owned();
+        assert!(executor.commit_startup_admission().is_err());
+        assert!(executor.assert_startup_admitted().is_err());
+        fs::remove_dir(&path).unwrap();
+        fs::rename(preserved, &path).unwrap();
+        let mut restarted = CodexCommandExecutor::new(&directory);
+        let error = restarted.poll_events().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider startup ownership remains unadmitted"));
+        assert_eq!(restarted.state.as_ref().unwrap().thread_id, None);
+        assert_eq!(
+            restarted
+                .state
+                .as_ref()
+                .unwrap()
+                .provider_process_generation,
+            0
+        );
+        assert_eq!(
+            restarted
+                .state
+                .as_ref()
+                .unwrap()
+                .startup_attempt
+                .as_ref()
+                .unwrap()
+                .phase,
+            ProviderStartupPhase::Spawned
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn runtime_launch_rebinding_preserves_protected_arguments() {
@@ -3961,6 +4477,7 @@ mod tests {
     #[test]
     fn rejects_inconsistent_provider_state() {
         let state = CodexProviderState {
+            startup_attempt: None,
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "turn_active".to_owned(),
             config: CodexProviderConfig {

@@ -184,6 +184,215 @@ fn call_count(directory: &Path, method: &str) -> usize {
         .count()
 }
 
+#[test]
+fn failed_provider_startup_is_persistently_fenced_before_another_process_can_resume() {
+    let directory = temporary_directory("failed-startup-fence");
+    let mut config = provider_config(
+        &directory,
+        &[
+            "--require-existing-resume-state",
+            "--record-process-start",
+            "--require-startup-spawn-receipt",
+        ],
+    );
+    config.provider_session_id = Some("missing-original-thread".to_owned());
+    let mut executor =
+        CodexCommandExecutor::with_runner_config(&directory, &durable_config(&directory));
+    executor
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .unwrap();
+    let failure = executor
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap_err();
+    assert!(failure.to_string().contains("no rollout found"));
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        persisted["startupAttempt"]["phase"],
+        "initialization_failed"
+    );
+    assert_eq!(
+        persisted["startupAttempt"]["authenticatedThreadId"],
+        Value::Null
+    );
+    assert_eq!(
+        persisted["startupAttempt"]["requestedThreadId"],
+        "missing-original-thread"
+    );
+    assert_eq!(persisted["startupAttempt"]["directChildExitObserved"], true);
+    assert_eq!(persisted["startupAttempt"]["processTreeRetired"], false);
+    assert_eq!(persisted["providerProcessGeneration"], 0);
+    assert!(executor.poll_events().is_err());
+    assert!(executor
+        .execute(&command("snapshot", 3, "session.snapshot", json!({})))
+        .is_err());
+    assert!(executor.shutdown().is_err());
+    drop(executor);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "failed_provider_startup_new_process_subprocess",
+            "--exact",
+            "--ignored",
+        ])
+        .env("PAPERCLIP_STARTUP_FENCE_TEST_DIR", &directory)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for (field, invalid) in [
+        ("phase", json!("intent")),
+        ("phase", json!("spawned")),
+        ("failedStage", Value::Null),
+        ("failedStage", json!("arbitrary")),
+        ("processId", json!(0)),
+        ("processGroupId", json!(1)),
+        ("authenticatedThreadId", json!("unadmitted")),
+        ("configurationFingerprint", json!("sha256:bad")),
+        ("requestedThreadId", json!("x".repeat(1025))),
+        ("origin", json!({"runId":"foreign"})),
+        (
+            "command",
+            json!({"commandId":"x".repeat(161),"controllerSeq":2,"commandType":"session.open"}),
+        ),
+        ("processTreeRetired", json!(true)),
+    ] {
+        let mut corrupt = persisted.clone();
+        corrupt["startupAttempt"][field] = invalid;
+        fs::write(
+            directory.join("codex-provider-state.json"),
+            serde_json::to_vec(&corrupt).unwrap(),
+        )
+        .unwrap();
+        let mut reopened = NativeProviderCommandExecutor::with_runner_config(
+            &directory,
+            &durable_config(&directory),
+        );
+        assert!(
+            reopened.poll_events().is_err(),
+            "malformed {field} must deny before launch"
+        );
+    }
+    assert_eq!(call_count(&directory, "initialize"), 1);
+    assert_eq!(call_count(&directory, "process-start"), 1);
+    assert_eq!(call_count(&directory, "thread/resume"), 1);
+    assert_eq!(call_count(&directory, "turn/start"), 0);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn failed_autonomous_restore_and_rollover_keep_their_exact_startup_origin() {
+    for rollover in [false, true] {
+        let directory = temporary_directory(if rollover {
+            "failed-rollover"
+        } else {
+            "failed-autonomous-restore"
+        });
+        let config = provider_config(
+            &directory,
+            &[
+                "--require-existing-resume-state",
+                "--record-process-start",
+                "--require-startup-spawn-receipt",
+            ],
+        );
+        let runner_config = durable_config(&directory);
+        let mut executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+        executor
+            .execute(&command(
+                "prepare",
+                1,
+                "run.prepare",
+                json!({"provider":config}),
+            ))
+            .unwrap();
+        executor
+            .execute(&command("open", 2, "session.open", json!({})))
+            .unwrap();
+        executor.shutdown().unwrap();
+        drop(executor);
+        let path = directory.join("codex-provider-state.json");
+        if rollover {
+            let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            state["settledProviderTurnIds"] = json!((0..4096)
+                .map(|n| format!("settled-{n}"))
+                .collect::<Vec<_>>());
+            fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        }
+        let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+        if rollover {
+            poll_and_ack(&mut recovered).unwrap();
+        }
+        fs::remove_file(directory.join("fake-state.json")).unwrap();
+        let error = if rollover {
+            recovered
+                .execute(&command(
+                    "rollover",
+                    3,
+                    "turn.start",
+                    json!({"text":"Never start after failed replacement initialization."}),
+                ))
+                .unwrap_err()
+        } else {
+            recovered.poll_events().unwrap_err()
+        };
+        assert!(error.to_string().contains("no rollout found"));
+        let failed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let fact = &failed["startupAttempt"];
+        assert_eq!(fact["phase"], "initialization_failed");
+        assert_eq!(
+            fact["trigger"],
+            if rollover { "rollover" } else { "restore" }
+        );
+        assert_eq!(
+            fact["command"],
+            if rollover {
+                json!({"commandId":"rollover","controllerSeq":3,"commandType":"turn.start"})
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(fact["directChildExitObserved"], true);
+        let mut rotated = runner_config.clone();
+        rotated.run_id = "different-run".to_owned();
+        recovered.rotate_authority(&rotated);
+        let events = recovered.retained_events().unwrap();
+        let final_fact = events
+            .iter()
+            .filter_map(|event| event.payload.get("startup"))
+            .find(|fact| fact["phase"] == "initialization_failed")
+            .unwrap();
+        assert_eq!(final_fact["origin"]["runId"], "run-1");
+        assert!(recovered.poll_events().is_err());
+        assert!(recovered.shutdown().is_err());
+        assert_eq!(call_count(&directory, "turn/start"), 0);
+        assert_eq!(
+            call_count(&directory, "process-start"),
+            if rollover { 3 } else { 2 }
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "isolated process checks persisted failed-startup admission"]
+fn failed_provider_startup_new_process_subprocess() {
+    let directory = std::env::var_os("PAPERCLIP_STARTUP_FENCE_TEST_DIR")
+        .map(PathBuf::from)
+        .expect("this helper requires its parent fixture");
+    let mut executor =
+        NativeProviderCommandExecutor::with_runner_config(&directory, &durable_config(&directory));
+    assert!(executor.poll_events().is_err());
+    assert!(executor
+        .execute(&command("snapshot-new", 4, "session.snapshot", json!({})))
+        .is_err());
+    assert!(executor.shutdown().is_err());
+}
+
 fn recorded_tool_responses(directory: &Path) -> Vec<String> {
     fs::read_to_string(directory.join("calls.log"))
         .unwrap_or_default()
@@ -196,6 +405,14 @@ fn poll_and_ack(
     executor: &mut CodexCommandExecutor,
 ) -> Result<Vec<PolledEvent>, DurableRunnerError> {
     let events = executor.poll_events()?;
+    executor.acknowledge_events(events.len())?;
+    Ok(events)
+}
+
+fn retained_and_ack(
+    executor: &mut CodexCommandExecutor,
+) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+    let events = executor.retained_events()?;
     executor.acknowledge_events(events.len())?;
     Ok(events)
 }
@@ -922,7 +1139,9 @@ fn durable_backend_closes_when_identity_rollover_resumes_unowned_work() {
     assert_eq!(closed["completedTurnAuthoritative"], false);
     assert!(closed["providerProcessGeneration"].as_u64().unwrap() > attached_generation);
 
-    let events = poll_and_ack(&mut recovered).expect("read fail-closed rollover diagnostic");
+    assert!(recovered.poll_events().is_err());
+    let events = retained_and_ack(&mut recovered)
+        .expect("read fail-closed rollover diagnostic without restoring");
     assert!(events.iter().any(|event| {
         event.event_type == "harness.diagnostic"
             && event.payload["code"] == "provider_turn_identity_invalid"
@@ -940,14 +1159,17 @@ fn durable_backend_closes_when_identity_rollover_resumes_unowned_work() {
         ))
         .unwrap_err()
         .to_string()
-        .contains("provider session is closed"));
+        .contains("provider startup ownership remains unadmitted"));
     assert_eq!(
         call_count(&directory, "thread/resume"),
         resumes_before_retry,
         "closed rollover state must never resume the unowned provider turn",
     );
 
-    recovered.shutdown().expect("close fail-closed executor");
+    assert!(
+        recovered.shutdown().is_err(),
+        "failed startup must not report a successful cold shutdown"
+    );
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -2355,9 +2577,17 @@ fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
 
     let resumes_before_recovery = call_count(&directory, "thread/resume");
     let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    assert!(recovered
+        .execute(&command(
+            "suspend-rejected",
+            99,
+            "runner.suspend",
+            json!({})
+        ))
+        .is_err());
     let events = recovered
-        .poll_events()
-        .expect("fail-closed recovery remains observable");
+        .retained_events()
+        .expect("fail-closed recovery facts remain observable without launch");
     assert!(events.iter().any(|event| {
         event.event_type == "harness.diagnostic"
             && event.payload["code"] == "provider_turn_identity_reused"
@@ -2379,16 +2609,18 @@ fn durable_recovery_closes_a_provider_that_reopens_a_settled_turn() {
     drop(recovered);
     let resumes_before_closed_restore = call_count(&directory, "thread/resume");
     let mut closed = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
-    closed
-        .poll_events()
-        .expect("closed recovery state remains readable");
+    assert!(
+        closed.poll_events().is_err(),
+        "the new executor retains the failed startup fence"
+    );
+    assert!(!closed.retained_events().unwrap().is_empty());
     assert_eq!(
         call_count(&directory, "thread/resume"),
         resumes_before_closed_restore,
         "closed recovery must not resume the contradictory provider turn again",
     );
 
-    closed.shutdown().expect("close fail-closed executor");
+    assert!(closed.shutdown().is_err());
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -2904,8 +3136,8 @@ fn durable_backend_replays_pending_tool_calls_without_mutating_the_event_queue()
         );
         assert_eq!(
             after["nextProviderEventSeq"].as_u64(),
-            before["nextProviderEventSeq"].as_u64().map(|sequence| sequence + 1),
-            "only session.resumed may consume durable event capacity during exact pending replay {replay}"
+            before["nextProviderEventSeq"].as_u64().map(|sequence| sequence + 3),
+            "exact restore adds one session.resumed and two durable startup facts, never duplicate tool inputs, during replay {replay}"
         );
         recovered = Some(next);
         if replay < 3 {
@@ -3449,12 +3681,42 @@ fn durable_backend_attaches_after_a_settled_restore_notice() {
         .events
         .iter()
         .any(|(event_type, _, _)| event_type == "run.attached"));
-    assert!(
-        rotated
-            .poll_events()
-            .expect("inspect the provider queue after attachment")
-            .is_empty(),
-        "attachment must not replay the prior recovery notice"
+    let audit = rotated
+        .retained_events()
+        .expect("inspect the retained queue without starting the next provider epoch");
+    assert_eq!(
+        audit.len(),
+        4,
+        "preserve restore and post-attach startup facts, not the prior restore notice"
+    );
+    assert_eq!(
+        audit
+            .iter()
+            .map(|event| event.payload["startup"]["phase"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["intent", "spawned", "intent", "spawned"]
+    );
+    assert!(audit
+        .iter()
+        .all(|event| event.event_type == "harness.diagnostic"
+            && event.payload["code"] == "provider_startup_ownership"));
+    for (pair, trigger, generation) in [(&audit[..2], "restore", 2), (&audit[2..], "ensure", 3)] {
+        assert_eq!(
+            pair[0].payload["startup"]["launchId"],
+            pair[1].payload["startup"]["launchId"]
+        );
+        for event in pair {
+            let startup = &event.payload["startup"];
+            assert_eq!(startup["trigger"], trigger);
+            assert_eq!(startup["attemptedProcessGeneration"], generation);
+            assert_eq!(startup["command"]["commandId"], "attach");
+            assert_eq!(startup["command"]["controllerSeq"], 4);
+            assert_eq!(startup["origin"]["runId"], runner_config.run_id);
+        }
+    }
+    assert_ne!(
+        audit[0].payload["startup"]["launchId"],
+        audit[2].payload["startup"]["launchId"]
     );
 
     rotated.shutdown().expect("stop the rotated provider");
@@ -4119,9 +4381,17 @@ fn legacy_full_active_epoch_is_closed_on_recovery() {
         .expect("write legacy full active state");
 
     let mut recovered = CodexCommandExecutor::new(&directory);
+    assert!(recovered
+        .execute(&command(
+            "suspend-rejected",
+            99,
+            "runner.suspend",
+            json!({})
+        ))
+        .is_err());
     let events = recovered
-        .poll_events()
-        .expect("legacy full-epoch recovery remains observable");
+        .retained_events()
+        .expect("legacy full-epoch facts remain observable without launch");
     assert!(events.iter().any(|event| {
         event.event_type == "harness.diagnostic"
             && event.payload["code"] == "legacy_provider_turn_epoch_ambiguous"
@@ -4151,10 +4421,13 @@ fn legacy_full_active_epoch_is_closed_on_recovery() {
         ))
         .expect_err("closed legacy full-epoch state rejects replacement work")
         .to_string()
-        .contains("closed"));
+        .contains("provider startup ownership remains unadmitted"));
     assert_eq!(call_count(&directory, "turn/start"), 1);
 
-    recovered.shutdown().expect("close recovered executor");
+    assert!(
+        recovered.shutdown().is_err(),
+        "failed legacy startup remains fenced"
+    );
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -4189,9 +4462,17 @@ fn legacy_filtered_ambiguous_epoch_is_closed_on_recovery() {
         .expect("write legacy-filtered ambiguous state");
 
     let mut recovered = CodexCommandExecutor::new(&directory);
+    assert!(recovered
+        .execute(&command(
+            "suspend-rejected",
+            99,
+            "runner.suspend",
+            json!({})
+        ))
+        .is_err());
     let events = recovered
-        .poll_events()
-        .expect("legacy ambiguous recovery remains observable");
+        .retained_events()
+        .expect("legacy ambiguous facts remain observable without launch");
     let diagnostic = events
         .iter()
         .find(|event| {
@@ -4213,7 +4494,10 @@ fn legacy_filtered_ambiguous_epoch_is_closed_on_recovery() {
         .is_empty());
     assert_eq!(call_count(&directory, "turn/start"), 0);
 
-    recovered.shutdown().expect("close recovered executor");
+    assert!(
+        recovered.shutdown().is_err(),
+        "failed ambiguous startup remains fenced"
+    );
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -4682,8 +4966,8 @@ fn receipt_limit_polls_an_authoritative_terminal_with_unacknowledged_events() {
             events.is_empty()
                 || events
                     .iter()
-                    .all(|event| event.event_type == "session.resumed"),
-            "only recovery lifecycle events may precede the receipt-limit diagnostic"
+                    .all(|event| event.event_type == "session.resumed" || (event.event_type == "harness.diagnostic" && event.payload["code"] == "provider_startup_ownership" && matches!(event.payload["startup"]["phase"].as_str(), Some("intent" | "spawned")))),
+            "only recovery lifecycle and exact startup facts may precede the receipt-limit diagnostic"
         );
         recovered
             .acknowledge_events(events.len())

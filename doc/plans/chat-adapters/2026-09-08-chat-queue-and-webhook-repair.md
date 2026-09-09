@@ -2964,3 +2964,52 @@ provider startup qualification, not successful chat execution, a model-latency
 measurement, full-tree retirement, or permission to retry historical sessions.
 The broader transport suite still has separately tracked readiness and fixture
 issues; this canary passing is not a release-completion claim.
+
+### September 9: forward startup evidence and bounded warm readiness
+
+The native provider now persists a unique startup intent before spawning,
+records the exact child before initialization RPCs, and preserves a closed
+failed-startup receipt before returning command failure. An unadmitted attempt
+stays fenced across runner restart. Failed-command evidence drains through the
+retained-only FIFO, never an implicit provider restore/poll. Direct-child exit
+is explicitly not whole-process-tree retirement or historical retry authority.
+
+Warm attachment now commits and obtains cumulative ACKs for the old authority's
+events before returning its successful result and rotating. Failed/rejected
+attachments do not rotate. Held and lost old-event ACKs preserve replay and
+deduplication. A separate, preexisting lost **attach-result** transition remains
+unresolved: safely retaining old/new authority across that boundary needs a
+durable transition receipt, not merely the event-ACK fence introduced here.
+
+Composed tests caught two regressions during implementation. Eager draining on
+every successful command could starve suspend-result acknowledgement; it is
+now limited to attachment. Conversely, frequent warm-readiness probes could
+starve their own retained startup facts. An explicit valid quiescing snapshot
+now advances at most one 128-event retained prefix, only after the old outbox
+is empty and fully acknowledged. It performs no extra provider poll/launch;
+the next probe recomputes readiness. Ordinary/terminal controls remain
+control-first. Both failures were reproduced before their fixes; no timeout
+was lengthened and the final source passed independent review.
+
+Fixture coverage now distinguishes genuinely new failed startup (never strip
+its real fence) from a separately synthesized old-producer terminal-delivery
+fixture. Likewise, the 1,024-event suffix has explicit persisted-completion
+success and contradictory-active-work refusal cases. Both retain the original
+stop/suspend, event-deduplication and archived-source assertions. The latter
+starts no successor turn. The provider's prepared-active-work guard was not
+weakened to make the success test pass.
+
+Final Rust library checks passed **247/247**, provider **74/74** plus both
+subprocess helpers, native wrapper **10/10**, supervisor **5/5**, fake-provider
+fixtures **10/10**, and public durable-store checks **3/3**. Root's control-plane
+cohort passed **49/49**, package types/build and strict binary signature passed.
+The normally staged candidate is
+`2400740c02b85a0099c18c17cb8567905c8dd07fc677363c90f98d0d9b9dbbc8`.
+The final actual-Codex canary also passed against it, fixture
+`paperclip-real-startup-87DVmb`, provider PID 61163, with only the three expected
+initialization/resume methods and no second provider launch after reopen.
+The final full transport cohort passed **105/105**, zero skips, in **143.09s**
+on that exact normal binary. This includes the startup/no-relaunch, legacy
+terminal replay, held/lost ACK, rejected attach, both 1,024-event provider-state
+variants and preexisting transport cases. Server deployment follows separately;
+the Mac is still locked, so no new live chat or latency-improvement claim is made.

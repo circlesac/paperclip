@@ -7,6 +7,41 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 02:04 UTC: the final composed transport cohort passed **105/105**
+(143.09 seconds), zero skips. Normal optimized runner SHA is
+`2400740c02b85a0099c18c17cb8567905c8dd07fc677363c90f98d0d9b9dbbc8`;
+strict signing/build/package types and final independent review passed.
+Additional final checks: Rust lib **247**, provider **74** plus both helper
+subprocesses, native wrapper **10**, supervisor **5**, fake producer **10**,
+durable store **3**, controller **49**, all passed. Root's final real-Codex
+canary (`paperclip-real-startup-87DVmb`) also passed with exactly one provider
+launch, startup facts committed before failure, and no provider RPC/relaunch
+after reopening. Preparing server 68 now; record its health before claiming
+the Board is back. The Mac remains locked, and no live browser pass is implied.
+
+The control-first regression, warm-probe starvation and misleading fixture
+premises below are now resolved. Ordinary controls retain backpressure;
+explicit valid quiescing snapshots advance only one retained prefix after
+old ACKs, without provider polling. Genuine new startup failures remain fenced;
+legacy terminal replay uses a separate synthetic fixture. Both settled and
+contradictory-active 1,024-event suffix cases are deterministic and verified.
+Historical Discord/Telegram retry eligibility is unchanged. Their recorded
+maintenance attempts remain one/two; no new heartbeat was created (286 total,
+zero active before restart). The separate attach-result-loss transition,
+live media batching A/B, GitHub fallback UI and tenant-qualified Teams remain.
+
+September 9, 01:46 UTC: server 67 was intentionally drained and stopped with
+zero active/interrupted runs while the candidate normal runner is checked.
+Do not report the Board as currently available until it is restarted. The new
+optimized artifact is SHA `0d264024b0656388e1dc9207046c733f07b879292f39c6b693a79de25b5dc4dc`;
+signature/build/types and Rust lib 245, provider 74 (+2 helper subprocesses),
+native-wrapper 10, supervisor 5 and durable-store 3 cases passed. The three new
+real-process warm-ACK cases passed after genuine old-binary RED. However the
+13-case composed maintenance cohort has one primary failure and five resulting
+shared-fixture quarantine failures (7 passed). It is **not green**. James is
+diagnosing eager successful-command draining versus terminal acknowledgement
+backpressure before any further live use. Do not widen historical retries.
+
 September 9, 01:38 UTC: the Mac remains locked. Root independently verified
 the webhook logging privacy repair: **97/97** focused tests, server types, and
 **55/55** inert ingress-canary tests pass. Request bodies (including raw Buffer
@@ -24,6 +59,16 @@ eligibility. Native startup fencing also exposed a warm-attach ordering defect:
 authority rotation could discard unacknowledged evidence. James is fixing the
 ACK-before-rotation boundary; Epicurus is independently reviewing it and adding
 a composed regression. Do not stage or deploy that runner until frozen/verified.
+
+Independent review also found a distinct, preexisting warm-handoff gap to
+address next: loss of the `run.attach` result between runner socket write and
+controller persistence is not covered by the old-event ACK fence. Simply
+ACKing that result is insufficient: the controller currently rotates/deletes
+old command authority before a lost ACK can be replayed. A separate durable
+transition needs the exact old identity/lease, attach fingerprint/result and
+ACK cursor plus desired identity; old-authority reconnect must be restricted
+to that receipt replay, with no new work, until exact new-authority activation
+is authenticated. Preserve this as unresolved, not covered by current tests.
 
 September 9, 01:19 UTC: the Mac remains locked. Parallel code work continues
 on forward-only provider startup fencing: persist launch intent and exact child

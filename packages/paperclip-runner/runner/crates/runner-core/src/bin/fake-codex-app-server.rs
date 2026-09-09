@@ -57,7 +57,11 @@ fn send_split_event_burst(state: &FakeState) -> io::Result<()> {
     }))
 }
 
-fn finish_split_event_burst(state: &FakeState, count: usize) -> io::Result<()> {
+fn finish_split_event_burst_with_send(
+    state: &FakeState,
+    count: usize,
+    mut send: impl FnMut(Value) -> io::Result<()>,
+) -> io::Result<()> {
     let turn_id = state.active_turn_id.as_deref().unwrap_or("provider-turn-1");
     for index in 0..count {
         send(json!({
@@ -71,6 +75,36 @@ fn finish_split_event_burst(state: &FakeState, count: usize) -> io::Result<()> {
         }))?;
     }
     Ok(())
+}
+
+fn finish_split_event_turn_with_send(
+    state_path: &Path,
+    state: &mut FakeState,
+    count: usize,
+    lifecycle: Option<&str>,
+    mut send: impl FnMut(Value) -> io::Result<()>,
+) -> io::Result<()> {
+    if lifecycle == Some("settled-before-output") {
+        // This explicit fixture mode models completed work whose output is
+        // still blocked in the pipe. Keep the original turn identity for all
+        // suffix and terminal frames, but persist completion before any send.
+        let suffix_state = state.clone();
+        let mut suffix_sent = false;
+        return finish_turn_with_send(state_path, state, "completed", |message| {
+            if !suffix_sent {
+                finish_split_event_burst_with_send(&suffix_state, count, &mut send)?;
+                suffix_sent = true;
+            }
+            send(message)
+        });
+    }
+    finish_split_event_burst_with_send(state, count, &mut send)?;
+    if lifecycle == Some("active-after-output") {
+        // Adversarial counterpart: no completion claim or durable settlement.
+        // A later physical stop must not authorize this reported active turn.
+        return Ok(());
+    }
+    finish_turn_with_send(state_path, state, "completed", send)
 }
 
 fn load_state(path: &Path) -> io::Result<FakeState> {
@@ -569,6 +603,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .any(|value| value == "--require-existing-resume-state")
         && !state_path.exists();
     let call_log = argument(&args, "--call-log").map(PathBuf::from);
+    if args.iter().any(|value| value == "--record-process-start") {
+        log_call(call_log.as_deref(), "process-start")?;
+    }
     let emit_question = args.iter().any(|value| value == "--emit-question");
     let emit_runtime_question = args.iter().any(|value| value == "--runtime-question");
     let emit_opencode_proxy_runtime_question = args
@@ -583,6 +620,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(48);
     if !(1..=4096).contains(&split_event_suffix_count) {
         return Err("split event suffix count must be between 1 and 4096".into());
+    }
+    let split_event_suffix_lifecycle = argument(&args, "--split-event-suffix-lifecycle");
+    if split_event_suffix_lifecycle
+        .as_deref()
+        .is_some_and(|value| {
+            !emit_split_event_burst
+                || !matches!(value, "settled-before-output" | "active-after-output")
+        })
+    {
+        return Err(
+            "split event suffix lifecycle requires an explicit supported split-burst mode".into(),
+        );
     }
     let require_skill_instructions = args
         .iter()
@@ -826,8 +875,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if message.pointer("/result/success") != Some(&json!(true)) {
                 return Err("split event burst semantic tool failed".into());
             }
-            finish_split_event_burst(&state, split_event_suffix_count)?;
-            finish_turn(&state_path, &mut state, "completed")?;
+            finish_split_event_turn_with_send(
+                &state_path,
+                &mut state,
+                split_event_suffix_count,
+                split_event_suffix_lifecycle.as_deref(),
+                send,
+            )?;
             continue;
         }
         if message.get("method").is_none() && message.get("id") == Some(&json!("tool-request-1")) {
@@ -899,10 +953,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_call(call_log.as_deref(), method)?;
         let id = message.get("id").cloned();
         match method {
-            "initialize" => send(json!({
+            "initialize" => {
+                if args
+                    .iter()
+                    .any(|value| value == "--require-startup-spawn-receipt")
+                {
+                    let receipt: Value = serde_json::from_slice(&fs::read(
+                        state_path.with_file_name("codex-provider-state.json"),
+                    )?)?;
+                    if receipt.pointer("/startupAttempt/phase") != Some(&json!("spawned"))
+                        || receipt.pointer("/startupAttempt/processId")
+                            != Some(&json!(std::process::id()))
+                    {
+                        return Err(
+                            "initialize arrived before durable exact-child spawn receipt".into(),
+                        );
+                    }
+                }
+                send(json!({
                 "id": id,
                 "result": {"user": {"sessionId": "codex-account-session"}}
-            }))?,
+                }))?;
+            }
             "initialized" => {}
             "thread/start" => {
                 if require_external_sandbox
@@ -1548,5 +1620,99 @@ mod state_persistence_tests {
         })
         .unwrap();
         assert_eq!(terminal_count, 1);
+    }
+
+    #[test]
+    fn settled_split_suffix_persists_before_output_even_when_the_first_write_fails() {
+        let fixture = StateFixture::new();
+        let path = fixture.path();
+        let mut state = active_state();
+        save_state(&path, &state).unwrap();
+        let failure = finish_split_event_turn_with_send(
+            &path,
+            &mut state,
+            1024,
+            Some("settled-before-output"),
+            |message| {
+                assert_eq!(message["method"], "item/agentMessage/delta");
+                assert_eq!(message["params"]["turnId"], "provider-turn-1");
+                let persisted = load_state(&path)?;
+                assert!(persisted.active_turn_id.is_none());
+                assert_eq!(persisted.next_turn, 1);
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected suffix write failure",
+                ))
+            },
+        );
+        assert_eq!(failure.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert!(load_state(&path).unwrap().active_turn_id.is_none());
+    }
+
+    #[test]
+    fn active_split_suffix_retains_the_original_work_without_a_terminal_claim() {
+        let fixture = StateFixture::new();
+        let path = fixture.path();
+        let mut state = active_state();
+        save_state(&path, &state).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut messages = Vec::new();
+        finish_split_event_turn_with_send(
+            &path,
+            &mut state,
+            1024,
+            Some("active-after-output"),
+            |message| {
+                messages.push(message);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1024);
+        assert!(messages
+            .iter()
+            .all(|message| message["method"] == "item/agentMessage/delta"
+                && message["params"]["turnId"] == "provider-turn-1"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(state.active_turn_id.as_deref(), Some("provider-turn-1"));
+        assert_eq!(state.next_turn, 1);
+    }
+
+    #[test]
+    fn settled_split_suffix_keeps_the_original_identity_and_terminal_after_all_output() {
+        let fixture = StateFixture::new();
+        let path = fixture.path();
+        let mut state = active_state();
+        state.active_turn_id = Some("provider-turn-7".to_owned());
+        state.next_turn = 7;
+        save_state(&path, &state).unwrap();
+        let mut messages = Vec::new();
+        finish_split_event_turn_with_send(
+            &path,
+            &mut state,
+            1024,
+            Some("settled-before-output"),
+            |message| {
+                assert!(load_state(&path)?.active_turn_id.is_none());
+                messages.push(message);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1027);
+        assert!(messages[..1024]
+            .iter()
+            .all(|message| message["method"] == "item/agentMessage/delta"
+                && message["params"]["turnId"] == "provider-turn-7"));
+        assert_eq!(messages.last().unwrap()["method"], "turn/completed");
+        assert_eq!(
+            messages.last().unwrap()["params"]["turn"]["id"],
+            "provider-turn-7"
+        );
+        assert_eq!(
+            messages.last().unwrap()["params"]["turn"]["status"],
+            "completed"
+        );
+        assert_eq!(load_state(&path).unwrap().next_turn, 7);
     }
 }

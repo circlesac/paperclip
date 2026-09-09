@@ -93,6 +93,7 @@ it.each([
   { alreadyEnded: true, appendFailure: false, homeScoped: true },
   { alreadyEnded: true, appendFailure: false, homeScoped: true, missingHome: true },
   { alreadyEnded: true, appendFailure: false, homeScoped: true, missingHome: true, unknownExit: true },
+  { alreadyEnded: true, appendFailure: false, homeScoped: true, missingHome: true, startupFailureProof: true },
   {
     alreadyEnded: true,
     appendFailure: false,
@@ -100,7 +101,7 @@ it.each([
     terminalReplay: true,
   },
 ])(
-  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned/$homeScoped/$missingHome/$unknownExit)",
+  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned/$homeScoped/$missingHome/$unknownExit) startup-failure-proof=$startupFailureProof",
   async ({
     alreadyEnded,
     appendFailure,
@@ -111,6 +112,7 @@ it.each([
     homeScoped,
     missingHome,
     unknownExit,
+    startupFailureProof,
   }) => {
     const fixtureRunner = defaultCapabilityRunnerdBinary();
     const directory = await mkdtemp(join(tmpdir(), "runnerd-maintenance-"));
@@ -157,6 +159,7 @@ it.each([
           : ["--state-file", fakeState]),
         "--call-log",
         calls,
+        ...(startupFailureProof ? ["--record-process-start"] : []),
         "--hold-turn",
       ],
       sourceCodexHome: home,
@@ -173,6 +176,40 @@ it.each([
     };
     let runnerPid = 0;
     let providerPid = 0;
+    let retainFixtureForUnprovenExit = false;
+    const stopAndJoinReplayProcess = async (
+      handle: ReturnType<typeof durableControlPlane.spawnRunner>,
+    ) => {
+      // This helper may time out immediately after dispatching SIGKILL. Its
+      // return/rejection alone is not proof that this exact child has exited.
+      await durableControlPlane.waitForProcess(handle, 250).catch(() => undefined);
+      let deadline: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          handle.completion,
+          new Promise<never>((_resolveJoin, rejectJoin) => {
+            deadline = setTimeout(() => rejectJoin(new Error(
+              "startup-proof fixture could not join its exact runner child",
+            )), 5_000);
+          }),
+        ]);
+        if (handle.processGroupId && !dead(-handle.processGroupId)) {
+          try { process.kill(-handle.processGroupId, "SIGKILL"); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          }
+        }
+        await vi.waitFor(() => {
+          expect(handle.child.pid && dead(handle.child.pid)).toBe(true);
+          expect(handle.processGroupId && dead(-handle.processGroupId)).toBe(true);
+        }, { timeout: 2_000 });
+      } catch (error) {
+        retainFixtureForUnprovenExit = true;
+        throw error;
+      } finally {
+        if (deadline !== undefined) clearTimeout(deadline);
+      }
+    };
     try {
       const thread = (await bundle.transport.request("thread/start", {
         cwd: directory,
@@ -306,7 +343,7 @@ it.each([
         backend: {
           kind: "codex",
           name: missingHome
-            ? `maintenance-test-missing-home-${Boolean(unknownExit)}`
+            ? `maintenance-test-missing-home-${Boolean(unknownExit)}${startupFailureProof ? "-startup-proof" : ""}`
             : epochFailure
             ? `maintenance-test-${epochFailure}`
             : appendFailure
@@ -524,6 +561,11 @@ it.each([
         }
       }
       if (missingHome) {
+        const startupEvents = () => appendEvent.mock.calls
+          .map(([event]) => event)
+          .filter((event) => event.eventType === "harness.diagnostic" &&
+            event.payload.code === "provider_startup_ownership");
+        let startupPhasesBeforeFailure: unknown[] | null = null;
         const launch = durableControlPlane.spawnRunner;
         const completions: Promise<unknown>[] = [];
         let releaseExit!: () => void;
@@ -553,8 +595,12 @@ it.each([
             current.commands.some(
               (command: { status: string }) => command.status === "failed",
             )
-          )
+          ) {
+            if (startupFailureProof && startupPhasesBeforeFailure === null)
+              startupPhasesBeforeFailure = startupEvents().map((event) =>
+                (event.payload.startup as Record<string, unknown>).phase);
             throw new Error("native_cleanup_maintenance_unproven");
+          }
         });
         try {
           await expect(settleRetainedRunnerdSession(input)).rejects.toThrow(
@@ -617,6 +663,166 @@ it.each([
         expect(methods.filter((method) => method === "turn/start")).toHaveLength(
           1,
         );
+        if (startupFailureProof) {
+          expect(startupPhasesBeforeFailure).toEqual([
+            "intent", "spawned", "initialization_failed",
+          ]);
+          const events = startupEvents();
+          expect(events).toHaveLength(3);
+          expect(events.map((event) => event.sourceSeq)).toEqual(
+            events.map((event) => event.sourceSeq).sort((left, right) => left - right),
+          );
+          expect(new Set(events.map((event) => event.sourceEventId)).size).toBe(3);
+          const facts = events.map((event) => event.payload.startup as Record<string, unknown>);
+          const [intent, spawned, initializationFailed] = facts;
+          expect(intent!.launchId).toMatch(/^[0-9a-f-]{36}$/);
+          expect(intent!.configurationFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/);
+          const failedStop = failed.commands.find((command: { type: string; status: string }) =>
+            command.type === "turn.stop" && command.status === "failed");
+          for (const fact of facts) {
+            expect(Object.keys(fact).sort()).toEqual([
+              "schema", "launchId", "phase", "trigger", "attemptedProcessGeneration",
+              "origin", "command", "configurationFingerprint", "requestedThreadId",
+              "authenticatedThreadId", "processId", "processGroupId", "failedStage",
+              "directChildExitObserved", "exitCode", "signal", "processTreeRetired",
+            ].sort());
+            expect(fact).toMatchObject({
+              schema: "paperclip.provider_startup.v1",
+              launchId: intent!.launchId,
+              trigger: "restore",
+              attemptedProcessGeneration: providerBefore.providerProcessGeneration + 1,
+              origin: {
+                runnerInstanceId: identity.runnerInstanceId,
+                runId: identity.runId,
+                normalizedSessionId: identity.normalizedSessionId,
+                turnId: identity.turnId,
+                itemId: identity.itemId,
+              },
+              command: {
+                commandId: failedStop.commandId,
+                controllerSeq: failedStop.controllerSeq,
+                commandType: "turn.stop",
+              },
+              configurationFingerprint: intent!.configurationFingerprint,
+              requestedThreadId: thread.thread.id,
+              authenticatedThreadId: null,
+              processTreeRetired: false,
+            });
+          }
+          expect(intent).toMatchObject({
+            phase: "intent", processId: null, processGroupId: null,
+            directChildExitObserved: false, failedStage: null, exitCode: null, signal: null,
+          });
+          expect(spawned!.processId).toBeGreaterThan(0);
+          expect(spawned).toMatchObject({
+            phase: "spawned", processGroupId: spawned!.processId,
+            directChildExitObserved: false, failedStage: null, exitCode: null, signal: null,
+          });
+          expect(initializationFailed).toMatchObject({
+            phase: "initialization_failed", failedStage: "thread_open",
+            processId: spawned!.processId, processGroupId: spawned!.processId,
+            directChildExitObserved: true,
+          });
+          expect(dead(Number(spawned!.processId))).toBe(true);
+          expect(appendEvent.mock.calls.filter(([event]) =>
+            ["session.started", "session.resumed"].includes(event.eventType) &&
+            event.payload.processId !== providerPid)).toHaveLength(0);
+          expect(failed.commands.some((command: {
+            type: string; result?: { result?: { providerExitConfirmed?: boolean } };
+          }) => command.type === "turn.stop" &&
+            command.result?.result?.providerExitConfirmed === true)).toBe(false);
+          const deltas = appendEvent.mock.calls.map(([event]) => event.payload.delta)
+            .filter((delta) => typeof delta === "string" && delta.startsWith("maintenance-"));
+          expect(deltas).toHaveLength(218);
+          expect(new Set(deltas).size).toBe(218);
+          const failedProviderState = JSON.parse(await readFile(copyProvider, "utf8"));
+          expect(failedProviderState.startupAttempt).toMatchObject({
+            launchId: intent!.launchId,
+          });
+          const observedMethods = await readFile(calls, "utf8");
+          expect(observedMethods.trim().split("\n").filter((method) =>
+            method === "process-start")).toHaveLength(2);
+          const originalFailure = structuredClone(failedStop.result);
+          // Exercise the producer fence directly in this isolated fixture.
+          // This does not admit the failed copy through maintenance or alter
+          // its source/receipt bytes to manufacture recovery eligibility.
+          for (let restart = 0; restart < 2; restart++) {
+            const replayCore = new DurablePrpControlPlane({
+              stateDirectory: join(copy, "control-plane"),
+              identity,
+              expectedRunnerVersion: "0.3.0",
+              expectedRunnerDigest: `sha256:${createHash("sha256")
+                .update(await readFile(fixtureRunner)).digest("hex")}`,
+              onCommittedEvent: appendEvent,
+            });
+            const snapshot = replayCore.queueCommand("session.snapshot", {});
+            const stop = replayCore.queueCommand("turn.stop", {
+              reason: "startup-fence regression only",
+            });
+            let replayHandle: ReturnType<typeof durableControlPlane.spawnRunner> | null = null;
+            let replayAssertionFailed = false;
+            try {
+              await replayCore.start();
+              const runnerState = JSON.parse(await readFile(join(copy, files[1]!), "utf8"));
+              replayHandle = durableControlPlane.spawnRunner({
+                connectUrl: replayCore.connectUrl,
+                stateDirectory: join(copy, "runner"),
+                identity,
+                ticket: replayCore.issueBootstrapTicket(),
+                maxOutboxBytes: runnerState.maxOutboxBytes,
+                p0ReserveBytes: runnerState.p0ReserveBytes,
+                maxRuntimeMs: 2_000,
+                reconnectGraceMs: 1_000,
+                runnerBinaryPath: fixtureRunner,
+                runnerVersion: "0.3.0",
+                runnerDigest: `sha256:${createHash("sha256")
+                  .update(await readFile(fixtureRunner)).digest("hex")}`,
+                environment: createCapabilityRunnerdProviderEnvironment({
+                  provider: "codex",
+                  options: {},
+                  identity,
+                  codexHome: join(copy, "codex-home"),
+                  runtimeContextPath: join(copy, "runtime-context.json"),
+                  hasRuntimeContext: false,
+                }),
+              });
+              await vi.waitFor(() => {
+                for (const command of [snapshot, stop]) {
+                  expect(command.status).toBe("failed");
+                  expect(command.result).toMatchObject({ result: {
+                    message: expect.stringContaining("provider startup ownership remains unadmitted"),
+                  } });
+                }
+              }, { timeout: 5_000 });
+              await durableControlPlane.waitForProcess(replayHandle, 5_000);
+              expect(await readFile(calls, "utf8")).toBe(observedMethods);
+              expect((await readFile(calls, "utf8")).trim().split("\n")
+                .filter((method) => method === "process-start")).toHaveLength(2);
+              expect(replayCore.store.state.commands.find((command) =>
+                command.commandId === failedStop.commandId)?.result).toEqual(originalFailure);
+              expect(JSON.parse(await readFile(copyProvider, "utf8")).startupAttempt)
+                .toEqual(failedProviderState.startupAttempt);
+              expect(startupEvents()).toHaveLength(3);
+            } catch (error) {
+              replayAssertionFailed = true;
+              throw error;
+            } finally {
+              try {
+                if (replayHandle) await stopAndJoinReplayProcess(replayHandle);
+              } catch (error) {
+                // Keep the original assertion as the primary failure. Do not
+                // delete evidence underneath an unjoined owned process.
+                if (!replayAssertionFailed) throw error;
+                console.error("startup-proof fixture cleanup unproven; directory retained");
+              } finally {
+                await replayCore.stop();
+              }
+            }
+          }
+          expect(await readFile(fakeState)).toEqual(originalProviderHome);
+          expect(await Promise.all(files.map((file) => readFile(join(original, file)))))
+            .toEqual(bytes);
+        }
         return;
       }
       if (appendFailure) {
@@ -726,7 +932,13 @@ it.each([
         return;
       }
       let failedAttempt: { directory: string; bytes: Buffer[] } | null = null;
+      let failedStartupAttempt: {
+        directory: string;
+        bytes: Buffer[];
+      } | null = null;
       if (terminalReplay) {
+        // Forward failures now preserve a startup fence. Keep this genuinely
+        // produced failed copy intact; it is NOT a legacy replay candidate.
         await expect(
           settleRetainedRunnerdSession({
             ...input,
@@ -737,26 +949,123 @@ it.each([
         const failedBytes = await Promise.all(
           files.map((file) => readFile(join(copy, file))),
         );
-        expect(failedBytes[2]).toEqual(bytes[2]);
-        const failedRunner = JSON.parse(failedBytes[1]!.toString("utf8"));
-        expect(failedRunner.pendingTerminalDelivery).toMatchObject({
-          commandType: "runner.suspend",
-          lifecycle: "suspended",
-        });
-        const failedControl = JSON.parse(failedBytes[0]!.toString("utf8"));
         expect(
-          failedControl.commands
+          JSON.parse(failedBytes[2]!.toString("utf8")).startupAttempt,
+        ).toMatchObject({
+          schema: "paperclip.provider_startup.v1",
+          phase: "initialization_failed",
+          failedStage: "spawn",
+          requestedThreadId: thread.thread.id,
+          authenticatedThreadId: null,
+          processId: null,
+          directChildExitObserved: false,
+          processTreeRetired: false,
+        });
+        expect(
+          appendEvent.mock.calls
+            .filter(
+              ([event]) => event.payload.code === "provider_startup_ownership",
+            )
+            .map(
+              ([event]) => (event.payload.startup as { phase: string }).phase,
+            ),
+        ).toEqual(["intent", "initialization_failed"]);
+        expect(
+          await Promise.all(
+            files.map((file) => readFile(join(original, file))),
+          ),
+        ).toEqual(bytes);
+        await expect(
+          readFile(join(activated, files[1]!)),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+        const failedStartupDirectory = join(
+          original,
+          "..",
+          "failed-startup-attempt",
+        );
+        await rename(copy, failedStartupDirectory);
+        failedStartupAttempt = {
+          directory: failedStartupDirectory,
+          bytes: failedBytes,
+        };
+
+        // Backward-compatibility fixture, synthesized ONLY from the pristine
+        // original snapshots: old producers recorded terminal failure without
+        // a startup-attempt field. Never delete a real generated fence above.
+        const directory = join(original, "..", "legacy-failed-terminal");
+        await cp(original, directory, { recursive: true });
+        const legacyControl = JSON.parse(bytes[0]!.toString("utf8"));
+        const legacyRunner = JSON.parse(bytes[1]!.toString("utf8"));
+        expect(
+          JSON.parse(bytes[2]!.toString("utf8")).startupAttempt ?? null,
+        ).toBeNull();
+        const legacyCommands = legacyControl.commands.slice(-2);
+        expect(
+          legacyCommands.map((command: { type: string }) => command.type),
+        ).toEqual(["turn.stop", "runner.suspend"]);
+        for (const command of legacyCommands) {
+          const wire = {
+            schema: command.schema,
+            commandId: command.commandId,
+            controllerSeq: command.controllerSeq,
+            type: command.type,
+            issuedAt: command.issuedAt,
+            deadlineAt: null,
+            precondition: null,
+            payload: command.payload,
+          };
+          const result = {
+            commandId: command.commandId,
+            commandType: command.type,
+            controllerSeq: command.controllerSeq,
+            status: "failed",
+            result: {
+              code: "command_execution_failed",
+              message: "legacy pre-start failure fixture",
+            },
+          };
+          command.status = "failed";
+          command.result = result;
+          legacyRunner.processedCommands[command.commandId] = result;
+          legacyRunner.processedCommandFingerprints[command.commandId] =
+            createHash("sha256")
+              .update(
+                durableControlPlane.durableRecoveryInternals.canonicalJson(wire),
+              )
+              .digest("hex");
+          legacyRunner.lastControllerCommandSeq = command.controllerSeq;
+        }
+        const terminal = legacyCommands[1]!;
+        legacyRunner.lifecycle = "suspended";
+        legacyRunner.pendingTerminalDelivery = {
+          commandId: terminal.commandId,
+          controllerSeq: terminal.controllerSeq,
+          commandType: terminal.type,
+          lifecycle: "suspended",
+        };
+        await writeFile(
+          join(directory, files[0]!),
+          JSON.stringify(legacyControl),
+        );
+        await writeFile(
+          join(directory, files[1]!),
+          JSON.stringify(legacyRunner),
+        );
+        const legacyBytes = await Promise.all(
+          files.map((file) => readFile(join(directory, file))),
+        );
+        expect(legacyBytes[2]).toEqual(bytes[2]);
+        expect(
+          legacyControl.commands
             .slice(-2)
             .map((command: { status: string }) => command.status),
         ).toEqual(["failed", "failed"]);
-        const directory = join(original, "..", "failed-attempt");
-        await rename(copy, directory);
         await cp(directory, copy, { recursive: true });
-        failedAttempt = { directory, bytes: failedBytes };
+        failedAttempt = { directory, bytes: legacyBytes };
         input.sourceFingerprint = createHash("sha256")
           .update(
             JSON.stringify(
-              failedBytes.map((value) =>
+              legacyBytes.map((value) =>
                 createHash("sha256").update(value).digest("hex"),
               ),
             ),
@@ -764,6 +1073,7 @@ it.each([
           .digest("hex");
         input.requestId = "maintenance-fixture-continuation";
         recordEpoch.mockClear();
+        appendEvent.mockClear();
       }
       const proof = await settleRetainedRunnerdSession(input).catch(
         async (error: unknown) => {
@@ -789,6 +1099,23 @@ it.each([
                 outbox: runner.outbox.length,
                 acked: runner.ackedSourceSeq,
                 next: runner.nextSourceSeq,
+                terminalAckTimedOut: JSON.stringify(
+                  runner.diagnostics,
+                ).includes("terminal command result acknowledgement timed out"),
+                pendingTerminalDelivery:
+                  runner.pendingTerminalDelivery ?? null,
+                retainedIdentityTypes: runner.outbox
+                  .filter((row: { eventType: string }) =>
+                    [
+                      "session.started",
+                      "session.resumed",
+                      "harness.ready",
+                    ].includes(row.eventType),
+                  )
+                  .map((row: { sourceSeq: number; eventType: string }) => ({
+                    sourceSeq: row.sourceSeq,
+                    eventType: row.eventType,
+                  })),
               },
               provider: {
                 lifecycle: provider.lifecycle,
@@ -803,12 +1130,27 @@ it.each([
                 }),
               ),
               committedCount: appendEvent.mock.calls.length,
+              epochExits: recordEpoch.mock.calls
+                .map(([receipt]) => receipt)
+                .filter((receipt) => receipt.phase === "retired")
+                .map((receipt) => ({
+                  epoch: receipt.epoch,
+                  exitCode: receipt.exitCode,
+                  exitSignal: receipt.exitSignal,
+                })),
             }),
             { cause: error },
           );
         },
       );
       if (failedAttempt) {
+        expect(
+          await Promise.all(
+            files.map((file) =>
+              readFile(join(failedStartupAttempt!.directory, file)),
+            ),
+          ),
+        ).toEqual(failedStartupAttempt!.bytes);
         expect(
           await Promise.all(
             files.map((file) => readFile(join(failedAttempt!.directory, file))),
@@ -940,7 +1282,8 @@ it.each([
           } catch {}
         }
       }
-      await rm(directory, { recursive: true, force: true });
+      if (!retainFixtureForUnprovenExit)
+        await rm(directory, { recursive: true, force: true });
     }
   },
   40_000,
@@ -2704,9 +3047,13 @@ it("continues rehydrating events after the committed-event window slides", async
   }
 }, 30_000);
 
-it.each([48, 1024])(
-  "proves local suspension after an event backlog before rebinding the next run (%s suffix deltas)",
-  async (suffixCount) => {
+it.each([
+  { suffixCount: 48, suffixLifecycle: null },
+  { suffixCount: 1024, suffixLifecycle: "settled-before-output" },
+  { suffixCount: 1024, suffixLifecycle: "active-after-output" },
+] as const)(
+  "proves local suspension after an event backlog before rebinding the next run ($suffixCount suffix deltas; $suffixLifecycle)",
+  async ({ suffixCount, suffixLifecycle }) => {
     const stateDirectory = await mkdtemp(
       join(tmpdir(), "runnerd-local-close-backlog-"),
     );
@@ -2839,6 +3186,12 @@ it.each([48, 1024])(
         "--split-event-suffix-count",
         String(suffixCount),
         "--durable-turn-ids",
+        "--call-log",
+        join(stateDirectory, "calls.log"),
+        "--record-process-start",
+        ...(suffixLifecycle === null
+          ? []
+          : ["--split-event-suffix-lifecycle", suffixLifecycle]),
       ),
       stateDirectory,
       lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
@@ -2890,6 +3243,18 @@ it.each([48, 1024])(
       expect(deltas).toBe(suffixCount > 48 ? 97 : 144);
       expect(semanticResult).toHaveBeenCalledTimes(1);
       if (suffixCount > 48) {
+        // Both cases stop with unread output. One provider has already
+        // persisted completion; the adversarial one still owns active work.
+        // Physical exit alone must not turn the latter into a safe resume.
+        const fakeBeforeStop = JSON.parse(
+          await readFile(join(stateDirectory, "fake-codex-state.json"), "utf8"),
+        );
+        expect(fakeBeforeStop.nextTurn).toBe(1);
+        expect(fakeBeforeStop.activeTurnId).toBe(
+          suffixLifecycle === "active-after-output"
+            ? (firstTurn.turn as Record<string, unknown>).id
+            : null,
+        );
         const beforeClose = await readRunnerState();
         const unacknowledgedDeltas = (
           beforeClose.outbox as { eventType: string }[]
@@ -2944,6 +3309,7 @@ it.each([48, 1024])(
       expect(provider.pendingEvents).toEqual([]);
       expect(provider.queuedEvents).toEqual([]);
       expect(provider.activeProviderTurnId).toBeNull();
+      const firstStoppedJournal = await readRunnerState();
       closePhase = "successor-attach";
       second = createCapabilityRunnerdCodexTransport({
         ...options,
@@ -2960,6 +3326,146 @@ it.each([48, 1024])(
         contentItems: [],
       }));
       second.transport.setServerRequestHandler(secondSemanticResult);
+      if (suffixLifecycle === "active-after-output") {
+        await expect(
+          second.transport.request("thread/read", {}),
+        ).rejects.toThrow(
+          "prepared provider checkpoint resumed unexpected active work",
+        );
+        expect(secondSemanticResult).not.toHaveBeenCalled();
+        const refusedProvider = JSON.parse(
+          await readFile(
+            join(stateDirectory, "runner/codex-provider-state.json"),
+            "utf8",
+          ),
+        );
+        expect(refusedProvider).toMatchObject({
+          lifecycle: "closed",
+          activeProviderTurnId: null,
+          completedTurnAuthoritative: false,
+          startupAttempt: {
+            schema: "paperclip.provider_startup.v1",
+            phase: "initialization_failed",
+            failedStage: "admission",
+            requestedThreadId: (opened.thread as Record<string, unknown>).id,
+            authenticatedThreadId: null,
+            directChildExitObserved: true,
+            processTreeRetired: false,
+            origin: {
+              runnerInstanceId: identity.runnerInstanceId,
+              normalizedSessionId: identity.normalizedSessionId,
+              runId: "run-close-second",
+              turnId: "turn-close-second",
+              itemId: "item-close-second",
+            },
+            command: { commandType: "run.attach" },
+          },
+        });
+        expect(refusedProvider.startupAttempt.attemptedProcessGeneration).toBe(
+          provider.providerProcessGeneration + 1,
+        );
+        expect(refusedProvider.startupAttempt.processId).toBeGreaterThan(0);
+        expect(refusedProvider.startupAttempt.processGroupId).toBe(
+          refusedProvider.startupAttempt.processId,
+        );
+        for (const pid of [
+          refusedProvider.startupAttempt.processId,
+          -refusedProvider.startupAttempt.processGroupId,
+        ]) {
+          expect(() => process.kill(pid, 0)).toThrow(
+            expect.objectContaining({ code: "ESRCH" }),
+          );
+        }
+        const refusedControl = JSON.parse(
+          await readFile(
+            join(stateDirectory, "control-plane/control-plane-state.json"),
+            "utf8",
+          ),
+        );
+        expect(refusedControl.commands).toContainEqual(
+          expect.objectContaining({
+            type: "run.attach",
+            status: "failed",
+          }),
+        );
+        expect(
+          refusedControl.committedEvents.some((event: { eventType: string }) =>
+            [
+              "session.started",
+              "session.resumed",
+              "turn.started",
+              "run.attached",
+            ].includes(event.eventType),
+          ),
+        ).toBe(false);
+        expect(
+          refusedControl.committedEvents
+            .filter(
+              (event: { eventType: string; envelope: { payload: PrpEvent } }) =>
+                event.eventType === "harness.diagnostic" &&
+                event.envelope.payload.payload.code ===
+                  "provider_startup_ownership",
+            )
+            .map(
+              (event: { envelope: { payload: PrpEvent } }) =>
+                (
+                  event.envelope.payload.payload.startup as Record<
+                    string,
+                    unknown
+                  >
+                ).phase,
+            ),
+        ).toEqual(["intent", "spawned", "initialization_failed"]);
+        const calls = (
+          await readFile(join(stateDirectory, "calls.log"), "utf8")
+        )
+          .trim()
+          .split(/\r?\n/);
+        expect(calls.filter((call) => call === "process-start")).toHaveLength(
+          2,
+        );
+        expect(calls.filter((call) => call === "thread/start")).toHaveLength(1);
+        expect(calls.filter((call) => call === "thread/resume")).toHaveLength(
+          1,
+        );
+        expect(calls.filter((call) => call === "turn/start")).toHaveLength(1);
+        const stillActive = JSON.parse(
+          await readFile(join(stateDirectory, "fake-codex-state.json"), "utf8"),
+        );
+        expect(stillActive.activeTurnId).toBe(
+          (firstTurn.turn as Record<string, unknown>).id,
+        );
+        expect(stillActive.nextTurn).toBe(1);
+        const epochs = await readdir(join(stateDirectory, "authority-epochs"));
+        expect(epochs).toHaveLength(1);
+        const archivedStop = JSON.parse(
+          await readFile(
+            join(
+              stateDirectory,
+              "authority-epochs",
+              epochs[0]!,
+              "runner-state.json",
+            ),
+            "utf8",
+          ),
+        );
+        expect(archivedStop).toEqual(firstStoppedJournal);
+        expect(control.commands).toContainEqual(
+          expect.objectContaining({
+            type: "turn.stop",
+            status: "completed",
+            result: expect.objectContaining({
+              result: expect.objectContaining({
+                providerTurnId: (firstTurn.turn as Record<string, unknown>).id,
+                status: "stopped",
+                providerExitConfirmed: true,
+                interruptAccepted: false,
+              }),
+            }),
+          }),
+        );
+        return;
+      }
       const resumed = await second.transport.request("thread/read", {});
       expect(resumed.thread).toMatchObject({
         id: (opened.thread as Record<string, unknown>).id,
@@ -3997,6 +4503,307 @@ it("steers the active provider turn through the durable PRP command path", async
     await rm(stateDirectory, { recursive: true, force: true });
   }
 }, 30_000);
+
+it.each(["held-ack", "lost-ack", "rejected-attach"] as const)(
+  "preserves old warm-attach authority and event ownership across %s",
+  async (mode) => {
+    const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-warm-ack-"));
+    const callsPath = join(stateDirectory, "calls.log");
+    const cores: DurablePrpControlPlane[] = [];
+    const effects = new Map<string, { event: PrpEvent; deliveries: number }>();
+    const handles: ReturnType<typeof durableControlPlane.spawnRunner>[] = [];
+    let armed = false;
+    let heldEvent: PrpEvent | null = null;
+    let releaseCommit!: () => void;
+    let enteredCommit!: () => void;
+    const commitGate = new Promise<void>((resolveCommit) => {
+      releaseCommit = resolveCommit;
+    });
+    const commitEntered = new Promise<void>((resolveEntered) => {
+      enteredCommit = resolveEntered;
+    });
+    const OriginalCore = durableControlPlane.DurablePrpControlPlane;
+    const coreSpy = vi
+      .spyOn(durableControlPlane, "DurablePrpControlPlane")
+      .mockImplementation(function (
+        options: ConstructorParameters<typeof OriginalCore>[0],
+      ) {
+        const core = new OriginalCore({
+          ...options,
+          onCommittedEvent: async (event) => {
+            await options.onCommittedEvent?.(event);
+            const prior = effects.get(event.sourceEventId);
+            if (prior) {
+              expect(event).toEqual(prior.event);
+              prior.deliveries += 1;
+            } else {
+              effects.set(event.sourceEventId, {
+                event: structuredClone(event),
+                deliveries: 1,
+              });
+            }
+            if (
+              armed &&
+              mode !== "rejected-attach" &&
+              heldEvent === null &&
+              event.eventType === "run.attached"
+            ) {
+              heldEvent = structuredClone(event);
+              enteredCommit();
+              await commitGate;
+              if (mode === "lost-ack") {
+                // The external durable effect exists, but this connection
+                // disappears before its local cursor/ACK can be published.
+                throw new Error(
+                  "fixture lost the old authority ACK after commit",
+                );
+              }
+            }
+          },
+        });
+        cores.push(core);
+        return core;
+      } as unknown as typeof OriginalCore);
+    const launch = durableControlPlane.spawnRunner;
+    const launchSpy = vi
+      .spyOn(durableControlPlane, "spawnRunner")
+      .mockImplementation((options) => {
+        const handle = launch(options);
+        handles.push(handle);
+        return handle;
+      });
+    const within = async <T>(
+      label: string,
+      promise: Promise<T>,
+      timeout = 5_000,
+    ) => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_resolveWait, rejectWait) => {
+            timer = setTimeout(
+              () => rejectWait(new Error(`${label} timeout`)),
+              timeout,
+            );
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    };
+    const dead = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    };
+    const bundle = createCapabilityRunnerdCodexTransport({
+      runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: fakeCodex,
+      codexArgs: fakeCodexArgs(
+        stateDirectory,
+        "--call-log",
+        callsPath,
+        "--record-process-start",
+      ),
+      stateDirectory,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+      runnerReconnectGraceMs: 5_000,
+    });
+    const readRunner = async () =>
+      JSON.parse(
+        await readFile(
+          join(stateDirectory, "runner/runner-state.json"),
+          "utf8",
+        ),
+      ) as {
+        runId: string;
+        ackedSourceSeq: number;
+        processedCommands: Record<string, { commandType: string; status: string }>;
+        outbox: { envelope: { payload: PrpEvent } }[];
+      };
+    let providerPid: number | null = null;
+    let primaryError: unknown;
+    let cleanupProven = false;
+    try {
+      const opened = await within(
+        "initial thread",
+        bundle.transport.request("thread/start", {
+          cwd: tmpdir(),
+          dynamicTools: [],
+        }),
+      ) as { thread: { id: string } };
+      const core = cores[0]!;
+      expect(cores).toHaveLength(1);
+      const oldIdentity = structuredClone(core.store.state.identity);
+      const runnerPid = bundle.evidence().runnerPid;
+      providerPid = bundle.evidence().codexPid;
+      const rotations: (typeof core.store.state)[] = [];
+      const rotate = core.rotateRunIdentity.bind(core);
+      vi.spyOn(core, "rotateRunIdentity").mockImplementation(
+        (identity, template) => {
+          rotations.push(structuredClone(core.store.state));
+          return rotate(identity, template);
+        },
+      );
+      if (mode === "rejected-attach") {
+        const queue = core.queueCommand.bind(core);
+        vi.spyOn(core, "queueCommand").mockImplementation(
+          (type, payload = {}, id, immediate) =>
+            queue(
+              type,
+              type === "run.attach"
+                ? {
+                    ...payload,
+                    provider: {
+                      ...(payload.provider as Record<string, unknown>),
+                      model: "foreign-profile",
+                    },
+                  }
+                : payload,
+              id,
+              immediate,
+            ),
+        );
+      }
+      armed = true;
+      const attachment = bundle.transport.attachRun!({
+        runId: "run-warm-ack-next",
+        turnId: "turn-warm-ack-next",
+        itemId: "item-warm-ack-next",
+      });
+      void attachment.catch(() => undefined);
+      if (mode === "rejected-attach") {
+        await expect(within("rejected attach", attachment)).rejects.toThrow(
+          "run.attach cannot change the durable Codex provider profile",
+        );
+        expect(rotations).toHaveLength(0);
+        expect(core.store.state.identity).toEqual(oldIdentity);
+        expect((await readRunner()).runId).toBe(oldIdentity.runId);
+        const read = await within(
+          "read under unchanged authority",
+          bundle.transport.request("thread/read", {}),
+        );
+        expect((read.thread as { id: string }).id).toBe(opened.thread.id);
+        expect(
+          core.store.state.commands.find((entry) => entry.type === "run.attach")
+            ?.status,
+        ).toBe("failed");
+      } else {
+        await within("old authority commit barrier", commitEntered);
+        const retained = await readRunner();
+        expect(retained.runId).toBe(oldIdentity.runId);
+        expect(
+          Object.values(retained.processedCommands).find((entry) => entry.commandType === "run.attach")
+            ?.status,
+        ).toBe("completed");
+        expect(
+          retained.outbox.some(
+            (entry) =>
+              entry.envelope.payload.sourceEventId === heldEvent!.sourceEventId,
+          ),
+        ).toBe(true);
+        expect(
+          core.store.state.commands.find((entry) => entry.type === "run.attach")
+            ?.status,
+        ).toBe("pending");
+        expect(rotations).toHaveLength(0);
+        if (mode === "lost-ack") core.disconnectActiveRunner();
+        releaseCommit();
+        await within("warm attach after old ACK", attachment, 10_000);
+        expect(rotations).toHaveLength(1);
+        const retired = rotations[0]!;
+        const attachedEvent = retired.committedEvents.find(
+          (entry) => entry.sourceEventId === heldEvent!.sourceEventId,
+        )!;
+        expect(attachedEvent.logicalEffectCount).toBe(1);
+        expect(retired.ackedSourceSeq).toBeGreaterThanOrEqual(
+          attachedEvent.sourceSeq,
+        );
+        expect(
+          retired.committedEvents.slice(-2).map((entry) => entry.eventType),
+        ).toEqual(["session.resumed", "run.attached"]);
+        expect(
+          retired.committedEvents.every(
+            (entry) => entry.envelope.runId === oldIdentity.runId,
+          ),
+        ).toBe(true);
+        if (mode === "lost-ack") {
+          expect(retired.connectionCount).toBeGreaterThanOrEqual(2);
+          expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(2);
+        } else {
+          expect(effects.get(heldEvent!.sourceEventId)?.deliveries).toBe(1);
+        }
+        await vi.waitFor(async () =>
+          expect((await readRunner()).runId).toBe("run-warm-ack-next"),
+        );
+        const read = await within(
+          "read under new authority",
+          bundle.transport.request("thread/read", {}),
+        );
+        expect((read.thread as { id: string }).id).toBe(opened.thread.id);
+      }
+      expect(bundle.evidence()).toMatchObject({
+        runnerPid,
+        codexPid: providerPid,
+        runnerExited: false,
+      });
+      const calls = (await readFile(callsPath, "utf8")).trim().split(/\r?\n/);
+      expect(calls.filter((call) => call === "process-start")).toHaveLength(1);
+      expect(calls.filter((call) => call === "thread/start")).toHaveLength(1);
+      expect(calls.filter((call) => call === "turn/start")).toHaveLength(0);
+    } catch (error) {
+      primaryError = error;
+      throw error;
+    } finally {
+      releaseCommit();
+      try {
+        await within(
+          "warm fixture close",
+          bundle.transport.close(),
+          10_000,
+        ).catch(() => undefined);
+        for (const handle of handles) {
+          await durableControlPlane
+            .waitForProcess(handle, 250)
+            .catch(() => undefined);
+          await within("exact warm fixture runner exit", handle.completion);
+          if (handle.processGroupId && !dead(-handle.processGroupId))
+            process.kill(-handle.processGroupId, "SIGKILL");
+          await vi.waitFor(() => {
+            expect(handle.child.pid && dead(handle.child.pid)).toBe(true);
+            expect(handle.processGroupId && dead(-handle.processGroupId)).toBe(
+              true,
+            );
+          });
+        }
+        if (providerPid && !dead(-providerPid))
+          process.kill(-providerPid, "SIGKILL");
+        if (providerPid)
+          await vi.waitFor(() => expect(dead(-providerPid!)).toBe(true));
+        cleanupProven = true;
+      } catch (error) {
+        if (primaryError === undefined) throw error;
+        console.error(
+          "Warm ACK fixture cleanup unproven; retaining its private state directory.",
+        );
+      } finally {
+        try {
+          for (const core of cores) await core.stop().catch(() => undefined);
+        } finally {
+          launchSpy.mockRestore();
+          coreSpy.mockRestore();
+          if (cleanupProven)
+            await rm(stateDirectory, { recursive: true, force: true });
+        }
+      }
+    }
+  },
+  30_000,
+);
 
 it("rotates PRP authority in place for a warm cross-run attachment", async () => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-warm-attach-"));

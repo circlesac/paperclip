@@ -212,6 +212,11 @@ fn apply_authority_rotation(
     endpoint: &mut RunnerTransportEndpoint,
     next: DurableRunnerConfig,
 ) -> Result<(), DurableRunnerError> {
+    if !state.outbox.is_empty() || state.acked_source_seq < state.highest_source_seq() {
+        return Err(DurableRunnerError::invalid(
+            "warm authority rotation requires the old event outbox to be durably acknowledged",
+        ));
+    }
     let reconnect_count = state.reconnect_count.saturating_add(1);
     let mut diagnostics = std::mem::take(&mut state.diagnostics);
     endpoint.rotate(&next.connect_url, &next.run_id)?;
@@ -239,6 +244,15 @@ pub trait CommandExecutor {
     fn rotate_authority(&mut self, _config: &DurableRunnerConfig) {}
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        Ok(Vec::new())
+    }
+
+    /// Returns only already-retained evidence, without polling, restoration,
+    /// launch, or provider RPCs. The runner commits and ACKs this FIFO before
+    /// recording a command failure or completing an authority attachment.
+    /// Other successful commands retain ordinary control-first backpressure.
+    /// Persistence errors must not become an empty successful drain.
+    fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
         Ok(Vec::new())
     }
 
@@ -490,6 +504,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
             let next_authority = next_authority_config(&command, &config)?;
             let (result, lifecycle) =
                 process_command(&mut state, &store, &config, &mut executor, &command)?;
+            let next_authority = next_authority.filter(|_| completed_attachment(&result));
             if let Some(durable_lifecycle) = lifecycle.durable_state() {
                 persist_lifecycle_before_command_delivery(
                     &mut state,
@@ -499,7 +514,21 @@ pub fn run_durable_runner<E: CommandExecutor>(
                 )?;
             }
             lifecycle_after_reply = lifecycle_after_reply.merge(lifecycle);
-            if let Err(error) = transport.send_json(&command_result_envelope(&state, &result)) {
+            let delivery = (|| {
+                if next_authority.is_some() {
+                    wait_for_old_authority_outbox_ack(
+                        &mut transport,
+                        &mut state,
+                        &store,
+                        &connection,
+                        &mut sent_source_seq,
+                    )?;
+                } else if result.status == "failed" {
+                    send_outbox(&mut transport, &state, &mut sent_source_seq)?;
+                }
+                transport.send_json(&command_result_envelope(&state, &result))
+            })();
+            if let Err(error) = delivery {
                 if lifecycle.durable_state().is_some() {
                     return stop_after_terminal_result_delivery_failure(
                         &mut state,
@@ -649,6 +678,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
                     let next_authority = next_authority_config(&command, &config)?;
                     let (result, lifecycle) =
                         process_command(&mut state, &store, &config, &mut executor, &command)?;
+                    let next_authority = next_authority.filter(|_| completed_attachment(&result));
                     if let Some(durable_lifecycle) = lifecycle.durable_state() {
                         persist_lifecycle_before_command_delivery(
                             &mut state,
@@ -657,9 +687,21 @@ pub fn run_durable_runner<E: CommandExecutor>(
                             &result,
                         )?;
                     }
-                    if let Err(error) =
+                    let delivery = (|| {
+                        if next_authority.is_some() {
+                            wait_for_old_authority_outbox_ack(
+                                &mut transport,
+                                &mut state,
+                                &store,
+                                &connection,
+                                &mut sent_source_seq,
+                            )?;
+                        } else if result.status == "failed" {
+                            send_outbox(&mut transport, &state, &mut sent_source_seq)?;
+                        }
                         transport.send_json(&command_result_envelope(&state, &result))
-                    {
+                    })();
+                    if let Err(error) = delivery {
                         if lifecycle.durable_state().is_some() {
                             return stop_after_terminal_result_delivery_failure(
                                 &mut state,
@@ -928,6 +970,67 @@ fn wait_for_terminal_result_ack(
     ))
 }
 
+fn completed_attachment(result: &StoredCommandResult) -> bool {
+    result.command_type == "run.attach"
+        && result.status == "completed"
+        && !matches!(
+            result.result.get("status").and_then(Value::as_str),
+            Some("rejected" | "failed")
+        )
+}
+
+fn wait_for_old_authority_outbox_ack(
+    transport: &mut AuthenticatedTransport,
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    connection: &ConnectionMetadata,
+    sent_source_seq: &mut u64,
+) -> Result<(), DurableRunnerError> {
+    send_outbox(transport, state, sent_source_seq)?;
+    let target = state.highest_source_seq();
+    let deadline = Instant::now() + TERMINAL_RESULT_ACK_TIMEOUT;
+    while state.acked_source_seq < target {
+        if Instant::now() >= deadline {
+            return Err(DurableRunnerError::invalid(
+                "old authority event acknowledgement timed out",
+            ));
+        }
+        let Some(message) = transport.receive_json()? else {
+            continue;
+        };
+        validate_control_identity(&message, state, Some(connection))?;
+        match message.get("kind").and_then(Value::as_str) {
+            Some("ack") => {
+                let acked = message
+                    .pointer("/payload/ackedSourceSeq")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| DurableRunnerError::invalid("ACK cursor is required"))?;
+                state.apply_ack(acked)?;
+                store.save(state)?;
+            }
+            Some("ping") => transport.send_json(&control_envelope(
+                state,
+                connection,
+                "pong",
+                json!({
+                    "lifecycle": state.lifecycle,
+                    "ackedSourceSeq": state.acked_source_seq,
+                    "outboxBytes": state.outbox_bytes(),
+                }),
+            ))?,
+            // Do not execute or forget another command inside this fence. The
+            // caller disconnects with the completed attach and old outbox still
+            // durable; the controller replays its own pending command queue.
+            _ => {
+                return Err(DurableRunnerError::invalid(
+                    "old authority acknowledgement fence received non-ACK control",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
     state: &mut DurableState,
     store: &DurableStateStore,
@@ -957,7 +1060,14 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
                 "pending terminal command did not replay its durable lifecycle",
             ));
         }
-        if let Err(error) = transport.send_json(&command_result_envelope(state, &result)) {
+        let delivery = (|| {
+            if result.status == "failed" {
+                let mut sent = state.acked_source_seq;
+                send_outbox(transport, state, &mut sent)?;
+            }
+            transport.send_json(&command_result_envelope(state, &result))
+        })();
+        if let Err(error) = delivery {
             return stop_after_terminal_result_delivery_failure(state, store, executor, error);
         }
         if let Err(error) =
@@ -1062,7 +1172,52 @@ fn poll_executor_events<E: CommandExecutor>(
     if state.pending_provider_cleanup.is_some() {
         return Ok(());
     }
-    let mut events = executor.poll_events()?.into_iter().peekable();
+    let events = match executor.poll_events() {
+        Ok(events) => events,
+        Err(error) => {
+            drain_retained_events(state, store, config, executor).map_err(|secondary| {
+                DurableRunnerError::invalid(format!(
+                    "{error}; retained failure evidence remains uncommitted: {secondary}"
+                ))
+            })?;
+            return Err(error);
+        }
+    };
+    commit_executor_events(state, store, config, executor, events)
+}
+
+fn drain_retained_events<E: CommandExecutor>(
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    executor: &mut E,
+) -> Result<(), DurableRunnerError> {
+    let mut observed_heads = std::collections::HashSet::new();
+    let mut total = 0usize;
+    loop {
+        let events = executor.retained_events()?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let first_id = events[0].executor_event_id.clone();
+        total = total.saturating_add(events.len());
+        if !observed_heads.insert(first_id) || total > 32_768 {
+            return Err(DurableRunnerError::invalid(
+                "retained failure evidence did not make bounded FIFO progress",
+            ));
+        }
+        commit_executor_events(state, store, config, executor, events)?;
+    }
+}
+
+fn commit_executor_events<E: CommandExecutor>(
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    executor: &mut E,
+    events: Vec<PolledEvent>,
+) -> Result<(), DurableRunnerError> {
+    let mut events = events.into_iter().peekable();
     while events.peek().is_some() {
         let mut durable_prefix = 0;
         let committed = (|| -> Result<(), DurableRunnerError> {
@@ -1147,6 +1302,14 @@ fn process_command<E: CommandExecutor>(
     let execution = match executor.execute(command) {
         Ok(execution) => execution,
         Err(error) => {
+            // Failure facts may follow a full retained provider backlog. Only
+            // the non-restoring FIFO is legal here; regular poll can launch.
+            // A failed evidence save leaves this command pending/indeterminate.
+            drain_retained_events(state, store, config, executor).map_err(|secondary| {
+                DurableRunnerError::invalid(format!(
+                    "{error}; retained failure evidence remains uncommitted: {secondary}"
+                ))
+            })?;
             // An executor-returned error is a terminal observation, not crash
             // ambiguity. Commit it before replying so recovery can replay the
             // original provider/bootstrap failure without executing the
@@ -1168,6 +1331,34 @@ fn process_command<E: CommandExecutor>(
             return Ok((result, CommandLifecycle::for_terminal(command)));
         }
     };
+    if command.command_type == "run.attach" {
+        // Rotation must preserve the old authority's retained audit FIFO.
+        // Ordinary successful controls must not pull a whole provider backlog
+        // ahead of stop/suspend result delivery; regular polling retains its
+        // existing cumulative-ACK backpressure for those events.
+        drain_retained_events(state, store, config, executor)?;
+    } else if command.command_type == "session.snapshot"
+        && command.payload.get("quiesceForWarmAttach") == Some(&Value::Bool(true))
+        && execution
+            .result
+            .get("warmAttachReady")
+            .and_then(Value::as_bool)
+            .is_some()
+        && !matches!(
+            execution.result.get("status").and_then(Value::as_str),
+            Some("failed" | "rejected")
+        )
+        && state.outbox.is_empty()
+        && state.acked_source_seq == state.highest_source_seq()
+    {
+        // Repeated explicit readiness probes can otherwise occupy the control
+        // loop forever while retained startup facts keep readiness false. Move
+        // only one already-retained prefix, without polling/restoring, and wait
+        // for its ordinary cumulative ACK before the next probe can advance.
+        // The current result remains conservative; the next probe recomputes it.
+        let prefix = executor.retained_events()?.into_iter().take(128).collect();
+        commit_executor_events(state, store, config, executor, prefix)?;
+    }
     for (event_type, priority, payload) in execution.events {
         state.enqueue_event(config, event_type, priority, payload)?;
     }
@@ -1266,6 +1457,150 @@ mod tests {
         events: VecDeque<PolledEvent>,
         fail_acknowledgement: bool,
         acknowledgements: Vec<usize>,
+    }
+
+    struct StartupFailureExecutor {
+        retained: RetainingEventExecutor,
+        polls: usize,
+        calls: usize,
+        stalled_ack: bool,
+        alternating_ack: bool,
+    }
+
+    impl CommandExecutor for StartupFailureExecutor {
+        fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+            self.calls += 1;
+            Err(DurableRunnerError::invalid(
+                "original provider startup failure",
+            ))
+        }
+        fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+            self.polls += 1;
+            Err(DurableRunnerError::invalid(
+                "original autonomous restore failure",
+            ))
+        }
+        fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+            Ok(self.retained.events.iter().take(128).cloned().collect())
+        }
+        fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+            if self.stalled_ack {
+                return Ok(());
+            }
+            if self.alternating_ack {
+                self.retained.events.rotate_left(1);
+                return Ok(());
+            }
+            self.retained.acknowledge_events(count)
+        }
+    }
+
+    #[test]
+    fn startup_failure_facts_cross_full_fifo_before_failed_command_and_never_poll() {
+        for mode in [
+            "command",
+            "poll",
+            "ack_failure",
+            "invalid_suffix",
+            "stalled_ack",
+            "alternating_ack",
+            "outbox_full",
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-startup-facts-{mode}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut config = config(directory.clone());
+            config.max_frame_bytes = 4096;
+            config.max_outbox_bytes = 1024 * 1024;
+            if mode == "outbox_full" {
+                config.max_outbox_bytes = 64 * 1024;
+            }
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let mut executor = StartupFailureExecutor {
+                retained: RetainingEventExecutor {
+                    events: (0..if mode == "alternating_ack" { 2 } else { 131 })
+                        .map(|index| PolledEvent {
+                            executor_event_id: format!("startup-fifo-{index}"),
+                            event_type: "harness.diagnostic".to_owned(),
+                            priority: EventPriority::P0,
+                            payload: if mode == "invalid_suffix" && index == 130 {
+                                json!({"message":"x".repeat(8192)})
+                            } else {
+                                json!({"code":"provider_startup_ownership", "index":index})
+                            },
+                        })
+                        .collect(),
+                    fail_acknowledgement: mode == "ack_failure",
+                    acknowledgements: Vec::new(),
+                },
+                polls: 0,
+                calls: 0,
+                stalled_ack: mode == "stalled_ack",
+                alternating_ack: mode == "alternating_ack",
+            };
+            let command = command("session.open");
+            if mode == "poll" {
+                let failure =
+                    poll_executor_events(&mut state, &store, &config, &mut executor).unwrap_err();
+                assert!(failure
+                    .to_string()
+                    .starts_with("original autonomous restore failure"));
+                assert_eq!(executor.polls, 1);
+            } else {
+                let outcome = process_command(&mut state, &store, &config, &mut executor, &command);
+                if mode == "command" {
+                    let result = outcome.unwrap().0;
+                    assert_eq!(result.status, "failed");
+                    assert_eq!(
+                        result.result["message"],
+                        "original provider startup failure"
+                    );
+                    let replay =
+                        process_command(&mut state, &store, &config, &mut executor, &command)
+                            .unwrap()
+                            .0;
+                    assert_eq!(result, replay);
+                } else {
+                    let error = outcome.unwrap_err().to_string();
+                    assert!(error.starts_with("original provider startup failure; retained failure evidence remains uncommitted:"));
+                    assert_eq!(
+                        state.processed_commands[&command.command_id].status,
+                        "pending"
+                    );
+                    let replay =
+                        process_command(&mut state, &store, &config, &mut executor, &command)
+                            .unwrap()
+                            .0;
+                    assert_eq!(replay.status, "pending");
+                    assert_eq!(executor.calls, 1);
+                }
+                assert_eq!(executor.polls, 0);
+            }
+            let (reloaded, _) = store.load_or_create(&config).unwrap();
+            let expected = match mode {
+                "ack_failure" | "stalled_ack" => 128,
+                "invalid_suffix" => 130,
+                "alternating_ack" => 2,
+                "outbox_full" => reloaded.outbox.len(),
+                _ => 131,
+            };
+            assert_eq!(reloaded.outbox.len(), expected);
+            if mode == "outbox_full" {
+                assert!(expected > 0 && expected < 131);
+                assert_eq!(executor.retained.events.len() + expected, 131);
+                assert_eq!(
+                    executor.retained.acknowledgements.iter().sum::<usize>(),
+                    expected
+                );
+            }
+            if matches!(mode, "command" | "poll") {
+                assert!(executor.retained.events.is_empty());
+                assert_eq!(executor.retained.acknowledgements, vec![128, 3]);
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     impl CommandExecutor for CountingExecutor {
@@ -1723,15 +2058,25 @@ mod tests {
 
         let store = DurableStateStore::new(&directory).unwrap();
         let (mut state, _) = store.load_or_create(&current).unwrap();
-        state.outbox.push(crate::durable::state::StoredOutboxEvent {
-            source_seq: 1,
-            priority: 0,
-            event_type: "run.attached".to_owned(),
-            byte_size: 1,
-            envelope: json!({}),
-        });
+        state
+            .enqueue_event(&current, "run.attached", EventPriority::P0, json!({}))
+            .unwrap();
+        store.save(&state).unwrap();
         let mut endpoint =
             RunnerTransportEndpoint::new(&current.connect_url, &current.run_id).unwrap();
+        assert!(apply_authority_rotation(
+            &mut state,
+            &store,
+            &mut current,
+            &mut endpoint,
+            next.clone()
+        )
+        .is_err());
+        assert_eq!(current.run_id, "run_1");
+        let (preserved, _) = store.load_or_create(&current).unwrap();
+        assert_eq!(preserved.outbox.len(), 1);
+        state.apply_ack(1).unwrap();
+        store.save(&state).unwrap();
         apply_authority_rotation(&mut state, &store, &mut current, &mut endpoint, next).unwrap();
 
         assert_eq!(state.run_id, "run_2");
@@ -1739,6 +2084,296 @@ mod tests {
         assert!(state.outbox.is_empty());
         assert_eq!(current.run_id, "run_2");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ordinary_success_preserves_retained_backlog_for_control_first_polling() {
+        struct StopExecutor {
+            retained: Vec<PolledEvent>,
+            retained_reads: usize,
+        }
+        impl CommandExecutor for StopExecutor {
+            fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                Ok(CommandExecution::result(
+                    json!({"providerExitConfirmed": true}),
+                ))
+            }
+            fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                self.retained_reads += 1;
+                Ok(self.retained.clone())
+            }
+            fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+                self.retained.drain(..count);
+                Ok(())
+            }
+            fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                panic!("a control command must not poll the provider")
+            }
+        }
+        for kind in [
+            "turn.stop",
+            "runner.drain",
+            "runner.suspend",
+            "session.snapshot",
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-control-first-retained-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut config = config(directory.clone());
+            config.max_outbox_bytes = 1_048_576;
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let retained = (0..131)
+                .map(|index| PolledEvent {
+                    executor_event_id: format!("retained-{index}"),
+                    event_type: "item.delta".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"delta": "retained backlog"}),
+                })
+                .collect::<Vec<_>>();
+            let mut executor = StopExecutor {
+                retained,
+                retained_reads: 0,
+            };
+            let result =
+                process_command(&mut state, &store, &config, &mut executor, &command(kind))
+                    .unwrap()
+                    .0;
+            assert_eq!(result.status, "completed");
+            assert_eq!(
+                executor.retained_reads, 0,
+                "{kind} must not move the provider FIFO ahead of control delivery"
+            );
+            assert_eq!(executor.retained.len(), 131);
+            assert!(state.outbox.is_empty());
+            assert!(store.load_or_create(&config).unwrap().0.outbox.is_empty());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_quiescing_snapshot_advances_one_retained_prefix_only_after_old_ack() {
+        struct SnapshotExecutor {
+            retained: VecDeque<PolledEvent>,
+            reads: usize,
+            result_override: Option<Value>,
+        }
+        impl CommandExecutor for SnapshotExecutor {
+            fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                Ok(CommandExecution::result(
+                    self.result_override.clone().unwrap_or_else(|| {
+                        json!({
+                            "warmAttachReady": self.retained.is_empty(),
+                        })
+                    }),
+                ))
+            }
+            fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                self.reads += 1;
+                Ok(self.retained.iter().cloned().collect())
+            }
+            fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+                self.retained.drain(..count);
+                Ok(())
+            }
+            fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                panic!("readiness transfer must not poll or restore a provider")
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-warm-readiness-prefix-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = config(directory.clone());
+        config.max_outbox_bytes = 1_048_576;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = SnapshotExecutor {
+            retained: (0..131)
+                .map(|index| PolledEvent {
+                    executor_event_id: format!("retained-{index}"),
+                    event_type: "harness.diagnostic".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: json!({"index": index}),
+                })
+                .collect(),
+            reads: 0,
+            result_override: None,
+        };
+        for seq in 1..=4 {
+            let mut snapshot = command("session.snapshot");
+            snapshot.command_id = format!("snapshot-{seq}");
+            snapshot.controller_seq = seq;
+            snapshot.payload = json!({"quiesceForWarmAttach": true});
+            if seq == 3 || seq == 4 {
+                state.apply_ack(state.highest_source_seq()).unwrap();
+                store.save(&state).unwrap();
+            }
+            let result = process_command(&mut state, &store, &config, &mut executor, &snapshot)
+                .unwrap()
+                .0;
+            assert_eq!(result.result["warmAttachReady"], json!(seq == 4));
+            match seq {
+                1 | 2 => {
+                    assert_eq!(
+                        executor.reads, 1,
+                        "unACKed outbox blocks another retained prefix"
+                    );
+                    assert_eq!(executor.retained.len(), 3);
+                    assert_eq!(state.outbox.len(), 128);
+                }
+                3 => {
+                    assert_eq!(executor.reads, 2);
+                    assert!(executor.retained.is_empty());
+                    assert_eq!(state.outbox.len(), 3);
+                }
+                4 => assert!(state.outbox.is_empty()),
+                _ => unreachable!(),
+            }
+        }
+        executor.retained.push_back(PolledEvent {
+            executor_event_id: "retained-negative".to_owned(),
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({"negative": true}),
+        });
+        let reads = executor.reads;
+        for (index, result) in [
+            json!({"status": "rejected", "warmAttachReady": false}),
+            json!({"status": "failed", "warmAttachReady": true}),
+            json!({"status": "completed"}),
+            json!({"warmAttachReady": "true"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            executor.result_override = Some(result);
+            let mut snapshot = command("session.snapshot");
+            snapshot.command_id = format!("negative-snapshot-{index}");
+            snapshot.controller_seq = 5 + index as u64;
+            snapshot.payload = json!({"quiesceForWarmAttach": true});
+            process_command(&mut state, &store, &config, &mut executor, &snapshot).unwrap();
+            assert_eq!(
+                executor.reads, reads,
+                "only a genuine readiness result may transfer a prefix"
+            );
+            assert_eq!(executor.retained.len(), 1);
+            assert!(state.outbox.is_empty());
+        }
+        assert!(store.load_or_create(&config).unwrap().0.outbox.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn completed_attachment_commits_retained_fifo_before_execution_events_and_replays_without_effects(
+    ) {
+        struct AttachExecutor {
+            calls: usize,
+            retained: VecDeque<PolledEvent>,
+            fail_ack: bool,
+        }
+        impl CommandExecutor for AttachExecutor {
+            fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                self.calls += 1;
+                Ok(CommandExecution {
+                    result: json!({"status":"resumed"}),
+                    events: vec![(
+                        "run.attached".to_owned(),
+                        EventPriority::P0,
+                        json!({"order":3}),
+                    )],
+                })
+            }
+            fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                Ok(self.retained.iter().cloned().collect())
+            }
+            fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+                if self.fail_ack {
+                    return Err(DurableRunnerError::invalid("retained ACK failure"));
+                }
+                self.retained.drain(..count);
+                Ok(())
+            }
+            fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                panic!("no polling during command receipt transfer")
+            }
+        }
+        for fail_ack in [false, true] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-attach-evidence-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let config = config(directory.clone());
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let mut executor = AttachExecutor {
+                calls: 0,
+                fail_ack,
+                retained: (1..=2)
+                    .map(|order| PolledEvent {
+                        executor_event_id: format!("retained-{order}"),
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({"order":order}),
+                    })
+                    .collect(),
+            };
+            let attach = command("run.attach");
+            let outcome = process_command(&mut state, &store, &config, &mut executor, &attach);
+            if fail_ack {
+                assert!(outcome.is_err());
+                assert_eq!(
+                    state.processed_commands[&attach.command_id].status,
+                    "pending"
+                );
+            } else {
+                assert!(completed_attachment(&outcome.unwrap().0));
+            }
+            let (mut reloaded, _) = store.load_or_create(&config).unwrap();
+            assert_eq!(
+                reloaded
+                    .outbox
+                    .iter()
+                    .map(|event| event
+                        .envelope
+                        .pointer("/payload/payload/order")
+                        .or_else(|| event.envelope.pointer("/payload/order"))
+                        .cloned()
+                        .unwrap_or(Value::Null))
+                    .collect::<Vec<_>>(),
+                if fail_ack {
+                    vec![json!(1), json!(2)]
+                } else {
+                    vec![json!(1), json!(2), json!(3)]
+                }
+            );
+            let replay = process_command(&mut reloaded, &store, &config, &mut executor, &attach)
+                .unwrap()
+                .0;
+            assert_eq!(executor.calls, 1);
+            assert_eq!(
+                replay.status,
+                if fail_ack {
+                    "indeterminate"
+                } else {
+                    "completed"
+                }
+            );
+            for (status, payload_status) in [
+                ("failed", "resumed"),
+                ("pending", "resumed"),
+                ("rejected", "resumed"),
+                ("completed", "rejected"),
+                ("completed", "failed"),
+            ] {
+                let mut rejected = replay.clone();
+                rejected.status = status.to_owned();
+                rejected.result = json!({"status":payload_status});
+                assert!(!completed_attachment(&rejected));
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
