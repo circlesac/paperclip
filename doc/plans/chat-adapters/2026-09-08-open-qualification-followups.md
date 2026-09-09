@@ -7,6 +7,24 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 01:38 UTC: the Mac remains locked. Root independently verified
+the webhook logging privacy repair: **97/97** focused tests, server types, and
+**55/55** inert ingress-canary tests pass. Request bodies (including raw Buffer
+bytes), response headers, SDK error prose and malformed callback paths now use
+content-free logging; signature verification/admission are unchanged. Preparing
+server 67 with the unchanged normal runner below, separately from moving Rust.
+
+The latest full chat integration run passed **584/584**, zero skips, on fresh
+`chat_adapters_startup_boundary_20260909_full01` (99.62 seconds). The final
+nested startup-diagnostic fixture shape then passed all **6/6** selected cases
+on fresh `chat_adapters_startup_boundary_20260909_final02` (578 filtered).
+The broader targeted checks passed **665/665** server and **120/120** connector
+UI cases. These do not establish live Teams qualification or historical retry
+eligibility. Native startup fencing also exposed a warm-attach ordering defect:
+authority rotation could discard unacknowledged evidence. James is fixing the
+ACK-before-rotation boundary; Epicurus is independently reviewing it and adding
+a composed regression. Do not stage or deploy that runner until frozen/verified.
+
 September 9, 01:19 UTC: the Mac remains locked. Parallel code work continues
 on forward-only provider startup fencing: persist launch intent and exact child
 facts before RPCs, retain failed-startup evidence through command failure, and

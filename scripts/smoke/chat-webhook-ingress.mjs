@@ -361,8 +361,10 @@ export async function main(
   if (
     process.env.NODE_DEBUG?.trim() ||
     process.env.NODE_DEBUG_NATIVE?.trim() ||
-    process.execArgv.includes("--trace-tls") ||
-    /(?:^|\s)--trace-tls(?:\s|$)/u.test(process.env.NODE_OPTIONS ?? "")
+    process.execArgv.some((arg) => /^--trace[-_]tls(?:=|$)/u.test(arg)) ||
+    /(?:^|[\s"'])--trace[-_]tls(?:[=\s"']|$)/u.test(
+      process.env.NODE_OPTIONS ?? "",
+    )
   ) {
     write(
       `${JSON.stringify({ outcome: "invalid_configuration", errorCode: "UNSAFE_DEBUG_ENVIRONMENT" })}\n`,

@@ -701,6 +701,37 @@ test("CLI refuses native debug output before starting a request", async () => {
   }
 });
 
+for (const flag of ["--trace_tls", "--trace-tls=true", "--trace_tls=true"]) {
+  for (const source of ["argv", "environment"]) {
+    test(`refuses ${source} TLS tracing alias ${flag} without networking`, async (t) => {
+      const previousArgv = process.execArgv;
+      const previousOptions = process.env.NODE_OPTIONS;
+      t.after(() => {
+        process.execArgv = previousArgv;
+        if (previousOptions === undefined) delete process.env.NODE_OPTIONS;
+        else process.env.NODE_OPTIONS = previousOptions;
+      });
+      if (source === "argv") process.execArgv = [...previousArgv, flag];
+      else process.env.NODE_OPTIONS = flag;
+      let calls = 0;
+      let output = "";
+      const status = await main(["--url", publicUrl], {
+        write: (line) => {
+          output += line;
+        },
+        probe: async () => {
+          calls++;
+          return { outcome: "expected_rejection" };
+        },
+      });
+      assert.equal(calls, 0);
+      assert.equal(status, 2);
+      assert.equal(JSON.parse(output).errorCode, "UNSAFE_DEBUG_ENVIRONMENT");
+      assertRedacted(output);
+    });
+  }
+}
+
 test("two explicit targets run once in order and any unexpected result fails the command", async () => {
   for (const statuses of [
     [401, 401],

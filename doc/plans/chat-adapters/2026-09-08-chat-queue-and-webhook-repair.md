@@ -2906,5 +2906,18 @@ localizes the original pre-proxy HTTP error. It remains unresolved.
 
 The canary exposed a separate generic HTTP logging defect: raw webhook buffers
 are included as numeric byte properties in warning logs. The observed body
-was only the inert `{}` fixture, not an actual leaked credential. A narrowly
-scoped raw-body/error-prose suppression regression is now in progress.
+was only the inert `{}` fixture, not an actual leaked credential. The repair
+now treats the reserved webhook namespace as private for logging even for
+malformed paths or rejected methods. It keeps only request ID/method, a generic
+route, response status/timing and generic errors; it omits the entire raw or
+parsed body, params, request/response headers and SDK prose. Actual Express/pino
+regressions first failed for Buffer bytes and independent error/response fields.
+Root independently passed the final **97/97** six-file cohort and server types.
+Adjacent non-webhook diagnostics remain intact. Routing, signature verification,
+admission and provider publication behavior are unchanged.
+
+The diagnostic's TLS-debug guard also now rejects Node's underscore and
+`=true` tracing aliases before any request. All six injected regressions first
+failed, then passed; the final canary suite is **55/55**, with no real network
+traffic in those tests. Live verification of the logging repair follows its
+separate server deployment; these automated results are not a deployment claim.

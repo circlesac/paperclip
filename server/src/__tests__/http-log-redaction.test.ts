@@ -12,6 +12,298 @@ import { testAdapterEnvironmentSchema } from "@paperclipai/shared";
 import { createHttpLogger } from "../middleware/logger.js";
 
 describe("HTTP logger redaction", () => {
+  it.each([
+    {
+      method: "POST",
+      path: "http://provider.invalid/api/chat-webhooks/../private-url-canary",
+    },
+    { method: "GET", path: "/api/chat-webhooks/private-url-canary/slack/" },
+    { method: "PUT", path: "/API/CHAT-WEBHOOKS/private-url-canary/SLACK" },
+    { method: "PATCH", path: "/api/chat-webhooks//private-url-canary" },
+    { method: "DELETE", path: "/api/chat-webhooks/private-url-canary/%XX" },
+    {
+      method: "POST",
+      path: "/api/chat-webhooks/private-url-canary/slack/extra",
+    },
+    { method: "POST", path: "/api/chat-webhooks?payload=private-url-canary" },
+    {
+      method: "POST",
+      path: "http://provider.invalid/api/chat-webhooks/private-url-canary/slack?token=private-url-canary",
+    },
+  ])(
+    "keeps malformed/rejected webhook $method requests content-free",
+    async ({ method, path }) => {
+      const privateText = "private-rejected-method-body-canary";
+      const chunks: string[] = [];
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(chunk.toString());
+          callback();
+        },
+      });
+      const app = express();
+      app.use(
+        createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)),
+      );
+      app.use(express.raw({ type: "*/*" }));
+      app.use((_req, res) => {
+        (res as any).err = new Error(`SDK error echoed ${privateText}`);
+        res.setHeader("x-provider-prose", privateText);
+        res.status(405).end();
+      });
+      const server = createServer(app);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (!address || typeof address === "string")
+          throw new Error("Fixture listener unavailable");
+        const body = JSON.stringify({ text: privateText });
+        await new Promise<void>((resolve, reject) => {
+          const client = httpRequest(
+            {
+              hostname: "127.0.0.1",
+              port: address.port,
+              method,
+              path,
+              headers: {
+                "content-type": "application/json",
+                "content-length": Buffer.byteLength(body),
+                "x-provider-prose": privateText,
+              },
+            },
+            (res) => {
+              expect(res.statusCode).toBe(405);
+              res.resume();
+              res.on("end", resolve);
+            },
+          );
+          client.on("error", reject);
+          client.end(body);
+        });
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+      const output = chunks.join("");
+      expect(output).not.toContain(privateText);
+      expect(output).not.toContain("private-url-canary");
+      expect(output).not.toContain("provider.invalid");
+      const log = JSON.parse(output.trim());
+      expect(log.req).toMatchObject({
+        method,
+        url: "/api/chat-webhooks/:publicId/:provider",
+      });
+      expect(log.reqBody).toBe("[REDACTED]");
+      expect(log.err.message).toBe("Chat webhook request failed");
+      expect(log.res).toEqual({ statusCode: 405 });
+      expect(log.responseTime).toEqual(expect.any(Number));
+    },
+  );
+
+  it.each(
+    ["raw-json", "raw-form", "raw-text", "parsed-json", "parsed-form"].flatMap(
+      (bodyKind) =>
+        ["warning", "context-error", "bare-sdk-error"].flatMap((failureMode) =>
+          [false, true].map((mountedLogger) => ({
+            bodyKind,
+            failureMode,
+            mountedLogger,
+          })),
+        ),
+    ),
+  )(
+    "omits private webhook input: $bodyKind / $failureMode / mounted=$mountedLogger",
+    async ({ bodyKind, failureMode, mountedLogger }) => {
+      const canaries = {
+        text: "private-chat-text-canary-9024",
+        filename: "private-file-name-canary-7731.txt",
+        token: "private-webhook-token-canary-2342",
+        sdk: "private-sdk-prose-canary-1148",
+      };
+      const payload = {
+        text: canaries.text,
+        files: [{ name: canaries.filename }],
+        token: canaries.token,
+      };
+      const chunks: string[] = [];
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(chunk.toString());
+          callback();
+        },
+      });
+      const testLogger = pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream);
+      const app = express();
+      const routes = express.Router();
+      if (mountedLogger) routes.use(createHttpLogger(testLogger));
+      else app.use(createHttpLogger(testLogger));
+      routes.use(
+        bodyKind === "parsed-json"
+          ? express.json()
+          : bodyKind === "parsed-form"
+            ? express.urlencoded({ extended: false })
+            : bodyKind === "raw-text"
+              ? express.text({ type: "*/*" })
+              : express.raw({ type: "*/*" }),
+      );
+      routes.post("/chat-webhooks/:publicId/:provider", (req, res) => {
+        res.setHeader("x-provider-diagnostic", canaries.sdk);
+        const sdkError = Object.assign(
+          new Error(`${canaries.sdk}: ${canaries.text} ${canaries.token}`),
+          {
+            name: canaries.filename,
+            request: { body: req.body },
+            response: { data: canaries.text },
+          },
+        );
+        if (failureMode === "context-error") {
+          (res as any).__errorContext = {
+            error: {
+              message: sdkError.message,
+              stack: sdkError.stack,
+              name: sdkError.name,
+              raw: sdkError,
+            },
+            reqBody: req.body,
+            reqParams: { ...req.params, private: canaries.filename },
+            reqQuery: { text: canaries.text },
+          };
+        }
+        if (failureMode !== "warning") (res as any).err = sdkError;
+        res.status(failureMode === "warning" ? 401 : 503).end();
+      });
+      app.use("/api", routes);
+      const contentType = bodyKind.includes("form")
+        ? "application/x-www-form-urlencoded"
+        : bodyKind === "raw-text"
+          ? "text/plain"
+          : "application/json";
+      const wireBody = bodyKind.includes("form")
+        ? new URLSearchParams({ payload: JSON.stringify(payload) }).toString()
+        : JSON.stringify(payload);
+      const response = await request(app)
+        .post("/api/chat-webhooks/endpoint-1/slack")
+        .set("Content-Type", contentType)
+        .send(wireBody);
+      expect(response.status).toBe(failureMode === "warning" ? 401 : 503);
+      const output = chunks.join("");
+      const log = JSON.parse(output.trim());
+      // Structural absence catches Buffer's numeric-byte representation too;
+      // matching plaintext canaries alone would miss that encoding of the body.
+      expect(log.reqBody).toBe("[REDACTED]");
+      expect(log.reqParams).toBeUndefined();
+      expect(log.req.body).toBeUndefined();
+      expect(log.req.params).toBeUndefined();
+      expect(log.req.query).toBeUndefined();
+      expect(log.req.method).toBe("POST");
+      expect(log.res.statusCode).toBe(response.status);
+      expect(log.res.headers).toBeUndefined();
+      expect(log.responseTime).toEqual(expect.any(Number));
+      expect(log.level).toBe(failureMode === "warning" ? 40 : 50);
+      for (const canary of Object.values(canaries))
+        expect(output).not.toContain(canary);
+      if (failureMode !== "warning") {
+        expect(log.msg).toMatch(/503 — request failed$/);
+        expect(log.err.message).toBe("Chat webhook request failed");
+        expect(log.err.request).toBeUndefined();
+        expect(log.errorContext).toEqual({ name: "Error" });
+      }
+    },
+  );
+
+  it.each(["slack", "github", "discord", "telegram", "microsoft-teams"])(
+    "keeps %s webhook request serialization and error-handler SDK prose content-free",
+    async (provider) => {
+      const privateText = "private-serialized-webhook-text-canary-8124";
+      const privateFile = "private-serialized-webhook-file-canary-2443.png";
+      const chunks: string[] = [];
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(chunk.toString());
+          callback();
+        },
+      });
+      const app = express();
+      const routes = express.Router();
+      routes.use(express.raw({ type: "*/*" }));
+      routes.use(
+        createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)),
+      );
+      routes.post("/chat-webhooks/:publicId/:provider", (req, _res, next) => {
+        req.params.extra = privateFile;
+        req.log.warn({ req }, "Webhook fixture rejected");
+        const error = Object.assign(new Error(`SDK echoed ${privateText}`), {
+          name: privateFile,
+        });
+        next(error);
+      });
+      app.use("/api", routes);
+      app.use(errorHandler);
+      const response = await request(app)
+        .post(`/api/chat-webhooks/endpoint-1/${provider}`)
+        .set("Content-Type", "application/json")
+        .send(JSON.stringify({ text: privateText, file: privateFile }));
+      expect(response.status).toBe(500);
+      const output = chunks.join("");
+      expect(output).not.toContain(privateText);
+      expect(output).not.toContain(privateFile);
+      const logs = output
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(logs).toHaveLength(2);
+      for (const log of logs) {
+        expect(log.req.method).toBe("POST");
+        expect(log.req.params).toBeUndefined();
+        expect(log.req.body).toBeUndefined();
+      }
+      expect(logs[1].res.statusCode).toBe(500);
+      expect(logs[1].reqBody).toBe("[REDACTED]");
+      expect(logs[1].errorContext).toEqual({ name: "Error" });
+      expect(logs[1].err.message).toBe("Chat webhook request failed");
+    },
+  );
+
+  it("preserves ordinary request diagnostics outside the exact webhook route", async () => {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(
+      createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)),
+    );
+    app.post("/api/issues/:id", (req, res) => {
+      (res as any).__errorContext = {
+        error: { name: "Error", message: "ordinary diagnostic" },
+        reqBody: req.body,
+        reqParams: req.params,
+      };
+      res.status(422).end();
+    });
+    await request(app)
+      .post("/api/issues/issue-1")
+      .send({ title: "ordinary task", token: "redact-me" });
+    const log = JSON.parse(chunks.join("").trim());
+    expect(log.reqBody).toEqual({
+      title: "ordinary task",
+      token: "[REDACTED]",
+    });
+    expect(log.reqParams).toEqual({ id: "issue-1" });
+    expect(log.errorContext).toEqual({
+      name: "Error",
+      message: "ordinary diagnostic",
+    });
+  });
+
   it("defines the HTTP auth and cookie header paths that must be redacted", () => {
     expect(HTTP_LOG_REDACT_PATHS).toContain("req.headers.authorization");
     expect(HTTP_LOG_REDACT_PATHS).toContain("req.headers.cookie");

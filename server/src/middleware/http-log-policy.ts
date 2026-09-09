@@ -42,16 +42,41 @@ const SECRET_SENSITIVE_HTTP_PATHS = [
 ];
 const SECRET_SENSITIVE_HTTP_METHODS = new Set(["POST", "PUT", "PATCH"]);
 
+/** Provider payloads are private even when a method/signature is rejected. */
+export function isPrivateChatWebhookHttpRequest(
+  method: string | undefined,
+  url: string | undefined,
+): boolean {
+  if (!method || !url) return false;
+  let pathname = normalizePath(url);
+  if (/^https?:\/\//i.test(pathname)) {
+    // Do not let URL dot-segment normalization erase an explicitly supplied
+    // ingress namespace on a malformed absolute-form callback.
+    const rawPath = pathname.replace(/^https?:\/\/[^/]*/i, "");
+    if (/^\/api\/chat-webhooks(?:\/|$)/i.test(rawPath)) return true;
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      return false;
+    }
+  }
+  // This namespace is reserved for provider ingress, including malformed or
+  // unknown callback paths. Rejecting a route must not make its payload public.
+  return /^\/api\/chat-webhooks(?:\/|$)/i.test(pathname);
+}
+
 /**
  * These routes accept or create one-time connector credentials. A provider or
  * validation error can echo credential material in its message even after the
  * structured request body has been redacted, so HTTP failure logs use generic
- * error metadata for the whole route.
+ * error metadata for the whole route. Webhook failures also use generic error
+ * metadata: raw provider text/files/credentials cannot be named-field redacted.
  */
 export function isSecretSensitiveHttpRequest(
   method: string | undefined,
   url: string | undefined,
 ): boolean {
+  if (isPrivateChatWebhookHttpRequest(method, url)) return true;
   if (!method || !url) return false;
   if (!SECRET_SENSITIVE_HTTP_METHODS.has(method.toUpperCase())) return false;
   const pathname = normalizePath(url);

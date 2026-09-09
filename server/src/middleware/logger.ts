@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
+  isPrivateChatWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
@@ -50,11 +51,47 @@ function requestClassificationUrl(req: {
       : undefined;
 }
 
+function isPrivateWebhook(req: {
+  method?: string;
+  originalUrl?: unknown;
+  url?: unknown;
+}) {
+  return isPrivateChatWebhookHttpRequest(
+    req.method,
+    requestClassificationUrl(req),
+  );
+}
+
+function requestLogUrl(req: {
+  method?: string;
+  originalUrl?: unknown;
+  url?: unknown;
+}) {
+  return isPrivateWebhook(req)
+    ? "/api/chat-webhooks/:publicId/:provider"
+    : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
+}
+
 export function createHttpLogger(baseLogger: Logger) {
   return pinoHttp({
     logger: baseLogger,
     serializers: {
       req(req: Record<string, unknown> & { url?: unknown }) {
+        if (
+          isPrivateWebhook({
+            method: typeof req.method === "string" ? req.method : undefined,
+            url: req.url,
+          })
+        ) {
+          // pino's standard request serializer has already selected originalUrl.
+          // A closed projection also excludes params, arbitrary headers and any
+          // parser/SDK-added body copies, including Buffer numeric byte keys.
+          return {
+            id: req.id,
+            method: req.method,
+            url: "/api/chat-webhooks/:publicId/:provider",
+          };
+        }
         return {
           ...req,
           url:
@@ -67,6 +104,19 @@ export function createHttpLogger(baseLogger: Logger) {
           query: undefined,
         };
       },
+      res(
+        res: Record<string, unknown> & {
+          raw?: {
+            req?: { method?: string; originalUrl?: unknown; url?: unknown };
+          };
+        },
+      ) {
+        // A provider error may also be reflected in response headers. Keep the
+        // same content-free contract on both sides of a webhook request.
+        return res.raw?.req && isPrivateWebhook(res.raw.req)
+          ? { statusCode: res.statusCode }
+          : res;
+      },
     },
     customLogLevel(_req, res, err) {
       if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
@@ -77,13 +127,13 @@ export function createHttpLogger(baseLogger: Logger) {
       return "info";
     },
     customSuccessMessage(req, res) {
-      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode}`;
+      return `${req.method} ${requestLogUrl(req)} ${res.statusCode}`;
     },
     customErrorMessage(req, res, err) {
       if (
         isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))
       ) {
-        return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — request failed`;
+        return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
       }
       const ctx = (res as any).__errorContext;
       const errMsg =
@@ -93,9 +143,29 @@ export function createHttpLogger(baseLogger: Logger) {
         "unknown error";
       return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
     },
+    customErrorObject(req, _res, _err, value) {
+      // pino-http serializes res.err independently of customProps/errorContext.
+      // Do not rely on a particular error handler having sanitized an SDK Error.
+      return isPrivateWebhook(req)
+        ? {
+            ...value,
+            err: { type: "Error", message: "Chat webhook request failed" },
+          }
+        : value;
+    },
     customProps(req, res) {
       if (res.statusCode >= 400) {
         const ctx = (res as any).__errorContext;
+        if (isPrivateWebhook(req)) {
+          // Omit, rather than recursively redact, the entire provider payload.
+          // This applies equally before/after parsing and with/without context.
+          return {
+            reqBody: "[REDACTED]",
+            ...(ctx || (res as any).err
+              ? { errorContext: { name: "Error" } }
+              : {}),
+          };
+        }
         if (ctx) {
           const secretSensitiveRoute = isSecretSensitiveHttpRequest(
             req.method,
