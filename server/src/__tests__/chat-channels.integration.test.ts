@@ -133,8 +133,9 @@ import {
 } from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
 import { nativePublicationTextFits, renderPublicationTransportText } from "../services/chat-publication-text-parts.js";
-import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
+import { MAX_ATTACHMENT_BYTES, formatAttachmentSize } from "../attachment-types.js";
 import { TELEGRAM_VIDEO_NOTE_MP4 } from "./fixtures/telegram-video-note.js";
+import { TELEGRAM_VOICE_OGG } from "./fixtures/telegram-voice.js";
 import {
   GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS,
   githubAttachmentLocator,
@@ -340,6 +341,27 @@ class FakeEndpointRuntime {
     return (
       tenantIds.length > 0 && tenantIds.every((value) => value === expected)
     );
+  }
+
+  async applySlackReceiptReaction(input: {
+    operation: "add" | "remove";
+    threadId: string;
+    messageId: string;
+    reaction: "eyes";
+  }) {
+    const adapter = this.thread(input.threadId).adapter;
+    if (input.operation === "add")
+      await adapter.addReaction(
+        input.threadId,
+        input.messageId,
+        input.reaction,
+      );
+    else
+      await adapter.removeReaction(
+        input.threadId,
+        input.messageId,
+        input.reaction,
+      );
   }
 
   thread(threadId: string) {
@@ -19464,6 +19486,438 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await service.shutdown();
     },
   );
+
+  it.each([
+    "ordinary",
+    "final_before_add",
+    "newer_followup",
+    "same_source_retry",
+  ] as const)(
+    "retires only the exact Slack final's receipt (%s)",
+    async (mode) => {
+      const fixture = await seedCompany();
+      const statusCalls: string[] = [];
+      const ordinaryFetch = fakeSlackFetch();
+      let earlyFinal:
+        | ((
+            agentId: string,
+            opts: Parameters<ChatChannelServiceOptions["heartbeat"]["wakeup"]>[1],
+          ) => Promise<unknown>)
+        | undefined;
+      const context = await configuredSlackEndpoint(fixture, {
+        scheduleDeferredWork: () => undefined,
+        fetch: async (input, init) => {
+          if (String(input) === "https://slack.com/api/agents.sessions.setStatus")
+            statusCalls.push(JSON.parse(String(init?.body)).status);
+          return await ordinaryFetch(input);
+        },
+        ...(mode === "final_before_add"
+          ? { wakeup: async (agentId, opts) => await earlyFinal!(agentId, opts) }
+          : {}),
+      });
+      const { callbacks, endpoint, runtime, service, wakeup } = context;
+      const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+      const thread = makeThread({
+        channelId: "CCLEANUP",
+        id: "slack:CCLEANUP:1740000021.1",
+      });
+      const runId = randomUUID();
+      const publishFinal = async () => {
+        const [conversation] = await service.listConversations(endpoint.id);
+        await db
+          .insert(heartbeatRuns)
+          .values({
+            id: runId,
+            companyId: fixture.companyId,
+            agentId: fixture.assignedAgentId,
+            status: "succeeded",
+            contextSnapshot: await chatWakeContext({
+              endpointId: endpoint.id,
+              issueId: conversation.issueId,
+              provider: "slack",
+              providerMessageId: "1740000021.1",
+            }),
+          });
+        await addSelectedChatFinal({
+          agentId: fixture.assignedAgentId,
+          body: "SLACK-RECEIPT-FINAL",
+          companyId: fixture.companyId,
+          issueId: conversation.issueId,
+          runId,
+        });
+        await service.processPendingPublications();
+      };
+      earlyFinal = async (agentId, opts) => {
+        const request = opts.durableChatRequest!;
+        await db.transaction(async (tx) => {
+          await request.authorize(tx as never);
+          await tx
+            .insert(agentWakeupRequests)
+            .values({
+              id: request.id,
+              companyId: request.companyId,
+              agentId,
+              source: opts.source!,
+              triggerDetail: opts.triggerDetail,
+              reason: opts.reason,
+              payload: opts.payload,
+              requestedByActorType: opts.requestedByActorType,
+              requestedByActorId: opts.requestedByActorId,
+              idempotencyKey: request.idempotencyKey,
+              requestedAt: request.requestedAt,
+              status: "queued",
+            });
+        });
+        await expect(
+          db
+            .select({ id: chatActions.id })
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.endpointId, endpoint.id),
+                eq(chatActions.kind, "receipt_reaction"),
+              ),
+            ),
+        ).resolves.toHaveLength(0);
+        await publishFinal();
+        return { runId };
+      };
+      try {
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          thread: thread.thread,
+          message: makeMessage({
+            id: "1740000021.1",
+            text: "@maya reply exactly",
+            mentioned: true,
+          }),
+          trigger: "mention",
+        });
+        if (mode !== "final_before_add") await publishFinal();
+        const [delivery] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id));
+        const [removal] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(
+                chatActions.providerActionId,
+                `receipt_reaction_remove:${delivery.id}`,
+              ),
+            ),
+          );
+        expect(removal).toBeDefined();
+        if (mode === "newer_followup") {
+          await deliverMessage({
+            callbacks,
+            endpointId: endpoint.id,
+            thread: thread.thread,
+            message: makeMessage({
+              id: "1740000022.2",
+              text: "Newer follow-up must retain its own receipt",
+            }),
+            trigger: "subscribed_message",
+          });
+        }
+        await service.processPendingReceiptReactions(1, removal!.id);
+        await service.processPendingReceiptReactions(1, removal!.id);
+        expect(providerRuntime.removedReactions).toEqual([
+          {
+            threadId: thread.thread.id,
+            messageId: "1740000021.1",
+            emoji: "eyes",
+          },
+        ]);
+        const expectedAdds =
+          mode === "final_before_add"
+            ? []
+            : [
+                {
+                  threadId: thread.thread.id,
+                  messageId: "1740000021.1",
+                  emoji: "eyes",
+                },
+              ];
+        if (mode === "newer_followup")
+          expectedAdds.push({
+            threadId: thread.thread.id,
+            messageId: "1740000022.2",
+            emoji: "eyes",
+          });
+        expect(providerRuntime.reactions).toEqual(expectedAdds);
+        const [add] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            eq(chatActions.providerActionId, `receipt_reaction:${delivery.id}`),
+          );
+        await db
+          .update(chatActions)
+          .set({
+            status: "failed",
+            result: { retryable: true, retryAt: new Date(0).toISOString() },
+          })
+          .where(eq(chatActions.id, add.id));
+        await service.processPendingReceiptReactions(1, add.id);
+        expect(providerRuntime.reactions).toEqual(expectedAdds);
+        if (mode === "same_source_retry") {
+          const [conversation] = await service.listConversations(endpoint.id);
+          const retryRunId = randomUUID();
+          await db
+            .insert(heartbeatRuns)
+            .values({
+              id: retryRunId,
+              companyId: fixture.companyId,
+              agentId: fixture.assignedAgentId,
+              runtimeMode: "native",
+              status: "running",
+              contextSnapshot: await chatWakeContext({
+                endpointId: endpoint.id,
+                issueId: conversation.issueId,
+                provider: "slack",
+                providerMessageId: "1740000021.1",
+              }),
+            });
+          await enqueueChatRunMilestones(db);
+          await service.processPendingPublications();
+          const [statusAction] = await db
+            .select({ id: chatActions.id })
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.endpointId, endpoint.id),
+                eq(chatActions.kind, "slack_session_sync"),
+              ),
+            );
+          await service.processPendingSlackSessionSyncs(1, statusAction.id);
+          expect(statusCalls.at(-1)).toBe("processing");
+          // The retry has native working status, not a reminted acknowledgement
+          // for the same original provider message. Late add replay stays inert.
+          await service.processPendingDeliveries(25, delivery.id);
+          expect(providerRuntime.reactions).toEqual(expectedAdds);
+          expect(providerRuntime.removedReactions).toHaveLength(1);
+        }
+        expect(
+          [...providerRuntime.posts, ...providerRuntime.edits].filter(
+            (entry) => entry.text === "SLACK-RECEIPT-FINAL",
+          ),
+        ).toHaveLength(1);
+        expect(wakeup).toHaveBeenCalledTimes(mode === "newer_followup" ? 2 : 1);
+      } finally {
+        // Retire the synthetic still-running retry's conversation so later
+        // globally-scanned milestone fixtures cannot inherit this test's work.
+        if (mode === "same_source_retry")
+          await db
+            .update(chatConversations)
+            .set({ state: "completed" })
+            .where(eq(chatConversations.endpointId, endpoint.id));
+        await retirePublicationFixture(service, endpoint.id);
+      }
+    },
+  );
+
+  it.each([429, 503])(
+    "does not accept a contradictory HTTP%s Slack duplicate receipt",
+    async (status) => {
+      const fixture = await seedCompany();
+      const { callbacks, endpoint, runtime, service } =
+        await configuredSlackEndpoint(fixture, {
+          scheduleDeferredWork: () => undefined,
+        });
+      const pinned = createChatSdkEndpointRuntime({
+        ...runtime.configurations.get(endpoint.id)!,
+        logger: "silent",
+      });
+      Object.assign(runtime.endpoints.get(endpoint.id)!, {
+        applySlackReceiptReaction: (
+          input: Parameters<typeof pinned.applySlackReceiptReaction>[0],
+        ) =>
+          pinned.applySlackReceiptReaction(input, async () =>
+            Response.json(
+              { ok: false, error: "already_reacted" },
+              { status, headers: { "retry-after": "60" } },
+            ),
+          ),
+      });
+      try {
+        const thread = makeThread({
+          channelId: "CRECEIPTDENY",
+          id: "slack:CRECEIPTDENY:1740000041.1",
+        });
+        await deliverMessage({
+          callbacks,
+          endpointId: endpoint.id,
+          thread: thread.thread,
+          message: makeMessage({
+            id: "1740000041.1",
+            text: "@maya receipt must be coherent",
+            mentioned: true,
+          }),
+          trigger: "mention",
+        });
+        const [action] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.kind, "receipt_reaction"),
+            ),
+          );
+        expect(action.status).toBe("failed");
+        expect(action.result?.code).not.toBe("receipt_reaction_already_applied");
+        expect(action.result?.retryable).toBe(true);
+      } finally {
+        try {
+          await pinned.shutdown();
+        } finally {
+          await retirePublicationFixture(service, endpoint.id);
+        }
+      }
+    },
+  );
+
+  it("bounds a held Slack receipt before delivering an already-ready same-endpoint final", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture, {
+        scheduleDeferredWork: () => undefined,
+      });
+    const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+    const pinned = createChatSdkEndpointRuntime({
+      ...runtime.configurations.get(endpoint.id)!,
+      logger: "silent",
+    });
+    let started!: () => void;
+    const start = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let release!: () => void;
+    let localTransportSettled = false;
+    let aborted = false;
+    const hold = async (signal?: AbortSignal | null) => {
+      await new Promise<void>((resolve, reject) => {
+        const stop = () => {
+          aborted = true;
+          localTransportSettled = true;
+          reject(new Error("synthetic local transport aborted"));
+        };
+        release = () => {
+          signal?.removeEventListener("abort", stop);
+          localTransportSettled = true;
+          resolve();
+        };
+        signal?.addEventListener("abort", stop, { once: true });
+        started();
+      });
+    };
+    const originalThread = providerRuntime.thread.bind(providerRuntime);
+    vi.spyOn(providerRuntime, "thread").mockImplementation((id) => {
+      const thread = originalThread(id);
+      return {
+        ...thread,
+        adapter: { ...thread.adapter, addReaction: async () => hold() },
+      };
+    });
+    // Before the repair, the real service calls its unbounded adapter method.
+    // Afterward, forward only the new runtime transport into fake provider HTTP.
+    const bounded = (
+      pinned as unknown as {
+        applySlackReceiptReaction?: (...args: unknown[]) => Promise<void>;
+      }
+    ).applySlackReceiptReaction;
+    if (bounded)
+      Object.assign(providerRuntime, {
+        applySlackReceiptReaction: (...args: unknown[]) =>
+          bounded.call(
+            pinned,
+            ...args.slice(0, 1),
+            async (_url: unknown, init?: RequestInit) => {
+              await hold(init?.signal);
+              return Response.json({ ok: true });
+            },
+          ),
+      });
+    const thread = makeThread({
+      channelId: "CRECEIPTBOUND",
+      id: "slack:CRECEIPTBOUND:1740000011.1",
+    });
+    let inbound: Promise<unknown> | undefined;
+    let publication: Promise<unknown> | undefined;
+    try {
+      inbound = deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        thread: thread.thread,
+        message: makeMessage({
+          id: "1740000011.1",
+          text: "@maya a fast final",
+          mentioned: true,
+        }),
+        trigger: "mention",
+      });
+      await start;
+      const [lease] = await db
+        .select()
+        .from(chatEndpointLeases)
+        .where(
+          and(
+            eq(chatEndpointLeases.endpointId, endpoint.id),
+            eq(chatEndpointLeases.leaseKey, "credentials"),
+          ),
+        );
+      expect(lease).toBeDefined();
+      const [conversation] = await service.listConversations(endpoint.id);
+      const runId = randomUUID();
+      await db
+        .insert(heartbeatRuns)
+        .values({
+          id: runId,
+          companyId: fixture.companyId,
+          agentId: fixture.assignedAgentId,
+          status: "succeeded",
+          contextSnapshot: await chatWakeContext({
+            endpointId: endpoint.id,
+            issueId: conversation.issueId,
+            provider: "slack",
+            providerMessageId: "1740000011.1",
+          }),
+        });
+      await addSelectedChatFinal({
+        agentId: fixture.assignedAgentId,
+        body: "SLACK-FAST-FINAL",
+        companyId: fixture.companyId,
+        issueId: conversation.issueId,
+        runId,
+      });
+      publication = service.processPendingPublications();
+      await vi.waitFor(
+        () =>
+          expect(
+            [...providerRuntime.posts, ...providerRuntime.edits].filter(
+              (entry) => entry.text === "SLACK-FAST-FINAL",
+            ),
+          ).toHaveLength(1),
+        { timeout: 3_500, interval: 25 },
+      );
+      expect(aborted).toBe(true);
+      expect(localTransportSettled).toBe(true);
+      await Promise.all([inbound, publication]);
+    } finally {
+      release?.();
+      await Promise.allSettled([inbound, publication]);
+      try {
+        await pinned.shutdown();
+      } finally {
+        await retirePublicationFixture(service, endpoint.id);
+      }
+    }
+  });
 
   it("settles a retried Slack receipt reaction when the provider reports already_reacted", async () => {
     const fixture = await seedCompany();
@@ -42929,12 +43383,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   it("acknowledges a denied Slack action before its durable notice completes and deduplicates redelivery", async () => {
     const scheduled: Array<() => void> = [];
     const fixture = await seedCompany();
-    const { callbacks, endpoint, service } = await configuredSlackEndpoint(
-      fixture,
-      {
+    const { callbacks, endpoint, runtime, service } =
+      await configuredSlackEndpoint(fixture, {
         scheduleDeferredWork: (task) => scheduled.push(task),
-      },
-    );
+      });
     if (!callbacks.onAction) {
       throw new Error("Slack action callback was not registered");
     }
@@ -42957,6 +43409,50 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
     await qualifySetupRoundTrip(service, endpoint.id, "U-DENIAL-OUTBOX");
     await service.test(endpoint.id, "owner-user");
+    // Setup publishes its own final and schedules exact-source eyes cleanup.
+    // Settle and identify that work before measuring the denied-action queue.
+    const setupRemovals = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.endpointId, endpoint.id),
+          eq(chatActions.kind, "receipt_reaction"),
+          sql`${chatActions.payload}->>'operation' = 'remove'`,
+        ),
+      );
+    expect(setupRemovals).toHaveLength(1);
+    const setupRemoval = setupRemovals[0]!;
+    expect(setupRemoval).toMatchObject({
+      providerActionId: `receipt_reaction_remove:${setupRemoval.deliveryId}`,
+      status: "received",
+      payload: {
+        operation: "remove",
+        reaction: "eyes",
+        threadId: channel.thread.id,
+        messageId: expect.stringMatching(/^setup-follow-up-/),
+      },
+    });
+    expect(scheduled).toHaveLength(1);
+    expect(channel.postEphemeral).not.toHaveBeenCalled();
+    scheduled.shift()!();
+    await vi.waitFor(async () => {
+      const removal = await db
+        .select({ status: chatActions.status })
+        .from(chatActions)
+        .where(eq(chatActions.id, setupRemoval.id));
+      expect(removal).toEqual([{ status: "processed" }]);
+    });
+    const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+    expect(providerRuntime.removedReactions).toEqual([
+      {
+        threadId: channel.thread.id,
+        messageId: setupRemoval.payload.messageId,
+        emoji: "eyes",
+      },
+    ]);
+    expect(scheduled).toHaveLength(0);
+    expect(channel.postEphemeral).not.toHaveBeenCalled();
     let releaseNotice!: () => void;
     const noticeRelease = new Promise<void>((resolve) => {
       releaseNotice = resolve;
@@ -43002,9 +43498,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await expect(callbacks.onAction(deniedAction)).resolves.toBeUndefined();
     expect(scheduled).toHaveLength(0);
     expect(channel.postEphemeral).toHaveBeenCalledTimes(1);
+    expect(providerRuntime.removedReactions).toHaveLength(1);
 
     releaseNotice();
-    await service.shutdown();
+    await retirePublicationFixture(service, endpoint.id);
     await expect(
       db
         .select({ kind: chatActions.kind, status: chatActions.status })
@@ -54411,68 +54908,70 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const failedDownload = vi.fn(async () => {
       throw new Error("injected Telegram attachment outage");
     });
+    try {
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "telegram",
+        thread: dm.thread,
+        message: makeMessage({
+          attachments: [
+            {
+              type: "file",
+              name: "request.txt",
+              mimeType: "text/plain",
+              size: 42,
+              fetchData: failedDownload,
+              fetchMetadata: { testRecoveryKey: "telegram-failed-media" },
+            } as Attachment,
+          ],
+          id: "77115567:41",
+          text: "",
+          userId: "77115567",
+        }),
+        trigger: "direct_message",
+      });
 
-    await deliverMessage({
-      callbacks,
-      endpointId: endpoint.id,
-      provider: "telegram",
-      thread: dm.thread,
-      message: makeMessage({
-        attachments: [
-          {
-            type: "file",
-            name: "request.txt",
-            mimeType: "text/plain",
-            size: 42,
-            fetchData: failedDownload,
-            fetchMetadata: { testRecoveryKey: "telegram-failed-media" },
-          } as Attachment,
-        ],
-        id: "77115567:41",
-        text: "",
-        userId: "77115567",
-      }),
-      trigger: "direct_message",
-    });
-
-    expect(failedDownload).toHaveBeenCalledTimes(1);
-    expect(storage.putFile).not.toHaveBeenCalled();
-    expect(wakeup).not.toHaveBeenCalled();
-    const [conversation] = await service.listConversations(endpoint.id);
-    if (!conversation)
-      throw new Error("Expected Telegram attachment failure conversation");
-    const visibleFailure =
-      "Paperclip could not safely import the attached Telegram file. Please resend it as a supported file under 25 MB or include text describing the request.";
-    await expect(
-      db
-        .select({ body: issueComments.body })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, conversation.issueId)),
-    ).resolves.toEqual([{ body: visibleFailure }]);
-    const [delivery] = await db
-      .select()
-      .from(chatDeliveries)
-      .where(eq(chatDeliveries.endpointId, endpoint.id));
-    expect(delivery).toMatchObject({
-      state: "processed",
-      redactedError: expect.stringContaining(
-        "1 external attachment was omitted",
-      ),
-    });
-    await vi.waitFor(() =>
-      expect(dm.post).toHaveBeenCalledWith(visibleFailure),
-    );
-    await expect(
-      db
-        .select({ kind: chatActions.kind, status: chatActions.status })
-        .from(chatActions)
-        .where(eq(chatActions.deliveryId, delivery.id)),
-    ).resolves.toEqual(
-      expect.arrayContaining([
-        { kind: "inbound_wakeup", status: "failed" },
-        { kind: "provider_effect", status: "processed" },
-      ]),
-    );
+      expect(failedDownload).toHaveBeenCalledTimes(1);
+      expect(storage.putFile).not.toHaveBeenCalled();
+      expect(wakeup).not.toHaveBeenCalled();
+      const [conversation] = await service.listConversations(endpoint.id);
+      if (!conversation)
+        throw new Error("Expected Telegram attachment failure conversation");
+      const visibleFailure = `Paperclip could not safely import the attached Telegram file. Please resend it as a supported file under ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)} or include text describing the request.`;
+      await expect(
+        db
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, conversation.issueId)),
+      ).resolves.toEqual([{ body: visibleFailure }]);
+      const [delivery] = await db
+        .select()
+        .from(chatDeliveries)
+        .where(eq(chatDeliveries.endpointId, endpoint.id));
+      expect(delivery).toMatchObject({
+        state: "processed",
+        redactedError: expect.stringContaining(
+          "1 external attachment was omitted",
+        ),
+      });
+      await vi.waitFor(() =>
+        expect(dm.post).toHaveBeenCalledWith(visibleFailure),
+      );
+      await expect(
+        db
+          .select({ kind: chatActions.kind, status: chatActions.status })
+          .from(chatActions)
+          .where(eq(chatActions.deliveryId, delivery.id)),
+      ).resolves.toEqual(
+        expect.arrayContaining([
+          { kind: "inbound_wakeup", status: "failed" },
+          { kind: "provider_effect", status: "processed" },
+        ]),
+      );
+    } finally {
+      await retirePublicationFixture(service, endpoint.id);
+    }
   });
 
   it("defers a rate-limited Telegram receipt reaction for the full provider interval without blocking the inbound turn", async () => {
@@ -59963,4 +60462,467 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
+  describe("Telegram source-bound optional media", () => {
+    it.each([
+      "topic_restart",
+      "changed_locator",
+      "revoked_before_fetch",
+      "revoked_during_fetch",
+    ] as const)(
+      "retains exact durable media authority across restart (%s)",
+      async (mode) => {
+        const fixture = await seedCompany();
+        const storage = createStorageService();
+        const first = await configuredTelegramEndpoint(fixture, {
+          storage: storage.storage,
+          deferWebhookProcessing: true,
+          scheduleDeferredWork: () => undefined,
+        });
+        const { endpoint, runtime, service, callbacks, wakeup } = first;
+        const configuration = runtime.configurations.get(endpoint.id)!;
+        const pinned = createChatSdkEndpointRuntime({
+          ...configuration,
+          logger: "silent",
+        });
+        const recovered = createChatSdkEndpointRuntime({
+          ...configuration,
+          logger: "silent",
+        });
+        let restarted: ReturnType<typeof createService> | undefined;
+        const topic = mode === "topic_restart";
+        const chatId = topic ? -10077115579 : 77115579;
+        const threadId = `telegram:${chatId}${topic ? ":42" : ""}`;
+        const requests: string[] = [];
+        const fetchSpy = vi
+          .spyOn(globalThis, "fetch")
+          .mockImplementation(async (input, init) => {
+            const url = new URL(
+              input instanceof Request ? input.url : String(input),
+            );
+            if (url.hostname !== "api.telegram.org")
+              throw new Error("Unexpected fixture host");
+            if (url.pathname.endsWith("/getFile")) {
+              expect(JSON.parse(String(init?.body))).toEqual({
+                file_id: "restart-media",
+              });
+              requests.push("getFile");
+              return Response.json({
+                ok: true,
+                result: { file_path: "fixture/restart.mp4" },
+              });
+            }
+            if (!url.pathname.endsWith("/fixture/restart.mp4"))
+              throw new Error("Unexpected fixture method");
+            requests.push("download");
+            if (mode === "revoked_during_fetch")
+              await db
+                .update(chatEndpoints)
+                .set({ allowDirectMessages: false })
+                .where(eq(chatEndpoints.id, endpoint.id));
+            return new Response(TELEGRAM_VIDEO_NOTE_MP4);
+          });
+        try {
+          Object.assign(runtime.endpoints.get(endpoint.id)!, {
+            attachmentRecoveryDescriptor:
+              pinned.attachmentRecoveryDescriptor.bind(pinned),
+            rehydrateAttachment: pinned.rehydrateAttachment.bind(pinned),
+          });
+          if (topic) {
+            await db
+              .update(chatEndpoints)
+              .set({ status: "active" })
+              .where(eq(chatEndpoints.id, endpoint.id));
+            await db.insert(chatEndpointResources).values({
+              companyId: fixture.companyId,
+              endpointId: endpoint.id,
+              type: "chat",
+              providerResourceId: String(chatId),
+              label: "Fixture topic",
+              availability: "available",
+              enabled: true,
+            });
+          }
+          const message = pinned.parseTelegramCommandMessage({
+            message_id: 50,
+            date: Math.floor(Date.now() / 1_000),
+            ...(topic ? { message_thread_id: 42 } : {}),
+            chat: { id: chatId, type: topic ? "supergroup" : "private" },
+            from: {
+              id: 77115579,
+              is_bot: false,
+              first_name: "Restart fixture",
+            },
+            video: {
+              file_id: "restart-media",
+              file_unique_id: "restart-unique",
+              file_size: TELEGRAM_VIDEO_NOTE_MP4.length,
+              width: 16,
+              height: 16,
+              duration: 1,
+            },
+          })!;
+          // The runtime's verified mention callback supplies addressing;
+          // attachment bytes/identity still come from the actual pinned parser.
+          if (topic) message.isMention = true;
+          await deliverMessage({
+            callbacks,
+            endpointId: endpoint.id,
+            provider: "telegram",
+            thread: makeThread({
+              channelId: String(chatId),
+              id: threadId,
+              isDM: !topic,
+            }).thread,
+            message,
+            trigger: topic ? "mention" : "direct_message",
+          });
+          const [received] = await db
+            .select()
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.endpointId, endpoint.id));
+          expect(received).toMatchObject({ state: "received", attempts: 0 });
+          expect(received.normalizedEvent).toMatchObject({
+            message: {
+              attachments: [
+                {
+                  recovery: {
+                    locator: {
+                      kind: "telegram_media",
+                      fileId: "restart-media",
+                      fileUniqueId: "restart-unique",
+                      threadId,
+                      messageId: `${chatId}:50`,
+                      principalExternalId: "77115579",
+                    },
+                  },
+                },
+              ],
+            },
+          });
+          expect(requests).toEqual([]);
+          expect(wakeup).not.toHaveBeenCalled();
+          const originalFetch = vi.fn(async () => {
+            throw new Error("Retired closure used");
+          });
+          message.attachments[0]!.fetchData = originalFetch;
+          await service.shutdown();
+          if (mode === "changed_locator") {
+            const normalized = structuredClone(received.normalizedEvent) as {
+              message: {
+                attachments: Array<{
+                  recovery: { locator: { fileId: string } };
+                }>;
+              };
+            };
+            normalized.message.attachments[0]!.recovery.locator.fileId =
+              "unrelated-file";
+            await db
+              .update(chatDeliveries)
+              .set({ normalizedEvent: normalized })
+              .where(eq(chatDeliveries.id, received.id));
+          }
+          if (mode === "revoked_before_fetch")
+            await db
+              .update(chatEndpoints)
+              .set({ allowDirectMessages: false })
+              .where(eq(chatEndpoints.id, endpoint.id));
+          await db
+            .update(chatDeliveries)
+            .set({ nextAttemptAt: new Date(0) })
+            .where(eq(chatDeliveries.id, received.id));
+          const nextRuntime = new FakeChatSdkRuntime();
+          const replace = nextRuntime.replaceEndpoint.bind(nextRuntime);
+          vi.spyOn(nextRuntime, "replaceEndpoint").mockImplementation(
+            async (options) => {
+              const next = await replace(options);
+              Object.assign(next, {
+                attachmentRecoveryDescriptor:
+                  recovered.attachmentRecoveryDescriptor.bind(recovered),
+                rehydrateAttachment:
+                  recovered.rehydrateAttachment.bind(recovered),
+              });
+              const thread = next.thread.bind(next);
+              vi.spyOn(next, "thread").mockImplementation((id) => ({
+                ...thread(id),
+                channelId: String(chatId),
+                isDM: !topic,
+              }));
+              return next;
+            },
+          );
+          restarted = createService(
+            nextRuntime,
+            fakeTelegramFetch() as typeof globalThis.fetch,
+            { storage: storage.storage, scheduleDeferredWork: () => undefined },
+          );
+          await restarted.service.processPendingDeliveries(25, received.id);
+          expect(originalFetch).not.toHaveBeenCalled();
+          if (topic) {
+            expect(requests).toEqual(["getFile", "download"]);
+            expect(storage.putFile).toHaveBeenCalledOnce();
+            expect(storage.putFile.mock.calls[0]![0]).toMatchObject({
+              body: TELEGRAM_VIDEO_NOTE_MP4,
+              contentType: "video/mp4",
+            });
+            expect(restarted.wakeup).toHaveBeenCalledOnce();
+            expect(
+              await restarted.service.listConversations(endpoint.id),
+            ).toEqual([
+              expect.objectContaining({ externalThreadId: threadId }),
+            ]);
+            await restarted.service.processPendingDeliveries(25, received.id);
+            expect(requests).toEqual(["getFile", "download"]);
+            expect(restarted.wakeup).toHaveBeenCalledOnce();
+          } else {
+            expect(storage.putFile).not.toHaveBeenCalled();
+            expect(restarted.wakeup).not.toHaveBeenCalled();
+            expect(requests).toEqual(
+              mode === "revoked_during_fetch" ? ["getFile", "download"] : [],
+            );
+            if (mode === "changed_locator") {
+              const [comment] = await db
+                .select()
+                .from(issueComments)
+                .where(eq(issueComments.companyId, fixture.companyId));
+              expect(comment!.body).toContain("could not safely import");
+            }
+          }
+        } finally {
+          try {
+            await pinned.shutdown();
+          } finally {
+            try {
+              await recovered.shutdown();
+            } finally {
+              try {
+                await retirePublicationFixture(
+                  restarted?.service ?? service,
+                  endpoint.id,
+                );
+              } finally {
+                try {
+                  await service.shutdown();
+                } finally {
+                  fetchSpy.mockRestore();
+                }
+              }
+            }
+          }
+        }
+      },
+    );
+
+    it.each([
+      "video",
+      "voice",
+      "live_photo",
+      "oversize",
+      "unknown_document",
+      "malformed_video",
+      "malformed_live_photo",
+      "malformed_bytes",
+      "office_named_video",
+      "office_named_invalid",
+    ] as const)(
+      "imports exact permitted bytes or gives accurate recovery advice (%s)",
+      async (mode) => {
+        const fixture = await seedCompany();
+        const storage = createStorageService();
+        const context = await configuredTelegramEndpoint(fixture, {
+          storage: storage.storage,
+        });
+        const { service, runtime, endpoint, callbacks, wakeup } = context;
+        const pinned = createChatSdkEndpointRuntime({
+          ...runtime.configurations.get(endpoint.id)!,
+          logger: "silent",
+        });
+        const photo = await sharp({
+          create: { width: 16, height: 16, channels: 3, background: "teal" },
+        })
+          .jpeg()
+          .toBuffer();
+        const bytes =
+          mode === "voice"
+            ? TELEGRAM_VOICE_OGG
+            : mode === "malformed_bytes" || mode === "office_named_invalid"
+              ? TELEGRAM_VIDEO_NOTE_MP4.subarray(0, -1)
+              : TELEGRAM_VIDEO_NOTE_MP4;
+        const requests: string[] = [];
+        const fetchSpy = vi
+          .spyOn(globalThis, "fetch")
+          .mockImplementation(async (input, init) => {
+            const url = new URL(
+              input instanceof Request ? input.url : String(input),
+            );
+            if (url.hostname !== "api.telegram.org")
+              throw new Error("Unexpected fixture host");
+            if (url.pathname.endsWith("/getFile")) {
+              const fileId = JSON.parse(String(init?.body)).file_id as string;
+              expect(["optional-media", "optional-photo"]).toContain(fileId);
+              requests.push(`getFile:${fileId}`);
+              return Response.json({
+                ok: true,
+                result: { file_path: `fixture/${fileId}` },
+              });
+            }
+            const file = url.pathname.split("/").at(-1)!;
+            if (!["optional-media", "optional-photo"].includes(file))
+              throw new Error("Unexpected fixture method");
+            requests.push(`download:${file}`);
+            return new Response(file === "optional-photo" ? photo : bytes);
+          });
+        try {
+          Object.assign(runtime.endpoints.get(endpoint.id)!, {
+            attachmentRecoveryDescriptor:
+              pinned.attachmentRecoveryDescriptor.bind(pinned),
+            rehydrateAttachment: pinned.rehydrateAttachment.bind(pinned),
+          });
+          const media = {
+            file_id: "optional-media",
+            file_unique_id: "optional-media-unique",
+            file_size:
+              mode === "oversize" ? MAX_ATTACHMENT_BYTES + 1 : bytes.length,
+            duration:
+              mode === "malformed_video" || mode === "malformed_live_photo"
+                ? -1
+                : 1,
+            ...(mode.startsWith("office_named")
+              ? { file_name: "recording.docx" }
+              : {}),
+          };
+          const raw = {
+            message_id: 41,
+            date: Math.floor(Date.now() / 1_000),
+            chat: { id: 77115579, type: "private" },
+            from: {
+              id: 77115579,
+              is_bot: false,
+              first_name: "Optional media fixture",
+            },
+            ...(mode === "unknown_document"
+              ? { document: media }
+              : mode === "voice"
+                ? { voice: media }
+                : mode === "live_photo" || mode === "malformed_live_photo"
+                  ? {
+                      live_photo: {
+                        ...media,
+                        width: 16,
+                        height: 16,
+                        photo: [
+                          {
+                            file_id: "optional-photo",
+                            file_unique_id: "optional-photo-unique",
+                            file_size: photo.length,
+                            width: 16,
+                            height: 16,
+                          },
+                        ],
+                      },
+                    }
+                  : { video: { ...media, width: 16, height: 16 } }),
+          };
+          const message = pinned.parseTelegramCommandMessage(raw)!;
+          await deliverMessage({
+            callbacks,
+            endpointId: endpoint.id,
+            provider: "telegram",
+            thread: makeThread({
+              channelId: "77115579",
+              id: "telegram:77115579",
+              isDM: true,
+            }).thread,
+            message,
+            trigger: "direct_message",
+          });
+          if (
+            [
+              "oversize",
+              "unknown_document",
+              "malformed_video",
+              "malformed_live_photo",
+              "malformed_bytes",
+              "office_named_invalid",
+            ].includes(mode)
+          ) {
+            expect(storage.putFile).not.toHaveBeenCalled();
+            expect(requests).toEqual(
+              mode === "malformed_bytes" || mode === "office_named_invalid"
+                ? ["getFile:optional-media", "download:optional-media"]
+                : [],
+            );
+            const [comment] = await db
+              .select()
+              .from(issueComments)
+              .where(eq(issueComments.companyId, fixture.companyId));
+            expect(comment!.body).toContain(
+              `under ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)}`,
+            );
+            expect(wakeup).not.toHaveBeenCalled();
+            return;
+          }
+          expect(storage.putFile).toHaveBeenCalledTimes(
+            mode === "live_photo" ? 2 : 1,
+          );
+          expect(
+            storage.putFile.mock.calls.some(
+              ([input]) =>
+                input.body.equals(bytes) &&
+                input.contentType ===
+                  (mode === "voice" ? "audio/ogg" : "video/mp4"),
+            ),
+          ).toBe(true);
+          if (mode === "live_photo")
+            expect(
+              storage.putFile.mock.calls.some(
+                ([input]) =>
+                  input.body.equals(photo) &&
+                  input.contentType === "image/jpeg",
+              ),
+            ).toBe(true);
+          expect(wakeup).toHaveBeenCalledOnce();
+          const [delivery] = await db
+            .select()
+            .from(chatDeliveries)
+            .where(eq(chatDeliveries.endpointId, endpoint.id));
+          expect(delivery).toMatchObject({
+            state: "processed",
+            redactedError: null,
+          });
+          // Replay this exact source, not unrelated admission retries left in
+          // the shared fixture DB by tests exercising failed scheduler calls.
+          await service.processPendingDeliveries(25, delivery.id);
+          expect(requests).toHaveLength(mode === "live_photo" ? 4 : 2);
+          expect(wakeup).toHaveBeenCalledOnce();
+          expect(wakeup.mock.calls[0]![0]).toBe(fixture.assignedAgentId);
+          await expect(
+            db
+              .select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .innerJoin(
+                chatActions,
+                eq(chatActions.id, agentWakeupRequests.id),
+              )
+              .where(
+                and(
+                  eq(chatActions.deliveryId, delivery.id),
+                  eq(agentWakeupRequests.companyId, fixture.companyId),
+                  eq(agentWakeupRequests.agentId, fixture.assignedAgentId),
+                ),
+              ),
+          ).resolves.toHaveLength(1);
+        } finally {
+          try {
+            await pinned.shutdown();
+          } finally {
+            try {
+              await retirePublicationFixture(service, endpoint.id);
+            } finally {
+              fetchSpy.mockRestore();
+            }
+          }
+        }
+      },
+    );
+  });
 });

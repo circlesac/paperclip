@@ -98,6 +98,7 @@ import {
   LOW_TRUST_REVIEW_RAW_OUTPUT_DISPOSITION,
 } from "@paperclipai/shared";
 import {
+  formatAttachmentSize,
   isAllowedContentType,
   MAX_ATTACHMENT_BYTES,
   normalizeContentType,
@@ -123,6 +124,10 @@ import {
 } from "./chat-publication-batches.js";
 
 import { telegramAttachmentForUpload } from "./chat-telegram-photo.js";
+import {
+  hasTelegramMediaProvenance,
+  identifyTelegramMedia,
+} from "./chat-telegram-media-intake.js";
 import {
   nativeFailedRunRetryStateIsSafe,
   nativePreProviderRetryAfterCleanupStateIsSafe,
@@ -3567,11 +3572,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       // proving the action's durable generation/fingerprint is still current.
       // Never reuse the live callback's adapter: it may hold an installation
       // token minted by a superseded private key.
-      const adapter = (await runtimeFor(record.endpoint)).thread(
-        payload.threadId,
-      ).adapter;
+      const endpointRuntime = await runtimeFor(record.endpoint);
+      const adapter = endpointRuntime.thread(payload.threadId).adapter;
       await credentialLease.assertOwned();
-      if (payload.operation === "remove") {
+      if (record.endpoint.provider === "slack") {
+        await endpointRuntime.applySlackReceiptReaction(payload, fetchImpl);
+      } else if (payload.operation === "remove") {
         await adapter.removeReaction(
           payload.threadId,
           payload.messageId,
@@ -9098,7 +9104,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const storedIds: string[] = [];
     const withCurrentAttachmentAuthorization = async <T>(
       work: (tx: DbTransaction) => Promise<T>,
-      teamsInlineImage = false,
+      enforceUnchangedSource = false,
+      telegramMedia?: Attachment,
     ): Promise<T> => {
       for (let attempt = 0; ; attempt++) {
         try {
@@ -9193,7 +9200,53 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 "The attachment's current chat admission is unavailable",
                 { code: "chat_action_authorization_changed" },
               );
-            if (teamsInlineImage) {
+            if (enforceUnchangedSource) {
+              if (telegramMedia) {
+                const normalized = lockedDelivery.normalizedEvent as {
+                  principal?: { externalId?: string };
+                  message?: {
+                    providerMessageId?: string;
+                    attachments?: Array<{ recovery?: unknown }>;
+                  };
+                };
+                const fence = lifecycleRuntimeFence(lockedDelivery);
+                const descriptor =
+                  input.endpointRuntime.attachmentRecoveryDescriptor(
+                    telegramMedia,
+                    {
+                      threadId: current.conversation.externalThreadId,
+                      messageId: normalized.message?.providerMessageId ?? "",
+                      principalExternalId: normalized.principal?.externalId,
+                      runtimeGeneration: fence?.generation,
+                      credentialFingerprint: fence?.credentialFingerprint,
+                    },
+                  );
+                if (
+                  descriptor?.locator.kind !== "telegram_media" ||
+                  !normalized.message?.attachments?.some((item) => {
+                    const retained = item.recovery as {
+                      version?: unknown;
+                      provider?: unknown;
+                      locator?: Record<string, unknown>;
+                      attachment?: Record<string, unknown>;
+                    } | null;
+                    return (
+                      retained?.version === 1 &&
+                      retained.provider === "telegram" &&
+                      Object.entries(descriptor.locator).every(
+                        ([key, value]) => retained.locator?.[key] === value,
+                      ) &&
+                      Object.entries(descriptor.attachment).every(
+                        ([key, value]) => retained.attachment?.[key] === value,
+                      )
+                    );
+                  })
+                )
+                  throw forbidden(
+                    "The media's admitted source is unavailable",
+                    { code: "chat_action_authorization_changed" },
+                  );
+              }
               const [source] = await tx
                 .select({ id: issueComments.id })
                 .from(issueComments)
@@ -9273,8 +9326,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         input.endpoint.provider === "microsoft-teams" &&
         input.endpointRuntime.attachmentRecoveryDescriptor(attachment)?.locator
           .kind === "teams_inline_image";
+      const telegramMedia =
+        input.endpoint.provider === "telegram" &&
+        hasTelegramMediaProvenance(attachment);
+      const sourceBoundMedia = teamsInlineImage || telegramMedia;
       const requireCurrentAttachmentAuthorization =
-        input.endpoint.provider === "github" || teamsInlineImage;
+        input.endpoint.provider === "github" || sourceBoundMedia;
       try {
         if (teamsInlineImage && teamsInlineBatchSignal?.aborted) {
           omit("download_unavailable");
@@ -9305,7 +9362,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         )
           await withCurrentAttachmentAuthorization(
             async () => {},
-            teamsInlineImage,
+            sourceBoundMedia,
+            telegramMedia ? attachment : undefined,
           );
         if (
           attachment.size !== undefined &&
@@ -9319,7 +9377,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           continue;
         }
         const originalFilename = sanitizeFilename(attachment.name);
-        const contentType = normalizeUploadAttachmentContentType({
+        let contentType = normalizeUploadAttachmentContentType({
           contentType: normalizeContentType(
             attachment.mimeType ?? "application/octet-stream",
           ),
@@ -9329,7 +9387,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // Reject a provider-declared type before allocating the downloaded
         // payload. The actual byte length is checked again after the adapter's
         // bounded fetch contract resolves.
-        if (!isAllowedContentType(contentType)) {
+        // A filename may infer an Office MIME for ordinary documents, but it
+        // must not bypass byte identification for native media without MIME.
+        const identifyTelegram =
+          telegramMedia &&
+          normalizeContentType(
+            attachment.mimeType ?? "application/octet-stream",
+          ) === "application/octet-stream";
+        if (!isAllowedContentType(contentType) && !identifyTelegram) {
           omit("unsupported_type");
           continue;
         }
@@ -9348,6 +9413,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           omit("downloaded_too_large");
           continue;
         }
+        if (identifyTelegram) {
+          contentType =
+            identifyTelegramMedia(attachment, body) ??
+            "application/octet-stream";
+          if (!isAllowedContentType(contentType)) {
+            omit("unsupported_type");
+            continue;
+          }
+        }
         const fingerprint = JSON.stringify([
           createHash("sha256").update(body).digest("hex"),
           body.length,
@@ -9361,7 +9435,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           // must prevent storage and attachment registration for that input.
           await withCurrentAttachmentAuthorization(
             async () => {},
-            teamsInlineImage,
+            sourceBoundMedia,
+            telegramMedia ? attachment : undefined,
           );
         }
         if (existingId) {
@@ -9394,7 +9469,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   issueService(tx as unknown as Db).createAttachment(
                     registration,
                   ),
-                teamsInlineImage,
+                sourceBoundMedia,
+                telegramMedia ? attachment : undefined,
               )
             : await issuesSvc.createAttachment(registration);
         } catch (error) {
@@ -9483,8 +9559,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const diagnostic =
       attachmentOmissionDetail(input.attachmentResult) ??
       "The Telegram attachment could not be imported";
-    const visibleFailure =
-      "Paperclip could not safely import the attached Telegram file. Please resend it as a supported file under 25 MB or include text describing the request.";
+    const visibleFailure = `Paperclip could not safely import the attached Telegram file. Please resend it as a supported file under ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)} or include text describing the request.`;
     const effectContext =
       input.runtimeContext ??
       runtimeContextForRecord(
@@ -12921,7 +12996,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           recovery: teamsNonPersonal
             ? (inlineRecovery.get(attachment) ?? null)
             : nativeInboundAttachments.includes(attachment)
-              ? endpointRuntime.attachmentRecoveryDescriptor(attachment)
+              ? endpointRuntime.attachmentRecoveryDescriptor(
+                  attachment,
+                  endpoint.provider === "telegram"
+                    ? attachmentSource
+                    : undefined,
+                )
               : null,
         })),
       },
@@ -15122,12 +15202,24 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               })
             : null;
         if (rehydrated) return rehydrated;
-        if (isTeams) {
+        if (
+          isTeams ||
+          (endpointRuntime.provider === "telegram" &&
+            typeof attachment.recovery === "object" &&
+            attachment.recovery !== null &&
+            "locator" in attachment.recovery &&
+            typeof attachment.recovery.locator === "object" &&
+            attachment.recovery.locator !== null &&
+            "kind" in attachment.recovery.locator &&
+            attachment.recovery.locator.kind === "telegram_media")
+        ) {
           // Non-personal references and personal files whose safe download
           // capability did not survive restart still belong to this input.
           // Keep bounded metadata so ingestion records an explicit omission;
           // never persist bearer URLs or fabricate a download capability.
           // Even a legacy URL locator cannot enable non-personal downloads.
+          // A Telegram media locator which fails its exact source proof also
+          // remains an unavailable input, never an empty attachment-free turn.
           return {
             type: "file",
             name:
@@ -31027,7 +31119,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       : null;
   }
 
-  async function stageDiscordReceiptReactionRemovals(
+  async function stageTerminalReceiptReactionRemovals(
     tx: Db,
     input: {
       endpoint: EndpointRow;
@@ -31036,7 +31128,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       runtimeContext: RuntimeContext;
     },
   ): Promise<string[]> {
-    if (input.endpoint.provider !== "discord") return [];
+    if (!["discord", "slack"].includes(input.endpoint.provider)) return [];
     const runId = await receiptReactionCompletionRunId(
       tx,
       input.publication,
@@ -31051,6 +31143,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         payload: chatActions.payload,
         result: chatActions.result,
         status: chatActions.status,
+        normalizedEvent: chatDeliveries.normalizedEvent,
       })
       .from(heartbeatRuns)
       .innerJoin(
@@ -31067,7 +31160,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           ),
         ),
       )
-      .innerJoin(
+      .leftJoin(
+        chatDeliveries,
+        and(
+          eq(chatDeliveries.id, chatMessageLinks.deliveryId),
+          eq(chatDeliveries.companyId, chatMessageLinks.companyId),
+          eq(chatDeliveries.endpointId, chatMessageLinks.endpointId),
+          eq(chatDeliveries.conversationId, chatMessageLinks.conversationId),
+          input.endpoint.provider === "slack"
+            ? eq(chatDeliveries.state, "processed")
+            : undefined,
+        ),
+      )
+      .leftJoin(
         chatActions,
         and(
           eq(chatActions.endpointId, chatMessageLinks.endpointId),
@@ -31088,7 +31193,40 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       );
     const removals = receipts.flatMap((receipt) => {
       if (!receipt.deliveryId) return [];
-      const payload = receiptReactionPayload(receipt.payload);
+      let payload = receipt.payload
+        ? receiptReactionPayload(receipt.payload)
+        : null;
+      if (input.endpoint.provider === "slack") {
+        // Eyes acknowledge this admitted message, not each model/retry run.
+        // A fast final can win before addReceiptReaction inserts its row.
+        // Persist the one-shot marker from the original admitted source now;
+        // the late add will observe it under the same credential fence.
+        const normalized = receipt.normalizedEvent;
+        if (!normalized) return [];
+        const acknowledgement = normalized.acknowledgement as
+          Record<string, unknown> | undefined;
+        const message = normalized.message as Record<string, unknown> | undefined;
+        const conversation = normalized.conversation as
+          Record<string, unknown> | undefined;
+        const source = receiptReactionPayload({
+          version: 1,
+          operation: "add",
+          reaction: "eyes",
+          threadId: conversation?.externalThreadId,
+          messageId: message?.providerMessageId,
+          runtimeGeneration: input.runtimeContext.generation,
+          credentialFingerprint: input.runtimeContext.credentialFingerprint,
+        });
+        if (
+          acknowledgement?.receiptReactionSupported !== true ||
+          !source ||
+          (payload &&
+            (payload.threadId !== source.threadId ||
+              payload.messageId !== source.messageId))
+        )
+          return [];
+        payload = source;
+      }
       if (!payload || payload.operation !== "add") return [];
       return [
         {
@@ -31109,8 +31247,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       ];
     });
     if (removals.length === 0) return [];
+    const removalDeliveryIds = new Set(
+      removals.map((removal) => removal.deliveryId),
+    );
     for (const receipt of receipts) {
-      if (!["received", "failed", "processing"].includes(receipt.status)) {
+      if (
+        !receipt.deliveryId ||
+        !removalDeliveryIds.has(receipt.deliveryId) ||
+        !receipt.actionId ||
+        !receipt.status ||
+        !["received", "failed", "processing"].includes(receipt.status)
+      ) {
         continue;
       }
       await tx
@@ -33864,7 +34011,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   });
                 }
                 receiptRemovalActionIds.push(
-                  ...(await stageDiscordReceiptReactionRemovals(
+                  ...(await stageTerminalReceiptReactionRemovals(
                     tx as unknown as Db,
                     {
                       endpoint: authorizationClaim.endpoint,

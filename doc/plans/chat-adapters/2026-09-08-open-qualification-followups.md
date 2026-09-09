@@ -135,9 +135,14 @@ describe the normal binary as continuously unchanged across that earlier check.
 **Current follow-up:** the restored Discord login is not the current gate:
 the in-app browser tool still reports that the Mac is locked. Read-only health
 confirms server 74 is ready and the original four configured endpoints remain
-active; that is not a new live conversation. Parallel agents are reproducing
-and fixing Slack receipt contention/cleanup and Telegram optional-MIME and
-Live Photo intake. Their changes are not yet qualified or deployed.
+active; that is not a new live conversation. Slack receipt contention/cleanup
+and Telegram optional-MIME/Live Photo repairs are now frozen and independently
+reviewed. Slack's final joined repeat passes 10/10, and Telegram's repaired
+configured-2-MiB cohort passes 22/22. After diagnosing three test-only failures,
+root's fresh combined regression passes **770/770** integration tests in
+149.26 seconds, **31/31** deterministic browser tests and **127/127** final
+helper/runtime checks. Shared/server/UI plain types and targeted formatting
+pass. These repairs are ready for deployment but are not live-provider proof.
 
 Root corrected stale Teams file guidance: personal chats ask for file consent,
 while channels/groups can receive supported images directly. The old universal
@@ -147,6 +152,27 @@ on fresh `chat_teams_guidance_browser_20260909_root01` in 14.1 seconds. Root
 inspected the rendered guidance screenshot; it fits without clipping. Provider
 publication is simulated in those tests. Token gates and targeted formatting
 pass. This does not qualify live Teams or the pending Slack/Telegram changes.
+
+**Next provider-version work:** the [current Telegram Bot API contract](https://core.telegram.org/bots/api#recent-changes)
+includes changes absent from the pinned adapter. A bounded read-only audit
+confirmed rich Markdown output and private drafts already work; do not list
+those as missing. Actual pinned-parser probes found three separate gaps:
+
+- API 10.3 `expandable_blockquote` and rich `document` input can disappear,
+  including a dropped quotation beside a supported paragraph. Next add exact
+  parser → service text/file/restart cases and truthful unsupported omissions.
+- Native ephemeral transport is absent, and distinct ephemeral message IDs
+  with `message_id: 0` collapse to one ordinary message identity. Keep private
+  commands disabled until recipient-bound transport, update identity, deadline,
+  retry and no-cross-recipient/public-fallback guarantees are qualified.
+- Native generation-stop updates are neither subscribed nor dispatched, and
+  draft IDs are process-local. First distinguish stopping the presentation of
+  already-approved output from cancelling a live model run; require durable
+  exact draft/publication ownership. Never cancel whichever run is current.
+
+These are next-pass implementation/qualification gaps, not newly shipped
+features. Preserve recipient/source authority and never expose raw model
+thinking merely because a provider offers a thinking block.
 
 **Deployed in `cfbda24be` on server 74:** a bounded parallel acceptance
 audit found two gaps beyond the browser lock. Explicit Board publication accepted

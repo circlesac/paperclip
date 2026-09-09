@@ -4104,3 +4104,130 @@ Logs: `teams-file-guidance-red-root-0909.log`,
 artifacts, not repository wireframes. Token gates and targeted Prettier checks
 pass. Slack receipt and Telegram media repairs are proceeding independently;
 their findings and eventual verification must be recorded separately.
+
+### September 9: Slack receipt latency and source-bound Telegram media
+
+Two bounded parallel audits produced new reproducible defects, independent
+of the blocked signed-in browser. No claim ties them to the historical
+61.5/234-second pre-ingress delays.
+
+Slack's nonessential acknowledgement shared the endpoint credential lease
+with final output and used the ordinary 45-second message timeout. A held
+reaction regression kept an already-ready same-endpoint final absent after
+3.5 seconds. The new reaction-only transport has a two-second abort deadline,
+awaits local headers/body transport settlement before releasing authority,
+keeps an 8 KiB response ceiling and exposes only closed error codes. Durable
+receipt actions own retry; the helper does not retry itself. An independent
+review probe caught HTTP 429/503 carrying `already_reacted` being mistaken for
+acceptance; those now remain HTTP failures.
+
+One-shot receipt cleanup now includes Slack. Exact final-run input selects
+the admitted delivery even when final output beats creation of its add row.
+The durable terminal marker suppresses a late original add and leaves another
+message's receipt alone. Same-source native retries do not mint new eyes;
+native Slack status owns working-state feedback. This is not a claim of
+atomic remote ordering after an ambiguous transport or that every task/file
+operation ended with the text response. No new per-run reaction protocol or
+row lock across provider I/O was introduced.
+
+Slack's frozen cohort passes **9/9** joined tests and **89/89** helper/adjacent
+tests, plus plain server TypeScript. Logs: `slack-receipt-held-red-0909.log`,
+`slack-receipt-cleanup-red-0909.log`, `slack-receipt-frozen-joined-0909.log`,
+`slack-receipt-frozen-units-0909.log`, `slack-receipt-frozen-types-0909.log`.
+Two expanded filtered cohorts hit an older session-status fixture's pending
+milestone before a later global count assertion. Their failed logs remain;
+older assertions were not changed. New fixtures retire their own endpoints
+and synthetic retry state. The full suite still supplies the ordering verdict.
+
+Telegram's four initial service regressions rejected valid video/voice with
+omitted optional MIME, dropped Live Photo parts, and advertised a 25 MB limit
+despite the deployment default. Runtime-owned source provenance now binds the
+exact media subtype, file IDs, author, message/topic and current endpoint
+credential generation. A closed durable locator survives restart; its digest
+detects corruption but is not authorization. The service separately rechecks
+the exact admitted descriptor and current source/reach before download, after
+download and before attachment registration. Ordinary unknown documents do
+not enter this lane. Bounded MP4/Ogg-Opus/MP3/GIF inspection identifies supported
+missing-MIME media; it is container screening, not complete codec decoding.
+Live Photos retain their video and optional original static photo.
+
+Review reproduced an Office-filename inference bypass; identification now
+uses original missing/generic MIME, not the filename-inferred type. Valid MP4
+named `.docx` imports as video; invalid bytes with that name are rejected.
+Corrupt restart locators and malformed Live Photos produce an explicit
+omission rather than an empty agent wake. Failure guidance uses the configured
+attachment ceiling. The pinned attachment-factory seam is checked at startup.
+
+The final Telegram cohort passes **21/21** (14 new, six video-note and one
+existing media case) on fresh `chat_telegram_optional_media_20260909_final01`;
+helper/runtime checks pass **85/85**, and plain server TypeScript passes.
+A separate fresh process with `PAPERCLIP_ATTACHMENT_MAX_BYTES=2097152`
+passes its service rejection case with 2 MB guidance. Logs are
+`telegram-optional-media-{red01,final01,units-final,types-final,cap01}-0909.log`.
+Independent review found no remaining code blocker. Provider HTTP is simulated;
+no Telegram/Slack live conversation, historical replay or deployment is implied.
+
+Root has started the final full integration/browser regression on separate
+fresh databases. The test-it-for-real live journey remains blocked by OS lock,
+not another Discord login. Runner/lockfile hashes remain unchanged.
+
+The first combined full run returned **767 passed, three failed** in 162.54
+seconds on `chat_receipts_media_full_20260909_root01`. One older Telegram test
+still expected 25 MB. The Slack denied-action test saw two scheduled callbacks
+instead of one after terminal cleanup was added, and the new Telegram video
+test observed two wake callbacks after draining global pending deliveries.
+Those counts require source-specific diagnosis; they are not waived as flakes
+or fixed by weakening the assertions. No deployment followed this failure.
+Log: `receipts-media-full-root-0909.log`.
+
+Separately, the full deterministic browser suite passed **31/31**, no retries,
+on `chat_receipts_media_browser_20260909_root01` (2.8 minutes), and the final
+six-file helper/runtime cohort passed **127/127** (6.86 seconds). Shared,
+server and UI plain TypeScript checks pass. Six standalone changed files pass
+Prettier; shared file formatting is limited to the edited ranges. The initial
+root helper command included two nonexistent filters and ran four actual
+files, passing 98 tests; the corrected six-file result is the final cohort.
+Logs: `receipts-media-browser-root-0909.log`,
+`receipts-media-helpers-final-root-0909.log`, and
+`receipts-media-{shared,server,ui}-types-root-0909.log`.
+
+Diagnosis of all three full-suite failures was test-only. The Slack test
+reproduced in isolation: setup-final publication legitimately scheduled its
+new one-shot receipt cleanup. The corrected fixture proves the exact setup
+removal settles before starting the denial scenario; its original one-task,
+one-ephemeral-notice and no-redelivery assertions remain unchanged. Fresh
+RED → GREEN and the final ten-case cohort pass, with server types clean.
+
+The preserved failed database shows exactly one wake receipt for the new
+Telegram video. The second global-sweep callback belonged to an earlier
+Slack `deferredChatQueueFixture(admissionFails=true)` source
+`C-DEFERRED-NOTICE:1999000.1`, in a different company and agent. This was not
+the denied-action test's cleanup and was not duplicate Telegram admission.
+The Telegram replay now targets its exact delivery and still requires one
+wake, the correct agent and one matching durable receipt. The stale 25 MB
+test now uses the actual configured limit and retires its fixture reliably.
+The repaired 22-case Telegram cohort passes on a fresh database under a
+2 MiB configured ceiling; server types also pass. Production source did not
+change for these test repairs. Logs: `slack-denial-scheduler-{red,green,final,types}-0909.log`,
+`telegram-optional-media-repair01-0909.log`, and
+`telegram-optional-media-repair-types-0909.log`.
+
+Root's fresh full-suite repeat uses `chat_receipts_media_full_20260909_root02`.
+Frozen source SHA256 values at start:
+
+- service: `5d4222782cba6036626bed6c413e059183838b2a21d751e8a27c4188d146825d`
+- integration: `b3c3ba9944a88ecf550035d723a91a18f6eb5af69d8e1cf04b2ebf5459fc6145`
+- runtime: `6dea30a19246d50c4274cf37adaa769d973098e7ba515caf009a7e14bbe8daaa`
+
+The full-suite repeat passed **770/770**, zero skips, in **149.26 seconds** on
+`chat_receipts_media_full_20260909_root02`; log
+`receipts-media-full-final-root-0909.log`. The three source hashes above remain
+unchanged. The failed first run remains preserved rather than reported as a
+pass. The 31 browser and 127 helper/runtime passes stand; test-only repairs
+also passed plain server TypeScript. Full workspace build/test was not rerun
+and is not claimed. Runner binary and CI-owned lockfile remain unchanged.
+
+A read-only live inventory at `07:36:42.375 UTC` still showed the original
+290 terminal runs, zero active; the latest start remained `02:15:47.812 UTC`.
+Deployment follows a separate fresh quiescence check. No provider result or
+historical recovery was manufactured to obtain this verification.

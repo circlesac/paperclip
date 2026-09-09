@@ -59,6 +59,19 @@ import {
 } from "./chat-teams-inline-image-intake.js";
 import { normalizeTelegramVideoNoteAttachments } from "./chat-telegram-video-note.js";
 import {
+  hasTelegramMediaProvenance,
+  normalizeTelegramMediaAttachments,
+  retainTelegramMediaProvenance,
+  telegramMediaLocator,
+  validateTelegramMediaLocator,
+  type TelegramMediaLocator,
+  type TelegramMediaScope,
+} from "./chat-telegram-media-intake.js";
+import {
+  applySlackReceiptReaction,
+  type SlackReceiptMutation,
+} from "./chat-slack-receipts.js";
+import {
   installTeamsFileConsentHook,
   parseTeamsFileConsentCard,
   parseTeamsUploadedFileCard,
@@ -192,6 +205,7 @@ interface DurableAttachmentMetadata {
 type ChatSdkAttachmentLocator =
   | GitHubPublicAttachmentLocator
   | TeamsInlineImageLocator
+  | TelegramMediaLocator
   | {
       enterpriseId?: string;
       isEnterpriseInstall?: true;
@@ -1437,13 +1451,26 @@ function createProviderAdapter(
       const adapter = createTelegramAdapter(adapterConfig);
       const parser = adapter as unknown as {
         extractAttachments(raw: TelegramRawMessage): Attachment[];
+        createAttachment(
+          type: Attachment["type"],
+          fileId: string,
+          metadata: Record<string, unknown>,
+        ): Attachment;
       };
-      if (typeof parser.extractAttachments !== "function") {
+      if (
+        typeof parser.extractAttachments !== "function" ||
+        typeof parser.createAttachment !== "function"
+      ) {
         throw new Error("Telegram attachment parser contract is unavailable");
       }
       const extractAttachments = parser.extractAttachments.bind(adapter);
       parser.extractAttachments = (raw) =>
-        normalizeTelegramVideoNoteAttachments(raw, extractAttachments(raw));
+        normalizeTelegramMediaAttachments(
+          raw,
+          normalizeTelegramVideoNoteAttachments(raw, extractAttachments(raw)),
+          (type, fileId, metadata) =>
+            parser.createAttachment(type, fileId, metadata),
+        );
       return adapter;
     }
   }
@@ -1895,6 +1922,7 @@ export class ChatSdkEndpointRuntime {
   private readonly discordCommandDispatch =
     new AsyncLocalStorage<DiscordCommandDispatch>();
   private readonly webhookIngressTimeoutMs: number;
+  private readonly slackReceiptBotToken: string | null;
   private readonly microsoftTeamsTenantId: string | null;
   private readonly microsoftTeamsAppId: string | null;
   private readonly teamsInlineImageDescriptors = new WeakMap<
@@ -1917,6 +1945,10 @@ export class ChatSdkEndpointRuntime {
     this.companyId = options.companyId;
     this.endpointId = options.endpointId;
     this.provider = options.providerConfig.provider;
+    this.slackReceiptBotToken =
+      options.providerConfig.provider === "slack"
+        ? options.providerConfig.credentials.botToken
+        : null;
     this.sdkAdapterKey = adapterKey(this.provider);
     this.teamsFileConsentEnabled =
       this.provider === "microsoft-teams" &&
@@ -2453,6 +2485,12 @@ export class ChatSdkEndpointRuntime {
     attachment: Attachment,
     source?: ChatSdkAttachmentSource,
   ): ChatSdkAttachmentRecoveryDescriptor | null {
+    if (this.provider === "telegram" && hasTelegramMediaProvenance(attachment)) {
+      const scope = this.telegramMediaScope(source);
+      const locator = scope && telegramMediaLocator(attachment, scope);
+      const metadata = durableAttachmentMetadata(attachment);
+      return locator && metadata ? { version: 1, provider: "telegram", attachment: metadata, locator } : null;
+    }
     const retained = this.teamsInlineImageDescriptors.get(attachment);
     if (retained) {
       if (!source) return retained;
@@ -2478,6 +2516,13 @@ export class ChatSdkEndpointRuntime {
     return createAttachmentRecoveryDescriptor(this.provider, attachment);
   }
 
+  private telegramMediaScope(source?: ChatSdkAttachmentSource): TelegramMediaScope | null {
+    if (!source || source.runtimeGeneration === undefined || !source.credentialFingerprint || !source.principalExternalId) return null;
+    return { companyId: this.companyId, endpointId: this.endpointId, runtimeGeneration: source.runtimeGeneration,
+      credentialFingerprint: source.credentialFingerprint, threadId: source.threadId, messageId: source.messageId,
+      principalExternalId: source.principalExternalId };
+  }
+
   private teamsInlineImageScope(
     source?: ChatSdkAttachmentSource,
   ): TeamsInlineImageScope | null {
@@ -2501,6 +2546,19 @@ export class ChatSdkEndpointRuntime {
       messageId: source.messageId,
       principalExternalId: source.principalExternalId,
     };
+  }
+
+  /** Service-owned receipt action; no ordinary message or native status retry. */
+  async applySlackReceiptReaction(
+    input: SlackReceiptMutation,
+    fetchImpl?: typeof globalThis.fetch,
+  ): Promise<void> {
+    if (this.provider !== "slack" || !this.slackReceiptBotToken)
+      throw new Error("Slack receipt runtime unavailable");
+    await applySlackReceiptReaction(
+      { ...input, botToken: this.slackReceiptBotToken },
+      fetchImpl,
+    );
   }
 
   /** Only attachments reconstructed by this runtime can use the batch budget. */
@@ -2671,6 +2729,37 @@ export class ChatSdkEndpointRuntime {
       this.teamsInlineImageFetchers.set(attachment, fetchData);
       return attachment;
     }
+    if (
+      this.provider === "telegram" &&
+      isRecord(descriptor) &&
+      descriptor.version === 1 &&
+      descriptor.provider === "telegram" &&
+      isRecord(descriptor.locator) &&
+      descriptor.locator.kind === "telegram_media"
+    ) {
+      const scope = this.telegramMediaScope(source);
+      const metadata =
+        isRecord(descriptor.attachment) &&
+        durableAttachmentMetadata(
+          descriptor.attachment as unknown as Attachment,
+        );
+      const locator =
+        scope &&
+        metadata &&
+        validateTelegramMediaLocator(descriptor.locator, metadata, scope);
+      if (!locator || !metadata || !this.adapter.rehydrateAttachment)
+        return null;
+      const attachment = this.adapter.rehydrateAttachment({
+        ...metadata,
+        fetchMetadata: {
+          fileId: locator.fileId,
+          fileUniqueId: locator.fileUniqueId,
+        },
+      });
+      return attachment
+        ? retainTelegramMediaProvenance(attachment, locator)
+        : null;
+    }
     const validated = validatedAttachmentRecoveryDescriptor(
       this.provider,
       descriptor,
@@ -2706,6 +2795,8 @@ export class ChatSdkEndpointRuntime {
         };
         break;
       case "teams_inline_image":
+        return null; // Only the exact source-bound branch above may authorize it.
+      case "telegram_media":
         return null; // Only the exact source-bound branch above may authorize it.
       case "teams_anonymous_url":
         fetchMetadata = { url: validated.locator.url };

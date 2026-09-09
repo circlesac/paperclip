@@ -507,6 +507,15 @@ Run C5 and C6, then verify specifically:
 - an unauthorized action uses an ephemeral safe denial; any generic text fallback contains no private task/account details and does not open an unsolicited DM;
 - In the bot DM, the registered agent command with `status` returns the active task state; `new` advances the DM to a fresh task generation and `close` closes the active one. In a channel, Slack does not include a thread timestamp in slash-command payloads, so these controls return private guidance to use the task link in the native thread rather than guessing among channel tasks;
 - the standard `eyes` receipt reaction is used without requiring a custom workspace emoji; retry/failure of that reaction does not re-admit the task or duplicate its message;
+- after a turn's final output is published, its `eyes` reaction clears. Use
+  deterministic fault injection for final-before-add and delayed add/removal:
+  an old completion must not remove a newer message's receipt. The reaction
+  acknowledges one admitted message; a same-source retry does not create a
+  new receipt, and native status conveys its working state. A stalled
+  acknowledgement must settle within its
+  bounded transport budget and release its credential lease before a ready
+  reply proceeds; it must not hold the reply behind the ordinary message
+  timeout. Provider rejection or malformed replies must not count as success;
 - native session status tracks working, waiting for input, final output, and closed conversations. A status-only rate limit retries independently, without replaying a provider reply. A working run exceeding 30 minutes refreshes status before Slack's one-hour timeout;
 - as a linked non-viewer, click native **Stop** during a long response. Verify the exact task/run is stopped, the visible confirmation says it stopped at your request, and working status clears. Repeat the same event, deliver it late after a new turn, and try as an unlinked or revoked identity: no later/unrelated run may be cancelled. The Paperclip Activity tab records the result;
 - a duplicated Slack retry is deduplicated and visible in Activity.
@@ -812,7 +821,18 @@ Run C3, C5, and C6, then verify specifically:
 - `FORM` uses inline keyboard buttons; fields that require a modal fall back to a Paperclip link or sequential prompts;
 - `/task <request>`, `/new`, `/status`, and `/close` are parsed as the documented small command vocabulary, and Paperclip registers that menu automatically;
 - image/document/media ingestion is bounded and type checked;
-- there is no claim of true ephemeral output; a private denial uses DM when possible or concise safe text;
+- send voice, audio, video, animation and a Live Photo. Verify current-input
+  originals on the same task and topic, including both Live Photo parts.
+  Use signed-envelope deterministic fixtures when Telegram omits optional
+  MIME metadata; only exact source-bound supported media may be identified
+  from bounded bytes. Ordinary unknown documents and malformed media must
+  not bypass the content policy. Repeat deferred intake after restart and
+  revoke or edit the source while a download is in flight;
+- reject a file above the configured attachment ceiling. Recovery guidance
+  must name that deployment's actual limit, not a larger hard-coded size;
+- the current pinned adapter does not claim true ephemeral output; its denial
+  uses DM when possible or concise safe text. Telegram's newer native ephemeral
+  contract needs separate recipient-bound implementation and qualification;
 - callback data contains only an opaque short key and every click reauthorizes the Telegram principal;
 - flood-control retry honors provider timing and produces one final message.
 
