@@ -551,7 +551,7 @@ function ConnectedTaskComposer({
                   ? "GitHub Apps cannot upload file bytes in comments. Checked files stay on the Paperclip task; GitHub receives an authenticated task link when this Board has a public URL, or a private-task notice otherwise."
                   : binding.provider === "microsoft-teams" &&
                       !showingRetainedFiles
-                    ? "Teams asks the recipient to accept each file before upload. Where direct delivery isn't available, files stay on the Paperclip task; Teams receives a task link or a private-task notice."
+                    ? "In personal Teams chats, recipients accept each file before upload. Channels and group chats receive supported images directly; other files stay on the task, with a task link or private-task notice."
                     : showingRetainedFiles
                       ? "These are the files selected for this send. Selection is locked until delivery is resolved."
                       : "Only checked files will be published to the external conversation."}

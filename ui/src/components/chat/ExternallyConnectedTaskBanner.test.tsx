@@ -635,10 +635,13 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
         );
       } else {
         expect(container.textContent).toContain(
-          "Teams asks the recipient to accept each file before upload.",
+          "In personal Teams chats, recipients accept each file before upload.",
         );
         expect(container.textContent).toContain(
-          "Teams receives a task link or a private-task notice.",
+          "Channels and group chats receive supported images directly; other files stay on the task, with a task link or private-task notice.",
+        );
+        expect(container.textContent).not.toContain(
+          "Teams asks the recipient to accept each file before upload.",
         );
       }
       expect(container.textContent).not.toContain(

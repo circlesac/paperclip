@@ -132,9 +132,25 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
+**Current follow-up:** the restored Discord login is not the current gate:
+the in-app browser tool still reports that the Mac is locked. Read-only health
+confirms server 74 is ready and the original four configured endpoints remain
+active; that is not a new live conversation. Parallel agents are reproducing
+and fixing Slack receipt contention/cleanup and Telegram optional-MIME and
+Live Photo intake. Their changes are not yet qualified or deployed.
+
+Root corrected stale Teams file guidance: personal chats ask for file consent,
+while channels/groups can receive supported images directly. The old universal
+consent wording failed the updated regression before the fix. The full composer
+component suite passes 27/27; two deterministic file-consent browser cases pass
+on fresh `chat_teams_guidance_browser_20260909_root01` in 14.1 seconds. Root
+inspected the rendered guidance screenshot; it fits without clipping. Provider
+publication is simulated in those tests. Token gates and targeted formatting
+pass. This does not qualify live Teams or the pending Slack/Telegram changes.
+
 **Deployed in `cfbda24be` on server 74:** a bounded parallel acceptance
-audit found two gaps beyond the browser lock. Explicit Board publication accepts
-100,000 characters but the shared projector silently keeps only 40,000. Four
+audit found two gaps beyond the browser lock. Explicit Board publication accepted
+100,000 characters but the shared projector silently kept only 40,000. Four
 real-service Slack/GitHub new/existing-comment cases reproduced the missing
 tail; the frozen lossless transport now passes 19 joined cases and 47 helper
 tests, including native-result, Unicode/rich-text, unknown-part and restart
@@ -427,8 +443,8 @@ approvalPolicy: never}`. Injecting an effort field is rejected; resolving
 
 The latest user reports Discord login restored; root's subsequent browser probe
 still reports **Mac locked**. Only the OS unlock is being requested. Root
-rechecked server 71 health and the 3104/3137 listeners; no new live provider
-turn has been sent during this code-only audit.
+rechecked server 74 health and its 3137 listener; no new live provider turn
+has been sent during this code-only audit.
 
 ## Latest provider evidence — scope matters
 
@@ -440,11 +456,11 @@ low field is outside the native v4 contract. Do not claim it is running low effo
 
 | Provider | Latest useful real evidence                                                                                                           | Still missing                                                                     |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Discord  | Server 68 same-thread image/TXT return on CHA-32; both previews and full TXT inspected, one attempt per output; bot reconnected on 71 | Live repeat on 71, remaining runbook cases, second-process takeover               |
-| Slack    | Server 68 same-thread image/TXT return on CHA-33; exact received bytes retained; live edited-source reuse denied                      | Live repeat on 71, remaining lifecycle/governance/failure permutations            |
+| Discord  | Server 68 same-thread image/TXT return on CHA-32; both previews and full TXT inspected, one attempt per output; bot reconnected on 74 | Live repeat on current deployment, remaining runbook cases, second-process takeover |
+| Slack    | Server 68 same-thread image/TXT return on CHA-33; exact received bytes retained; live edited-source reuse denied                      | Live repeat on current deployment, remaining lifecycle/governance/failure permutations |
 | GitHub   | Server 68 honest unavailable-private-file reply, followed by correct pasted-text answer on the same session                           | New safe task-link → task-upload live journey and remaining runbook cases         |
 | Telegram | Earlier real text/media/reaction/backlog cases; accepted CHA-26 image answer later delivered without another model run                | Exact failed document-B recovery and remaining file/interaction/performance cases |
-| Teams    | Deterministic personal/channel progress, actions, access and safe file-link coverage                                                  | Actual qualified tenant setup and live provider journeys                          |
+| Teams    | Deterministic personal-file consent, channel/group pictures, progress, actions, access and safe file-link coverage                     | Actual qualified tenant setup and live provider journeys                          |
 
 Real media repeats on server 68 were descriptive, not a controlled speed claim:
 Discord run `265d35e0-af1e-421b-b3e2-61ba65fcc288` took 60.073 seconds,

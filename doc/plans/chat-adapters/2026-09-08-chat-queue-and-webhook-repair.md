@@ -4078,3 +4078,29 @@ automatic unlock unavailable. Discord login was already restored; OS unlock
 is the remaining browser gate. Teams separately still needs an eligible
 tenant. No new live model/provider result, historical recovery or complete
 production-readiness claim is made from this deployment.
+
+### September 9: truthful Teams pre-send file guidance
+
+The restored Discord login was acknowledged, but the signed-in browser tool
+still reported an OS lock. Read-only checks confirmed server 74 (PID 7070,
+loaded `cfbda24be`) ready and all four original configured endpoints active.
+No live message, credential change or restart was performed for this check.
+
+Source inspection found that the Board composer still promised a consent card
+for every Teams file even after channel/group pictures gained direct transport.
+The updated assertion reproduced that mismatch (one failed Teams case, one
+passing GitHub case; 25 unrelated cases filtered). Corrected guidance separates
+personal consent from supported channel/group images and private-task fallback.
+The complete composer component suite then passed **27/27**; both deterministic
+Teams file-consent browser cases passed on fresh
+`chat_teams_guidance_browser_20260909_root01` in 14.1 seconds, with no retries.
+Root inspected the pre-send screenshot: guidance is readable and unclipped;
+selected files and the still-disabled empty-message Send control remain clear.
+This is local Board UI evidence with simulated publication, not live Teams.
+
+Logs: `teams-file-guidance-red-root-0909.log`,
+`teams-file-guidance-green-root-0909.log`,
+`teams-file-guidance-browser-root-0909.log`. Screenshots remain ignored test
+artifacts, not repository wireframes. Token gates and targeted Prettier checks
+pass. Slack receipt and Telegram media repairs are proceeding independently;
+their findings and eventual verification must be recorded separately.

@@ -2311,6 +2311,14 @@ test.describe("Board send delivery refresh", () => {
           banner.getByLabel("Attach file to channel update", { exact: true }),
         ).toBeEnabled();
       }
+      await expect(
+        banner.getByRole("group", { name: "Include task files", exact: true }),
+      ).toContainText(
+        "In personal Teams chats, recipients accept each file before upload. Channels and group chats receive supported images directly; other files stay on the task, with a task link or private-task notice.",
+      );
+      await banner.screenshot({
+        path: testInfo.outputPath("teams-file-guidance.png"),
+      });
       expect(posts).toHaveLength(0);
       await banner
         .getByRole("textbox", { name: "Board update", exact: true })
