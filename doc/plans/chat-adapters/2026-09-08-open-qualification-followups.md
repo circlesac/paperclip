@@ -7,6 +7,24 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+Current deployment (September 9, 01:09 UTC): server **66**, PID **61423**,
+handle **47172**, is healthy on **127.0.0.1:3137**, loaded code `807e2ace2`.
+The private Tailscale Board URL and webhook-only proxy are unchanged. Server 65
+drained with zero interrupted runs and closed; server 66 startup recovery is
+ready. No new heartbeat was created and historical Discord/Telegram maintenance
+attempt counts stayed 1/2 respectively: the new path fix did not replay them.
+Normal staged runner remains SHA `4acf2d1dbe99a6202d07b6d0be73b469ebf153103cda2bbd097e5e4233fcd57a`.
+
+Next: once the user unlocks the Mac, run the same two-file native Discord/Slack
+journey against deployed batching guidance and compare actual end-to-end
+latency/tool cycles, including provider redelivery. Verify the GitHub unavailable-
+file response gives the new safe fallback. Do not substitute fresh requests for
+the blocked historical Telegram B and call it recovery. Finish tenant-qualified
+Teams and broader provider fault/media coverage only when the needed real
+access is available. Forward provider-startup receipt design remains a separate
+hardening item; it needs exact no-launch failure-evidence ordering and cannot
+infer whole-provider retirement from a leader-exit fact.
+
 September 9, 01:08 UTC: the paginated SQLite path repair is frozen and
 independently reviewed. Two genuine additional regressions covered mixed-case
 table trigger lookup and foreign-key update cascades; both now deny before

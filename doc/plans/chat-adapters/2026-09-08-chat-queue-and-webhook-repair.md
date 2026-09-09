@@ -2866,3 +2866,11 @@ Discord maintenance runner has an exact exit-1 receipt; its failed provider
 initialization does not have authenticated renewed-provider exit evidence.
 Telegram additionally lacks its maintenance runner's retirement. Both remain
 conservatively denied, and no historical retry eligibility was widened.
+
+Deployment checkpoint: server 66 loaded `807e2ace2` on loopback 3137 at
+01:09 UTC after server 65's zero-interruption graceful drain. Health and startup
+recovery are ready. No new heartbeat was created; historical Discord/Telegram
+maintenance counts remained one/two. This deployment includes the verified
+paginated path fix, accepted-answer UI, batching guidance and actionable GitHub
+file fallback. The last two instruction changes still await live UI retesting
+after the Mac is unlocked; no measured latency improvement is claimed yet.
