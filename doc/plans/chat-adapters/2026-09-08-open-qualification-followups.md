@@ -140,7 +140,8 @@ the next implementation pass:
   consent/upload without new Graph permissions; the pinned adapter does not
   implement the consent callbacks. The consent-waiting state, per-file progress,
   exact authorization, encrypted upload capability, URL policy and uncertain
-  delivery semantics are under design review before edits. Channel/group
+  delivery semantics have an approved foundation design; helper/SDK-boundary
+  implementation is in progress without service activation yet. Channel/group
   files still need their documented fallback; do not infer broader authority.
 
 Root owns shared verification, documentation, Git and deployment. Server 71
@@ -334,7 +335,17 @@ It is not combined server→real-provider recovery proof. Only local Codex
 surviving-runner, remote/listen and missing-independent-checkpoint cases remain
 unsupported and fail closed.
 
-Latest full chat integration **625/625**, zero skips, ran on fresh
+Latest frozen-foundation chat integration **631/631**, zero skips, ran on fresh
+`chat_modal_telegram_foundation_20260909_root01` (119.53 seconds). It includes
+the Telegram video-note repair and Discord's modal transport foundation with
+capability still off, not the subsequent Discord service/correction workflow.
+The exact loaded source hashes are in the permanent log. A later test-only
+global-collector setup/cleanup correction passes GitHub-filtered **149/149**
+(482 other cases filtered) on a second fresh database; this does not change
+production behavior. GitHub attachment/stress/setup units pass **182/182**;
+the shared Slack/Teams/modal-helper cohort passes **41/41**.
+
+The preceding full chat integration **625/625**, zero skips, ran on fresh
 `chat_slack_modal_joined_20260909_root01` (125.87 seconds). A later test-only
 nested-cleanup/fixture-retirement adjustment passes the final-source focused
 Slack/Teams **3/3** and plain server TypeScript; the full run loaded the prior
@@ -345,7 +356,7 @@ The full suite includes Slack's signed corrected-modal/database flow,
 Teams invalid-form preservation, Discord's parsed
 question/denial paths, Telegram photo boundaries, and previous Slack/Discord
 partial-file batches across restart and explicit ambiguous-file resolution.
-Provider I/O is simulated. Latest log: `slack-signed-modal-full-root-0909.log`
+Provider I/O is simulated. Prior log: `slack-signed-modal-full-root-0909.log`
 in ignored runtime.
 
 Full deterministic chat browser **29/29**, zero retries (2.8 minutes), includes

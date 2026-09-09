@@ -123,7 +123,11 @@ vi.mock("@chat-adapter/teams", () => ({
 vi.mock("@chat-adapter/telegram", () => ({
   createTelegramAdapter: (config: Record<string, unknown>) => {
     captures.telegramConfigs.push(config);
-    return { name: "telegram" };
+    return {
+      name: "telegram",
+      extractAttachments:
+        config.botToken === "missing-telegram-parser" ? undefined : () => [],
+    };
   },
 }));
 
@@ -527,6 +531,21 @@ describe("Chat SDK endpoint runtime", () => {
         }),
       ),
     ).toThrow(DiscordAdapterCompatibilityError);
+  });
+
+  it("fails closed when the pinned Telegram attachment parser is unavailable", () => {
+    expect(() =>
+      createChatSdkEndpointRuntime(
+        baseOptions({
+          provider: "telegram",
+          userName: "paperclip-agent",
+          credentials: {
+            botToken: "missing-telegram-parser",
+            secretToken: "synthetic-secret",
+          },
+        }),
+      ),
+    ).toThrow("Telegram attachment parser contract is unavailable");
   });
 
   it("keeps one long-lived Discord Gateway session and shuts it down cleanly", async () => {

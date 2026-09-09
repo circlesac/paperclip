@@ -46594,70 +46594,77 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   ] as const)(
     "coalesces closed native progress on %s fixture %s (%s) without projecting event content",
     async (provider, suffix, surface) => {
+      // The collector is global. A provider-filtered run may leave a failed
+      // run's milestone from an earlier fixture that the full suite already
+      // drained. Settle that work before asserting this fixture's exact count.
+      await enqueueChatRunMilestones(db, { since: new Date(0) });
       const context = await safeNativeProgressFixture(
         provider,
         suffix,
         surface,
       );
-      const run = await context.createRun(`${provider} work`);
-      await context.addEvent(run);
-      // A future event name that merely shares an allowlisted prefix must not
-      // become provider authority or replace the latest exact event.
-      await context.addEvent(run, "item.completed.private-extension", 2);
+      try {
+        const run = await context.createRun(`${provider} work`);
+        await context.addEvent(run);
+        // A future event name that merely shares an allowlisted prefix must not
+        // become provider authority or replace the latest exact event.
+        await context.addEvent(run, "item.completed.private-extension", 2);
 
-      await expect(
-        enqueueChatRunMilestones(db, { since: new Date(0) }),
-      ).resolves.toBe(1);
-      await context.service.processPendingPublications(100);
+        await expect(
+          enqueueChatRunMilestones(db, { since: new Date(0) }),
+        ).resolves.toBe(1);
+        await context.service.processPendingPublications(100);
 
-      expect(context.providerRuntime.posts).toEqual([
-        {
-          threadId: context.thread.thread.id,
-          text: `Maya is working on ${provider} work…`,
-        },
-      ]);
-      expect(context.providerRuntime.edits).toEqual([
-        {
-          threadId: context.thread.thread.id,
-          messageId: "outbound-1",
-          text: "Maya is making progress…",
-        },
-      ]);
-      expect(
-        JSON.stringify({
-          edits: context.providerRuntime.edits,
-          posts: context.providerRuntime.posts,
-        }),
-      ).not.toMatch(/PRIVATE|secret_internal_tool/);
-      const progressRows = await db
-        .select()
-        .from(chatPublications)
-        .where(
-          like(
-            chatPublications.idempotencyKey,
-            `run:${run.runId}:working:${context.endpoint.id}:native:%`,
-          ),
-        );
-      expect(progressRows).toEqual([
-        expect.objectContaining({
-          idempotencyKey: `run:${run.runId}:working:${context.endpoint.id}:native:making_progress:1`,
-          payload: {
-            text: "Maya is making progress…",
-            progressState: "working",
+        expect(context.providerRuntime.posts).toEqual([
+          {
+            threadId: context.thread.thread.id,
+            text: `Maya is working on ${provider} work…`,
           },
-          providerMessageId: "outbound-1",
-          state: "published",
-        }),
-      ]);
-      await expect(
-        enqueueChatRunMilestones(db, { since: new Date(0) }),
-      ).resolves.toBe(0);
-      await expect(
-        context.service.processPendingPublications(100),
-      ).resolves.toBe(0);
-      expect(context.providerRuntime.posts).toHaveLength(1);
-      expect(context.providerRuntime.edits).toHaveLength(1);
-      await context.service.shutdown();
+        ]);
+        expect(context.providerRuntime.edits).toEqual([
+          {
+            threadId: context.thread.thread.id,
+            messageId: "outbound-1",
+            text: "Maya is making progress…",
+          },
+        ]);
+        expect(
+          JSON.stringify({
+            edits: context.providerRuntime.edits,
+            posts: context.providerRuntime.posts,
+          }),
+        ).not.toMatch(/PRIVATE|secret_internal_tool/);
+        const progressRows = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            like(
+              chatPublications.idempotencyKey,
+              `run:${run.runId}:working:${context.endpoint.id}:native:%`,
+            ),
+          );
+        expect(progressRows).toEqual([
+          expect.objectContaining({
+            idempotencyKey: `run:${run.runId}:working:${context.endpoint.id}:native:making_progress:1`,
+            payload: {
+              text: "Maya is making progress…",
+              progressState: "working",
+            },
+            providerMessageId: "outbound-1",
+            state: "published",
+          }),
+        ]);
+        await expect(
+          enqueueChatRunMilestones(db, { since: new Date(0) }),
+        ).resolves.toBe(0);
+        await expect(
+          context.service.processPendingPublications(100),
+        ).resolves.toBe(0);
+        expect(context.providerRuntime.posts).toHaveLength(1);
+        expect(context.providerRuntime.edits).toHaveLength(1);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
     },
   );
 

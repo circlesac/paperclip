@@ -3570,3 +3570,39 @@ new integration cleanup, and independently passed the helper/photo cohort
 40/40 (764 ms; `telegram-video-note-root-units-0909.log`). No new live Telegram
 upload or bot message was made;
 server 71 still runs the previously committed production code.
+
+### September 9: full foundation regression and filtered-suite isolation
+
+The frozen Telegram/Discord transport foundation passes **631/631** integration
+cases, zero skips, on fresh `chat_modal_telegram_foundation_20260909_root01`
+(119.53 seconds; `modal-telegram-foundation-full-root-0909.log`). The snapshot
+loaded before Discord service/form capability activation. Source SHA256 values:
+
+- Integration: `5fa9b2c74cd7ce3b0a7d1898d3e3627388774445292bcdd7b55ce1760e74e1a4`.
+- Service: `cb965bee7ee7c9b31399a2146dae2c6d9ace378c3b489d69f1c040e5301a4747`.
+- Runtime: `303fff465c815b32b572a2f13bfef6325cb13cdcdcbf8b8ca869e48887541045`.
+- Form helper: `fd0e377b6dd6e33ab953a4ff0b003a344e97abe91ca1a01ee457554786559d7e`.
+- Discord patch: `d22b34be175fad332ab338860a81e0f6a4161133ecaa21c7822f3ffaa7fedec4`.
+
+The GitHub-filtered run initially passed 148/149 and failed the native progress
+fixture's global enqueue count (two versus one). Read-only inspection of its
+isolated database showed the additional row was a different, earlier fixture's
+failed-run milestone; the current native run still had only its one expected
+progress row. The full suite had already drained that work, hiding the filtered
+order dependency. The fixture now settles the global collector before creating
+its own run and always retires its own endpoint in `finally`. The exact 1/0
+enqueue counts, one post/edit, durable key and no-private-prose assertions are
+unchanged. Fresh `chat_github_parallel_20260909_root02` then passes 149/149 with
+482 other cases filtered (30.01 seconds;
+`github-parallel-service-root-final-0909.log`). No production selector changed.
+
+GitHub attachment/provider-stress/setup units pass 182/182 (1.64 seconds);
+shared Slack/Teams/modal-helper tests pass 41/41 (2.30 seconds). The existing
+runtime Telegram test double also needed its real parser method: it previously
+caused five mock-contract failures. Adding only that method and an explicit
+missing-parser fail-closed case yields 66/66 runtime/video-note/photo tests.
+Root independently repeated that same cohort: 66/66, 1.05 seconds,
+`telegram-runtime-mock-root-0909.log`.
+Production still rejects a missing parser; no silent compatibility fallback
+was introduced. This later fixture-only change is distinct from the full-run
+source snapshot above. These tests simulate provider I/O, not live chats.
