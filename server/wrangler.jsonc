@@ -1,0 +1,15 @@
+{
+  "name": "paperclip-server",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-05-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "hyperdrive": [
+    {
+      // Placeholder ID for local development. Replace this before wrangler deploy.
+      // wrangler dev can run with this local connection string in place.
+      "binding": "HYPERDRIVE",
+      "id": "00000000-0000-0000-0000-000000000000",
+      "localConnectionString": "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip"
+    }
+  ]
+}
