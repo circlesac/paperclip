@@ -49,6 +49,14 @@ import {
   type WebhookOptions,
 } from "chat";
 import type { StateAdapter } from "chat";
+import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
+import {
+  deriveTeamsInlineImageLocator,
+  parseTeamsInlineImageLocator,
+  teamsInlineImageDownloadUrl,
+  type TeamsInlineImageLocator,
+  type TeamsInlineImageScope,
+} from "./chat-teams-inline-image-intake.js";
 import { normalizeTelegramVideoNoteAttachments } from "./chat-telegram-video-note.js";
 import {
   installTeamsFileConsentHook,
@@ -183,6 +191,7 @@ interface DurableAttachmentMetadata {
 
 type ChatSdkAttachmentLocator =
   | GitHubPublicAttachmentLocator
+  | TeamsInlineImageLocator
   | {
       enterpriseId?: string;
       isEnterpriseInstall?: true;
@@ -222,6 +231,16 @@ export interface ChatSdkAttachmentRecoveryDescriptor {
   locator: ChatSdkAttachmentLocator;
   provider: ChatSdkProvider;
   version: 1;
+}
+
+export interface ChatSdkAttachmentSource {
+  threadId: string;
+  messageId: string;
+  runtimeGeneration?: number;
+  credentialFingerprint?: string;
+  principalExternalId?: string;
+  message?: Message;
+  isDirectMessage?: boolean;
 }
 
 const ATTACHMENT_TYPES = new Set<DurableAttachmentType>([
@@ -1877,6 +1896,15 @@ export class ChatSdkEndpointRuntime {
     new AsyncLocalStorage<DiscordCommandDispatch>();
   private readonly webhookIngressTimeoutMs: number;
   private readonly microsoftTeamsTenantId: string | null;
+  private readonly microsoftTeamsAppId: string | null;
+  private readonly teamsInlineImageDescriptors = new WeakMap<
+    Attachment,
+    ChatSdkAttachmentRecoveryDescriptor
+  >();
+  private readonly teamsInlineImageFetchers = new WeakMap<
+    Attachment,
+    (signal?: AbortSignal) => Promise<Buffer>
+  >();
   private readonly discordGuildId: string | null;
   private readonly discordGatewayEnabled: boolean;
   private readonly githubAttachmentAppAuthority: boolean;
@@ -1904,6 +1932,10 @@ export class ChatSdkEndpointRuntime {
         ? options.providerConfig.credentials.appTenantId
             ?.trim()
             .toLowerCase() || null
+        : null;
+    this.microsoftTeamsAppId =
+      options.providerConfig.provider === "microsoft-teams"
+        ? options.providerConfig.credentials.appId
         : null;
     this.discordGuildId =
       options.providerConfig.provider === "discord"
@@ -2419,8 +2451,67 @@ export class ChatSdkEndpointRuntime {
   /** Build the closed, credential-free locator stored with durable ingress. */
   attachmentRecoveryDescriptor(
     attachment: Attachment,
+    source?: ChatSdkAttachmentSource,
   ): ChatSdkAttachmentRecoveryDescriptor | null {
+    const retained = this.teamsInlineImageDescriptors.get(attachment);
+    if (retained) {
+      if (!source) return retained;
+      const scope = this.teamsInlineImageScope(source);
+      return scope && parseTeamsInlineImageLocator(retained.locator, scope)
+        ? retained
+        : null;
+    }
+    if (
+      this.provider === "microsoft-teams" &&
+      source?.isDirectMessage === false
+    ) {
+      const scope = this.teamsInlineImageScope(source);
+      const locator =
+        scope && source.message
+          ? deriveTeamsInlineImageLocator(source.message, attachment, scope)
+          : null;
+      const metadata = durableAttachmentMetadata(attachment);
+      return locator && metadata
+        ? { version: 1, provider: this.provider, attachment: metadata, locator }
+        : null;
+    }
     return createAttachmentRecoveryDescriptor(this.provider, attachment);
+  }
+
+  private teamsInlineImageScope(
+    source?: ChatSdkAttachmentSource,
+  ): TeamsInlineImageScope | null {
+    if (
+      !source ||
+      !this.microsoftTeamsTenantId ||
+      !this.microsoftTeamsAppId ||
+      source.runtimeGeneration === undefined ||
+      !source.credentialFingerprint ||
+      !source.principalExternalId
+    )
+      return null;
+    return {
+      companyId: this.companyId,
+      endpointId: this.endpointId,
+      tenantId: this.microsoftTeamsTenantId,
+      botAppId: this.microsoftTeamsAppId,
+      runtimeGeneration: source.runtimeGeneration,
+      credentialFingerprint: source.credentialFingerprint,
+      threadId: source.threadId,
+      messageId: source.messageId,
+      principalExternalId: source.principalExternalId,
+    };
+  }
+
+  /** Only attachments reconstructed by this runtime can use the batch budget. */
+  async fetchTeamsInlineImage(
+    attachment: Attachment,
+    signal: AbortSignal,
+  ): Promise<Buffer> {
+    const fetcher = this.teamsInlineImageFetchers.get(attachment);
+    if (!fetcher || signal.aborted)
+      throw new Error("Teams inline image download unavailable");
+    return await fetcher(signal);
   }
 
   /** Called only after current inbound admission; installation App authority only. */
@@ -2470,8 +2561,116 @@ export class ChatSdkEndpointRuntime {
    */
   rehydrateAttachment(
     descriptor: unknown,
-    source?: { threadId: string; messageId: string },
+    source?: ChatSdkAttachmentSource,
   ): Attachment | null {
+    if (
+      this.provider === "microsoft-teams" &&
+      isRecord(descriptor) &&
+      isRecord(descriptor.locator) &&
+      descriptor.locator.kind === "teams_inline_image"
+    ) {
+      const scope = this.teamsInlineImageScope(source);
+      const locator = scope
+        ? parseTeamsInlineImageLocator(descriptor.locator, scope)
+        : null;
+      const metadata = isRecord(descriptor.attachment)
+        ? durableAttachmentMetadata(
+            descriptor.attachment as unknown as Attachment,
+          )
+        : null;
+      if (
+        !locator ||
+        !metadata ||
+        source?.isDirectMessage !== false ||
+        descriptor.version !== 1 ||
+        descriptor.provider !== this.provider ||
+        Object.keys(descriptor).sort().join(",") !==
+          "attachment,locator,provider,version" ||
+        Object.keys(descriptor.attachment as object).some(
+          (key) =>
+            !["type", "mimeType", "name", "size", "height", "width"].includes(
+              key,
+            ),
+        ) ||
+        metadata.type !== "image" ||
+        metadata.mimeType !== locator.mimeType ||
+        (metadata.size !== undefined && metadata.size > MAX_ATTACHMENT_BYTES)
+      )
+        return null;
+      const normalized: ChatSdkAttachmentRecoveryDescriptor = {
+        version: 1,
+        provider: this.provider,
+        attachment: metadata,
+        locator,
+      };
+      const fetchData = async (batchSignal?: AbortSignal): Promise<Buffer> => {
+        const controller = new AbortController();
+        const signal = batchSignal
+          ? AbortSignal.any([batchSignal, controller.signal])
+          : controller.signal;
+        let rejectDeadline!: () => void;
+        const deadline = new Promise<never>((_resolve, reject) => {
+          rejectDeadline = () =>
+            reject(new Error("Teams inline image download unavailable"));
+        });
+        signal.addEventListener("abort", rejectDeadline, { once: true });
+        const timer = setTimeout(() => controller.abort(), 10_000);
+        try {
+          // Same authenticated SDK HTTP client as the pinned parser, with an
+          // explicit allocation/deadline bound and no redirects. Never use
+          // a caller-supplied fetchData closure or bearer URL.
+          const http = (
+            this.adapter as unknown as {
+              app: {
+                api: {
+                  http: {
+                    get(
+                      url: string,
+                      options: unknown,
+                    ): Promise<{ data: ArrayBuffer | Uint8Array }>;
+                  };
+                };
+              };
+            }
+          ).app.api.http;
+          signal.throwIfAborted();
+          const result = await Promise.race([
+            http.get(teamsInlineImageDownloadUrl(locator), {
+              responseType: "arraybuffer",
+              maxRedirects: 0,
+              maxContentLength: MAX_ATTACHMENT_BYTES,
+              maxBodyLength: MAX_ATTACHMENT_BYTES,
+              timeout: 10_000,
+              signal,
+            }),
+            deadline,
+          ]);
+          signal.throwIfAborted();
+          if (
+            !result.data ||
+            (!(result.data instanceof ArrayBuffer) &&
+              !ArrayBuffer.isView(result.data)) ||
+            result.data.byteLength > MAX_ATTACHMENT_BYTES
+          )
+            throw new Error("Image exceeds attachment bound");
+          return Buffer.from(
+            result.data instanceof ArrayBuffer
+              ? new Uint8Array(result.data)
+              : result.data,
+          );
+        } catch {
+          throw new Error("Teams inline image download unavailable");
+        } finally {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", rejectDeadline);
+        }
+      };
+
+      const attachment: Attachment = { ...metadata, fetchData: () => fetchData() };
+      this.teamsInlineImageDescriptors.set(attachment, normalized);
+      this.teamsInlineImageFetchers.set(attachment, fetchData);
+      return attachment;
+    }
     const validated = validatedAttachmentRecoveryDescriptor(
       this.provider,
       descriptor,
@@ -2506,6 +2705,8 @@ export class ChatSdkEndpointRuntime {
           connectorOrigin: validated.locator.connectorOrigin,
         };
         break;
+      case "teams_inline_image":
+        return null; // Only the exact source-bound branch above may authorize it.
       case "teams_anonymous_url":
         fetchMetadata = { url: validated.locator.url };
         break;

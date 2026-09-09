@@ -52,11 +52,13 @@ The [reach audit](./2026-09-07-native-chat-reach-audit.md) records subsequent
 model-independent live checks. These are scenario-specific evidence, not a
 complete final-source qualification of every provider and feature.
 
-Server 70 deployed implementation `d5ec721f2` with qualified runner
-`6279d39a…`; health and Discord Gateway reconnection passed. Latest real
+Server 73 deployed implementation `b9461c4a6` with qualified runner
+`6279d39a…`; health, Discord Gateway reconnection and real global command
+registration passed. Command ID `1547131713472430131` is durably registered;
+this is not live command-invocation proof. Latest real
 Slack/Discord native PNG+TXT and GitHub private-file/pasted-text evidence is on
-server 68, not this deployment. Server 70 conversation, button and photo-boundary
-retests remain pending because the browser reports the Mac locked. Discord
+server 68, not this deployment. Server 73 conversation, command, modal and
+photo-boundary retests remain pending because the browser reports the Mac locked. Discord
 login has been restored; do not treat an OS lock as a new provider login gate.
 The [current handoff](./2026-09-08-open-qualification-followups.md) names exact
 remaining journeys and protected historical recovery failures.
@@ -172,7 +174,9 @@ When a provider requires MFA, CAPTCHA, passkey, tenant approval, organization ap
 
 ### 3.1 Required Paperclip fixture
 
-Use a publicly reachable, authenticated Paperclip staging instance with real HTTPS callbacks. Name the company and run uniquely:
+Use an authorized Paperclip staging instance with real HTTPS webhook callbacks.
+The Board may remain private; only verified webhook ingress needs public reach.
+Name the company and run uniquely:
 
 ```text
 Company: Chat Adapter E2E
@@ -180,7 +184,18 @@ Run ID: CHAT-E2E-YYYYMMDD-HHMM-<provider>
 Agent: Maya E2E
 ```
 
-`Maya E2E` is a deterministic test agent assigned to no production work. Its fixture contract is:
+`Maya E2E` is a dedicated test agent assigned to no production work. For live
+qualification it must use the new Paperclip Runner with Codex, initially
+`gpt-5.6-luna`. Verify actual admitted run records show `adapterType:
+paperclip_runner`, `runtimeMode: native`, `driverKind: codex_app_server`, and
+the explicit model; the agent's display name or saved configuration alone is
+insufficient. Terra is an allowed fallback only when necessary; record the
+reason and exact model, and do not present it as Luna evidence. Preserve the
+qualified runner binary and record its SHA256 with the tested server version.
+
+The following fixture vocabulary names behavior to exercise, not proof that a
+real model is deterministic. For live cases, send clear requests for that
+behavior and record the actual result, native run, and provider receipt:
 
 | Incoming instruction | Public behavior                                                                                                        |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
@@ -191,7 +206,12 @@ Agent: Maya E2E
 | `GOVERN <run-id>`    | Create a governed Paperclip approval and publish only the provider-safe approval status/link.                          |
 | `FAIL <run-id>`      | Terminate predictably after the safe working state so failure publication and retry are observable.                    |
 
-The fixture may use a dedicated process adapter, but the incoming turn must still traverse the normal chat delivery, task, wakeup, run, and publication paths.
+A deterministic suite may use a dedicated process adapter or simulated model
+port, but its incoming turns must still traverse the normal chat delivery,
+task, wakeup, run, and publication paths. Those tests do not satisfy the live
+runner requirement. Inspect provider output for safe milestones and final
+answers; raw reasoning, tool arguments and private traces remain internal even
+when the native runner makes them available to Paperclip.
 
 ### 3.2 Required people
 
@@ -256,11 +276,21 @@ Removing a connection archives the Paperclip endpoint, stops its runtime, marks 
 Before starting a provider run:
 
 1. Confirm Paperclip health and sign in as Dana E2E.
-2. Confirm `Maya E2E` is active and that its deterministic fixture contract passes from an ordinary Paperclip task.
+2. In instance **Experimental** settings, confirm **Chat connectors** is enabled
+   for this isolated qualification instance. Run C0 on a disposable instance
+   before enabling it; do not toggle an unrelated instance. Confirm Maya is
+   active, uses the native runner/model above, and can complete an ordinary
+   Paperclip task through that runner before sending a provider test message.
 3. Confirm the provider installer, Ari, and Jules browser sessions are signed into the intended sandbox accounts.
 4. Confirm the provider test resources contain no production data and that prior run messages/issues can be distinguished by run ID.
 5. Confirm the verified webhook ingress is publicly reachable when qualifying Slack, GitHub, Teams, or Telegram. For a private board, set `PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL` to the HTTPS webhook-only origin and keep `PAPERCLIP_PUBLIC_URL` at the real board origin. Public `POST /api/chat-webhooks/*` may be forwarded; the private board/API must not be. Verify external task links use the board, never the webhook-only host; local/private links should be omitted with neutral instructions. For Discord, confirm outbound HTTPS/WebSocket access to Discord instead. Relay qualification is a separate deployment run described in section 10.
-6. Confirm the connection does not already exist. If it does, remove the stale test connection through the UI and verify its historical tasks remain readable before creating the new connection. Separately inspect the provider installation: Paperclip removal does not uninstall it, except that Telegram webhook/menu cleanup is automatic.
+6. For first-time setup, use a new dedicated bot identity and disposable endpoint.
+   For follow-up qualification, reuse the intended existing endpoint and record
+   its current state. Never remove a live qualification endpoint simply to
+   restart this checklist, or erase unresolved delivery/recovery evidence.
+   Explicit removal/reinstall cases use disposable fixtures and verify retained
+   history. Paperclip removal does not uninstall provider resources, except
+   that Telegram webhook/menu cleanup is automatic.
 7. Start browser recording/screenshots before `/apps`; record the Paperclip SHA and current time.
 
 ### 3.6 Human login and credential handoffs
@@ -294,6 +324,22 @@ Do not call a provider passed based on a subset of capabilities. A blocked human
 ## 4. Shared assertions for every provider
 
 Run these assertions within each platform-specific procedure.
+
+### C0 — Experimental visibility without breaking existing tools
+
+1. On a disposable instance with **Chat connectors** off, open Connectors.
+   Chat-only setup must be hidden. GitHub's production tool connector must
+   remain available and go directly to tool setup, without a chat/tool chooser.
+2. Follow a saved chat setup/detail URL and the agent Channels URL. They must
+   return to the supported catalog/agent view without exposing chat controls.
+3. Turn **Chat connectors** on in instance Experimental settings. The chat
+   catalog entries, chat routes and agent Channels view must now be available.
+4. If testing an already connected disposable endpoint, turn the setting off
+   and verify it only hides Board surfaces: it must not stop the connection or
+   revoke credentials. Restore the setting before continuing chat UI tests.
+
+**Pass:** chat UI is opt-in; production tool connections remain usable, and a
+visibility setting is never presented as runtime pause or removal.
 
 ### C1 — Catalog and immutable agent
 
@@ -356,7 +402,7 @@ Run these assertions within each platform-specific procedure.
 ### C6 — Files, interactions, concurrency, edits, and failure
 
 1. Upload `chat-e2e.txt` containing only `FILE-MARKER <run-id>` and send `FILE <run-id>`.
-2. Verify Paperclip stores a bounded normal attachment, Maya reads the marker, and the result file is reachable through a provider-supported upload or expiring Paperclip link.
+2. Verify Paperclip stores a bounded normal attachment, Maya reads the marker, and the result file is reachable through a provider-supported upload or an authenticated Paperclip task link. Never expose the private Board or an asset through the public webhook origin.
 3. Send `FORM <run-id>` and complete the richest provider-supported action/form. Verify the submitted values reach the existing task exactly once.
 4. Send `ECHO <run-id>-Q1` and `ECHO <run-id>-Q2` rapidly in the same conversation.
 5. Verify default queue order in the task and publications.
@@ -364,6 +410,17 @@ Run these assertions within each platform-specific procedure.
 7. Verify Paperclip appends a correction/tombstone rather than rewriting audit history.
 8. Where the provider emits reaction callbacks, add and then remove a reaction on a linked test message, then repeat the same add/remove cycle. Verify Activity records all four distinct occurrences, while a duplicate delivery of the same provider event is deduplicated. Keep Activity open to check automatic refresh. In DMs, also react to a message from a completed task after a newer generation starts; the event must remain on the original task and obey current destination/access restrictions. The task must receive no new comment, wakeup, approval, or governed action.
 9. Send `FAIL <run-id>`, verify the safe failed state, then use the authorized retry action from Activity.
+10. On a disposable task, explicitly send a 100,000-character Board comment
+    with distinct beginning, middle and final markers. Repeat from an existing
+    comment. Verify complete content in ordered provider messages or the
+    provider's documented native Markdown-file transport. Nothing may silently
+    truncate at 40,000 characters. Include Unicode, escaped punctuation and a
+    long code block; oversized indivisible rich blocks may use visible Markdown
+    source, but all source text must remain available.
+11. Use deterministic fault injection for an unknown receipt in a middle text
+    part. Later parts must wait, already confirmed parts must not resend after
+    restart, and Activity must require explicit resolution of the uncertain
+    part. These protocol checks do not replace inspecting the live rendering.
 
 **Pass:** every supported native feature is used. Questions and confirmations follow the adapter's documented text/link/private fallback when native controls are unavailable; richer governance interactions remain Paperclip-only. Inputs apply once, queued turns retain order, edits/deletes and reactions remain auditable, reactions are never interpreted as authority, and retry does not duplicate task state or provider output.
 
@@ -528,7 +585,9 @@ Run only after Paperclip ships a **Create in GitHub** manifest exchange:
 Run C5 and C6 with GitHub-specific expectations:
 
 - acknowledgement uses a supported reaction;
-- long output is one GFM comment updated at a coarse cadence, not a stream of noisy comments;
+- output within the native size bound uses one GFM comment with coarse updates;
+  larger final output uses complete, ordered, durably tracked comments rather
+  than truncation or token-by-token comment noise;
 - provider edits preserve a stable message link and final content;
 - rich actions/forms fall back to explanatory text plus an authenticated Paperclip link;
 - public inbound GitHub uploads referenced in the exact admitted comment are ingested from canonical `github.com/user-attachments/assets/…` or `files/…` URLs. Test a PNG and text file in issue, PR, and inline-review comments, then verify exact bytes on the Paperclip task and native agent inspection. Arbitrary external links are not fetched;
@@ -627,8 +686,18 @@ Run C3, C5, and C6, then verify specifically:
 
 - DM, channel, and group output use bounded post/edit behavior; the current durable webhook pipeline advertises no native Teams streaming;
 - `FORM` uses an Adaptive Card and task module where supported, with server-side reauthorization on submit;
-- personal-chat Bot Framework file-download attachments are ingested only when the adapter supplies a scoped bot or anonymous download contract and the file passes Paperclip's allowed-content policy and configured size ceiling (10 MB by default); channel and group-chat files remain provider references without a separate Microsoft Graph grant;
-- outbound personal-chat files require an exact admitted recipient and native file consent. No file upload occurs before acceptance. Channel/group output, or a personal conversation without sufficient recipient proof, retains the truthful private-task/task-link fallback. A consent-card receipt is not a delivered file;
+- personal-chat Bot Framework file-download attachments are ingested only when
+  the adapter supplies a scoped bot or anonymous download contract and the file
+  passes Paperclip's allowed-content policy and configured size ceiling (10 MB
+  by default). Channel/group inline pictures require an exact authenticated
+  source-activity binding and a bounded Bot Connector download; arbitrary files
+  remain provider references without a separate Microsoft Graph grant;
+- outbound personal-chat files require an exact admitted recipient and native
+  file consent. No file upload occurs before acceptance. Channel/group picture
+  messages use bounded original PNG/JPEG/static-GIF bytes (at most 1,000,000
+  bytes and 1024 × 1024). Other channel/group files, unsupported images, or a
+  personal conversation without sufficient recipient proof retain the truthful
+  private-task/task-link fallback. A consent-card receipt is not a delivered file;
 - denials use targeted activity when supported, otherwise DM or concise text plus a Paperclip link;
 - tenant ID plus Entra object ID, not display name/email, determines identity;
 - edit a source message, soft-delete it, restore it, then edit it again; verify
@@ -659,8 +728,26 @@ plus a text file whose marker/bytes can be checked:
    never repeat a confirmed byte upload. Cancel is not remote deletion or proof
    that the provider received nothing.
 
+For channel/group pictures, repeat in both surfaces:
+
+1. Send a small PNG from Teams. Verify its exact bytes belong to the current
+   Paperclip input, and Maya can inspect that picture rather than an earlier
+   task attachment. Repeat through deferred intake/restart using the local
+   fault-injection suite; revocation or a pending source edit/delete must
+   prevent attachment registration. The image batch shares a ten-second
+   token/download budget: a stalled credential must not start another image
+   request after expiry. DB/storage commit work is not cancelled or declared
+   failed merely because that download budget expired.
+2. Ask Maya for a picture and explicitly send a Board picture. Inspect both
+   native images in Teams and their saved task attachments. Neither should
+   require a personal-file consent card or publicly accessible asset URL.
+3. Send an oversized image and a text file. Check that each remains available
+   on its exact task with a truthful fallback, not a claim that Teams received
+   an image. A lost or empty provider receipt must remain unconfirmed without
+   automatic resend.
+
 The local mocked suite covers protocol races; only the actual Teams consent,
-usable file and Board journeys above establish live file qualification.
+usable file, rendered picture and Board journeys establish live qualification.
 
 ### T7 — Teams evidence and cleanup
 
@@ -898,7 +985,7 @@ Slack Socket Mode and Telegram polling receive separate instance-admin smoke tes
 | Buttons/selections       | Native                        | Fallback link                       | Native Gateway interaction              | Native card action                            | Inline keyboard                         |
 | Modal/form               | Native modal                  | Fallback link                       | Native modal                            | Task module                                   | Sequential prompt/link fallback         |
 | Commands                 | Registered slash command      | Text mention vocabulary only        | Registered `/paperclip status/new/close` | Card/message vocabulary                       | `/new`, `/status`, `/close`             |
-| Files                    | Native send/receive           | Inbound URL text + safe output link | Native send/receive                     | Personal consent delivery; task link elsewhere | Native media/document                   |
+| Files                    | Native send/receive           | Scoped inbound uploads + task output link | Native send/receive              | Personal consent; channel/group pictures; task fallback | Native media/document          |
 | DM                       | Native                        | Unsupported                         | Native                                  | Personal scope                                | Native                                  |
 | Ephemeral/private denial | Ephemeral, then DM/text       | Safe public text/link               | DM, then safe text                      | Targeted, then DM/text                        | DM, then safe text                      |
 | Edit/delete audit        | Correction/tombstone          | Correction/tombstone                | Correction/tombstone                    | Correction/tombstone where delivered          | Correction/tombstone where delivered    |
@@ -934,6 +1021,8 @@ Never “fix” a failing run by manually editing a task, changing the assigned 
 
 A provider is release-ready only when all are true:
 
+- [ ] Default-off experimental visibility passed without breaking GitHub tool setup; enabling it reveals the chat surfaces.
+- [ ] Actual live runs use the new Paperclip Runner with the recorded Codex model and binary SHA; deterministic model fixtures are not counted as live proof.
 - [ ] Normal first-time setup passed through the real provider UI.
 - [ ] Every setup mode actually shipped and promised for that provider passed; conditional unshipped modes are recorded as non-blocking.
 - [ ] Requested provider permissions matched the pinned least-privilege contract.

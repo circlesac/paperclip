@@ -211,6 +211,10 @@ import {
   verifyDiscordBot,
 } from "./chat-discord.js";
 import {
+  renderPublicationTransportText,
+  splitNativePublicationText,
+} from "./chat-publication-text-parts.js";
+import {
   readRegisteredDiscordCommandRegistration,
   reconcileStoredDiscordCommandRegistration,
 } from "./chat-discord-command-registration-store.js";
@@ -260,6 +264,11 @@ import {
   normalizeMicrosoftTeamsCredentialIds,
   normalizeMicrosoftTeamsExternalPrincipalId,
 } from "./chat-teams-credentials.js";
+import {
+  isTeamsInlineImageContentType,
+  prepareTeamsInlineImage,
+  TEAMS_INLINE_IMAGE_MAX_BYTES,
+} from "./chat-teams-inline-images.js";
 import {
   shouldStreamSafePublicationText,
   splitTelegramPublicationText,
@@ -9087,8 +9096,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       existingByFingerprint.set(fingerprint, ids);
     }
     const storedIds: string[] = [];
-    const withGitHubAuthorization = async <T>(
+    const withCurrentAttachmentAuthorization = async <T>(
       work: (tx: DbTransaction) => Promise<T>,
+      teamsInlineImage = false,
     ): Promise<T> => {
       for (let attempt = 0; ; attempt++) {
         try {
@@ -9183,6 +9193,56 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 "The attachment's current chat admission is unavailable",
                 { code: "chat_action_authorization_changed" },
               );
+            if (teamsInlineImage) {
+              const [source] = await tx
+                .select({ id: issueComments.id })
+                .from(issueComments)
+                .where(
+                  and(
+                    eq(issueComments.companyId, input.endpoint.companyId),
+                    eq(issueComments.issueId, input.issueId),
+                    eq(issueComments.id, input.issueCommentId),
+                    isNull(issueComments.deletedAt),
+                    sql`${issueComments.updatedAt} = ${issueComments.createdAt}`,
+                  ),
+                )
+                .for("share", { noWait: true });
+              // Lifecycle admission precedes its conversation drain. Pending
+              // source changes already invalidate this image download, even
+              // when the append-only original comment is still untouched.
+              const [lifecycle] = await tx
+                .select({ id: chatDeliveries.id })
+                .from(chatDeliveries)
+                .where(
+                  and(
+                    eq(chatDeliveries.companyId, input.endpoint.companyId),
+                    eq(chatDeliveries.endpointId, input.endpoint.id),
+                    or(
+                      isNull(chatDeliveries.conversationId),
+                      eq(
+                        chatDeliveries.conversationId,
+                        current.conversation.id,
+                      ),
+                    ),
+                    ne(chatDeliveries.state, "filtered"),
+                    inArray(chatDeliveries.eventKind, [
+                      "message_updated",
+                      "message_deleted",
+                      "message_restored",
+                    ]),
+                    sql`${chatDeliveries.normalizedEvent}->'runtimeContext' = ${JSON.stringify(lifecycleRuntimeFence(lockedDelivery))}::jsonb`,
+                    sql`${chatDeliveries.normalizedEvent}->'message'->>'targetProviderEventId' = ${lockedDelivery.providerEventId}`,
+                  ),
+                )
+                .limit(1);
+              if (!source || lifecycle)
+                throw forbidden(
+                  "The image's admitted source changed before attachment registration",
+                  {
+                    code: "chat_action_authorization_changed",
+                  },
+                );
+            }
             return await work(tx);
           });
         } catch (error) {
@@ -9202,18 +9262,34 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       input.endpoint.provider === "github"
         ? AbortSignal.timeout(GITHUB_ATTACHMENT_BATCH_TIMEOUT_MS)
         : undefined;
+    // This new image-only lane shares one budget across token acquisition and
+    // downloads. DB/storage commit semantics remain explicit and unchanged.
+    const teamsInlineBatchSignal =
+      input.endpoint.provider === "microsoft-teams"
+        ? AbortSignal.timeout(10_000)
+        : undefined;
     for (let attachment of boundedAttachments) {
+      const teamsInlineImage =
+        input.endpoint.provider === "microsoft-teams" &&
+        input.endpointRuntime.attachmentRecoveryDescriptor(attachment)?.locator
+          .kind === "teams_inline_image";
+      const requireCurrentAttachmentAuthorization =
+        input.endpoint.provider === "github" || teamsInlineImage;
       try {
+        if (teamsInlineImage && teamsInlineBatchSignal?.aborted) {
+          omit("download_unavailable");
+          continue;
+        }
         // GitHub's anonymized upload URLs carry no trustworthy MIME metadata.
         // Resolve public bytes only here, after durable comment admission, and
         // then apply the same storage/type policy as every native attachment.
         if (input.endpoint.provider === "github") {
-          await withGitHubAuthorization(async () => {});
+          await withCurrentAttachmentAuthorization(async () => {});
           attachment = await prepareGitHubPublicAttachment(
             attachment,
             githubBatchSignal,
             async (request, signal) => {
-              await withGitHubAuthorization(async () => {});
+              await withCurrentAttachmentAuthorization(async () => {});
               return (
                 (await input.endpointRuntime.resolveGitHubAttachmentComment?.(
                   request,
@@ -9223,6 +9299,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             },
           );
         }
+        if (
+          requireCurrentAttachmentAuthorization &&
+          input.endpoint.provider !== "github"
+        )
+          await withCurrentAttachmentAuthorization(
+            async () => {},
+            teamsInlineImage,
+          );
         if (
           attachment.size !== undefined &&
           attachment.size > MAX_ATTACHMENT_BYTES
@@ -9249,7 +9333,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           omit("unsupported_type");
           continue;
         }
-        const fetched = await attachment.fetchData();
+        const fetched = teamsInlineImage
+          ? await input.endpointRuntime.fetchTeamsInlineImage(
+              attachment,
+              teamsInlineBatchSignal!,
+            )
+          : await attachment.fetchData();
         const body = Buffer.isBuffer(fetched) ? fetched : Buffer.from(fetched);
         if (body.length === 0) {
           omit("empty_download");
@@ -9267,10 +9356,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ]);
         const existingIds = existingByFingerprint.get(fingerprint);
         const existingId = existingIds?.shift();
-        if (input.endpoint.provider === "github") {
+        if (requireCurrentAttachmentAuthorization) {
           // Revoke during either API resolution or the anonymous byte download
           // must prevent storage and attachment registration for that input.
-          await withGitHubAuthorization(async () => {});
+          await withCurrentAttachmentAuthorization(
+            async () => {},
+            teamsInlineImage,
+          );
         }
         if (existingId) {
           storedIds.push(existingId);
@@ -9296,19 +9388,20 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         };
         let row;
         try {
-          row =
-            input.endpoint.provider === "github"
-              ? await withGitHubAuthorization((tx) =>
+          row = requireCurrentAttachmentAuthorization
+            ? await withCurrentAttachmentAuthorization(
+                (tx) =>
                   issueService(tx as unknown as Db).createAttachment(
                     registration,
                   ),
-                )
-              : await issuesSvc.createAttachment(registration);
+                teamsInlineImage,
+              )
+            : await issuesSvc.createAttachment(registration);
         } catch (error) {
           // An explicit authorization denial happens before registration. Do
           // not delete on ambiguous database errors which may have committed.
           if (
-            input.endpoint.provider === "github" &&
+            requireCurrentAttachmentAuthorization &&
             isExternalActionAuthorizationChange(error)
           )
             await options.storage
@@ -10322,7 +10415,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 lease.providerLeaseId === null &&
                 lease.issueId === issueId &&
                 ["failed", "released", "expired"].includes(lease.status) &&
-                (lease.cleanupStatus === null || lease.cleanupStatus === "success") &&
+                (lease.cleanupStatus === null ||
+                  lease.cleanupStatus === "success") &&
                 lease.releasedAt !== null,
             )
           ) {
@@ -12655,16 +12749,6 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // identity, so it must not defeat durable deduplication.
     const providerEventId = `${durableExternalThreadIdentity(thread.id)}:${message.id}`;
     const surfaceKind = chatSurfaceKind(endpoint.provider, thread);
-    // Teams' bot file APIs support native file transfer only in personal
-    // chats. Channel and group-chat attachments are provider references that
-    // require a separate Graph grant, which this endpoint deliberately does
-    // not hold. Retain bounded metadata for audit, but never persist a
-    // recovery locator or invoke the adapter download closure on those
-    // surfaces.
-    const nativeInboundAttachments =
-      endpoint.provider === "microsoft-teams" && !thread.isDM
-        ? []
-        : message.attachments;
     const addressed =
       trigger === "mention" ||
       trigger === "direct_message" ||
@@ -12682,6 +12766,51 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // to new credentials.
     const endpointRuntime =
       runtimeContext?.endpointRuntime ?? (await runtimeFor(endpoint));
+    // Non-personal generic files still require a separate Graph grant. Only
+    // exact inline image resources from the authenticated original activity
+    // receive a scope-bound, URL-free recovery locator. Reconstructed input
+    // can retain that proof, but cannot mint one from legacy fetch metadata.
+    const teamsNonPersonal =
+      endpoint.provider === "microsoft-teams" && !thread.isDM;
+    const attachmentSource = {
+      threadId: thread.id,
+      messageId: message.id,
+      runtimeGeneration: runtimeContext?.generation,
+      credentialFingerprint: runtimeContext?.credentialFingerprint,
+      principalExternalId: stableExternalPrincipalId(
+        endpoint.provider,
+        message.author,
+        message.raw,
+      ),
+      isDirectMessage: thread.isDM,
+      ...(runtimeContext?.endpointRuntime && !admittedDeliveryId
+        ? { message }
+        : {}),
+    };
+    const inlineRecovery = new Map<
+      Attachment,
+      ReturnType<ChatSdkEndpointRuntime["attachmentRecoveryDescriptor"]>
+    >();
+    const nativeInboundAttachments = teamsNonPersonal
+      ? message.attachments.slice(0, 20).flatMap((attachment) => {
+          const descriptor = endpointRuntime.attachmentRecoveryDescriptor(
+            attachment,
+            attachmentSource,
+          );
+          if (descriptor?.locator.kind !== "teams_inline_image") return [];
+          const restored = endpointRuntime.rehydrateAttachment(
+            descriptor,
+            attachmentSource,
+          );
+          if (!restored) return [];
+          inlineRecovery.set(attachment, descriptor);
+          return [restored];
+        })
+      : message.attachments;
+    const unavailableTeamsReferences = teamsNonPersonal
+      ? Math.min(message.attachments.length, 20) -
+        nativeInboundAttachments.length
+      : 0;
     const providerSentAt =
       message.metadata.dateSent instanceof Date &&
       Number.isFinite(message.metadata.dateSent.getTime())
@@ -12789,9 +12918,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           name: sanitizeFilename(attachment.name),
           mimeType: normalizeContentType(attachment.mimeType),
           size: attachment.size ?? null,
-          recovery: nativeInboundAttachments.includes(attachment)
-            ? endpointRuntime.attachmentRecoveryDescriptor(attachment)
-            : null,
+          recovery: teamsNonPersonal
+            ? (inlineRecovery.get(attachment) ?? null)
+            : nativeInboundAttachments.includes(attachment)
+              ? endpointRuntime.attachmentRecoveryDescriptor(attachment)
+              : null,
         })),
       },
     };
@@ -13433,10 +13564,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           issueCommentId: inboundCommentId,
           attachments: nativeInboundAttachments,
           attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
-          unavailableReferenceCount:
-            endpoint.provider === "microsoft-teams" && !thread.isDM
-              ? Math.min(message.attachments.length, 20)
-              : 0,
+          unavailableReferenceCount: unavailableTeamsReferences,
           actorUserId: rebound.authorUserId,
         });
         if (
@@ -14119,7 +14247,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const body =
           message.text.trim() ||
           (message.attachments.length > 0
-            ? taskEndpoint.provider === "microsoft-teams" && !thread.isDM
+            ? taskEndpoint.provider === "microsoft-teams" &&
+              !thread.isDM &&
+              nativeInboundAttachments.length === 0
               ? `Shared ${message.attachments.length} Microsoft Teams file reference${message.attachments.length === 1 ? "" : "s"}.${providerUrl ? ` Open in Microsoft Teams: ${providerUrl}` : ""}`
               : `Shared ${message.attachments.length} file${message.attachments.length === 1 ? "" : "s"}.`
             : "Sent an empty message.");
@@ -14369,10 +14499,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         issueCommentId: comment.id,
         attachments: nativeInboundAttachments,
         attachmentLimitOmissions: githubAttachmentLimitOmissions(message),
-        unavailableReferenceCount:
-          endpoint.provider === "microsoft-teams" && !thread.isDM
-            ? Math.min(message.attachments.length, 20)
-            : 0,
+        unavailableReferenceCount: unavailableTeamsReferences,
         actorUserId,
       });
       if (
@@ -14968,6 +15095,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return null;
     const isTeams = endpointRuntime.provider === "microsoft-teams";
     const referenceOnlyTeamsAttachments = isTeams && !thread.isDM;
+    const originFence = lifecycleRuntimeFence(delivery);
     const storedAttachments = normalized.message?.attachments ?? [];
     const attachments = (
       isTeams ? storedAttachments.slice(0, 20) : storedAttachments
@@ -14975,10 +15103,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .map((attachment) => {
         if (!attachment || typeof attachment !== "object") return null;
         const rehydrated =
-          !referenceOnlyTeamsAttachments && attachment.recovery
+          attachment.recovery &&
+          (!referenceOnlyTeamsAttachments ||
+            (typeof attachment.recovery === "object" &&
+              attachment.recovery !== null &&
+              "locator" in attachment.recovery &&
+              typeof attachment.recovery.locator === "object" &&
+              attachment.recovery.locator !== null &&
+              "kind" in attachment.recovery.locator &&
+              attachment.recovery.locator.kind === "teams_inline_image"))
             ? endpointRuntime.rehydrateAttachment(attachment.recovery, {
                 threadId: thread.id,
                 messageId: providerMessageId,
+                runtimeGeneration: originFence?.generation,
+                credentialFingerprint: originFence?.credentialFingerprint,
+                principalExternalId: externalId,
+                isDirectMessage: thread.isDM,
               })
             : null;
         if (rehydrated) return rehydrated;
@@ -14987,7 +15127,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           // capability did not survive restart still belong to this input.
           // Keep bounded metadata so ingestion records an explicit omission;
           // never persist bearer URLs or fabricate a download capability.
-          // Even a legacy locator cannot enable non-personal downloads.
+          // Even a legacy URL locator cannot enable non-personal downloads.
           return {
             type: "file",
             name:
@@ -29352,6 +29492,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function publicationFiles(
     publication: typeof chatPublications.$inferSelect,
     payload: SafeChatPublicationPayload,
+    preparation: { teamsInlineImagesOnly?: boolean } = {},
   ): Promise<FileUpload[]> {
     if (!payload.attachmentIds?.length) return [];
     try {
@@ -29393,6 +29534,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           );
         return row;
       });
+      // Picture messages have a different Teams contract from arbitrary files.
+      // Preserve the normal scope/metadata checks above, but never hydrate a
+      // document or oversized image just to discover it needs a task link.
+      if (
+        preparation.teamsInlineImagesOnly &&
+        orderedRows.some(
+          (row) =>
+            row.byteSize > TEAMS_INLINE_IMAGE_MAX_BYTES ||
+            !isTeamsInlineImageContentType(row.contentType),
+        )
+      ) {
+        return [];
+      }
       // Authorization and persisted metadata must fail definitively even when
       // storage is unavailable; do not mask an invalid file as a transient outage.
       if (!options.storage)
@@ -29689,8 +29843,27 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const card = safeCardForPublication(input.payload, input.endpoint.provider);
     let attachments: Attachment[] = [];
     let files: FileUpload[] = [];
-    let text = input.payload.text;
+    let text = renderPublicationTransportText(input.payload);
     if (input.payload.attachmentIds?.length) {
+      if (
+        input.endpoint.provider === "microsoft-teams" &&
+        !input.conversation.isDirectMessage
+      ) {
+        // The staged personal-file lane remains authoritative for consent.
+        // Channel/group pictures need no OneDrive upload or public asset URL:
+        // send only verified original picture bytes through the native adapter.
+        const candidates = await publicationFiles(
+          input.publication,
+          input.payload,
+          { teamsInlineImagesOnly: true },
+        );
+        const pictures = await Promise.all(
+          candidates.map(prepareTeamsInlineImage),
+        );
+        if (pictures.length && pictures.every((picture) => picture !== null)) {
+          files = pictures;
+        }
+      }
       const nativeFileSurface =
         CAPABILITIES[input.endpoint.provider].files &&
         input.endpoint.provider !== "microsoft-teams";
@@ -29706,7 +29879,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         } else {
           files = uploads;
         }
-      } else {
+      } else if (files.length === 0) {
         const taskUrl = safeChatTaskUrl(
           options.publicBaseUrl,
           input.publication.issueId,
@@ -29857,6 +30030,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     }
     if (
       !input.replaceProviderMessageId &&
+      !input.payload.transportPart &&
       CAPABILITIES[input.endpoint.provider].nativeStreaming &&
       shouldStreamSafePublicationText(text)
     ) {
@@ -31581,6 +31755,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         { code: "VALIDATION_ERROR", name: "ValidationError" },
       );
     }
+    // Validate closed persisted wrappers even on retries that are already split.
+    renderPublicationTransportText(persisted);
     await options.publicationTransportPreparationBarrier?.({
       publicationId: publication.id,
     });
@@ -31589,6 +31765,85 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .from(chatEndpoints)
       .where(eq(chatEndpoints.id, publication.endpointId))
       .then((rows) => rows[0]?.provider ?? null);
+    if (
+      provider === "slack" ||
+      provider === "github" ||
+      provider === "microsoft-teams"
+    ) {
+      if (
+        persisted.transportPart ||
+        persisted.card ||
+        persisted.interactionId ||
+        persisted.attachmentIds?.length
+      )
+        return publication;
+      const parts = splitNativePublicationText(provider, persisted.text);
+      if (parts.length === 1) return publication;
+      return db.transaction(async (tx) => {
+        const current = await tx
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.id, publication.id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!current) return publication;
+        const currentPayload = current.payload as SafeChatPublicationPayload;
+        renderPublicationTransportText(currentPayload);
+        if (
+          currentPayload.transportPart ||
+          currentPayload.card ||
+          currentPayload.interactionId ||
+          currentPayload.attachmentIds?.length ||
+          !["pending", "retry"].includes(current.state)
+        )
+          return current;
+        const currentParts =
+          currentPayload.text === persisted.text
+            ? parts
+            : splitNativePublicationText(provider, currentPayload.text);
+        if (currentParts.length === 1) return current;
+        const batchId = current.id;
+        const updatedAt = new Date();
+        const payloadFor = (index: number): SafeChatPublicationPayload => {
+          const part = currentParts[index]!;
+          const payload = {
+            ...currentPayload,
+            text: part.text,
+            transportPart: {
+              batchId,
+              index,
+              count: currentParts.length,
+              mode: "inline" as const,
+              orderKey: `${batchId}:${String(index).padStart(4, "0")}`,
+              ...(part.prefix ? { prefix: part.prefix } : {}),
+              ...(part.suffix ? { suffix: part.suffix } : {}),
+            },
+          };
+          if (index > 0) delete payload.progressState;
+          return payload;
+        };
+        const rootPayload = payloadFor(0);
+        await tx
+          .update(chatPublications)
+          .set({ payload: rootPayload, updatedAt })
+          .where(eq(chatPublications.id, current.id));
+        await tx.insert(chatPublications).values(
+          currentParts.slice(1).map((_part, offset) => ({
+            companyId: current.companyId,
+            endpointId: current.endpointId,
+            conversationId: current.conversationId,
+            issueId: current.issueId,
+            commentId: current.commentId,
+            idempotencyKey: `${current.idempotencyKey}:${provider}-part:${offset + 1}`,
+            payload: payloadFor(offset + 1),
+            state: "pending" as const,
+            createdAt: sql`(select ${chatPublications.createdAt} from ${chatPublications} where ${chatPublications.id} = ${current.id})`,
+            updatedAt,
+          })),
+        );
+        return { ...current, payload: rootPayload, updatedAt };
+      });
+    }
     if (provider === "discord") {
       if (
         persisted.transportPart ||
@@ -31676,7 +31931,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           idempotencyKey: `discord-markdown-attachment:${current.id}`,
           payload: attachmentPayload,
           state: "pending",
-          createdAt: current.createdAt,
+          createdAt: sql`(select ${chatPublications.createdAt} from ${chatPublications} where ${chatPublications.id} = ${current.id})`,
           updatedAt,
         });
         return { ...current, payload: handoffPayload, updatedAt };
@@ -31773,7 +32028,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           idempotencyKey: `telegram-markdown-attachment:${current.id}`,
           payload: attachmentPayload,
           state: "pending",
-          createdAt: current.createdAt,
+          createdAt: sql`(select ${chatPublications.createdAt} from ${chatPublications} where ${chatPublications.id} = ${current.id})`,
           updatedAt,
         });
         return { ...current, payload: handoffPayload, updatedAt };
@@ -31839,7 +32094,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               transportPart: transportPart(index),
             },
             state: "pending" as const,
-            createdAt: current.createdAt,
+            createdAt: sql`(select ${chatPublications.createdAt} from ${chatPublications} where ${chatPublications.id} = ${current.id})`,
             updatedAt,
           };
         }),
@@ -32934,22 +33189,26 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const current = await tx
         .select({ id: chatPublications.id })
         .from(chatPublications)
-        .where(and(
-          eq(chatPublications.companyId, publication.companyId),
-          eq(chatPublications.id, publication.id),
-          eq(chatPublications.state, publication.state),
-          eq(chatPublications.attempts, publication.attempts),
-        ))
+        .where(
+          and(
+            eq(chatPublications.companyId, publication.companyId),
+            eq(chatPublications.id, publication.id),
+            eq(chatPublications.state, publication.state),
+            eq(chatPublications.attempts, publication.attempts),
+          ),
+        )
         .for("update")
         .then((rows) => rows[0]);
       if (!current) return false;
       const transfer = await tx
         .select({ id: chatTeamsFileTransfers.id })
         .from(chatTeamsFileTransfers)
-        .where(and(
-          eq(chatTeamsFileTransfers.companyId, publication.companyId),
-          eq(chatTeamsFileTransfers.publicationId, current.id),
-        ))
+        .where(
+          and(
+            eq(chatTeamsFileTransfers.companyId, publication.companyId),
+            eq(chatTeamsFileTransfers.publicationId, current.id),
+          ),
+        )
         .then((rows) => rows[0]);
       if (transfer) return false;
       const [row] = await tx
@@ -33432,6 +33691,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 },
               });
               providerAccepted = true;
+              // A resolved SDK call is not a usable delivery receipt. Teams,
+              // for example, returns an empty ID for an empty HTTP success
+              // body. Preserve uncertainty instead of publishing a broken
+              // message link or automatically sending the content again.
+              if (
+                typeof sent?.id !== "string" ||
+                !sent.id ||
+                sent.id.length > 2048 ||
+                sent.id.trim() !== sent.id ||
+                /[\u0000-\u001f\u007f]/.test(sent.id)
+              ) {
+                throw new Error(
+                  "Provider did not return a usable message receipt",
+                );
+              }
               const { authorizationActionId } = authorizationClaim;
               const receiptRemovalActionIds: string[] = [];
               await db.transaction(async (tx) => {

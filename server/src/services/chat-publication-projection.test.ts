@@ -202,9 +202,21 @@ describe("chat publication projection", () => {
     ).toThrow(UnsafeChatPublicationError);
   });
 
-  it("truncates without splitting a Unicode code point", () => {
-    const projected = projectSafeChatPublicationText(`${"a".repeat(39_999)}😀tail`);
-    expect(Array.from(projected)).toHaveLength(40_000);
-    expect(projected.endsWith("😀")).toBe(true);
+  it("preserves a complete long Unicode result for durable provider transport", () => {
+    const source = `${"a".repeat(99_990)}😀tail`;
+    expect(projectSafeChatPublicationText(source)).toBe(source);
+  });
+
+  it("preserves expansion from sanitizing a maximum Board body", () => {
+    const source = "@here ".repeat(16_666);
+    const result = projectSafeChatPublicationText(source);
+    expect(result).toBe(source.replaceAll("@here", "@\u200bhere").trim());
+    expect(result.length).toBeGreaterThan(100_000);
+  });
+
+  it("refuses excessive sanitization input instead of silently truncating", () => {
+    expect(() => projectSafeChatPublicationText("a".repeat(1_000_001))).toThrow(
+      UnsafeChatPublicationError,
+    );
   });
 });

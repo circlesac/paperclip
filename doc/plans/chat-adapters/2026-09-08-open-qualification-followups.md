@@ -132,6 +132,38 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
+**Working tree after server 73 (not deployed):** a bounded parallel acceptance
+audit found two gaps beyond the browser lock. Explicit Board publication accepts
+100,000 characters but the shared projector silently keeps only 40,000. Four
+real-service Slack/GitHub new/existing-comment cases reproduced the missing
+tail; the frozen lossless transport now passes 19 joined cases and 47 helper
+tests, including native-result, Unicode/rich-text, unknown-part and restart
+coverage. Its first follow-up also exposed children sorting before a
+database-timestamped root because JavaScript loses PostgreSQL microseconds;
+children now preserve the root's exact database timestamp. A tiny-paragraph
+CPU adversary improved from 6.1 seconds to under one second locally. Independent
+boundary review found no remaining blocker; live rendering remains unqualified.
+
+Teams channel/group pictures were incorrectly treated like arbitrary files,
+both outbound and on intake. Root's two outbound cases reproduced zero native
+images; the current thirteen-case service cohort passes, including actual
+pinned SDK HTTP serialization, 100k text plus PNG ordering, malformed/large
+fallback, source/reach withdrawal and unknown/missing receipts with no resend.
+The bounded PNG/JPEG/static-GIF helper and pinned App HTTP tests pass in a
+195-case adjacent cohort. The two pinned-parser-to-service intake RED cases
+now pass in a 21-case intake/reference cohort, including deferred restart,
+revocation, and pending source edits/deletes during download. Its 84-case
+helper/runtime cohort also proves a deadline around the actual SDK's token
+acquisition; late token release issues no HTTP. The new image lane shares one
+10-second token/download budget, with no later request after expiry. This is
+not a deadline or cancellation claim for DB/storage commits. Final root checks
+pass 749/749 full integration tests (177.75 seconds), 31/31 deterministic
+browser tests (2.9 minutes) on separate fresh databases, 163/163 helper/runtime
+tests, shared/server/UI types, 85 UI tests and eight OpenAPI checks. No
+eligible Teams tenant or live picture journey is claimed. Personal-file consent
+and historical recovery evidence stay unchanged. The runbook now explicitly
+requires experimental visibility checks and actual native Runner/Luna evidence.
+
 **Current Teams composition (`693cfa888`, included in deployed `b9461c4a6`):**
 Teams personal-file output is now wired to
 the real service: source-derived recipient authority, atomic Board intent,

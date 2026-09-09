@@ -3953,3 +3953,96 @@ Historical ambiguous deliveries and native recovery evidence were not manually
 modified. The latest actual browser inventory still reports the Mac locked.
 Discord login was already restored; only OS unlock is needed to resume browser
 work. Teams additionally requires the previously documented eligible tenant.
+
+### September 9: lossless text and Teams inline-picture repairs
+
+A parallel acceptance audit after server 73 found two omitted behaviors, not
+live provider failures: the safe projector silently truncated long text at
+40,000 characters despite the 100,000-character Board contract, and Teams
+channel/group pictures were treated as unsupported arbitrary files.
+
+The long-text RED run reproduced all four Slack/GitHub new/existing-comment
+tail losses on fresh `chat_long_publication_20260909_red01` (28.11 seconds,
+`long-publication-red01-0909.log`). Removing truncation alone was insufficient:
+existing-comment roots had PostgreSQL microsecond timestamps while generated
+children used JavaScript millisecond timestamps, which could sort children
+before their root. New transport children now preserve the exact database
+timestamp. Complete source slices, closed generated Markdown fences, actual
+pinned converter limits and durable per-part state preserve the safe output.
+Discord/Telegram retain their existing long-Markdown file paths. Neither
+prepared parts nor retries use artificial character-by-character streaming.
+Previously truncated or delivered publications are not automatically rewritten
+or replayed; the repair preserves newly projected complete output.
+
+The expanded long-text cohort initially passed 11/14: three Teams cases had
+invalid test setup, missing an enabled channel resource and canonical root
+thread. After fixing fixtures without relaxing production reach, all 19
+joined cases passed, including the three existing Discord/Telegram transports.
+A 100,000-character tiny-paragraph adversary then exposed 5–6 seconds of CPU
+parsing, prompting grouped whole-block processing and a per-split converter
+cache. The repaired measurement was below one second for that corpus; final
+formatted verification is still pending at this checkpoint. These local CPU
+numbers do not explain or qualify the older provider-ingress delays.
+
+Teams outbound initially failed both native picture cases
+(`teams-inline-picture-red-root-0909.log`). The current joined cohort passes
+13/13 on a fresh embedded database (10.25 seconds,
+`pictures-text-outbound-composed-root-0909.log`): channel/group pictures,
+actual pinned SDK/App HTTP serialization, unsupported-image fallback,
+source/reach withdrawal, lost/empty receipts without resend, and a combined
+100,000-character Board send followed by its exact original PNG. Picture
+messages use original bounded PNG/JPEG/static-GIF bytes, not a public asset
+URL. Personal-file consent remains a separate staged path. A successful SDK
+call with no usable message ID now remains `delivery_unknown`.
+
+Inbound source-bound pictures passed an initial 18-case service/reference
+cohort and 83 helper/runtime checks. Review then reproduced two further edges:
+a pending source edit/delete could arrive while image download held the
+conversation drain, and the SDK could await token acquisition before applying
+its HTTP timeout. Both require explicit new-lane guards and regression tests;
+do not treat the earlier green cohort as final signoff. The final combined
+integration/browser run and deployment are still pending.
+
+Supporting root checks pass shared/UI types, 85 focused UI tests, eight
+OpenAPI route checks and 107 adjacent picture/consent/Discord command tests.
+An initial root Vitest invocation used a nonexistent project filter and ran
+no tests; the corrected server-directory invocation produced the 107 passes.
+No live tenant/browser picture journey is claimed. The Mac remains locked;
+Discord login itself was already restored. No runner binary, lockfile,
+wireframe image or historical recovery evidence was changed.
+
+Final source is now frozen and independently reviewed. The intake fixes pass
+21/21 joined service/reference tests and 84/84 helper/runtime tests. Exact
+pending source edits/deletes invalidate download registration at each short
+authorization gate. The actual SDK held-token regression proves the outer
+deadline settles and a late token release cannot issue HTTP. The two-image
+service case injects budget expiry to prove only one shared budget and no
+second request; it is not a real ten-second timing benchmark. The budget
+applies only to token/download work, not DB/storage commit cancellation.
+
+Root's final combined integration run passes **749/749**, no skips, on fresh
+`chat_pictures_text_full_20260909_root01` (177.75 seconds), recorded in
+`pictures-text-full-root-0909.log`. The deterministic browser suite passes
+**31/31**, no retries, on separate fresh
+`chat_pictures_text_browser_20260909_root01` (2.9 minutes), recorded in
+`pictures-text-browser-root-0909.log`. This uses real Board/task/upload flows
+with simulated provider/model ports, not live-account qualification.
+
+The formatted final helper/runtime cohort passes **163/163** in seven files
+(11.34 seconds). Shared, server and UI plain TypeScript checks pass. Eight
+standalone source/test/type files pass Prettier; new shared service/integration
+ranges were formatted without rewriting their existing whole-file debt.
+An initial style check caught a new test file's formatting; that was corrected
+before the final helper run. Full workspace build/test was not rerun and is
+not claimed. The qualified runner and CI-owned lockfile remain unchanged.
+
+Final tested source SHA256 values:
+
+- service: `e60faa5dbee6e54642f336fed6a768104f34c178e3664bd128a2c0cb8342a0aa`
+- integration: `3a7c57bd2fccbb439335d80de3e2e2882fc92a5248a22c4c168bba580e0418db`
+- runtime: `76aa0ae12faa310ca510a36c78a2befb467a1d245ec1bfe8774353980974cfb1`
+
+At `07:05:05.965 UTC`, the live inventory still showed only the same 290
+terminal runs (262 succeeded, 26 failed, two cancelled) and no active run.
+Deployment remains a separate next step; no old failed or uncertain turn was
+manually rewritten or replayed to manufacture this result.

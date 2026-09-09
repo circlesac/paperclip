@@ -356,6 +356,9 @@ export interface SafeChatPublicationPayload {
     mode?:
       "inline" | "discord_markdown_attachment" | "telegram_markdown_attachment";
     orderKey: string;
+    /** Closed, server-generated Markdown fence wrappers; text remains an exact source slice. */
+    prefix?: string;
+    suffix?: string;
   };
   progressState?:
     | "queued"

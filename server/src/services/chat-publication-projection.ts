@@ -6,7 +6,10 @@ import type {
 } from "@paperclipai/shared";
 import { redactSensitiveText } from "../redaction.js";
 
-const MAX_TEXT_LENGTH = 40_000;
+// Bound sanitization work, not the amount silently delivered. The Board accepts
+// 100k UTF-16 units; expansion from redaction/mention neutralization is allowed.
+const MAX_TEXT_INPUT_LENGTH = 1_000_000;
+const MAX_TEXT_OUTPUT_LENGTH = 4_000_000;
 const MAX_ATTACHMENTS = 20;
 const MAX_CARD_ACTIONS = 12;
 const MAX_TITLE_LENGTH = 160;
@@ -238,6 +241,11 @@ function truncateByCodePoint(input: string, limit: number): string {
  * dangerous or token-bearing links, and neutralizes provider-wide mentions.
  */
 export function projectSafeChatPublicationText(input: string): string {
+  if (input.length > MAX_TEXT_INPUT_LENGTH) {
+    throw new UnsafeChatPublicationError(
+      "External chat text exceeds its processing limit",
+    );
+  }
   let output = input.replace(/<\|[^|\r\n]{1,80}\|>/g, "");
   for (const pattern of HIDDEN_BLOCKS) output = output.replace(pattern, "");
   output = stripHiddenSections(output);
@@ -254,7 +262,12 @@ export function projectSafeChatPublicationText(input: string): string {
     .trim();
 
   if (!output) return "Update available in Paperclip.";
-  return truncateByCodePoint(output, MAX_TEXT_LENGTH);
+  if (output.length > MAX_TEXT_OUTPUT_LENGTH) {
+    throw new UnsafeChatPublicationError(
+      "External chat text exceeds its projected processing limit",
+    );
+  }
+  return output;
 }
 
 function projectAttachmentIds(

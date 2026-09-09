@@ -132,6 +132,7 @@ import {
   unregisterServerAdapter,
 } from "../adapters/index.js";
 import { projectSafeChatPublicationText } from "../services/chat-publication-projection.js";
+import { nativePublicationTextFits, renderPublicationTransportText } from "../services/chat-publication-text-parts.js";
 import { MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { TELEGRAM_VIDEO_NOTE_MP4 } from "./fixtures/telegram-video-note.js";
 import {
@@ -15273,6 +15274,297 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
+  describe("Teams inline picture publication", () => {
+    it.each([
+      { surface: "channel", outcome: "native" },
+      { surface: "group", outcome: "native" },
+      { surface: "channel", outcome: "native_http" },
+      { surface: "group", outcome: "native_http" },
+      { surface: "channel", outcome: "long_native_http" },
+      { surface: "channel", outcome: "malformed" },
+      { surface: "channel", outcome: "too_large" },
+      { surface: "channel", outcome: "dimensions" },
+      { surface: "channel", outcome: "source_deleted" },
+      { surface: "group", outcome: "reach_revoked" },
+      { surface: "channel", outcome: "lost_receipt" },
+      { surface: "channel", outcome: "empty_receipt" },
+    ] as const)(
+      "keeps $surface picture delivery truthful for $outcome",
+      async ({ surface, outcome }) => {
+        const fixture = await seedCompany();
+        const storage = createStorageService();
+        const { callbacks, endpoint, runtime, service } =
+          await configuredTeamsEndpoint(fixture, { storage: storage.storage });
+        let pinned: ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
+        try {
+          if (surface === "group") {
+            await service.update(
+              endpoint.id,
+              { allowGroupChats: true },
+              "owner-user",
+            );
+          }
+          const serviceUrl = "https://smba.trafficmanager.net/amer/";
+          const conversationId = `19:inline-picture-${surface}-${randomUUID()}@thread.${surface === "channel" ? "tacv2" : "v2"}`;
+          const rootId = "1740000000491";
+          const providerThread = makeThread({
+            channelId: `teams:${Buffer.from(conversationId).toString("base64url")}:${Buffer.from(serviceUrl).toString("base64url")}`,
+            id: `teams:${Buffer.from(surface === "channel" ? `${conversationId};messageid=${rootId}` : conversationId).toString("base64url")}:${Buffer.from(serviceUrl).toString("base64url")}`,
+            name: "Teams picture qualification",
+          });
+          await deliverMessage({
+            callbacks,
+            endpointId: endpoint.id,
+            provider: "microsoft-teams",
+            thread: providerThread.thread,
+            message: makeMessage({
+              id: rootId,
+              text: "@Maya inspect pictures here",
+              mentioned: true,
+            }),
+            trigger: "mention",
+          });
+          const [conversation] = await db
+            .select()
+            .from(chatConversations)
+            .where(eq(chatConversations.endpointId, endpoint.id));
+          expect(conversation).toBeDefined();
+          const body =
+            outcome === "malformed"
+              ? Buffer.from("not a PNG")
+              : outcome === "too_large"
+                ? Buffer.alloc(1_000_001)
+                : await sharp({
+                    create: {
+                      width: outcome === "dimensions" ? 1025 : 2,
+                      height: 2,
+                      channels: 4,
+                      background: { r: 50, g: 100, b: 150, alpha: 1 },
+                    },
+                  })
+                    .png()
+                    .toBuffer();
+          const stored = await storage.storage.putFile({
+            companyId: fixture.companyId,
+            namespace: `issues/${conversation!.issueId}`,
+            originalFilename: "teams-picture.png",
+            contentType: "image/png",
+            body,
+          });
+          const attachment = await issueService(db).createAttachment({
+            issueId: conversation!.issueId,
+            ...stored,
+            createdByUserId: "owner-user",
+          });
+          await service.processPendingPublications();
+          const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+          const httpBodies: Array<{ url: string; body: unknown }> = [];
+          const boardText =
+            outcome === "long_native_http"
+              ? "x".repeat(99_996) + "TAIL"
+              : "Share this picture.";
+          if (outcome === "native_http" || outcome === "long_native_http") {
+            pinned = createChatSdkEndpointRuntime({
+              ...runtime.configurations.get(endpoint.id)!,
+              logger: "silent",
+              callbacks: { onMessage() {} },
+            });
+            await pinned.initialize();
+            const app = (
+              pinned.getProviderAdapter() as unknown as {
+                app: {
+                  activitySender: {
+                    client: {
+                      post(
+                        url: string,
+                        body: unknown,
+                      ): Promise<{ data: unknown }>;
+                    };
+                  };
+                };
+              }
+            ).app;
+            vi.spyOn(app.activitySender.client, "post").mockImplementation(
+              async (url, body) => {
+                httpBodies.push({ url, body });
+                return {
+                  data: { id: `teams-http-receipt-${httpBodies.length}` },
+                };
+              },
+            );
+          }
+          const originalThread = providerRuntime.thread.bind(providerRuntime);
+          let pictureAttempts = 0;
+          let textSent = false;
+          vi.spyOn(providerRuntime, "thread").mockImplementation((id) => {
+            const target = originalThread(id);
+            return {
+              ...target,
+              post: async (message: unknown) => {
+                const sent = await target.post(message);
+                const hasFiles = Boolean(
+                  message && typeof message === "object" && "files" in message,
+                );
+                if (hasFiles) {
+                  pictureAttempts++;
+                  if (outcome === "lost_receipt")
+                    throw new Error(
+                      "Simulated picture response lost after acceptance",
+                    );
+                  if (outcome === "empty_receipt") return { ...sent, id: "" };
+                } else if (!textSent) {
+                  textSent = true;
+                  // Mutate after the Board text's provider effect, before the
+                  // separately ordered picture row claims its own authority.
+                  if (outcome === "source_deleted") {
+                    await db
+                      .delete(issueAttachments)
+                      .where(eq(issueAttachments.id, attachment.id));
+                  }
+                  if (outcome === "reach_revoked") {
+                    await db
+                      .update(chatEndpointResources)
+                      .set({ availability: "unavailable" })
+                      .where(
+                        eq(chatEndpointResources.id, conversation!.resourceId!),
+                      );
+                  }
+                }
+                return pinned
+                  ? await pinned
+                      .thread(id)
+                      .post(
+                        message as Parameters<
+                          ReturnType<typeof pinned.thread>["post"]
+                        >[0],
+                      )
+                  : sent;
+              },
+            };
+          });
+          const result = await service.publishBoardMessage(
+            endpoint.id,
+            conversation!.id,
+            boardText,
+            `teams-inline-picture-${surface}`,
+            "owner-user",
+            [attachment.id],
+          );
+          const denied = ["source_deleted", "reach_revoked"].includes(outcome);
+          const ambiguous = ["lost_receipt", "empty_receipt"].includes(outcome);
+          const fallback = ["malformed", "too_large", "dimensions"].includes(
+            outcome,
+          );
+          if (denied) expect(["failed", "cancelled"]).toContain(result.state);
+          else
+            expect(result.state).toBe(
+              ambiguous ? "delivery_unknown" : "published",
+            );
+          const imagePosts = (
+            runtime.endpoints.get(endpoint.id)?.posts ?? []
+          ).filter((post) => post.files?.length);
+          expect(imagePosts).toHaveLength(denied || fallback ? 0 : 1);
+          if (!denied && !fallback) {
+            expect(imagePosts[0]!.threadId).toBe(
+              conversation!.externalThreadId,
+            );
+            expect(imagePosts[0]!.files).toEqual([
+              {
+                data: body,
+                filename: "teams-picture.png",
+                mimeType: "image/png",
+              },
+            ]);
+            expect(imagePosts[0]!.text).not.toContain("isn't available");
+          }
+          if (fallback) {
+            expect(
+              providerRuntime.posts.some((post) =>
+                post.text.includes("Direct file delivery isn't available"),
+              ),
+            ).toBe(true);
+            if (outcome === "too_large")
+              expect(storage.storage.getObject).not.toHaveBeenCalled();
+          }
+          const [publication] = await db
+            .select()
+            .from(chatPublications)
+            .where(eq(chatPublications.id, result.id));
+          if (!denied)
+            expect(publication).toMatchObject({
+              state: ambiguous ? "delivery_unknown" : "published",
+              attempts: 1,
+            });
+          if (!denied && !ambiguous)
+            expect(publication!.providerMessageId).toBeTruthy();
+          if (outcome === "native_http" || outcome === "long_native_http") {
+            if (outcome === "native_http") expect(httpBodies).toHaveLength(2);
+            else {
+              expect(httpBodies.length).toBeGreaterThan(2);
+              expect(
+                providerRuntime.posts
+                  .slice(0, -1)
+                  .map((post) => post.text)
+                  .join(""),
+              ).toBe(boardText);
+              expect(providerRuntime.posts.at(-1)!.files).toHaveLength(1);
+            }
+            const pictureRequest = httpBodies.at(-1)!;
+            expect(pictureRequest.url).toBe(
+              `https://smba.trafficmanager.net/amer/v3/conversations/${surface === "channel" ? `${conversationId};messageid=${rootId}` : conversationId}/activities`,
+            );
+            expect(pictureRequest.body).toMatchObject({
+              type: "message",
+              attachments: [
+                {
+                  name: "teams-picture.png",
+                  contentType: "image/png",
+                  contentUrl: `data:image/png;base64,${body.toString("base64")}`,
+                },
+              ],
+            });
+            expect(JSON.stringify(pictureRequest.body)).not.toMatch(
+              /file\.consent|teams-test-secret/,
+            );
+            expect(publication!.providerMessageId).toBe(
+              `teams-http-receipt-${httpBodies.length}`,
+            );
+          }
+          if (ambiguous) expect(publication!.providerMessageId).toBeNull();
+          await expect(
+            db
+              .select()
+              .from(chatTeamsFileTransfers)
+              .where(eq(chatTeamsFileTransfers.endpointId, endpoint.id)),
+          ).resolves.toEqual([]);
+          const sentCount = runtime.endpoints.get(endpoint.id)!.posts.length;
+          await service.publishBoardMessage(
+            endpoint.id,
+            conversation!.id,
+            boardText,
+            `teams-inline-picture-${surface}`,
+            "owner-user",
+            [attachment.id],
+          );
+          expect(runtime.endpoints.get(endpoint.id)!.posts).toHaveLength(
+            sentCount,
+          );
+          await service.processPendingPublications();
+          expect(providerRuntime.posts).toHaveLength(sentCount);
+          expect(pictureAttempts).toBe(denied || fallback ? 0 : 1);
+        } finally {
+          await service.configure(
+            endpoint.id,
+            { action: "remove" },
+            "owner-user",
+          );
+          await service.shutdown();
+          await pinned?.shutdown();
+        }
+      },
+    );
+  });
+
   it("links outbound Teams files instead of attempting an unsupported native upload", async () => {
     const fixture = await seedCompany();
     const storage = createStorageService();
@@ -15413,6 +15705,394 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
     expect(personalAttachmentPost?.files).toBeUndefined();
     expect(storage.storage.getObject).not.toHaveBeenCalled();
+  });
+
+  describe("Teams authenticated inline-picture intake", () => {
+    it.each([
+      ["channel", "current"],
+      ["groupChat", "current"],
+      ["channel", "restart"],
+      ["groupChat", "restart"],
+      ["channel", "revoked_after_receipt"],
+      ["groupChat", "revoked_after_receipt"],
+      ["groupChat", "revoked_during_download"],
+      ["groupChat", "source_updated_during_download"],
+      ["groupChat", "source_deleted_during_download"],
+      ["groupChat", "batch_deadline"],
+    ] as const)(
+      "ingests an actual pinned-parser %s picture into its exact admitted turn (%s)",
+      async (conversationType, mode) => {
+        const fixture = await seedCompany();
+        const storage = createStorageService();
+        const { callbacks, endpoint, runtime, service, wakeup } =
+          await configuredTeamsEndpoint(fixture, {
+            storage: storage.storage,
+            deferWebhookProcessing:
+              mode === "restart" || mode === "revoked_after_receipt",
+            scheduleDeferredWork: () => undefined,
+          });
+        const configuration = runtime.configurations.get(endpoint.id)!;
+        if (configuration.providerConfig.provider !== "microsoft-teams")
+          throw new Error("Expected Teams configuration");
+        const pinned = createChatSdkEndpointRuntime({
+          ...configuration,
+          logger: "silent",
+        });
+        const image = await sharp({
+          create: { width: 2, height: 2, channels: 3, background: "#224466" },
+        })
+          .png()
+          .toBuffer();
+        const url =
+          "https://smba.trafficmanager.net/amer/v3/attachments/inline-fixture/views/original";
+        const http = (
+          pinned.getProviderAdapter() as unknown as {
+            app: {
+              api: { http: { get: (...args: unknown[]) => Promise<unknown> } };
+            };
+          }
+        ).app.api.http;
+        const get = vi.spyOn(http, "get").mockResolvedValue({ data: image });
+        let restarted: ReturnType<typeof createService> | undefined;
+        let recoveredParser:
+          ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
+        let recoveredGet: ReturnType<typeof vi.spyOn> | undefined;
+        let lifecycleCompletion: Promise<unknown> | undefined;
+        let timeoutSpy: ReturnType<typeof vi.spyOn> | undefined;
+        try {
+          if (conversationType === "groupChat")
+            await service.update(
+              endpoint.id,
+              { allowGroupChats: true },
+              "owner-user",
+            );
+          Object.assign(runtime.endpoints.get(endpoint.id)!, {
+            attachmentRecoveryDescriptor:
+              pinned.attachmentRecoveryDescriptor.bind(pinned),
+            rehydrateAttachment: pinned.rehydrateAttachment.bind(pinned),
+            fetchTeamsInlineImage: pinned.fetchTeamsInlineImage.bind(pinned),
+          });
+          const message = pinned.parseMicrosoftTeamsMessage({
+            type: "message",
+            channelId: "msteams",
+            id: "1740000000771",
+            timestamp: new Date().toISOString(),
+            text: "Inspect this exact picture",
+            serviceUrl: "https://smba.trafficmanager.net/amer/",
+            from: {
+              id: "29:inline-picture-user",
+              aadObjectId: randomUUID(),
+              name: "Picture User",
+            },
+            recipient: {
+              id: `28:${configuration.providerConfig.credentials.appId}`,
+            },
+            conversation: {
+              id: `19:inline-picture-${conversationType}@thread.tacv2${conversationType === "channel" ? ";messageid=1740000000771" : ""}`,
+              conversationType,
+              tenantId: configuration.providerConfig.credentials.appTenantId,
+            },
+            attachments: [
+              { contentType: "image/png", contentUrl: url, name: "inline.png" },
+            ],
+          })!;
+          expect(message.attachments[0]).toMatchObject({
+            type: "image",
+            mimeType: "image/png",
+            fetchMetadata: { auth: "bot" },
+          });
+          const thread = makeThread({
+            id: message.threadId,
+            channelId: message.threadId,
+            isDM: false,
+          });
+          if (mode === "batch_deadline") {
+            const raw = message.raw as {
+              attachments: Array<Record<string, unknown>>;
+            };
+            raw.attachments.push({
+              contentType: "image/png",
+              contentUrl: url.replace("inline-fixture", "inline-second"),
+              name: "second.png",
+            });
+            const second =
+              pinned.parseMicrosoftTeamsMessage(raw)!.attachments[1]!;
+            message.attachments.push(second);
+            const budget = new AbortController();
+            const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+            timeoutSpy = vi
+              .spyOn(AbortSignal, "timeout")
+              .mockImplementation((ms) =>
+                ms === 10_000 ? budget.signal : originalTimeout(ms),
+              );
+            get.mockImplementation(async () => {
+              budget.abort();
+              throw new Error("Synthetic exhausted image batch budget");
+            });
+          }
+          if (mode === "revoked_during_download") {
+            get.mockImplementation(async () => {
+              await db
+                .update(chatEndpoints)
+                .set({ allowGroupChats: false })
+                .where(eq(chatEndpoints.id, endpoint.id));
+              return { data: image };
+            });
+          }
+          if (mode.startsWith("source_")) {
+            get.mockImplementation(async () => {
+              const updated = pinned.parseMicrosoftTeamsMessage({
+                ...(message.raw as object),
+                text: "Corrected source without that image",
+                attachments: [],
+              })!;
+              lifecycleCompletion = Promise.resolve(
+                mode === "source_updated_during_download"
+                  ? callbacks.onMessageUpdated!({
+                      endpointId: endpoint.id,
+                      provider: "microsoft-teams",
+                      thread: thread.thread,
+                      message: updated,
+                    })
+                  : callbacks.onMessageDeleted!({
+                      endpointId: endpoint.id,
+                      provider: "microsoft-teams",
+                      event: {
+                        messageId: message.id,
+                        threadId: thread.thread.id,
+                        raw: message.raw,
+                        deletedAt: new Date(),
+                      },
+                    }),
+              ).catch((error: unknown) => error);
+              // The authenticated service callback records before waiting for
+              // this turn's drain. Observe that durable pending source event.
+              await vi.waitFor(async () => {
+                const rows = await db
+                  .select({ state: chatDeliveries.state })
+                  .from(chatDeliveries)
+                  .where(
+                    and(
+                      eq(chatDeliveries.endpointId, endpoint.id),
+                      eq(
+                        chatDeliveries.eventKind,
+                        mode === "source_updated_during_download"
+                          ? "message_updated"
+                          : "message_deleted",
+                      ),
+                    ),
+                  );
+                expect(rows).toEqual([{ state: "received" }]);
+              });
+              return { data: image };
+            });
+          }
+          // Actual parser + durable service. Provider HTTP, outer authenticated
+          // callback delivery, and native scheduler are explicitly simulated.
+          const deliver = () =>
+            deliverMessage({
+              callbacks,
+              endpointId: endpoint.id,
+              provider: "microsoft-teams",
+              thread: thread.thread,
+              message,
+              trigger: "mention",
+            });
+          if (mode === "revoked_during_download")
+            await expect(deliver()).rejects.toThrow(
+              "no longer authorized to start work",
+            );
+          else if (mode.startsWith("source_"))
+            await expect(deliver()).rejects.toThrow("admitted source changed");
+          else await deliver();
+          await lifecycleCompletion;
+          if (mode === "restart" || mode === "revoked_after_receipt") {
+            const [received] = await db
+              .select()
+              .from(chatDeliveries)
+              .where(eq(chatDeliveries.endpointId, endpoint.id));
+            expect(received).toMatchObject({ state: "received", attempts: 0 });
+            expect(get).not.toHaveBeenCalled();
+            expect(storage.putFile).not.toHaveBeenCalled();
+            expect(
+              JSON.stringify(received.normalizedEvent.message),
+            ).not.toContain("https://");
+            expect(received.normalizedEvent).toMatchObject({
+              message: {
+                attachments: [
+                  {
+                    recovery: {
+                      locator: {
+                        kind: "teams_inline_image",
+                        messageId: message.id,
+                      },
+                    },
+                  },
+                ],
+              },
+            });
+            await service.shutdown();
+            recoveredParser = createChatSdkEndpointRuntime({
+              ...configuration,
+              logger: "silent",
+            });
+            const nextHttp = (
+              recoveredParser.getProviderAdapter() as unknown as {
+                app: {
+                  api: { http: { get(...args: unknown[]): Promise<unknown> } };
+                };
+              }
+            ).app.api.http;
+            recoveredGet = vi
+              .spyOn(nextHttp, "get")
+              .mockResolvedValue({ data: image });
+            const nextRuntime = new FakeChatSdkRuntime();
+            const replace = nextRuntime.replaceEndpoint.bind(nextRuntime);
+            vi.spyOn(nextRuntime, "replaceEndpoint").mockImplementation(
+              async (options) => {
+                const next = await replace(options);
+                Object.assign(next, {
+                  attachmentRecoveryDescriptor:
+                    recoveredParser!.attachmentRecoveryDescriptor.bind(
+                      recoveredParser,
+                    ),
+                  rehydrateAttachment:
+                    recoveredParser!.rehydrateAttachment.bind(recoveredParser),
+                  fetchTeamsInlineImage:
+                    recoveredParser!.fetchTeamsInlineImage.bind(recoveredParser),
+                });
+                const originalThread = next.thread.bind(next);
+                vi.spyOn(next, "thread").mockImplementation((id) => ({
+                  ...originalThread(id),
+                  isDM: false,
+                }));
+                return next;
+              },
+            );
+            if (mode === "revoked_after_receipt") {
+              if (conversationType === "groupChat")
+                await db
+                  .update(chatEndpoints)
+                  .set({ allowGroupChats: false })
+                  .where(eq(chatEndpoints.id, endpoint.id));
+              else
+                await db
+                  .update(chatEndpointResources)
+                  .set({ enabled: false })
+                  .where(eq(chatEndpointResources.endpointId, endpoint.id));
+              // Leave verifying mode so restart cannot legitimately activate a
+              // first setup channel after this explicit operator revocation.
+              await db
+                .update(chatEndpoints)
+                .set({ status: "active" })
+                .where(eq(chatEndpoints.id, endpoint.id));
+            }
+            await db
+              .update(chatDeliveries)
+              .set({ nextAttemptAt: new Date(0) })
+              .where(eq(chatDeliveries.id, received.id));
+            restarted = createService(nextRuntime, undefined, {
+              storage: storage.storage,
+              scheduleDeferredWork: () => undefined,
+            });
+            await restarted.service.processPendingDeliveries(25, received.id);
+            expect(get).not.toHaveBeenCalled();
+          }
+          const [delivery] = await db
+            .select()
+            .from(chatDeliveries)
+            .where(
+              and(
+                eq(chatDeliveries.endpointId, endpoint.id),
+                eq(chatDeliveries.eventKind, "mention"),
+              ),
+            );
+          if (mode === "batch_deadline") {
+            expect(delivery.state).toBe("processed");
+            expect(delivery.redactedError).toContain(
+              "2 external attachments were omitted",
+            );
+            expect(storage.putFile).not.toHaveBeenCalled();
+            expect(get).toHaveBeenCalledOnce();
+            expect(wakeup).toHaveBeenCalledOnce();
+            await expect(
+              db
+                .select({ id: issueAttachments.id })
+                .from(issueAttachments)
+                .where(eq(issueAttachments.companyId, fixture.companyId)),
+            ).resolves.toHaveLength(0);
+            return;
+          }
+          if (mode.startsWith("revoked_") || mode.startsWith("source_")) {
+            expect(storage.putFile).not.toHaveBeenCalled();
+            expect(restarted?.wakeup ?? wakeup).not.toHaveBeenCalled();
+            expect(delivery.state).toBe(
+              mode === "revoked_after_receipt" ? "filtered" : "failed",
+            );
+            if (mode === "revoked_after_receipt")
+              expect(recoveredGet).not.toHaveBeenCalled();
+            else expect(get).toHaveBeenCalledOnce();
+            await expect(
+              db
+                .select({ id: issueAttachments.id })
+                .from(issueAttachments)
+                .where(eq(issueAttachments.companyId, fixture.companyId)),
+            ).resolves.toHaveLength(0);
+            return;
+          }
+          expect({
+            state: delivery.state,
+            error: delivery.redactedError,
+          }).toEqual({ state: "processed", error: null });
+          expect(storage.putFile).toHaveBeenCalledOnce();
+          expect(storage.putFile.mock.calls[0]![0]).toMatchObject({
+            body: image,
+            contentType: "image/png",
+          });
+          const download = recoveredGet ?? get;
+          expect(download).toHaveBeenCalledOnce();
+          expect(download.mock.calls[0]![0]).toBe(url);
+          expect(restarted?.wakeup ?? wakeup).toHaveBeenCalledOnce();
+          expect(delivery).toMatchObject({
+            state: "processed",
+            redactedError: null,
+          });
+          expect(JSON.stringify(delivery.normalizedEvent.message)).not.toContain(
+            "https://",
+          );
+          await expect(
+            db
+              .select({ id: issueAttachments.id })
+              .from(issueAttachments)
+              .where(eq(issueAttachments.companyId, fixture.companyId)),
+          ).resolves.toHaveLength(1);
+          await (restarted?.service ?? service).processPendingDeliveries(
+            25,
+            delivery.id,
+          );
+          expect(download).toHaveBeenCalledOnce();
+          expect(restarted?.wakeup ?? wakeup).toHaveBeenCalledOnce();
+        } finally {
+          await lifecycleCompletion;
+          timeoutSpy?.mockRestore();
+          get.mockRestore();
+          recoveredGet?.mockRestore();
+          try {
+            await pinned.shutdown();
+          } finally {
+            try {
+              await recoveredParser?.shutdown();
+            } finally {
+              try {
+                await restarted?.service.shutdown();
+              } finally {
+                await retirePublicationFixture(service, endpoint.id);
+              }
+            }
+          }
+        }
+      },
+    );
   });
 
   it("ingests Teams files only from personal chats and keeps non-DM references link-only", async () => {
@@ -58874,4 +59554,413 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     );
   });
+
+  describe("Lossless long Board publications", () => {
+    async function longFixture(provider: "slack" | "github" | "microsoft-teams") {
+      const fixture = await seedCompany();
+      const context =
+        provider === "slack"
+          ? await configuredSlackEndpoint(fixture)
+          : provider === "github"
+            ? await configuredGitHubEndpoint(fixture)
+            : await configuredTeamsEndpoint(fixture);
+      try {
+        const teamsChannel = `teams:${Buffer.from("19:long-publication@thread.tacv2").toString("base64url")}:${Buffer.from("https://smba.trafficmanager.net/amer/").toString("base64url")}`;
+        if (provider === "microsoft-teams") {
+          await db.insert(chatEndpointResources).values({
+            companyId: fixture.companyId,
+            endpointId: context.endpoint.id,
+            type: "channel",
+            providerResourceId: "19:long-publication@thread.tacv2",
+            label: "Long publication channel",
+            availability: "available",
+            enabled: true,
+          });
+        }
+        const channel = makeThread({
+          channelId:
+            provider === "slack"
+              ? "C-LONG-BOARD"
+              : provider === "github"
+                ? "paperclipai/paperclip"
+                : teamsChannel,
+          id:
+            provider === "slack"
+              ? "slack:C-LONG-BOARD:9900.1"
+              : provider === "github"
+                ? "github:paperclipai/paperclip:issue:9900"
+                : `teams:${Buffer.from("19:long-publication@thread.tacv2;messageid=99001").toString("base64url")}:${Buffer.from("https://smba.trafficmanager.net/amer/").toString("base64url")}`,
+          name: "long-board",
+        });
+        await deliverMessage({
+          callbacks: context.callbacks,
+          endpointId: context.endpoint.id,
+          provider,
+          thread: channel.thread,
+          message: makeMessage({
+            id: provider === "slack" ? "9900.1" : "99001",
+            text: "@maya begin the long Board publication fixture",
+            mentioned: true,
+          }),
+          trigger: "mention",
+        });
+        await qualifySetupRoundTrip(context.service, context.endpoint.id);
+        await context.service.test(context.endpoint.id, "owner-user");
+        const [conversation] = await context.service.listConversations(
+          context.endpoint.id,
+        );
+        if (!conversation)
+          throw new Error("Expected long publication conversation");
+        const transport = context.runtime.endpoints.get(context.endpoint.id)!;
+        transport.posts.length = 0;
+        return { ...context, fixture, conversation, transport, channel };
+      } catch (error) {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+        throw error;
+      }
+    }
+    const orderedBatch = (commentId: string) =>
+      db
+        .select()
+        .from(chatPublications)
+        .where(eq(chatPublications.commentId, commentId))
+        .orderBy(
+          asc(chatPublications.createdAt),
+          asc(sql`${chatPublications.payload}->'transportPart'->>'orderKey'`),
+        );
+
+    it.each([
+      ["slack", "new"],
+      ["slack", "existing"],
+      ["github", "new"],
+      ["github", "existing"],
+      ["microsoft-teams", "new"],
+      ["microsoft-teams", "existing"],
+    ] as const)(
+      "preserves all 100000 characters for %s %s-comment publication",
+      async (provider, source) => {
+        const { service, endpoint, conversation, transport } =
+          await longFixture(provider);
+        try {
+          const marker = "END-OF-100000-CHARACTER-BOARD-SEND";
+          const body = "a".repeat(100_000 - marker.length) + marker;
+          const comment =
+            source === "existing"
+              ? await issueService(db).addComment(conversation.issueId, body, {
+                  userId: "owner-user",
+                })
+              : null;
+          const publication = comment
+            ? await service.publishComment(
+                endpoint.id,
+                conversation.id,
+                comment.id,
+              )
+            : await service.publishBoardMessage(
+                endpoint.id,
+                conversation.id,
+                body,
+                "lossless-long-board-send",
+                "owner-user",
+              );
+          for (let drain = 0; drain < 20; drain++)
+            await service.processPendingPublications();
+          expect(publication?.commentId).toBeTruthy();
+          const rows = await orderedBatch(publication!.commentId!);
+          expect(rows.every((row) => row.state === "published")).toBe(true);
+          expect(rows.map((row) => row.payload.text).join("") === body).toBe(
+            true,
+          );
+          expect(transport.posts.map((post) => post.text).join("") === body).toBe(
+            true,
+          );
+          expect(
+            transport.posts.every((post) =>
+              nativePublicationTextFits(provider, post.text),
+            ),
+          ).toBe(true);
+          expect(transport.posts.at(-1)?.text).toContain(marker);
+          const before = transport.posts.length;
+          if (comment)
+            await service.publishComment(
+              endpoint.id,
+              conversation.id,
+              comment.id,
+            );
+          else
+            await service.publishBoardMessage(
+              endpoint.id,
+              conversation.id,
+              body,
+              "lossless-long-board-send",
+              "owner-user",
+            );
+          expect(transport.posts).toHaveLength(before);
+        } finally {
+          await retirePublicationFixture(service, endpoint.id);
+        }
+      },
+    );
+
+    it.each(["slack", "github", "microsoft-teams"] as const)(
+      "preserves %s code, Unicode and sanitization expansion through actual durable parts",
+      async (provider) => {
+        const { service, endpoint, conversation, transport } =
+          await longFixture(provider);
+        try {
+          const body =
+            "```ts\n" +
+            "const answer = '😀';\n".repeat(4_000) +
+            "```\n\n" +
+            "@here ".repeat(1_000) +
+            "END-OF-RICH-BOARD";
+          expect(body.length).toBeLessThanOrEqual(100_000);
+          const safe = projectSafeChatPublicationText(body);
+          const publication = await service.publishBoardMessage(
+            endpoint.id,
+            conversation.id,
+            body,
+            "long-rich-board-send",
+            "owner-user",
+          );
+          for (let drain = 0; drain < 20; drain++)
+            await service.processPendingPublications();
+          const rows = await orderedBatch(publication.commentId!);
+          expect(rows.every((row) => row.state === "published")).toBe(true);
+          expect(rows.map((row) => row.payload.text).join("") === safe).toBe(
+            true,
+          );
+          expect(transport.posts.map((post) => post.text)).toEqual(
+            rows.map((row) => renderPublicationTransportText(row.payload)),
+          );
+          expect(
+            transport.posts.every((post) =>
+              nativePublicationTextFits(provider, post.text),
+            ),
+          ).toBe(true);
+          expect(transport.posts.at(-1)?.text).toContain("END-OF-RICH-BOARD");
+          expect(JSON.stringify(transport.posts)).not.toContain("@here");
+        } finally {
+          await retirePublicationFixture(service, endpoint.id);
+        }
+      },
+    );
+
+    it.each(["discord", "telegram"] as const)(
+      "retains a complete 100000-character %s response in the existing Markdown document transport",
+      async (provider) => {
+        const context = await safeNativeProgressFixture(
+          provider,
+          provider === "discord" ? "811" : "812",
+        );
+        try {
+          await qualifySetupRoundTrip(
+            context.service,
+            context.endpoint.id,
+            provider === "telegram"
+              ? context.thread.thread.channelId
+              : "U-SAFE-PROGRESS",
+          );
+          await context.service.test(context.endpoint.id, "owner-user");
+          context.providerRuntime.posts.length = 0;
+          const marker = "\n```\nEND-OF-COMPLETE-DOCUMENT";
+          const body =
+            "```txt\n" + "x".repeat(100_000 - marker.length - 7) + marker;
+          expect(body.length).toBe(100_000);
+          const publication = await context.service.publishBoardMessage(
+            context.endpoint.id,
+            context.conversation.id,
+            body,
+            "long-document-board-send",
+            "owner-user",
+          );
+          for (let drain = 0; drain < 5; drain++)
+            await context.service.processPendingPublications();
+          const rows = await orderedBatch(publication.commentId!);
+          expect(rows).toHaveLength(1);
+          expect(rows[0]!.state).toBe("published");
+          expect(rows[0]!.payload.text).toBe(body);
+          expect(rows[0]!.payload.transportPart?.mode).toBe(
+            `${provider}_markdown_attachment`,
+          );
+          expect(context.providerRuntime.posts).toHaveLength(1);
+          const post = context.providerRuntime.posts[0]!;
+          const upload = (
+            provider === "discord" ? post.files?.[0] : post.attachments?.[0]
+          ) as { data: Buffer };
+          expect(Buffer.isBuffer(upload.data)).toBe(true);
+          expect(upload.data.equals(Buffer.from(body))).toBe(true);
+          await context.service.processPendingPublications();
+          expect(context.providerRuntime.posts).toHaveLength(1);
+        } finally {
+          await retirePublicationFixture(context.service, context.endpoint.id);
+        }
+      },
+    );
+
+    it.each(["slack", "github"] as const)(
+      "keeps an ambiguous %s text part blocked across restart and retries only that part and its tail",
+      async (provider) => {
+        const { service, endpoint, conversation, transport } =
+          await longFixture(provider);
+        let restarted: ChatChannelService | undefined;
+        try {
+          const body = "a".repeat(99_990) + "FINAL-TAIL";
+          let attempts = 0;
+          transport.postHook = async () => {
+            if (++attempts === 2)
+              throw new Error("connection closed after request write");
+          };
+          const blocked = await service.publishBoardMessage(
+            endpoint.id,
+            conversation.id,
+            body,
+            "long-unknown-board-send",
+            "owner-user",
+          );
+          expect(blocked.state).toBe("delivery_unknown");
+          const initial = await orderedBatch(blocked.commentId!);
+          expect(initial[0]!.state).toBe("published");
+          expect(initial[1]!.id).toBe(blocked.id);
+          expect(
+            initial
+              .slice(2)
+              .every((row) => row.state === "pending" && row.attempts === 0),
+          ).toBe(true);
+          expect(attempts).toBe(2);
+          await service.shutdown();
+          const fresh = createService(new FakeChatSdkRuntime());
+          restarted = fresh.service;
+          await restarted.processPendingPublications();
+          await restarted.processPendingPublications();
+          expect(await orderedBatch(blocked.commentId!)).toEqual(initial);
+          expect(fresh.runtime.endpoints.get(endpoint.id)?.posts ?? []).toEqual(
+            [],
+          );
+          await expect(
+            restarted.replayPublication(endpoint.id, blocked.id),
+          ).rejects.toMatchObject({ status: 409 });
+          await restarted.resolvePublication(
+            endpoint.id,
+            blocked.id,
+            "retry_anyway",
+            "owner-user",
+          );
+          for (let drain = 0; drain < 20; drain++)
+            await restarted.processPendingPublications();
+          const final = await orderedBatch(blocked.commentId!);
+          expect(final[0]).toEqual(initial[0]);
+          expect(final.every((row) => row.state === "published")).toBe(true);
+          expect(final[1]!.attempts).toBe(2);
+          expect(final.slice(2).every((row) => row.attempts === 1)).toBe(true);
+          const resumed = fresh.runtime.endpoints.get(endpoint.id)!.posts;
+          expect(
+            [...transport.posts, ...resumed].map((post) => post.text).join("") ===
+              body,
+          ).toBe(true);
+          expect(
+            (
+              await restarted.getPublicationBatchStatus(
+                endpoint.id,
+                conversation.id,
+                initial[0]!.id,
+              )
+            ).published,
+          ).toBe(final.length);
+          await restarted.processPendingPublications();
+          expect(await orderedBatch(blocked.commentId!)).toEqual(final);
+        } finally {
+          await service.shutdown();
+          await retirePublicationFixture(restarted ?? service, endpoint.id);
+        }
+      },
+    );
+
+    it("preserves an accepted native Slack response whose rendered mentions exceed the Markdown cap", async () => {
+      const summary = "@U12345678 ".repeat(1_080) + "NATIVE-END";
+      expect(summary.length).toBeLessThan(12_000);
+      const context = await committedChatResponseRecoveryFixture(
+        "slack",
+        "coordinator",
+        false,
+        undefined,
+        () => summary,
+      );
+      try {
+        expect(await context.repair()).toBe(true);
+        const [comment] = await db
+          .select()
+          .from(issueComments)
+          .where(eq(issueComments.createdByRunId, context.runId));
+        await context.service.processPendingPublications(100);
+        const rows = await orderedBatch(comment!.id);
+        expect(rows.length).toBeGreaterThan(1);
+        expect(rows.every((row) => row.state === "published")).toBe(true);
+        expect(rows.map((row) => row.payload.text).join("")).toBe(summary.trim());
+        expect(
+          rows.every((row) =>
+            nativePublicationTextFits(
+              "slack",
+              renderPublicationTransportText(row.payload),
+            ),
+          ),
+        ).toBe(true);
+        expect(await context.repair()).toBe(false);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+
+    it.each([
+      { prefix: "https://private.example/?token=PRIVATE" },
+      { suffix: { token: "PRIVATE" } },
+    ])(
+      "refuses malformed persisted wrappers before provider I/O %#",
+      async (badWrapper) => {
+        const { service, endpoint, conversation, transport, fixture } =
+          await longFixture("slack");
+        try {
+          const comment = await issueService(db).addComment(
+            conversation.issueId,
+            "Safe content",
+            { userId: "owner-user" },
+          );
+          const [publication] = await db
+            .insert(chatPublications)
+            .values({
+              companyId: fixture.companyId,
+              endpointId: endpoint.id,
+              conversationId: conversation.id,
+              issueId: conversation.issueId,
+              commentId: comment.id,
+              idempotencyKey: `explicit:${comment.id}:${endpoint.id}`,
+              state: "pending",
+              payload: {
+                text: "Safe content",
+                transportPart: {
+                  batchId: randomUUID(),
+                  count: 1,
+                  index: 0,
+                  orderKey: "fixture:0000",
+                  ...badWrapper,
+                },
+              } as never,
+            })
+            .returning();
+          await service.processPendingPublications();
+          expect(transport.posts).toEqual([]);
+          const [after] = await db
+            .select()
+            .from(chatPublications)
+            .where(eq(chatPublications.id, publication!.id));
+          expect(after!.state).toBe("failed");
+          expect(after!.redactedError).not.toContain("PRIVATE");
+          expect(after!.providerMessageId).toBeNull();
+        } finally {
+          await retirePublicationFixture(service, endpoint.id);
+        }
+      },
+    );
+  });
+
 });
