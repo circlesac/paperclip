@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, Paperclip, Radio } from "lucide-react";
 import type {
   ChatPublicationState,
+  ChatFileTransferPhase,
   IssueAttachment,
 } from "@paperclipai/shared";
 import {
@@ -22,6 +23,7 @@ import { issuesApi } from "@/api/issues";
 import {
   boardSendDraftKey,
   clearBoardSendDraft,
+  canDismissBoardSendBatch,
   readBoardSendDraft,
   writeBoardSendDraft,
   type RetainedBoardSend,
@@ -42,6 +44,11 @@ type PublicationFeedback = {
 };
 
 const publicationFeedback: Record<ChatPublicationState, PublicationFeedback> = {
+  awaiting_consent: {
+    title: "Waiting for file consent",
+    body: "The recipient must accept the file card in Microsoft Teams. The file is not delivered yet; this send identity is kept while Paperclip waits.",
+    tone: "info",
+  },
   published: {
     title: "Sent to channel",
     body: "The board update was published to the connected conversation.",
@@ -77,6 +84,24 @@ const publicationFeedback: Record<ChatPublicationState, PublicationFeedback> = {
     body: "Your draft is kept. Some parts may already have been published; check Activity before starting a new send.",
     tone: "info",
   },
+};
+
+const filePhaseLabels: Record<ChatFileTransferPhase, string> = {
+  consent_pending: "Consent card queued",
+  consent_sending: "Sending consent card",
+  consent_unknown: "Consent card delivery not confirmed",
+  awaiting_consent: "Awaiting consent",
+  upload_pending: "Upload queued",
+  uploading: "Uploading file",
+  upload_unknown: "File upload not confirmed",
+  file_info_pending: "File notification queued",
+  file_info_sending: "Sending file notification",
+  file_info_unknown: "File notification not confirmed",
+  delivered: "Delivered",
+  declined: "Declined",
+  expired: "Consent expired",
+  cancelled: "Cancelled; remote bytes may remain",
+  conflict: "File delivery needs review",
 };
 
 export function useIssueChatBinding(companyId: string, issueId: string) {
@@ -378,9 +403,29 @@ function ConnectedTaskComposer({
         (attachment) => attachment.issueCommentId === null,
       );
   const currentPublication = publicationStatus.data?.publication ?? publication;
-  const currentFeedback = currentPublication
-    ? publicationFeedback[currentPublication.state]
-    : null;
+  const batch = publicationStatus.data;
+  const dismissible =
+    !publicationStatus.isError &&
+    !publicationStatus.isFetching &&
+    canDismissBoardSendBatch(batch);
+  const mixedTerminal =
+    canDismissBoardSendBatch(batch) && batch!.published < batch!.total;
+  const currentFeedback = mixedTerminal
+    ? {
+        title: "Delivery settled with mixed outcomes",
+        body: "Not every part was confirmed delivered. Review the outcomes below; dismissing this receipt does not resend anything.",
+        tone: "info" as const,
+      }
+    : currentPublication?.state === "cancelled" &&
+        (batch?.awaitingConsent ?? 0) > 0
+      ? {
+          title: "Waiting for remaining file consent",
+          body: "Some parts have settled. The remaining file cards still need the recipient's response; this send stays locked until the whole batch is resolved.",
+          tone: "info" as const,
+        }
+      : currentPublication
+        ? publicationFeedback[currentPublication.state]
+        : null;
   const activityPath = `/apps/chat/${binding.endpointId}/activity`;
   return (
     <section
@@ -504,9 +549,12 @@ function ConnectedTaskComposer({
               <p className="text-xs text-muted-foreground">
                 {binding.provider === "github"
                   ? "GitHub Apps cannot upload file bytes in comments. Checked files stay on the Paperclip task; GitHub receives an authenticated task link when this Board has a public URL, or a private-task notice otherwise."
-                  : showingRetainedFiles
-                    ? "These are the files selected for this send. Selection is locked until delivery is resolved."
-                    : "Only checked files will be published to the external conversation."}
+                  : binding.provider === "microsoft-teams" &&
+                      !showingRetainedFiles
+                    ? "Teams asks the recipient to accept each file before upload. Where direct delivery isn't available, files stay on the Paperclip task; Teams receives a task link or a private-task notice."
+                    : showingRetainedFiles
+                      ? "These are the files selected for this send. Selection is locked until delivery is resolved."
+                      : "Only checked files will be published to the external conversation."}
               </p>
               <div className="space-y-2">
                 {visibleAttachments.map((attachment) => {
@@ -576,11 +624,42 @@ function ConnectedTaskComposer({
             >
               <p className="font-medium">{currentFeedback.title}</p>
               <p className="text-muted-foreground">{currentFeedback.body}</p>
-              {publicationStatus.data && (
+              {batch && (
                 <p className="text-muted-foreground">
-                  {publicationStatus.data.published} of{" "}
-                  {publicationStatus.data.total} parts published.
+                  {batch.declined !== undefined &&
+                  batch.expired !== undefined &&
+                  batch.cancelled !== undefined &&
+                  batch.awaitingConsent !== undefined
+                    ? [
+                        `${batch.published} published`,
+                        ...(batch.awaitingConsent
+                          ? [`${batch.awaitingConsent} awaiting consent`]
+                          : []),
+                        ...(batch.declined
+                          ? [`${batch.declined} declined`]
+                          : []),
+                        ...(batch.expired ? [`${batch.expired} expired`] : []),
+                        ...(batch.cancelled
+                          ? [`${batch.cancelled} cancelled`]
+                          : []),
+                      ].join(" · ")
+                    : `${batch.published} of ${batch.total} parts published.`}
                 </p>
+              )}
+              {batch?.parts?.some((part) => part.fileTransfer) && (
+                <ul
+                  className="space-y-1 text-muted-foreground"
+                  aria-label="File delivery outcomes"
+                >
+                  {batch.parts
+                    .filter((part) => part.fileTransfer)
+                    .map((part) => (
+                      <li key={part.id}>
+                        {part.fileTransfer!.filename} —{" "}
+                        {filePhaseLabels[part.fileTransfer!.phase]}
+                      </li>
+                    ))}
+                </ul>
               )}
               {publicationStatus.isError && (
                 <p role="alert" className="text-muted-foreground">
@@ -599,7 +678,7 @@ function ConnectedTaskComposer({
               >
                 Open Activity
               </Link>
-              {currentPublication.state === "cancelled" && (
+              {dismissible && (
                 <Button
                   className="ml-3"
                   size="sm"
@@ -615,16 +694,19 @@ function ConnectedTaskComposer({
                         return;
                       }
                     }
+                    setStorageError(null);
                     retainedSend.current = null;
                     setUnconfirmedRequest(false);
                     setPublication(null);
+                    setBody("");
                     setSelectedAttachmentIds([]);
                     setUploadedAttachments([]);
+                    setUploadError(null);
                     idempotencyKey.current = null;
                     publish.reset();
                   }}
                 >
-                  Start a new send
+                  Dismiss delivery receipt
                 </Button>
               )}
             </div>

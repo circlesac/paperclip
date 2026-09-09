@@ -108,18 +108,58 @@ const liveChatQueryOptions = {
 } as const;
 
 export function isReplayEligible(item: ChatActivityItem): boolean {
-  if (!item.replayable || !replayableFailureStates.has(item.status)) {
+  if (
+    item.fileTransfer ||
+    !item.replayable ||
+    !replayableFailureStates.has(item.status)
+  ) {
     return false;
   }
   if (item.kind === "delivery") return item.status === "failed";
   return item.kind === "publication";
 }
 
+export function activityResolutionActions(item: ChatActivityItem) {
+  const offered = item.resolutionActions ?? [];
+  if (!item.fileTransfer) return offered;
+  if (
+    item.kind !== "publication" ||
+    !Number.isSafeInteger(item.fileTransfer.version) ||
+    item.fileTransfer.version < 1
+  )
+    return [];
+  if (
+    ![
+      "consent_unknown",
+      "upload_unknown",
+      "file_info_unknown",
+      "conflict",
+    ].includes(item.fileTransfer.phase)
+  )
+    return [];
+  // Only the file-info stage can use ordinary visible-delivery resolution.
+  // Earlier consent/upload evidence must not be fabricated by these buttons.
+  return item.fileTransfer.phase === "file_info_unknown"
+    ? offered
+    : offered.filter((action) => action === "cancel");
+}
+
+export function activityResolutionDescription(item: ChatActivityItem): string {
+  const phase = item.fileTransfer?.phase;
+  if (phase === "file_info_unknown")
+    return "The file upload was confirmed, but its Teams notification was not. Check Teams first. Retrying sends only that notification, not the file bytes, and may create a duplicate card.";
+  if (phase === "consent_unknown")
+    return "The consent card may have reached Teams. File delivery is not confirmed. Cancelling here does not remove any card already sent.";
+  if (phase)
+    return "The file may already exist in OneDrive. Cancelling stops this Paperclip transfer; it does not delete remote bytes. Uploads cannot be marked delivered or retried from this uncertain state.";
+  return "Paperclip lost confirmation after sending. Check the provider conversation first. Retrying can create a duplicate message.";
+}
+
 export function isResolutionEligible(item: ChatActivityItem): boolean {
   return (
     (item.kind === "publication" || item.kind === "action") &&
     item.status === "delivery_unknown" &&
-    (item.resolutionActions?.length ?? 0) > 0
+    activityResolutionActions(item).length > 0
   );
 }
 
@@ -153,7 +193,7 @@ export function connectionHealthPresentation(
     endpoint.status === "active" ? null : lifecycleMessages[endpoint.status];
   return {
     message: lifecycleMessage ?? endpoint.healthMessage ?? null,
-    previousHealth: lifecycleMessage ? endpoint.healthMessage ?? null : null,
+    previousHealth: lifecycleMessage ? (endpoint.healthMessage ?? null) : null,
     error: endpoint.lastError ?? null,
     errorLabel: ["active", "attention", "revoked"].includes(endpoint.status)
       ? "Reason"
@@ -740,6 +780,12 @@ function Activity({
           endpointId,
           input.item.id,
           input.action,
+          input.item.fileTransfer
+            ? {
+                phase: input.item.fileTransfer.phase,
+                version: input.item.fileTransfer.version,
+              }
+            : undefined,
         );
       }
       return chatEndpointsApi.resolveAction(
@@ -1006,6 +1052,12 @@ function Activity({
                     </time>
                   </div>
                   <p className="mt-2 text-sm font-medium">{item.summary}</p>
+                  {item.fileTransfer && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {item.fileTransfer.filename} —{" "}
+                      {item.fileTransfer.phase.replaceAll("_", " ")}
+                    </p>
+                  )}
                   {item.detail && (
                     <p className="mt-1 text-xs text-muted-foreground">
                       <span className="font-medium text-foreground">
@@ -1067,63 +1119,76 @@ function Activity({
                 ? "Paperclip lost confirmation after asking Slack to start the task. Check Slack first. Retrying can create a duplicate starter message and task."
                 : resolutionItem?.actionType === "provider_effect"
                   ? "Paperclip lost confirmation after sending this provider reply. Check the provider first. Marking it delivered applies any pending Paperclip state change; retrying can create a duplicate message."
-                  : "Paperclip lost confirmation after sending. Check the provider conversation first. Retrying can create a duplicate message."}
+                  : resolutionItem
+                    ? activityResolutionDescription(resolutionItem)
+                    : ""}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter className="sm:flex-wrap">
             <AlertDialogCancel disabled={resolveActivity.isPending}>
               Keep unresolved
             </AlertDialogCancel>
-            {resolutionItem?.resolutionActions?.includes("cancel") && (
-              <Button
-                variant="outline"
-                disabled={resolveActivity.isPending}
-                onClick={() =>
-                  resolutionItem &&
-                  resolveActivity.mutate({
-                    item: resolutionItem,
-                    action: "cancel",
-                  })
-                }
-              >
-                {resolutionItem.actionType === "slash_task_start"
-                  ? "Cancel task start"
-                  : resolutionItem.actionType === "provider_effect"
-                    ? "Cancel provider reply"
-                    : "Cancel publication"}
-              </Button>
-            )}
-            {resolutionItem?.resolutionActions?.includes("retry_anyway") && (
-              <Button
-                variant="outline"
-                disabled={resolveActivity.isPending}
-                onClick={() =>
-                  resolutionItem &&
-                  resolveActivity.mutate({
-                    item: resolutionItem,
-                    action: "retry_anyway",
-                  })
-                }
-              >
-                Retry anyway
-              </Button>
-            )}
-            {resolutionItem?.resolutionActions?.includes("mark_delivered") && (
-              <AlertDialogAction
-                disabled={resolveActivity.isPending}
-                onClick={(event) => {
-                  event.preventDefault();
-                  if (resolutionItem) {
+            {resolutionItem &&
+              activityResolutionActions(resolutionItem).includes("cancel") && (
+                <Button
+                  variant="outline"
+                  disabled={resolveActivity.isPending}
+                  onClick={() =>
+                    resolutionItem &&
                     resolveActivity.mutate({
                       item: resolutionItem,
-                      action: "mark_delivered",
-                    });
+                      action: "cancel",
+                    })
                   }
-                }}
-              >
-                Mark delivered
-              </AlertDialogAction>
-            )}
+                >
+                  {resolutionItem.actionType === "slash_task_start"
+                    ? "Cancel task start"
+                    : resolutionItem.actionType === "provider_effect"
+                      ? "Cancel provider reply"
+                      : resolutionItem.fileTransfer
+                        ? "Cancel file transfer"
+                        : "Cancel publication"}
+                </Button>
+              )}
+            {resolutionItem &&
+              activityResolutionActions(resolutionItem).includes(
+                "retry_anyway",
+              ) && (
+                <Button
+                  variant="outline"
+                  disabled={resolveActivity.isPending}
+                  onClick={() =>
+                    resolutionItem &&
+                    resolveActivity.mutate({
+                      item: resolutionItem,
+                      action: "retry_anyway",
+                    })
+                  }
+                >
+                  {resolutionItem.fileTransfer
+                    ? "Retry file notification"
+                    : "Retry anyway"}
+                </Button>
+              )}
+            {resolutionItem &&
+              activityResolutionActions(resolutionItem).includes(
+                "mark_delivered",
+              ) && (
+                <AlertDialogAction
+                  disabled={resolveActivity.isPending}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    if (resolutionItem) {
+                      resolveActivity.mutate({
+                        item: resolutionItem,
+                        action: "mark_delivered",
+                      });
+                    }
+                  }}
+                >
+                  Mark delivered
+                </AlertDialogAction>
+              )}
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

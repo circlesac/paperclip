@@ -3,8 +3,13 @@ import type {
   ChatPublicationBatchStatus,
   ChatPublicationState,
   ChatPublicationSummary,
+  ChatActivityItem,
+  ChatFileTransferResolutionPrecondition,
 } from "@paperclipai/shared";
-export type { ChatPublicationSummary } from "@paperclipai/shared";
+export type {
+  ChatPublicationSummary,
+  ChatActivityItem,
+} from "@paperclipai/shared";
 
 export type ChatProvider =
   "slack" | "github" | "discord" | "microsoft-teams" | "telegram";
@@ -51,23 +56,6 @@ export interface ChatConversation {
     "active" | "waiting" | "completed" | "unavailable" | "endpoint_removed";
   updatedAt: string;
   lastPublicationStatus?: ChatPublicationState | null;
-}
-
-export interface ChatActivityItem {
-  id: string;
-  kind: "delivery" | "publication" | "action" | "health" | "repair";
-  actionType?:
-    | "slash_task_start"
-    | "provider_effect"
-    | "github_webhook_ingress"
-    | "slack_session_sync"
-    | "slack_session_stop";
-  status: string;
-  summary: string;
-  detail?: string | null;
-  createdAt: string;
-  replayable?: boolean;
-  resolutionActions?: Array<"mark_delivered" | "retry_anyway" | "cancel">;
 }
 
 export interface ExternalChannelBindingSummary {
@@ -273,10 +261,21 @@ export const chatEndpointsApi = {
     endpointId: string,
     publicationId: string,
     action: "mark_delivered" | "retry_anyway" | "cancel",
+    fileTransfer?: ChatFileTransferResolutionPrecondition,
   ) =>
     api.post<void>(
       `/chat-endpoints/${endpointId}/publications/${publicationId}/resolve`,
-      { action },
+      {
+        action,
+        ...(fileTransfer
+          ? {
+              fileTransfer: {
+                phase: fileTransfer.phase,
+                version: fileTransfer.version,
+              },
+            }
+          : {}),
+      },
     ),
   resolveAction: (
     endpointId: string,

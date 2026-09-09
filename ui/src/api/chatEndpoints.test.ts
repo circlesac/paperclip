@@ -215,4 +215,34 @@ describe("chatEndpointsApi", () => {
       { action: "mark_delivered" },
     );
   });
+
+  it("sends only the selected file-transfer phase and revision with publication resolution", async () => {
+    const fileTransfer = {
+      phase: "file_info_unknown" as const,
+      version: 4,
+      uploadUrl: "must-not-leave-client",
+    };
+    await chatEndpointsApi.resolvePublication(
+      "endpoint-1",
+      "publication-1",
+      "retry_anyway",
+      fileTransfer,
+    );
+    expect(mockApi.post).toHaveBeenCalledWith(
+      "/chat-endpoints/endpoint-1/publications/publication-1/resolve",
+      {
+        action: "retry_anyway",
+        fileTransfer: { phase: "file_info_unknown", version: 4 },
+      },
+    );
+    await chatEndpointsApi.resolvePublication(
+      "endpoint-1",
+      "ordinary",
+      "cancel",
+    );
+    expect(mockApi.post).toHaveBeenLastCalledWith(
+      "/chat-endpoints/endpoint-1/publications/ordinary/resolve",
+      { action: "cancel" },
+    );
+  });
 });

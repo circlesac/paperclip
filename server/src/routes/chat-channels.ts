@@ -306,6 +306,7 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
         req.params.publicationId as string,
         req.body.action,
         userId,
+        req.body.fileTransfer,
       );
       res.status(204).end();
     },

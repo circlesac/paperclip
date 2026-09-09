@@ -212,10 +212,7 @@ export function ChatEndpointSetup() {
     setEndpoint((visible) =>
       onlyIfStillVisible && visible?.id !== next.id ? visible : next,
     );
-    queryClient.setQueryData(
-      ["chat-endpoint-setup-resume", next.id],
-      next,
-    );
+    queryClient.setQueryData(["chat-endpoint-setup-resume", next.id], next);
     queryClient.setQueryData(queryKeys.chatEndpoints.detail(next.id), next);
     if (next.provider === "github") {
       queryClient.setQueryData(
@@ -476,15 +473,13 @@ export function ChatEndpointSetup() {
                 ? "loading"
                 : experimentalSettingsQuery.isError
                   ? "unknown"
-                  : experimentalSettingsQuery.data
-                        ?.enableIsolatedWorkspaces === true
+                  : experimentalSettingsQuery.data?.enableIsolatedWorkspaces ===
+                      true
                     ? "enabled"
                     : "disabled"
             }
             pending={testConnection.isPending}
-            onOpenAccess={() =>
-              navigate(`/apps/chat/${endpoint.id}/access`)
-            }
+            onOpenAccess={() => navigate(`/apps/chat/${endpoint.id}/access`)}
             onTest={() => testConnection.mutate()}
           />
         )}
@@ -570,9 +565,7 @@ function ProviderConnectStep({
   const [privateKeyFileLoaded, setPrivateKeyFileLoaded] = useState(false);
   const [privateKeyFileLoading, setPrivateKeyFileLoading] = useState(false);
   const privateKeyFileInputRef = useRef<HTMLInputElement>(null);
-  const privateKeyReadGuard = useRef(
-    createGitHubPrivateKeyReadGuard(),
-  ).current;
+  const privateKeyReadGuard = useRef(createGitHubPrivateKeyReadGuard()).current;
   useEffect(
     () => () => {
       privateKeyReadGuard.invalidate();
@@ -1060,9 +1053,9 @@ settings:
         <p className="text-sm text-muted-foreground">
           This release supports personal chats, group chats, and standard team
           channels—not private channels. <code>supportsFiles: true</code>{" "}
-          enables native file receipt only in personal chat; channel and
-          group-chat files need a separate Microsoft Graph connection and are
-          not ingested here.
+          enables native file receipt and consent-based sending in personal
+          chats; channel and group-chat files need a separate Microsoft Graph
+          connection and are not ingested here.
         </p>
         {!endpoint.setup?.messagingEndpoint && (
           <p className="text-sm text-destructive">
@@ -1606,9 +1599,7 @@ function TryStep({
           }
         >
           <h2 className="font-medium">{identityGuidance.title}</h2>
-          <p className="mt-1 text-muted-foreground">
-            {identityGuidance.body}
-          </p>
+          <p className="mt-1 text-muted-foreground">{identityGuidance.body}</p>
           <Button
             className="mt-3"
             size="sm"

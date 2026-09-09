@@ -232,7 +232,7 @@ describe("chat connector UI contract", () => {
     );
     expect(setup).not.toContain("api://paperclip-chat/");
     expect(setup).toContain("not private channels");
-    expect(setup).toContain("native file receipt only in personal chat");
+    expect(setup).toContain("native file receipt and consent-based sending");
     expect(setup).toContain("issue_comment");
     expect(setup).toContain("pull_request");
     expect(setup).toContain("pull_request_review_comment");
@@ -304,7 +304,7 @@ describe("chat connector UI contract", () => {
     expect(setup).toContain("privateKeyFileLoading ||");
     expect(setup).toContain("Show private key");
     expect(setup).toContain('type="password"');
-    expect(setup).toContain("event.clipboardData.getData(\"text\")");
+    expect(setup).toContain('event.clipboardData.getData("text")');
     expect(setup).not.toContain("WebkitTextSecurity");
     expect(generator).toContain("./setup-wireframe-data-v8.mjs");
     expect(generator).not.toContain("./setup-wireframe-data-v6.mjs");

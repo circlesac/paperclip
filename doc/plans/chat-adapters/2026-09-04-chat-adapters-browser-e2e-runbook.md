@@ -627,13 +627,40 @@ Run C3, C5, and C6, then verify specifically:
 
 - DM, channel, and group output use bounded post/edit behavior; the current durable webhook pipeline advertises no native Teams streaming;
 - `FORM` uses an Adaptive Card and task module where supported, with server-side reauthorization on submit;
-- personal-chat Bot Framework file-download attachments are ingested only when the adapter supplies a scoped bot or anonymous download contract and the file passes Paperclip's allowed-content policy and configured size ceiling (10 MB by default); channel and group-chat files remain provider references without a separate Microsoft Graph grant; outbound files use a safe authenticated Paperclip-link fallback on every Teams surface because this connector has no production-safe native upload contract;
+- personal-chat Bot Framework file-download attachments are ingested only when the adapter supplies a scoped bot or anonymous download contract and the file passes Paperclip's allowed-content policy and configured size ceiling (10 MB by default); channel and group-chat files remain provider references without a separate Microsoft Graph grant;
+- outbound personal-chat files require an exact admitted recipient and native file consent. No file upload occurs before acceptance. Channel/group output, or a personal conversation without sufficient recipient proof, retains the truthful private-task/task-link fallback. A consent-card receipt is not a delivered file;
 - denials use targeted activity when supported, otherwise DM or concise text plus a Paperclip link;
 - tenant ID plus Entra object ID, not display name/email, determines identity;
 - edit a source message, soft-delete it, restore it, then edit it again; verify
   Paperclip records exactly one correction, tombstone, restoration, and later
   correction without waking an extra agent run;
 - app removal, consent revocation, or invalid bot identity appears in Activity with the correct repair action.
+
+For the personal-chat file journey, use a new admitted task and a small image
+plus a text file whose marker/bytes can be checked:
+
+1. Send both files from the task's **Send to channel** composer. The text may
+   arrive first; each file must show a native consent card and the Board must
+   remain waiting, not declare the entire send delivered.
+2. Reload the Board. Confirm both filenames and the original send remain locked
+   without another comment, consent card or upload.
+3. Accept one file in Teams and decline the other. Open the accepted native file
+   and check its bytes. Verify the Board reports one delivered file and one
+   declined file, with explicit dismissal only once the whole batch settles.
+4. On a separate send, leave consent unanswered until expiry. Check the expired
+   outcome and no late automatic upload. Repeating an already accepted callback
+   must not send another file or wake the agent.
+5. Remove the recipient's Paperclip authority between the card and acceptance.
+   Verify no upload. Restore access only for a new qualifying attempt; do not
+   rewrite the original evidence or claim that revocation was ignored.
+6. Use the deterministic fault-injection suite, not provider account disruption,
+   for lost acknowledgements and restart races. Confirm Activity requires the
+   current file stage/version; retrying an uncertain final file message must
+   never repeat a confirmed byte upload. Cancel is not remote deletion or proof
+   that the provider received nothing.
+
+The local mocked suite covers protocol races; only the actual Teams consent,
+usable file and Board journeys above establish live file qualification.
 
 ### T7 — Teams evidence and cleanup
 

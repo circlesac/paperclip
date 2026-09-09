@@ -1,6 +1,7 @@
 import {
   CHAT_PUBLICATION_STATES,
   type ChatPublicationSummary,
+  type ChatPublicationBatchStatus,
 } from "@paperclipai/shared";
 
 export interface RetainedBoardSend {
@@ -70,4 +71,46 @@ export function writeBoardSendDraft(key: string, value: RetainedBoardSend) {
 
 export function clearBoardSendDraft(key: string) {
   sessionStorage.removeItem(key);
+}
+
+/** A terminal selected row alone cannot release a still-running batch. */
+export function canDismissBoardSendBatch(
+  batch: ChatPublicationBatchStatus | undefined,
+): boolean {
+  if (
+    !batch ||
+    batch.canDismiss !== true ||
+    !Number.isSafeInteger(batch.total) ||
+    batch.total <= 0
+  )
+    return false;
+  const counts = [
+    batch.published,
+    batch.declined,
+    batch.expired,
+    batch.cancelled,
+  ];
+  if (
+    !counts.every(
+      (count) =>
+        typeof count === "number" && Number.isSafeInteger(count) && count >= 0,
+    )
+  )
+    return false;
+  return (
+    batch.settled === batch.total &&
+    batch.awaitingConsent === 0 &&
+    counts.reduce<number>((sum, count) => sum + count!, 0) === batch.total &&
+    (!batch.parts ||
+      (batch.parts.length === batch.total &&
+        batch.parts.every(
+          (part) =>
+            part.state === "published" ||
+            (part.state === "cancelled" &&
+              (!part.fileTransfer ||
+                ["declined", "expired", "cancelled"].includes(
+                  part.fileTransfer.phase,
+                ))),
+        )))
+  );
 }

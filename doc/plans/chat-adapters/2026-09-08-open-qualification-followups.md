@@ -120,6 +120,27 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
+**Latest working-tree checkpoint:** Teams personal-file output is now wired to
+the real service: source-derived recipient authority, atomic Board intent,
+authenticated callback, staged worker, public receipt projection and audited
+stage/version resolution. Root has not restarted server 72 or applied the new
+table there. A native committed-response digest-format mismatch and a cold
+Board-send runtime initialization bug were reproduced and fixed. Focused Board
+and native-source suites pass 12/12 and 8/8. After fixing two scheduling
+regressions caught by the first full run, the corrected full integration suite
+passes 690/690 on a fresh database (134.68 seconds). The browser suite passes
+31/31 with simulated provider/model ports; the final consent-copy rerun passes
+2/2. Root inspected the waiting/mixed
+receipt screenshots and shortened the repeated pre-send explanation in a
+retained receipt. This is not live Teams consent/file qualification.
+
+Pushed `f5698f533` isolates Teams expiry recovery and adds guarded Discord
+command registration groundwork. Pushed `aacd4963f` adds the opt-in awaited
+Discord command boundary; its private acknowledgement cannot become an ordinary
+public publication receipt. Commands remain off pending durable service
+registration/admission integration. Root independently passes its 125-case
+runtime/Teams foundation cohort. The wireframe images remain removed.
+
 **New maximal-capability audit, September 9:** the original goal is not met by
 documenting every adapter omission as a fallback. Three concrete gaps now own
 the next implementation pass:
@@ -160,9 +181,9 @@ the next implementation pass:
 Root owns shared verification, documentation, Git and deployment. Server 72
 loads the committed Discord/Telegram implementations at `739750c15`;
 the new native modal and video-note journeys are not live qualified.
-Teams durable transfer, schema, safe batch UI/API and optional runtime hooks
-are now being implemented in parallel without activation. Root owns shared
-service integration and migration review. Browser control still reports Mac
+Teams durable transfer, schema, safe batch UI/API and runtime hooks
+are integrated in the working tree but not deployed. Root owns shared
+verification and migration review. Browser control still reports Mac
 locked. Preserve all parallel edits; no lockfile or PR work is part of this pass.
 
 **In-flight Teams activation checkpoint (after server 72 startup):**

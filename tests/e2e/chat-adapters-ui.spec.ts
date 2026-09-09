@@ -1883,14 +1883,18 @@ test.describe("Board send delivery refresh", () => {
             exact: true,
           }),
         ).toBeVisible();
-        await expect.soft(page).toHaveURL(
-          new RegExp(
-            `/${target.prefix}/issues/${issue.identifier}${
-              entry === "wrong-prefix-identifier" ? "\\?external=chat#files" : ""
-            }$`,
-          ),
-          { timeout: 4_000 },
-        );
+        await expect
+          .soft(page)
+          .toHaveURL(
+            new RegExp(
+              `/${target.prefix}/issues/${issue.identifier}${
+                entry === "wrong-prefix-identifier"
+                  ? "\\?external=chat#files"
+                  : ""
+              }$`,
+            ),
+            { timeout: 4_000 },
+          );
         const file = {
           name: classic ? "task-link-report.txt" : "task-link-image.png",
           mimeType: classic ? "text/plain" : "image/png",
@@ -1918,9 +1922,11 @@ test.describe("Board send delivery refresh", () => {
         await (await chooserPromise).setFiles(file);
         const response = await responsePromise;
         expect.soft(response.status(), await response.text()).toBe(201);
-        expect.soft(new URL(response.url()).pathname).toBe(
-          `/api/companies/${target.companyId}/issues/${issue.id}/attachments`,
-        );
+        expect
+          .soft(new URL(response.url()).pathname)
+          .toBe(
+            `/api/companies/${target.companyId}/issues/${issue.id}/attachments`,
+          );
         const attachments = await json<
           {
             originalFilename: string;
@@ -1998,7 +2004,9 @@ test.describe("Board send delivery refresh", () => {
           heading
             .evaluate((element) => ({
               height: element.getBoundingClientRect().height,
-              lineHeight: Number.parseFloat(getComputedStyle(element).lineHeight),
+              lineHeight: Number.parseFloat(
+                getComputedStyle(element).lineHeight,
+              ),
             }))
             .then(({ height, lineHeight }) => height <= lineHeight * 1.5),
         )
@@ -2172,6 +2180,288 @@ test.describe("Board send delivery refresh", () => {
     }
     expect(sends).toHaveLength(1);
   });
+
+  for (const cancelledHead of [false, true]) {
+    test(`keeps Teams file consent anchored across reload (${cancelledHead ? "cancelled head with waiting tail" : "mixed terminal receipt and explicit dismiss"})`, async ({
+      page,
+      request,
+    }, testInfo) => {
+      const seed = await seedCompanyAndAgent(request);
+      const issue = await json<{ id: string; identifier: string }>(
+        await request.post(`/api/companies/${seed.companyId}/issues`, {
+          data: { title: "Teams consent receipt", status: "backlog" },
+        }),
+        "create consent receipt task",
+      );
+      const endpointId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const conversationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const anchor = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      const nextAnchor = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+      const filePublications = [
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      ];
+      const filenames = ["consent-report.txt", "consent-notes.txt"];
+      const posts: Record<string, unknown>[] = [];
+      const statusReads: string[] = [];
+      let terminal = false;
+      const publicationsPath = `/api/chat-endpoints/${endpointId}/conversations/${conversationId}/publications`;
+      const storageKey = `paperclip:board-send:v1:${JSON.stringify([seed.companyId, issue.id, endpointId, conversationId])}`;
+      await page.route("**/api/instance/settings/experimental", (route) =>
+        fulfill(route, { enableChatConnectors: true }),
+      );
+      await page.route(`**/api/issues/${issue.id}/chat-binding`, (route) =>
+        fulfill(route, {
+          endpointId,
+          conversationId,
+          provider: "microsoft-teams",
+          externalLabel: "Personal file conversation",
+          assignedAgentLocked: true,
+        }),
+      );
+      // Only the publication API is simulated. Task creation and safe file
+      // uploads use this test's isolated Paperclip instance, never Teams.
+      await page.route(`**${publicationsPath}`, (route) => {
+        expect(route.request().method()).toBe("POST");
+        posts.push(bodyOf(route));
+        return fulfill(
+          route,
+          {
+            id: posts.length === 1 ? anchor : nextAnchor,
+            state: "pending",
+            attempts: 0,
+          },
+          201,
+        );
+      });
+      await page.route(`**${publicationsPath}/*/status`, (route) => {
+        expect(route.request().method()).toBe("GET");
+        const path = new URL(route.request().url()).pathname;
+        statusReads.push(path);
+        if (path.endsWith(`/${nextAnchor}/status`)) {
+          return fulfill(route, {
+            publication: { id: nextAnchor, state: "pending", attempts: 0 },
+            total: 1,
+            published: 0,
+            awaitingConsent: 0,
+            declined: 0,
+            expired: 0,
+            cancelled: 0,
+            settled: 0,
+            canDismiss: false,
+          });
+        }
+        expect(path).toBe(`${publicationsPath}/${anchor}/status`);
+        const parts = [
+          { id: anchor, state: "published", attempts: 1 },
+          ...filePublications.map((id, index) => ({
+            id,
+            state:
+              terminal || (cancelledHead && index === 0)
+                ? "cancelled"
+                : "awaiting_consent",
+            attempts: 1,
+            fileTransfer: {
+              provider: "microsoft-teams",
+              filename: filenames[index],
+              phase: terminal
+                ? index === 0
+                  ? "declined"
+                  : "expired"
+                : cancelledHead && index === 0
+                  ? "cancelled"
+                  : "awaiting_consent",
+              version: terminal ? 3 : 2,
+            },
+          })),
+        ];
+        return fulfill(route, {
+          publication: parts[1],
+          parts,
+          total: 3,
+          published: 1,
+          awaitingConsent: terminal ? 0 : cancelledHead ? 1 : 2,
+          declined: terminal ? 1 : 0,
+          expired: terminal ? 1 : 0,
+          cancelled: !terminal && cancelledHead ? 1 : 0,
+          settled: terminal ? 3 : cancelledHead ? 2 : 1,
+          canDismiss: terminal,
+        });
+      });
+      await page.goto(`/${seed.prefix}/issues/${issue.identifier}`);
+      const banner = page.getByRole("region", {
+        name: "External conversation",
+        exact: true,
+      });
+      await banner
+        .getByRole("button", { name: "Send to channel", exact: true })
+        .click();
+      for (const name of filenames) {
+        await banner
+          .getByLabel("Attach file to channel update", { exact: true })
+          .setInputFiles({
+            name,
+            mimeType: "text/plain",
+            buffer: Buffer.from(`Synthetic consent fixture: ${name}.\n`),
+          });
+        await expect(
+          banner.getByRole("checkbox", { name, exact: true }),
+        ).toBeChecked();
+        await expect(
+          banner.getByLabel("Attach file to channel update", { exact: true }),
+        ).toBeEnabled();
+      }
+      expect(posts).toHaveLength(0);
+      await banner
+        .getByRole("textbox", { name: "Board update", exact: true })
+        .fill("Please review these two files.");
+      await banner
+        .getByRole("button", { name: "Send to channel", exact: true })
+        .last()
+        .click();
+      await expect.poll(() => posts.length).toBe(1);
+      expect(posts[0].attachmentIds).toHaveLength(2);
+      await expect(
+        banner.getByText(
+          cancelledHead
+            ? "1 published · 1 awaiting consent · 1 cancelled"
+            : "1 published · 2 awaiting consent",
+          { exact: true },
+        ),
+      ).toBeVisible();
+      const retainedBeforeReload = await page.evaluate(
+        (key) => sessionStorage.getItem(key),
+        storageKey,
+      );
+      expect(JSON.parse(retainedBeforeReload!).publication.id).toBe(anchor);
+      const readsBeforeReload = statusReads.length;
+      await page.reload();
+      await expect
+        .poll(() => statusReads.length)
+        .toBeGreaterThan(readsBeforeReload);
+      expect(
+        await page.evaluate((key) => sessionStorage.getItem(key), storageKey),
+      ).toBe(retainedBeforeReload);
+      expect(
+        statusReads.every(
+          (path) => path === `${publicationsPath}/${anchor}/status`,
+        ),
+      ).toBe(true);
+      await expect(
+        banner.getByRole("textbox", { name: "Board update", exact: true }),
+      ).toBeDisabled();
+      await expect(
+        banner.getByLabel("Attach file to channel update", { exact: true }),
+      ).toBeDisabled();
+      await expect(
+        banner
+          .getByRole("button", { name: "Send to channel", exact: true })
+          .last(),
+      ).toBeDisabled();
+      await expect(
+        banner.getByRole("button", {
+          name: "Dismiss delivery receipt",
+          exact: true,
+        }),
+      ).toHaveCount(0);
+      await expect(
+        banner.getByText(
+          cancelledHead
+            ? "Waiting for remaining file consent"
+            : "Waiting for file consent",
+          { exact: true },
+        ),
+      ).toBeVisible();
+      await expect(
+        banner.getByText("Channel delivery cancelled", { exact: true }),
+      ).toHaveCount(0);
+      await expect(
+        banner.getByText("Sent to channel", { exact: true }),
+      ).toHaveCount(0);
+      for (const name of filenames) {
+        await expect(
+          banner.getByRole("checkbox", { name, exact: true }),
+        ).toBeChecked();
+        await expect(
+          banner.getByRole("checkbox", { name, exact: true }),
+        ).toBeDisabled();
+      }
+      expect(posts).toHaveLength(1);
+      await banner.screenshot({
+        path: testInfo.outputPath("consent-waiting.png"),
+      });
+      if (cancelledHead) return;
+
+      terminal = true;
+      await expect(
+        banner.getByText("Delivery settled with mixed outcomes", {
+          exact: true,
+        }),
+      ).toBeVisible({ timeout: 8_000 });
+      await expect(
+        banner.getByText("1 published · 1 declined · 1 expired", {
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(
+        banner.getByText("consent-report.txt — Declined", { exact: true }),
+      ).toBeVisible();
+      await expect(
+        banner.getByText("consent-notes.txt — Consent expired", {
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(
+        banner
+          .getByRole("button", { name: "Send to channel", exact: true })
+          .last(),
+      ).toBeDisabled();
+      await banner.screenshot({
+        path: testInfo.outputPath("consent-mixed.png"),
+      });
+      expect(posts).toHaveLength(1);
+      await banner
+        .getByRole("button", { name: "Dismiss delivery receipt", exact: true })
+        .click();
+      await expect(
+        banner.getByRole("textbox", { name: "Board update", exact: true }),
+      ).toHaveValue("");
+      await expect(
+        banner.getByRole("textbox", { name: "Board update", exact: true }),
+      ).toBeEnabled();
+      await expect(
+        banner
+          .getByRole("button", { name: "Send to channel", exact: true })
+          .last(),
+      ).toBeDisabled();
+      expect(
+        await page.evaluate((key) => sessionStorage.getItem(key), storageKey),
+      ).toBeNull();
+      expect(posts).toHaveLength(1);
+      await expect(
+        page.getByText("Sent to channel", { exact: true }),
+      ).toHaveCount(0);
+      for (const name of filenames) {
+        await expect(
+          banner.getByRole("checkbox", { name, exact: true }),
+        ).not.toBeChecked();
+      }
+      await banner
+        .getByRole("textbox", { name: "Board update", exact: true })
+        .fill("A separate text-only update.");
+      expect(posts).toHaveLength(1);
+      await banner
+        .getByRole("button", { name: "Send to channel", exact: true })
+        .last()
+        .click();
+      await expect.poll(() => posts.length).toBe(2);
+      expect(posts[1]).toMatchObject({
+        body: "A separate text-only update.",
+      });
+      expect(posts[1]).not.toHaveProperty("attachmentIds");
+      expect(posts[1].idempotencyKey).not.toBe(posts[0].idempotencyKey);
+    });
+  }
 
   for (const outcome of [
     "published",

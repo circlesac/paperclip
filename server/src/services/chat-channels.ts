@@ -56,6 +56,7 @@ import {
   chatMessageLinks,
   chatPublications,
   chatSdkState,
+  chatTeamsFileTransfers,
   companies,
   companyMemberships,
   companySecretBindings,
@@ -80,6 +81,7 @@ import type {
   ChatEndpointSetupState,
   ChatProvider,
   ChatPublicationBatchStatus,
+  ChatPublicationSummary,
   ConfigureChatEndpointInput,
   CreateChatEndpointInput,
   ExternalChannelBindingSummary,
@@ -102,6 +104,24 @@ import {
   normalizeUploadAttachmentContentType,
 } from "../attachment-types.js";
 import { isUniqueViolation } from "../db-errors.js";
+import {
+  bindTeamsPersonalRecipient,
+  deriveTeamsPersonalRecipient,
+  parseTeamsPersonalRecipient,
+} from "./chat-teams-personal-recipient.js";
+import {
+  teamsFileTransferService,
+  type TeamsFileTransferAuthority,
+  type TeamsFileTransferOptions,
+} from "./chat-teams-file-transfers.js";
+import { projectTeamsFilePublication } from "./chat-teams-file-publication.js";
+import type { TeamsFileConsentEvent } from "./chat-teams-file-consent.js";
+import {
+  chatFileTransferResolutionActions,
+  projectChatFileTransfer,
+  projectChatPublicationBatch,
+} from "./chat-publication-batches.js";
+
 import { telegramAttachmentForUpload } from "./chat-telegram-photo.js";
 import {
   nativeFailedRunRetryStateIsSafe,
@@ -267,6 +287,38 @@ import type {
   Thread,
 } from "chat";
 import { Actions, Button, Card, CardText, LinkButton } from "chat";
+
+// Only these closed fields may reach Activity or a delivery-batch response.
+// The resolution predicate yields one boolean, never the private envelope.
+const fileTransferProjectionColumns = {
+  publicationId: chatTeamsFileTransfers.publicationId,
+  phase: chatTeamsFileTransfers.phase,
+  version: chatTeamsFileTransfers.version,
+  filename: chatTeamsFileTransfers.filename,
+  expiresAt: chatTeamsFileTransfers.expiresAt,
+  consentMessageId: chatTeamsFileTransfers.consentMessageId,
+  responseActivityId: chatTeamsFileTransfers.responseActivityId,
+  fileInfoMessageId: chatTeamsFileTransfers.fileInfoMessageId,
+  operatorConfirmed: sql<boolean>`
+    coalesce(${chatTeamsFileTransfers.privateState}#>>'{resolution,schema}', '') = 'paperclip.teams.file-resolution.v1'
+    and coalesce(${chatTeamsFileTransfers.privateState}#>>'{resolution,action}', '') = 'mark_delivered'
+    and coalesce(${chatTeamsFileTransfers.privateState}#>>'{resolution,fromPhase}', '') = 'file_info_unknown'
+  `,
+};
+
+function publicationSummary(
+  row: typeof chatPublications.$inferSelect,
+): ChatPublicationSummary {
+  return {
+    id: row.id,
+    state: row.state,
+    providerUrl: row.providerUrl,
+    attempts: row.attempts,
+    redactedError: row.redactedError,
+    nextAttemptAt: row.nextAttemptAt?.toISOString() ?? null,
+    publishedAt: row.publishedAt?.toISOString() ?? null,
+  };
+}
 
 const PROVIDER_LABELS: Record<ChatProvider, string> = {
   slack: "Slack",
@@ -1204,6 +1256,8 @@ export interface ChatChannelServiceOptions {
     token: string;
   }) => Promise<boolean>;
   fetch?: typeof globalThis.fetch;
+  /** Test-only private upload transport; production retains guarded egress. */
+  teamsFileUploadRequest?: TeamsFileTransferOptions["uploadRequest"];
   heartbeat: IssueAssignmentWakeupDeps & {
     cancelRun?: (
       runId: string,
@@ -2731,6 +2785,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   // One bounded publication lane per endpoint; credential/reconnect fencing
   // still serializes a bot's sends while unrelated bots can make progress.
   const publicationEndpointTasks = new Map<string, Promise<void>>();
+  // Scheduling-only cooldown for rejected/contended staged work. Do not alter
+  // an unverified transfer or its publication merely because a worker saw it.
+  const teamsFileRetryAfter = new Map<string, number>();
   const runtimeContexts = new WeakMap<object, RuntimeContext>();
   const runtimeInitializations = new Map<
     string,
@@ -7157,6 +7214,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                   : undefined,
               onMessageDeleted: (event) => handleMessageDeleted(event, context),
               onMessageUpdated: (event) => handleMessageUpdated(event, context),
+              onTeamsFileConsent:
+                record.endpoint.provider === "microsoft-teams"
+                  ? (event) => handleTeamsFileConsent(event, context)
+                  : undefined,
               onReaction:
                 record.endpoint.capabilities.reactions === true
                   ? (event) => handleReaction(event, context)
@@ -10236,6 +10297,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         resultId: string;
         canonicalSha256?: string;
         decisionId?: string;
+        /** Internal source-proof continuation for one locked Teams transfer.
+         * Never permission to repeat its card/PUT or retry a model run. */
+        continuingTeamsFileTransfer?: {
+          transferId: string;
+          publicationId: string;
+          version: number;
+          phase: "consent_unknown" | "file_info_unknown";
+        };
       };
     },
     visited = new Set<string>(),
@@ -10377,6 +10446,126 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       )
         throw failedChatRetryDenied();
     }
+    let continuingUnknownPublicationId: string | undefined;
+    const continuingTransfer =
+      input.committedResponse?.continuingTeamsFileTransfer;
+    if (continuingTransfer !== undefined) {
+      if (
+        input.publication !== true ||
+        input.retryActionId !== undefined ||
+        input.runId !== undefined ||
+        provider !== "microsoft-teams" ||
+        !continuingTransfer ||
+        !isUuidLike(continuingTransfer.transferId) ||
+        !isUuidLike(continuingTransfer.publicationId) ||
+        !Number.isSafeInteger(continuingTransfer.version) ||
+        continuingTransfer.version < 1 ||
+        !["consent_unknown", "file_info_unknown"].includes(
+          continuingTransfer.phase,
+        )
+      )
+        throw failedChatRetryDenied();
+      // The caller supplies a selector only. Independently prove the exact
+      // unknown publication is this native run's own selected file, not a
+      // sibling effect or another actor/generation. All ordinary source and
+      // committed-result authorization below still runs unchanged.
+      const [continuing] = await tx
+        .select({
+          publicationId: chatPublications.id,
+          attemptId: chatTeamsFileTransfers.attemptId,
+          attemptExpiresAt: chatTeamsFileTransfers.attemptExpiresAt,
+        })
+        .from(chatTeamsFileTransfers)
+        .innerJoin(
+          chatPublications,
+          and(
+            eq(chatPublications.id, chatTeamsFileTransfers.publicationId),
+            eq(chatPublications.companyId, chatTeamsFileTransfers.companyId),
+            eq(chatPublications.endpointId, chatTeamsFileTransfers.endpointId),
+            eq(
+              chatPublications.conversationId,
+              chatTeamsFileTransfers.conversationId,
+            ),
+            eq(chatPublications.issueId, chatTeamsFileTransfers.issueId),
+            eq(chatPublications.commentId, chatTeamsFileTransfers.commentId),
+            eq(chatPublications.state, "delivery_unknown"),
+            sql`${chatPublications.payload}->'attachmentIds' = jsonb_build_array(${chatTeamsFileTransfers.attachmentId}::text)`,
+          ),
+        )
+        .innerJoin(
+          chatEndpoints,
+          and(
+            eq(chatEndpoints.id, chatTeamsFileTransfers.endpointId),
+            eq(chatEndpoints.companyId, input.companyId),
+            eq(chatEndpoints.provider, "microsoft-teams"),
+          ),
+        )
+        .innerJoin(
+          chatConversations,
+          and(
+            eq(chatConversations.id, chatTeamsFileTransfers.conversationId),
+            eq(chatConversations.companyId, input.companyId),
+            eq(chatConversations.endpointId, chatTeamsFileTransfers.endpointId),
+            eq(chatConversations.issueId, issue.id),
+            eq(
+              chatConversations.sessionGeneration,
+              chatTeamsFileTransfers.conversationGeneration,
+            ),
+          ),
+        )
+        .innerJoin(
+          issueComments,
+          and(
+            eq(issueComments.id, chatTeamsFileTransfers.commentId),
+            eq(issueComments.companyId, input.companyId),
+            eq(issueComments.issueId, issue.id),
+            eq(issueComments.createdByRunId, failedRun.id),
+            eq(issueComments.authorAgentId, input.agentId),
+            isNull(issueComments.deletedAt),
+          ),
+        )
+        .innerJoin(
+          issueAttachments,
+          and(
+            eq(issueAttachments.id, chatTeamsFileTransfers.attachmentId),
+            eq(issueAttachments.companyId, input.companyId),
+            eq(issueAttachments.issueId, issue.id),
+            eq(issueAttachments.issueCommentId, issueComments.id),
+            eq(issueAttachments.originatingRunId, failedRun.id),
+          ),
+        )
+        .innerJoin(
+          assets,
+          and(
+            eq(assets.id, issueAttachments.assetId),
+            eq(assets.companyId, input.companyId),
+            eq(assets.sha256, chatTeamsFileTransfers.sha256),
+            eq(assets.byteSize, chatTeamsFileTransfers.byteSize),
+          ),
+        )
+        .where(
+          and(
+            eq(chatTeamsFileTransfers.companyId, input.companyId),
+            eq(chatTeamsFileTransfers.issueId, issue.id),
+            eq(chatTeamsFileTransfers.id, continuingTransfer.transferId),
+            eq(
+              chatTeamsFileTransfers.publicationId,
+              continuingTransfer.publicationId,
+            ),
+            eq(chatTeamsFileTransfers.version, continuingTransfer.version),
+            eq(chatTeamsFileTransfers.phase, continuingTransfer.phase),
+          ),
+        )
+        .for("share", { noWait: true });
+      if (
+        !continuing ||
+        (continuing.attemptId &&
+          (!continuing.attemptExpiresAt ||
+            continuing.attemptExpiresAt > new Date()))
+      )
+        throw failedChatRetryDenied();
+      continuingUnknownPublicationId = continuing.publicationId;
+    }
     const [question] = await tx
       .select({ id: issueThreadInteractions.id })
       .from(issueThreadInteractions)
@@ -10407,6 +10596,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           eq(chatPublications.issueId, issue.id),
           input.committedResponse
             ? eq(chatPublications.state, "delivery_unknown")
+            : undefined,
+          continuingUnknownPublicationId
+            ? ne(chatPublications.id, continuingUnknownPublicationId)
             : undefined,
           or(
             and(
@@ -12283,10 +12475,32 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         providerMessageId: message.id,
         raw: message.raw,
       }) ?? recoveredProviderUrl;
+    // Preserve only the closed personal-recipient proof from the runtime that
+    // authenticated this original activity. A reconstructed delivery's AAD-only
+    // author and SDK route caches cannot recreate its Bot Framework recipient.
+    const teamsPersonalRecipient =
+      endpoint.provider === "microsoft-teams" &&
+      runtimeContext?.endpointRuntime &&
+      !admittedDeliveryId &&
+      endpoint.providerAccountId &&
+      endpoint.botExternalId
+        ? deriveTeamsPersonalRecipient(message, {
+            companyId: endpoint.companyId,
+            endpointId: endpoint.id,
+            runtimeGeneration: runtimeContext.generation,
+            credentialFingerprint: runtimeContext.credentialFingerprint,
+            tenantId: endpoint.providerAccountId,
+            botAppId: endpoint.botExternalId,
+            providerEventId,
+            threadId: thread.id,
+            isDirectMessage: thread.isDM,
+          })
+        : null;
     const normalized = {
       providerEventId,
       kind: eventKind,
       trigger,
+      ...(teamsPersonalRecipient ? { teamsPersonalRecipient } : {}),
       ...(suppressSetupDestinationActivation
         ? // A slash-command root is provider-confirmed only after an enabled
           // destination authorized its transport. Persist that closed origin so
@@ -25286,6 +25500,39 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         action.deliveryId ? [action.deliveryId] : [],
       ),
     );
+    const transferRows = publications.length
+      ? await db
+          .select(fileTransferProjectionColumns)
+          .from(chatTeamsFileTransfers)
+          .innerJoin(
+            chatPublications,
+            and(
+              eq(chatPublications.id, chatTeamsFileTransfers.publicationId),
+              eq(chatPublications.companyId, chatTeamsFileTransfers.companyId),
+              eq(
+                chatPublications.endpointId,
+                chatTeamsFileTransfers.endpointId,
+              ),
+              eq(
+                chatPublications.conversationId,
+                chatTeamsFileTransfers.conversationId,
+              ),
+            ),
+          )
+          .where(
+            and(
+              eq(chatTeamsFileTransfers.companyId, publications[0]!.companyId),
+              eq(chatTeamsFileTransfers.endpointId, endpointId),
+              inArray(
+                chatTeamsFileTransfers.publicationId,
+                publications.map((row) => row.id),
+              ),
+            ),
+          )
+      : [];
+    const transfers = new Map(
+      transferRows.map((row) => [row.publicationId, row]),
+    );
     return [
       ...deliveries.map((row) => {
         const normalized =
@@ -25326,6 +25573,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         };
       }),
       ...publications.map((row) => {
+        const transfer = transfers.get(row.id);
+        const projected = projectChatFileTransfer(
+          publicationSummary(row),
+          transfer,
+        );
         const payload = row.payload as Partial<SafeChatPublicationPayload>;
         const summary = payload.progressState
           ? `${payload.progressState.replaceAll("_", " ")} update`
@@ -25335,13 +25587,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return {
           id: row.id,
           kind: "publication" as const,
-          status: row.state,
+          status: projected.state,
           summary,
-          detail: row.redactedError,
+          detail: projected.redactedError ?? null,
           createdAt: row.createdAt.toISOString(),
-          replayable: row.state === "failed",
-          resolutionActions:
-            row.state === "delivery_unknown"
+          replayable: !transfer && row.state === "failed",
+          ...(projected.fileTransfer
+            ? { fileTransfer: projected.fileTransfer }
+            : {}),
+          resolutionActions: transfer
+            ? chatFileTransferResolutionActions(projected)
+            : row.state === "delivery_unknown"
               ? (["mark_delivered", "retry_anyway", "cancel"] as const)
               : [],
         };
@@ -25659,22 +25915,61 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         );
       }
     }
-    const claimed = await db
-      .update(chatPublications)
-      .set({
-        state: "retry",
-        nextAttemptAt: new Date(),
-        redactedError: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(chatPublications.id, publication.id),
-          eq(chatPublications.state, publication.state),
-          eq(chatPublications.attempts, publication.attempts),
-        ),
+    const claimed = await db.transaction(async (tx) => {
+      const current = await tx
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.companyId, publication.companyId),
+            eq(chatPublications.endpointId, endpointId),
+            eq(chatPublications.id, publication.id),
+          ),
+        )
+        .for("update")
+        .then((rows) => rows[0]);
+      if (
+        !current ||
+        current.state !== publication.state ||
+        current.attempts !== publication.attempts
       )
-      .returning({ id: chatPublications.id });
+        return [];
+      // Lock the publication before checking the transfer lane: issue() takes
+      // the same lock, so a concurrent consent/upload cannot slip into replay.
+      const transfer = await tx
+        .select({ id: chatTeamsFileTransfers.id })
+        .from(chatTeamsFileTransfers)
+        .where(
+          and(
+            eq(chatTeamsFileTransfers.companyId, current.companyId),
+            eq(chatTeamsFileTransfers.publicationId, current.id),
+          ),
+        )
+        .then((rows) => rows[0]);
+      if (transfer)
+        throw conflict(
+          "File delivery requires a stage-specific operator resolution",
+          {
+            code: "chat_file_transfer_resolution_required",
+          },
+        );
+      return tx
+        .update(chatPublications)
+        .set({
+          state: "retry",
+          nextAttemptAt: new Date(),
+          redactedError: null,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(chatPublications.id, publication.id),
+            eq(chatPublications.state, publication.state),
+            eq(chatPublications.attempts, publication.attempts),
+          ),
+        )
+        .returning({ id: chatPublications.id });
+    });
     if (!claimed.length) {
       throw conflict("This publication is already being replayed", {
         code: "chat_publication_replay_conflict",
@@ -25688,6 +25983,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publicationId: string,
     action: "mark_delivered" | "retry_anyway" | "cancel",
     userId: string,
+    fileTransfer?: {
+      phase: import("@paperclipai/shared").ChatFileTransferPhase;
+      version: number;
+    },
   ) {
     const initialRecord = await endpointRecord(endpointId);
     if (!initialRecord) throw notFound("Chat endpoint not found");
@@ -25708,6 +26007,91 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             .for("update")
             .then((rows) => rows[0] ?? null);
           if (!publication) throw notFound("Publication not found");
+          const transfer = await tx
+            .select({
+              id: chatTeamsFileTransfers.id,
+              endpointId: chatTeamsFileTransfers.endpointId,
+              conversationId: chatTeamsFileTransfers.conversationId,
+              phase: chatTeamsFileTransfers.phase,
+              version: chatTeamsFileTransfers.version,
+            })
+            .from(chatTeamsFileTransfers)
+            .where(
+              and(
+                eq(chatTeamsFileTransfers.companyId, publication.companyId),
+                eq(chatTeamsFileTransfers.publicationId, publication.id),
+              ),
+            )
+            .then((rows) => rows[0]);
+          if (transfer || fileTransfer) {
+            const resolutionRequired = () =>
+              conflict(
+                "File delivery requires its current stage-specific resolution",
+                { code: "chat_file_transfer_resolution_required" },
+              );
+            if (
+              !transfer ||
+              !fileTransfer ||
+              publication.state !== "delivery_unknown" ||
+              transfer.endpointId !== publication.endpointId ||
+              transfer.conversationId !== publication.conversationId ||
+              transfer.phase !== fileTransfer.phase ||
+              transfer.version !== fileTransfer.version ||
+              ![
+                "consent_unknown",
+                "upload_unknown",
+                "file_info_unknown",
+                "conflict",
+              ].includes(transfer.phase)
+            )
+              throw resolutionRequired();
+            let result;
+            try {
+              result = await teamsTransferProtocol({
+                credentialLease,
+              }).resolveInTransaction(tx, {
+                companyId: publication.companyId,
+                publicationId: publication.id,
+                transferId: transfer.id,
+                expectedVersion: fileTransfer.version,
+                expectedPhase: fileTransfer.phase as
+                  | "consent_unknown"
+                  | "upload_unknown"
+                  | "file_info_unknown"
+                  | "conflict",
+                action,
+              });
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                error.message ===
+                  "Teams file transfer authority or state changed"
+              )
+                throw resolutionRequired();
+              throw error;
+            }
+            await logActivity(tx as unknown as Db, {
+              companyId: publication.companyId,
+              actorType: "user",
+              actorId: userId,
+              action: `chat.publication_${action}`,
+              entityType: "chat_publication",
+              entityId: publication.id,
+              issueId: publication.issueId,
+              details: {
+                endpointId,
+                conversationId: publication.conversationId,
+                transferId: transfer.id,
+                previousPhase: fileTransfer.phase,
+                previousVersion: fileTransfer.version,
+                nextPhase: result.phase,
+                nextVersion: result.version,
+                duplicateRiskAcknowledged: action === "retry_anyway",
+              },
+            });
+            await credentialLease.assertOwned(tx);
+            return;
+          }
           if (publication.state !== "delivery_unknown") {
             throw conflict(
               "Only an unconfirmed publication needs an operator resolution",
@@ -26723,42 +27107,49 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // An explicit Board send and every durable text/file transport part share
     // its comment. Read all parts without Activity's history limit; never
     // advance the worker or replay a provider side effect from this GET.
-    const batch = anchor.commentId
-      ? await db
-          .select()
-          .from(chatPublications)
-          .where(
-            and(
-              eq(chatPublications.companyId, anchor.companyId),
-              eq(chatPublications.endpointId, endpointId),
-              eq(chatPublications.conversationId, conversationId),
-              eq(chatPublications.commentId, anchor.commentId),
-            ),
-          )
-          .orderBy(
-            asc(chatPublications.createdAt),
-            asc(publicationTransportOrderKey(chatPublications)),
-          )
-      : [anchor];
-    const current =
-      batch.find((candidate) => candidate.state !== "published") ??
-      batch.at(-1);
-    if (!current) throw notFound("Chat publication not found");
-    return {
-      publication: {
-        id: current.id,
-        state:
-          current.state as ChatPublicationBatchStatus["publication"]["state"],
-        providerUrl: current.providerUrl,
-        attempts: current.attempts,
-        redactedError: current.redactedError,
-        nextAttemptAt: current.nextAttemptAt?.toISOString() ?? null,
-        publishedAt: current.publishedAt?.toISOString() ?? null,
-      },
-      total: batch.length,
-      published: batch.filter((candidate) => candidate.state === "published")
-        .length,
-    };
+    // Join public receipts and private transfer facts in one database snapshot.
+    // A concurrent consent or file receipt cannot produce a mixed-time batch.
+    const batch = await db
+      .select({
+        publication: chatPublications,
+        transfer: fileTransferProjectionColumns,
+      })
+      .from(chatPublications)
+      .leftJoin(
+        chatTeamsFileTransfers,
+        and(
+          eq(chatTeamsFileTransfers.companyId, chatPublications.companyId),
+          eq(chatTeamsFileTransfers.endpointId, chatPublications.endpointId),
+          eq(
+            chatTeamsFileTransfers.conversationId,
+            chatPublications.conversationId,
+          ),
+          eq(chatTeamsFileTransfers.publicationId, chatPublications.id),
+        ),
+      )
+      .where(
+        and(
+          eq(chatPublications.companyId, anchor.companyId),
+          eq(chatPublications.endpointId, endpointId),
+          eq(chatPublications.conversationId, conversationId),
+          anchor.commentId
+            ? eq(chatPublications.commentId, anchor.commentId)
+            : eq(chatPublications.id, anchor.id),
+        ),
+      )
+      .orderBy(
+        asc(chatPublications.createdAt),
+        asc(publicationTransportOrderKey(chatPublications)),
+      );
+    if (!batch.length) throw notFound("Chat publication not found");
+    return projectChatPublicationBatch(
+      batch.map(({ publication, transfer }) =>
+        projectChatFileTransfer(
+          publicationSummary(publication),
+          transfer?.publicationId ? transfer : undefined,
+        ),
+      ),
+    );
   }
 
   async function publishComment(
@@ -26843,6 +27234,31 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     // conversation can neither suppress its send nor return the first task's
     // publication.
     const idempotencyKey = `explicit-board:${endpointId}:${conversationId}:${clientIdempotencyKey}`;
+    if (attachmentIds.length > 0) {
+      const record = await endpointRecord(endpointId);
+      if (
+        record?.endpoint.provider === "microsoft-teams" &&
+        record.endpoint.status === "active"
+      ) {
+        const [existing] = await db
+          .select({ id: chatPublications.id })
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.companyId, record.endpoint.companyId),
+              eq(chatPublications.endpointId, endpointId),
+              eq(chatPublications.conversationId, conversationId),
+              eq(chatPublications.idempotencyKey, idempotencyKey),
+            ),
+          )
+          .limit(1);
+        // A cold service must not permanently choose the task-link fallback
+        // merely because runtime reconciliation has not run yet. Initialize
+        // outside all Board/source locks, then recheck the full scope below.
+        // A repeated send identity needs only its existing durable receipt.
+        if (!existing) await runtimeFor(record.endpoint);
+      }
+    }
     const publication = await db.transaction(async (tx) => {
       const conversation = await tx
         .select()
@@ -26964,6 +27380,12 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             updatedAt: attachmentCreatedAt,
           })
           .returning();
+        await stageTeamsBoardFileIntent(
+          tx,
+          attachmentPublication,
+          userId,
+          conversation,
+        );
         terminalPublication = attachmentPublication;
       }
       await logActivity(tx as unknown as Db, {
@@ -27009,6 +27431,1302 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       batch.at(-1) ??
       publication
     );
+  }
+
+  // Native Teams file consent is authority for one personal recipient and one
+  // immutable file, not authority inferred from the SDK's latest route cache.
+  const teamsBoardFileIntentKind = "teams_board_file_intent";
+  const teamsFileProofHash = (value: unknown) =>
+    createHash("sha256")
+      .update(
+        JSON.stringify(value, (_key, entry) =>
+          entry && typeof entry === "object" && !Array.isArray(entry)
+            ? Object.fromEntries(
+                Object.keys(entry)
+                  .sort()
+                  .map((key) => [key, entry[key]]),
+              )
+            : entry,
+        ),
+      )
+      .digest("hex");
+
+  async function teamsFileCurrentScope(
+    tx: DbTransaction,
+    supplied: typeof chatPublications.$inferSelect,
+    fence?: LifecycleRuntimeFence,
+  ) {
+    const [endpoint] = await tx
+      .select()
+      .from(chatEndpoints)
+      .where(
+        and(
+          eq(chatEndpoints.companyId, supplied.companyId),
+          eq(chatEndpoints.id, supplied.endpointId),
+        ),
+      )
+      .for("no key update", { noWait: true });
+    if (
+      !endpoint ||
+      endpoint.provider !== "microsoft-teams" ||
+      endpoint.status !== "active" ||
+      !endpoint.allowDirectMessages ||
+      !isUuidLike(endpoint.providerAccountId) ||
+      !isUuidLike(endpoint.botExternalId)
+    )
+      return null;
+    const [connection] = await tx
+      .select()
+      .from(toolConnections)
+      .where(
+        and(
+          eq(toolConnections.companyId, endpoint.companyId),
+          eq(toolConnections.id, endpoint.connectionId),
+        ),
+      )
+      .for("share", { noWait: true });
+    if (!connection?.enabled || connection.status !== "active") return null;
+    const currentFence = {
+      generation: runtimeGeneration(endpoint.setup),
+      credentialFingerprint: credentialFingerprint(
+        connection.credentialSecretRefs,
+      ),
+    };
+    const instance = runtime.get(endpoint.id);
+    const registration = instance
+      ? runtimeContexts.get(instance as object)
+      : null;
+    if (
+      !instance ||
+      !registration ||
+      registration.generation !== currentFence.generation ||
+      registration.credentialFingerprint !==
+        currentFence.credentialFingerprint ||
+      registration.localEpoch !== localRuntimeEpoch(endpoint.id) ||
+      runtimeVersions.get(endpoint.id) !== registration.version ||
+      (fence &&
+        (fence.generation !== currentFence.generation ||
+          fence.credentialFingerprint !== currentFence.credentialFingerprint))
+    )
+      return null;
+    const [conversation] = await tx
+      .select()
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          eq(chatConversations.id, supplied.conversationId),
+          eq(chatConversations.issueId, supplied.issueId),
+        ),
+      )
+      .for("update", { noWait: true });
+    if (
+      !conversation?.isDirectMessage ||
+      !["active", "waiting"].includes(conversation.state)
+    )
+      return null;
+    const [superseded] = await tx
+      .select({ id: chatConversations.id })
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          eq(chatConversations.externalThreadId, conversation.externalThreadId),
+          gt(
+            chatConversations.sessionGeneration,
+            conversation.sessionGeneration,
+          ),
+        ),
+      )
+      .limit(1);
+    if (superseded) return null;
+    const [issue] = await tx
+      .select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, endpoint.companyId),
+          eq(issues.id, conversation.issueId),
+        ),
+      )
+      .for("share", { noWait: true });
+    if (!issue || issue.assigneeAgentId !== endpoint.assignedAgentId)
+      return null;
+    // The conversation lock serializes rollover. The endpoint lock serializes
+    // reach/credential changes; no lock here waits behind inverse Board order.
+    if (conversation.resourceId)
+      await tx
+        .select({ id: chatEndpointResources.id })
+        .from(chatEndpointResources)
+        .where(
+          and(
+            eq(chatEndpointResources.companyId, endpoint.companyId),
+            eq(chatEndpointResources.endpointId, endpoint.id),
+            eq(chatEndpointResources.id, conversation.resourceId),
+          ),
+        )
+        .for("update", { noWait: true });
+    const [publication] = await tx
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, endpoint.companyId),
+          eq(chatPublications.endpointId, endpoint.id),
+          eq(chatPublications.conversationId, conversation.id),
+          eq(chatPublications.issueId, conversation.issueId),
+          eq(chatPublications.id, supplied.id),
+        ),
+      )
+      .for("update", { noWait: true });
+    const ids = publication?.payload.attachmentIds;
+    if (
+      !publication?.commentId ||
+      !Array.isArray(ids) ||
+      ids.length !== 1 ||
+      !isUuidLike(ids[0]) ||
+      publication.payload.progressState !== undefined ||
+      publication.payload.interactionId ||
+      publication.payload.card ||
+      publication.idempotencyKey.startsWith("control:") ||
+      publication.idempotencyKey.startsWith("wake:")
+    )
+      return null;
+    const [comment] = await tx
+      .select()
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, endpoint.companyId),
+          eq(issueComments.issueId, conversation.issueId),
+          eq(issueComments.id, publication.commentId),
+          isNull(issueComments.deletedAt),
+        ),
+      )
+      .for("share", { noWait: true });
+    const [file] = await tx
+      .select({ attachment: issueAttachments, asset: assets })
+      .from(issueAttachments)
+      .innerJoin(
+        assets,
+        and(
+          eq(assets.id, issueAttachments.assetId),
+          eq(assets.companyId, endpoint.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(issueAttachments.companyId, endpoint.companyId),
+          eq(issueAttachments.issueId, conversation.issueId),
+          eq(issueAttachments.issueCommentId, publication.commentId),
+          eq(issueAttachments.id, ids[0]),
+        ),
+      )
+      .for("share", { noWait: true });
+    const filename =
+      file?.asset.originalFilename ??
+      (file ? `attachment-${file.attachment.id}` : "");
+    if (
+      !comment ||
+      comment.updatedAt.getTime() !== comment.createdAt.getTime() ||
+      !file ||
+      !Number.isSafeInteger(file.asset.byteSize) ||
+      file.asset.byteSize <= 0 ||
+      file.asset.byteSize > MAX_ATTACHMENT_BYTES ||
+      file.asset.byteSize >= 60 * 1024 * 1024 ||
+      !/^[a-f0-9]{64}$/.test(file.asset.sha256) ||
+      !file.asset.objectKey.trim() ||
+      !isAllowedContentType(file.asset.contentType) ||
+      !filename ||
+      filename.length > 255 ||
+      filename !== filename.trim() ||
+      filename.endsWith(".") ||
+      /[<>:"/\\|?*\x00-\x1f\x7f]/.test(filename)
+    )
+      return null;
+    const byteIdentity = {
+      attachmentId: file.attachment.id,
+      assetId: file.asset.id,
+      sha256: file.asset.sha256,
+      byteSize: file.asset.byteSize,
+      filename,
+      contentType: file.asset.contentType,
+      originatingRunId: file.attachment.originatingRunId,
+    };
+    return {
+      endpoint,
+      conversation,
+      publication,
+      comment,
+      file,
+      filename,
+      currentFence,
+      byteIdentity,
+      instance,
+    };
+  }
+
+  async function teamsFilePrincipalAuthorization(
+    tx: DbTransaction,
+    endpoint: EndpointRow,
+    principalId: string,
+  ) {
+    const identity = await tx.execute(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${`chat-identity:${endpoint.companyId}:${principalId}`}, 0)) as locked`,
+    );
+    if (!identity[0]?.locked)
+      throw new NativeChatReviewPresentationContentionError();
+    const [link] = await tx
+      .select()
+      .from(chatIdentityLinks)
+      .where(
+        and(
+          eq(chatIdentityLinks.companyId, endpoint.companyId),
+          eq(chatIdentityLinks.endpointId, endpoint.id),
+          eq(chatIdentityLinks.principalId, principalId),
+        ),
+      )
+      .for("update", { noWait: true });
+    const userId =
+      link?.status === "linked" ? link.paperclipUserId : endpoint.sponsorUserId;
+    if (userId)
+      await tx
+        .select()
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, endpoint.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, userId),
+          ),
+        )
+        .for("update", { noWait: true });
+    // All rows and the identity advisory key used by the common authorization
+    // helper are already held; the helper cannot introduce an inverse wait.
+    return lockCurrentPrincipalAuthorization(tx, endpoint, principalId);
+  }
+
+  async function teamsFileSourceBinding(
+    tx: DbTransaction,
+    scope: NonNullable<Awaited<ReturnType<typeof teamsFileCurrentScope>>>,
+    actionId: string,
+  ) {
+    const { endpoint, conversation } = scope;
+    const [action] = await tx
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, endpoint.companyId),
+          eq(chatActions.endpointId, endpoint.id),
+          eq(chatActions.conversationId, conversation.id),
+          eq(chatActions.id, actionId),
+          eq(chatActions.kind, "inbound_wakeup"),
+          eq(chatActions.status, "processed"),
+        ),
+      )
+      .for("update", { noWait: true });
+    if (
+      !action?.deliveryId ||
+      !action.principalId ||
+      action.payload.version !== 1 ||
+      action.payload.issueId !== conversation.issueId ||
+      action.payload.agentId !== endpoint.assignedAgentId ||
+      action.payload.sessionGeneration !== conversation.sessionGeneration ||
+      typeof action.payload.commentId !== "string" ||
+      !isUuidLike(action.payload.commentId)
+    )
+      return null;
+    const [delivery] = await tx
+      .select()
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.companyId, endpoint.companyId),
+          eq(chatDeliveries.endpointId, endpoint.id),
+          eq(chatDeliveries.conversationId, conversation.id),
+          eq(chatDeliveries.id, action.deliveryId),
+          eq(chatDeliveries.principalId, action.principalId),
+          eq(chatDeliveries.state, "processed"),
+          inArray(chatDeliveries.eventKind, [
+            "direct_message",
+            "mention",
+            "message",
+          ]),
+        ),
+      )
+      .for("update", { noWait: true });
+    const originalFence = delivery ? lifecycleRuntimeFence(delivery) : null;
+    const [principal] = await tx
+      .select()
+      .from(chatExternalPrincipals)
+      .where(
+        and(
+          eq(chatExternalPrincipals.companyId, endpoint.companyId),
+          eq(chatExternalPrincipals.id, action.principalId),
+          eq(chatExternalPrincipals.provider, "microsoft-teams"),
+          eq(
+            chatExternalPrincipals.providerAccountId,
+            endpoint.providerAccountId!,
+          ),
+          eq(chatExternalPrincipals.kind, "user"),
+          eq(chatExternalPrincipals.isBot, false),
+        ),
+      )
+      .for("share", { noWait: true });
+    if (!delivery || !originalFence || !principal) return null;
+    const admission = {
+      companyId: endpoint.companyId,
+      endpointId: endpoint.id,
+      runtimeGeneration: originalFence.generation,
+      credentialFingerprint: originalFence.credentialFingerprint,
+      tenantId: endpoint.providerAccountId!,
+      botAppId: endpoint.botExternalId!,
+      providerEventId: delivery.providerEventId,
+      threadId: conversation.externalThreadId,
+      isDirectMessage: true,
+    };
+    const parsed = parseTeamsPersonalRecipient(
+      delivery.normalizedEvent.teamsPersonalRecipient,
+      admission,
+    );
+    const binding = parsed
+      ? bindTeamsPersonalRecipient(parsed, {
+          admission,
+          deliveryId: delivery.id,
+          principalId: principal.id,
+          conversationId: conversation.id,
+          conversationGeneration: conversation.sessionGeneration,
+          externalPrincipalId: principal.externalId,
+        })
+      : null;
+    const originalConversation = delivery.normalizedEvent.conversation as
+      Record<string, unknown> | undefined;
+    const originalMessage = delivery.normalizedEvent.message as
+      Record<string, unknown> | undefined;
+    const originalPrincipal = delivery.normalizedEvent.principal as
+      Record<string, unknown> | undefined;
+    if (
+      !binding ||
+      originalConversation?.isDirectMessage !== true ||
+      typeof originalConversation.externalThreadId !== "string" ||
+      canonicalTeamsThreadId(originalConversation.externalThreadId) !==
+        canonicalTeamsThreadId(conversation.externalThreadId) ||
+      originalMessage?.providerMessageId !==
+        binding.recipient.providerActivityId ||
+      originalPrincipal?.externalId !== principal.externalId
+    )
+      return null;
+    const [source] = await tx
+      .select({ comment: issueComments, link: chatMessageLinks })
+      .from(chatMessageLinks)
+      .innerJoin(
+        issueComments,
+        and(
+          eq(issueComments.id, chatMessageLinks.commentId),
+          eq(issueComments.companyId, endpoint.companyId),
+          eq(issueComments.issueId, conversation.issueId),
+        ),
+      )
+      .where(
+        and(
+          eq(chatMessageLinks.companyId, endpoint.companyId),
+          eq(chatMessageLinks.endpointId, endpoint.id),
+          eq(chatMessageLinks.conversationId, conversation.id),
+          eq(chatMessageLinks.deliveryId, delivery.id),
+          eq(chatMessageLinks.commentId, action.payload.commentId),
+          eq(chatMessageLinks.direction, "inbound"),
+        ),
+      )
+      .for("share", { noWait: true });
+    const expectedUserId =
+      action.payload.requestedByActorType === "user"
+        ? action.payload.requestedByActorId
+        : null;
+    if (
+      !source ||
+      source.link.providerMessageId !== binding.recipient.providerActivityId ||
+      source.comment.deletedAt ||
+      source.comment.createdAt > scope.comment.createdAt ||
+      source.comment.updatedAt.getTime() !==
+        source.comment.createdAt.getTime() ||
+      source.comment.authorUserId !== expectedUserId ||
+      !["user", "system"].includes(
+        String(action.payload.requestedByActorType),
+      ) ||
+      (expectedUserId === null &&
+        action.payload.requestedByActorId !== principal.id)
+    )
+      return null;
+    const [lifecycle] = await tx
+      .select({ id: chatDeliveries.id })
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.companyId, endpoint.companyId),
+          eq(chatDeliveries.endpointId, endpoint.id),
+          or(
+            isNull(chatDeliveries.conversationId),
+            eq(chatDeliveries.conversationId, conversation.id),
+          ),
+          ne(chatDeliveries.state, "filtered"),
+          inArray(chatDeliveries.eventKind, [
+            "message_updated",
+            "message_deleted",
+            "message_restored",
+          ]),
+          sql`${chatDeliveries.normalizedEvent}->'runtimeContext' = ${JSON.stringify(originalFence)}::jsonb`,
+          sql`${chatDeliveries.normalizedEvent}->'message'->>'targetProviderEventId' = ${delivery.providerEventId}`,
+        ),
+      )
+      .limit(1);
+    if (lifecycle) return null;
+    const authorization = await teamsFilePrincipalAuthorization(
+      tx,
+      endpoint,
+      principal.id,
+    );
+    if (!authorization.allowed || authorization.userId !== expectedUserId)
+      return null;
+    const [receipt] = await tx
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, endpoint.companyId),
+          eq(agentWakeupRequests.id, action.id),
+          eq(agentWakeupRequests.agentId, endpoint.assignedAgentId),
+        ),
+      )
+      .for("share", { noWait: true });
+    if (!receipt || ["skipped", "cancelled"].includes(receipt.status))
+      return null;
+    try {
+      assertFailedRetryReceipt(
+        createDurableChatWakeupRequest({
+          id: action.id,
+          companyId: endpoint.companyId,
+          agentId: endpoint.assignedAgentId,
+          issueId: conversation.issueId,
+          commentId: source.comment.id,
+          requestedByActorType: action.payload.requestedByActorType as
+            "user" | "system",
+          requestedByActorId: String(action.payload.requestedByActorId),
+          requestedAt: action.createdAt,
+          authorize: async () => {},
+        }),
+        receipt,
+      );
+    } catch (error) {
+      if (
+        error instanceof HttpError &&
+        (error.details as { code?: string } | undefined)?.code ===
+          "chat_failed_run_retry_not_authorized"
+      )
+        return null;
+      throw error;
+    }
+    return {
+      binding,
+      authorization,
+      action,
+      sourceFacts: {
+        actionId: action.id,
+        deliveryId: delivery.id,
+        commentId: source.comment.id,
+        principalId: principal.id,
+        scope: inboundWakeScope(action),
+        originalFence,
+        bodySha256: createHash("sha256")
+          .update(source.comment.body)
+          .digest("hex"),
+        receiptId: receipt.id,
+        recipientBindingSha256: teamsFileProofHash(binding),
+      },
+    };
+  }
+
+  async function teamsBoardOriginBinding(
+    tx: DbTransaction,
+    scope: NonNullable<Awaited<ReturnType<typeof teamsFileCurrentScope>>>,
+  ) {
+    // Pick the task's first admitted source, never the latest DM actor. If the
+    // durable task contains different recipient principals, consent is ambiguous.
+    const principals = await tx
+      .selectDistinct({ id: chatActions.principalId })
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, scope.endpoint.companyId),
+          eq(chatActions.endpointId, scope.endpoint.id),
+          eq(chatActions.conversationId, scope.conversation.id),
+          eq(chatActions.kind, "inbound_wakeup"),
+          eq(chatActions.status, "processed"),
+          sql`${chatActions.payload}->>'sessionGeneration' = ${String(scope.conversation.sessionGeneration)}`,
+        ),
+      )
+      .limit(2);
+    if (principals.length !== 1 || !principals[0]?.id) return null;
+    const [origin] = await tx
+      .select({ id: chatActions.id })
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, scope.endpoint.companyId),
+          eq(chatActions.endpointId, scope.endpoint.id),
+          eq(chatActions.conversationId, scope.conversation.id),
+          eq(chatActions.kind, "inbound_wakeup"),
+          eq(chatActions.status, "processed"),
+          sql`${chatActions.payload}->>'sessionGeneration' = ${String(scope.conversation.sessionGeneration)}`,
+        ),
+      )
+      .orderBy(asc(chatActions.createdAt), asc(chatActions.id))
+      .limit(1);
+    return origin ? teamsFileSourceBinding(tx, scope, origin.id) : null;
+  }
+
+  async function teamsBoardAuthorIsCurrent(
+    tx: DbTransaction,
+    companyId: string,
+    userId: string,
+  ) {
+    const [membership] = await tx
+      .select()
+      .from(companyMemberships)
+      .where(
+        and(
+          eq(companyMemberships.companyId, companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, userId),
+        ),
+      )
+      .for("share", { noWait: true });
+    return (
+      membership?.status === "active" && membership.membershipRole !== "viewer"
+    );
+  }
+
+  function teamsBoardFileIntentPayload(
+    scope: NonNullable<Awaited<ReturnType<typeof teamsFileCurrentScope>>>,
+    source: NonNullable<Awaited<ReturnType<typeof teamsFileSourceBinding>>>,
+    userId: string,
+  ) {
+    return {
+      schema: "paperclip.teams.board-file-intent.v1",
+      publicationId: scope.publication.id,
+      issueId: scope.conversation.issueId,
+      commentId: scope.comment.id,
+      attachmentId: scope.file.attachment.id,
+      userId,
+      conversationGeneration: scope.conversation.sessionGeneration,
+      sourceActionId: source.action.id,
+      sourceScopeSha256: teamsFileProofHash(source.sourceFacts),
+      recipientBindingSha256: teamsFileProofHash(source.binding),
+      byteIdentitySha256: teamsFileProofHash(scope.byteIdentity),
+      commentBodySha256: createHash("sha256")
+        .update(scope.comment.body)
+        .digest("hex"),
+    };
+  }
+
+  function teamsFileRuntimeStillCurrent(
+    scope: NonNullable<Awaited<ReturnType<typeof teamsFileCurrentScope>>>,
+  ) {
+    const registration = runtimeContexts.get(scope.instance as object);
+    return (
+      runtime.get(scope.endpoint.id) === scope.instance &&
+      registration?.generation === scope.currentFence.generation &&
+      registration.credentialFingerprint ===
+        scope.currentFence.credentialFingerprint &&
+      registration.localEpoch === localRuntimeEpoch(scope.endpoint.id) &&
+      runtimeVersions.get(scope.endpoint.id) === registration.version
+    );
+  }
+
+  async function stageTeamsBoardFileIntent(
+    tx: DbTransaction,
+    publication: typeof chatPublications.$inferSelect,
+    userId: string,
+    conversation: ConversationRow,
+  ): Promise<void> {
+    if (
+      !publication.idempotencyKey.startsWith("explicit-board:") ||
+      !conversation.isDirectMessage
+    )
+      return;
+    const scope = await teamsFileCurrentScope(tx, publication);
+    if (
+      !scope ||
+      scope.conversation.id !== conversation.id ||
+      scope.conversation.sessionGeneration !== conversation.sessionGeneration ||
+      scope.comment.authorUserId !== userId ||
+      scope.comment.authorAgentId ||
+      scope.comment.createdByRunId ||
+      !(await teamsBoardAuthorIsCurrent(tx, scope.endpoint.companyId, userId))
+    )
+      return;
+    const source = await teamsBoardOriginBinding(tx, scope);
+    if (!source || !teamsFileRuntimeStillCurrent(scope)) return;
+    const key = `${teamsBoardFileIntentKind}:${publication.id}`;
+    const payload = teamsBoardFileIntentPayload(scope, source, userId);
+    const [existing] = await tx
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, scope.endpoint.companyId),
+          eq(chatActions.endpointId, scope.endpoint.id),
+          eq(chatActions.providerActionId, key),
+        ),
+      )
+      .for("update", { noWait: true });
+    if (existing) {
+      if (
+        existing.kind !== teamsBoardFileIntentKind ||
+        existing.status !== "processed" ||
+        existing.deliveryId !== source.binding.deliveryId ||
+        existing.principalId !== source.binding.principalId ||
+        existing.conversationId !== scope.conversation.id ||
+        teamsFileProofHash(existing.payload) !== teamsFileProofHash(payload)
+      )
+        throw conflict("The Teams file recipient intent has changed", {
+          code: "chat_file_transfer_authority_changed",
+        });
+      return;
+    }
+    await tx.insert(chatActions).values({
+      companyId: scope.endpoint.companyId,
+      endpointId: scope.endpoint.id,
+      conversationId: scope.conversation.id,
+      deliveryId: source.binding.deliveryId,
+      principalId: source.binding.principalId,
+      kind: teamsBoardFileIntentKind,
+      providerActionId: key,
+      status: "processed",
+      payload,
+    });
+  }
+
+  async function deriveTeamsFileTransferAuthority(
+    tx: DbTransaction,
+    publication: typeof chatPublications.$inferSelect,
+    fence: LifecycleRuntimeFence,
+    continuingTeamsFileTransfer?: NonNullable<
+      NonNullable<
+        Parameters<typeof failedChatRetrySource>[1]["committedResponse"]
+      >["continuingTeamsFileTransfer"]
+    >,
+  ): Promise<TeamsFileTransferAuthority | null> {
+    const scope = await teamsFileCurrentScope(tx, publication, fence);
+    if (!scope) return null;
+    let source: NonNullable<Awaited<ReturnType<typeof teamsFileSourceBinding>>>;
+    let causal: Record<string, unknown>;
+    if (isExplicitOperatorPublication(scope.publication)) {
+      if (
+        !scope.publication.idempotencyKey.startsWith("explicit-board:") ||
+        !scope.comment.authorUserId ||
+        scope.comment.authorAgentId ||
+        scope.comment.createdByRunId ||
+        !(await teamsBoardAuthorIsCurrent(
+          tx,
+          scope.endpoint.companyId,
+          scope.comment.authorUserId,
+        ))
+      )
+        return null;
+      const [intent] = await tx
+        .select()
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.companyId, scope.endpoint.companyId),
+            eq(chatActions.endpointId, scope.endpoint.id),
+            eq(chatActions.conversationId, scope.conversation.id),
+            eq(chatActions.kind, teamsBoardFileIntentKind),
+            eq(
+              chatActions.providerActionId,
+              `${teamsBoardFileIntentKind}:${scope.publication.id}`,
+            ),
+            eq(chatActions.status, "processed"),
+          ),
+        )
+        .for("share", { noWait: true });
+      if (
+        !intent ||
+        typeof intent.payload.sourceActionId !== "string" ||
+        !isUuidLike(intent.payload.sourceActionId)
+      )
+        return null;
+      const bound = await teamsBoardOriginBinding(tx, scope);
+      if (
+        !bound ||
+        bound.action.id !== intent.payload.sourceActionId ||
+        intent.deliveryId !== bound.binding.deliveryId ||
+        intent.principalId !== bound.binding.principalId
+      )
+        return null;
+      const currentPayload = teamsBoardFileIntentPayload(
+        scope,
+        bound,
+        scope.comment.authorUserId,
+      );
+      if (
+        teamsFileProofHash(intent.payload) !==
+        teamsFileProofHash(currentPayload)
+      )
+        return null;
+      source = bound;
+      causal = {
+        kind: "explicit_board_send",
+        intentId: intent.id,
+        ...currentPayload,
+      };
+    } else {
+      const runId = scope.comment.createdByRunId;
+      if (
+        !runId ||
+        scope.comment.authorAgentId !== scope.endpoint.assignedAgentId ||
+        scope.file.attachment.originatingRunId !== runId
+      )
+        return null;
+      const [run] = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, scope.endpoint.companyId),
+            eq(heartbeatRuns.id, runId),
+            eq(heartbeatRuns.agentId, scope.endpoint.assignedAgentId),
+            eq(heartbeatRuns.nativeIssueId, scope.conversation.issueId),
+            eq(heartbeatRuns.runtimeMode, "native"),
+            eq(heartbeatRuns.status, "succeeded"),
+            isNotNull(heartbeatRuns.finishedAt),
+          ),
+        )
+        .for("share", { noWait: true });
+      const marker = run?.resultJson?.nativeCommittedChatResponse as
+        Record<string, unknown> | undefined;
+      if (
+        !run ||
+        !marker ||
+        marker.schema !== "paperclip.native_committed_chat_response.v1" ||
+        typeof marker.resultId !== "string" ||
+        !isUuidLike(marker.resultId) ||
+        typeof marker.decisionId !== "string" ||
+        !isUuidLike(marker.decisionId) ||
+        typeof marker.canonicalSha256 !== "string" ||
+        !/^(?:sha256:)?[a-f0-9]{64}$/.test(marker.canonicalSha256)
+      )
+        return null;
+      // Pre-lock the exact causal source and actor rows before the existing
+      // complete native publication proof invokes its common authorization.
+      const originActions = await tx
+        .select({ id: chatActions.id })
+        .from(chatActions)
+        .where(
+          and(
+            eq(chatActions.companyId, scope.endpoint.companyId),
+            eq(chatActions.conversationId, scope.conversation.id),
+            eq(chatActions.kind, "inbound_wakeup"),
+            inArray(
+              sql<string>`${chatActions.payload}->>'commentId'`,
+              retryCommentIds(run.contextSnapshot ?? {}),
+            ),
+          ),
+        );
+      const bindings: Array<
+        NonNullable<Awaited<ReturnType<typeof teamsFileSourceBinding>>>
+      > = [];
+      for (const action of originActions) {
+        const binding = await teamsFileSourceBinding(tx, scope, action.id);
+        if (!binding) return null;
+        bindings.push(binding);
+      }
+      let proved: FailedChatRetrySource;
+      try {
+        proved = await failedChatRetrySource(tx, {
+          companyId: scope.endpoint.companyId,
+          issueId: scope.conversation.issueId,
+          agentId: run.agentId,
+          failedRunId: run.id,
+          publication: true,
+          committedResponse: {
+            resultId: marker.resultId,
+            canonicalSha256: marker.canonicalSha256,
+            decisionId: marker.decisionId,
+            continuingTeamsFileTransfer,
+          },
+        });
+      } catch (error) {
+        if (
+          error instanceof HttpError &&
+          (error.details as { code?: string } | undefined)?.code ===
+            "chat_failed_run_retry_not_authorized"
+        )
+          return null;
+        throw error;
+      }
+      if (
+        proved.provider !== "microsoft-teams" ||
+        proved.endpointId !== scope.endpoint.id ||
+        proved.conversationId !== scope.conversation.id ||
+        proved.sessionGeneration !== scope.conversation.sessionGeneration ||
+        bindings.length !== proved.sources.length
+      )
+        return null;
+      const ordered = proved.sources.map((entry) =>
+        bindings.find((binding) => binding.action.id === entry.actionId),
+      );
+      const first = ordered[0];
+      if (
+        !first ||
+        ordered.some(
+          (entry) =>
+            !entry ||
+            entry.binding.principalId !== proved.principalId ||
+            entry.binding.recipient.providerConversationId !==
+              first.binding.recipient.providerConversationId ||
+            entry.binding.recipient.providerUserId !==
+              first.binding.recipient.providerUserId ||
+            entry.binding.recipient.aadObjectId !==
+              first.binding.recipient.aadObjectId,
+        )
+      )
+        return null;
+      if (
+        run.resultJson?.finalizationReasonCode ===
+          "governed_response_waiting" &&
+        !(await authorizeNativeChatReviewPresentation(
+          tx as unknown as Db,
+          {
+            companyId: scope.endpoint.companyId,
+            issueId: scope.conversation.issueId,
+            runId: run.id,
+            resultJson: run.resultJson,
+            destination: {
+              endpointId: scope.endpoint.id,
+              conversationId: scope.conversation.id,
+            },
+          },
+          "nonblocking",
+        ))
+      )
+        return null;
+      source = first;
+      causal = {
+        kind: "native_committed_response",
+        runId: run.id,
+        resultId: marker.resultId,
+        canonicalSha256: marker.canonicalSha256,
+        decisionId: marker.decisionId,
+        sourceScopeSha256: proved.sourceScopeSha256,
+        sources: ordered.map((entry) => entry!.sourceFacts),
+      };
+    }
+    // No mutable stage, attempt, receipt, route URL or provider token enters
+    // this digest. The next authorization derives these facts afresh.
+    const sourceDigest = teamsFileProofHash({
+      schema: "paperclip.teams.file-source.v1",
+      companyId: scope.endpoint.companyId,
+      endpointId: scope.endpoint.id,
+      conversationId: scope.conversation.id,
+      conversationGeneration: scope.conversation.sessionGeneration,
+      issueId: scope.conversation.issueId,
+      publicationId: scope.publication.id,
+      commentId: scope.comment.id,
+      causal,
+      byteIdentity: scope.byteIdentity,
+    });
+    if (!teamsFileRuntimeStillCurrent(scope)) return null;
+    return {
+      companyId: scope.endpoint.companyId,
+      endpointId: scope.endpoint.id,
+      conversationId: scope.conversation.id,
+      issueId: scope.conversation.issueId,
+      publicationId: scope.publication.id,
+      commentId: scope.comment.id,
+      attachmentId: scope.file.attachment.id,
+      principalId: source.binding.principalId,
+      authorizedUserId: source.authorization.userId,
+      runtimeGeneration: scope.currentFence.generation,
+      credentialFingerprint: scope.currentFence.credentialFingerprint,
+      conversationGeneration: scope.conversation.sessionGeneration,
+      sourceDigest,
+      tenantId: source.binding.recipient.tenantId,
+      botAppId: source.binding.recipient.botAppId,
+      aadObjectId: source.binding.recipient.aadObjectId,
+      providerConversationId: source.binding.recipient.providerConversationId,
+      providerUserId: source.binding.recipient.providerUserId,
+      sha256: scope.file.asset.sha256,
+      byteSize: scope.file.asset.byteSize,
+      filename: scope.filename,
+    };
+  }
+
+  function teamsTransferProtocol(
+    input: {
+      credentialLease?: CredentialMutationLeaseGuard;
+      callbackContext?: RuntimeContext;
+    } = {},
+  ) {
+    const denied = () =>
+      conflict("Teams file delivery authority changed", {
+        code: "chat_file_transfer_authority_changed",
+      });
+    const currentRuntime = async (authority: TeamsFileTransferAuthority) => {
+      if (!input.credentialLease) throw denied();
+      await input.credentialLease.assertOwned();
+      const record = await endpointRecord(authority.endpointId);
+      if (
+        !record ||
+        record.endpoint.companyId !== authority.companyId ||
+        record.endpoint.provider !== "microsoft-teams" ||
+        record.endpoint.status !== "active"
+      )
+        throw denied();
+      const context = runtimeContextForRecord(record);
+      if (
+        context.generation !== authority.runtimeGeneration ||
+        context.credentialFingerprint !== authority.credentialFingerprint
+      )
+        throw denied();
+      const instance = await runtimeFor(record.endpoint);
+      const registered = runtimeContexts.get(instance as object);
+      if (
+        !registered ||
+        registered.version !== context.version ||
+        registered.localEpoch !== localRuntimeEpoch(authority.endpointId) ||
+        runtime.get(authority.endpointId) !== instance
+      )
+        throw denied();
+      await input.credentialLease.assertOwned();
+      return instance;
+    };
+    const personalThread = (authority: TeamsFileTransferAuthority) =>
+      `teams:${Buffer.from(authority.providerConversationId).toString("base64url")}:personal`;
+    return teamsFileTransferService(db, {
+      project: projectTeamsFilePublication,
+      authorize: async (tx, expected, stage) => {
+        await input.credentialLease?.assertOwned(tx);
+        if (
+          input.callbackContext &&
+          (input.callbackContext.generation !== expected.runtimeGeneration ||
+            input.callbackContext.credentialFingerprint !==
+              expected.credentialFingerprint ||
+            input.callbackContext.localEpoch !==
+              localRuntimeEpoch(expected.endpointId) ||
+            input.callbackContext.endpointRuntime !==
+              runtime.get(expected.endpointId))
+        )
+          throw denied();
+        const [publication] = await tx
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.companyId, expected.companyId),
+              eq(chatPublications.endpointId, expected.endpointId),
+              eq(chatPublications.id, expected.publicationId),
+            ),
+          )
+          .for("update");
+        // This selector is derived only inside the staged protocol's locked
+        // authority check, never from a retry request or a model instruction.
+        const [continuing] =
+          publication?.state === "delivery_unknown" &&
+          (stage === "response" || stage === "file_info")
+            ? await tx
+                .select({
+                  transferId: chatTeamsFileTransfers.id,
+                  publicationId: chatTeamsFileTransfers.publicationId,
+                  version: chatTeamsFileTransfers.version,
+                  phase: chatTeamsFileTransfers.phase,
+                })
+                .from(chatTeamsFileTransfers)
+                .where(
+                  and(
+                    eq(chatTeamsFileTransfers.companyId, expected.companyId),
+                    eq(chatTeamsFileTransfers.endpointId, expected.endpointId),
+                    eq(
+                      chatTeamsFileTransfers.conversationId,
+                      expected.conversationId,
+                    ),
+                    eq(
+                      chatTeamsFileTransfers.publicationId,
+                      expected.publicationId,
+                    ),
+                    eq(
+                      chatTeamsFileTransfers.phase,
+                      stage === "response"
+                        ? "consent_unknown"
+                        : "file_info_unknown",
+                    ),
+                  ),
+                )
+                .for("update")
+            : [];
+        const current =
+          publication &&
+          (await deriveTeamsFileTransferAuthority(
+            tx,
+            publication,
+            {
+              generation: expected.runtimeGeneration,
+              credentialFingerprint: expected.credentialFingerprint,
+            },
+            continuing && {
+              ...continuing,
+              phase: continuing.phase as
+                "consent_unknown" | "file_info_unknown",
+            },
+          ));
+        if (!current) throw denied();
+        await input.credentialLease?.assertOwned(tx);
+        return current;
+      },
+      loadBytes: async (authority) => {
+        const [publication] = await db
+          .select()
+          .from(chatPublications)
+          .where(
+            and(
+              eq(chatPublications.companyId, authority.companyId),
+              eq(chatPublications.endpointId, authority.endpointId),
+              eq(chatPublications.id, authority.publicationId),
+            ),
+          );
+        if (!publication) throw denied();
+        const files = await publicationFiles(publication, publication.payload);
+        if (files.length !== 1 || !Buffer.isBuffer(files[0]?.data))
+          throw denied();
+        return files[0].data;
+      },
+      postConsent: async ({ authority, card, signal }) => {
+        const instance = await currentRuntime(authority);
+        signal.throwIfAborted();
+        return instance.sendTeamsFileConsentCard(
+          personalThread(authority),
+          card,
+        );
+      },
+      postFileInfo: async ({ authority, card, signal }) => {
+        const instance = await currentRuntime(authority);
+        signal.throwIfAborted();
+        return instance.sendTeamsUploadedFileCard(
+          personalThread(authority),
+          card,
+        );
+      },
+      uploadRequest: options.teamsFileUploadRequest,
+    });
+  }
+
+  async function handleTeamsFileConsent(
+    callback: ChatSdkCallbackEvent<TeamsFileConsentEvent>,
+    context: RuntimeContext,
+  ): Promise<"recorded" | "ignored" | "denied"> {
+    if (
+      callback.provider !== "microsoft-teams" ||
+      callback.endpointId !== callback.event.endpointId ||
+      context.endpointRuntime !== runtime.get(callback.endpointId) ||
+      context.localEpoch !== localRuntimeEpoch(callback.endpointId)
+    )
+      return "denied";
+    // Do not wait for the sender's credential lease: an authentic acceptance
+    // can arrive while its consent-card POST is still awaiting the receipt.
+    let result: "recorded" | "ignored" | "denied";
+    try {
+      result = await teamsTransferProtocol({
+        callbackContext: context,
+      }).recordConsent(callback.event);
+    } catch (error) {
+      // A known current-policy denial is not a temporary provider outage.
+      // Contention and unproven persistence still propagate as retryable 503.
+      if (
+        error instanceof HttpError &&
+        (error.details as { code?: string } | undefined)?.code ===
+          "chat_file_transfer_authority_changed"
+      )
+        return "denied";
+      throw error;
+    }
+    if (result === "recorded")
+      scheduleMessageProcessing(async () => {
+        await processPendingPublications();
+      });
+    return result;
+  }
+
+  async function tryProcessTeamsFilePublication(
+    selected: typeof chatPublications.$inferSelect,
+  ): Promise<boolean> {
+    const [existing] = await db
+      .select({
+        id: chatTeamsFileTransfers.id,
+        endpointId: chatTeamsFileTransfers.endpointId,
+        conversationId: chatTeamsFileTransfers.conversationId,
+      })
+      .from(chatTeamsFileTransfers)
+      .where(
+        and(
+          eq(chatTeamsFileTransfers.companyId, selected.companyId),
+          eq(chatTeamsFileTransfers.publicationId, selected.id),
+        ),
+      );
+    if (!existing && !selected.payload.attachmentIds?.length) return false;
+    const record = await endpointRecord(selected.endpointId);
+    if (!record || record.endpoint.provider !== "microsoft-teams")
+      return Boolean(existing);
+    if (
+      existing &&
+      (existing.endpointId !== selected.endpointId ||
+        existing.conversationId !== selected.conversationId)
+    )
+      return true;
+    if (record.endpoint.status !== "active") return Boolean(existing);
+    try {
+      return await withCredentialMutationLease(
+        record.endpoint,
+        async (credentialLease) => {
+          await runtimeFor(record.endpoint);
+          const protocol = teamsTransferProtocol({ credentialLease });
+          let transferId = existing?.id;
+          if (!transferId) {
+            const authority = await db.transaction(async (tx) => {
+              await credentialLease.assertOwned(tx);
+              const [current] = await tx
+                .select()
+                .from(chatPublications)
+                .where(
+                  and(
+                    eq(chatPublications.companyId, selected.companyId),
+                    eq(chatPublications.id, selected.id),
+                  ),
+                )
+                .for("update");
+              if (
+                !current ||
+                !["pending", "retry"].includes(current.state) ||
+                (current.nextAttemptAt && current.nextAttemptAt > new Date())
+              )
+                return null;
+              return deriveTeamsFileTransferAuthority(
+                tx,
+                current,
+                runtimeContextForRecord(record),
+              );
+            });
+            // Missing personal-recipient proof is not permission to guess a DM.
+            // The ordinary path sends the truthful task-link fallback instead.
+            if (!authority) return false;
+            transferId = (
+              await protocol.issue(
+                authority,
+                new Date(Date.now() + 60 * 60 * 1000),
+              )
+            ).id;
+          }
+          // A successful consent/upload transition can immediately progress to
+          // its next effect, but no user wait, unknown outcome or backoff spins.
+          for (let stage = 0; stage < 3; stage++) {
+            const [current] = await db
+              .select({ nextAttemptAt: chatPublications.nextAttemptAt })
+              .from(chatPublications)
+              .where(
+                and(
+                  eq(chatPublications.companyId, selected.companyId),
+                  eq(chatPublications.id, selected.id),
+                ),
+              );
+            if (
+              !current ||
+              (current.nextAttemptAt && current.nextAttemptAt > new Date())
+            )
+              break;
+            const result = await protocol.process(
+              selected.companyId,
+              transferId,
+            );
+            if (
+              ![
+                "consent_pending",
+                "upload_pending",
+                "file_info_pending",
+              ].includes(result.phase)
+            )
+              break;
+          }
+          teamsFileRetryAfter.delete(selected.id);
+          return true;
+        },
+      );
+    } catch {
+      // A failed authorization/lock/receipt write must never fall through to a
+      // generic resend. Preserve exact durable evidence; this cooldown grants
+      // no authority and safely resets when the server restarts.
+      if (teamsFileRetryAfter.size >= 1000)
+        teamsFileRetryAfter.delete(teamsFileRetryAfter.keys().next().value!);
+      teamsFileRetryAfter.set(selected.id, Date.now() + 30_000);
+      return true;
+    }
+  }
+
+  let teamsMaintenancePending = false;
+  let teamsMaintenanceAfter = 0;
+  function scheduleTeamsFileMaintenance() {
+    if (
+      teamsMaintenancePending ||
+      Date.now() < teamsMaintenanceAfter ||
+      shuttingDown
+    )
+      return;
+    teamsMaintenancePending = true;
+    teamsMaintenanceAfter = Date.now() + 30_000;
+    scheduleMessageProcessing(async () => {
+      try {
+        const scopes = await db
+          .selectDistinct({ companyId: chatTeamsFileTransfers.companyId })
+          .from(chatTeamsFileTransfers)
+          .where(
+            or(
+              and(
+                inArray(chatTeamsFileTransfers.phase, [
+                  "consent_pending",
+                  "awaiting_consent",
+                  "upload_pending",
+                ]),
+                lte(chatTeamsFileTransfers.expiresAt, new Date()),
+              ),
+              and(
+                inArray(chatTeamsFileTransfers.phase, [
+                  "consent_sending",
+                  "uploading",
+                  "file_info_sending",
+                  "conflict",
+                ]),
+                lte(chatTeamsFileTransfers.attemptExpiresAt, new Date()),
+              ),
+            ),
+          );
+        const protocol = teamsTransferProtocol();
+        // Separate from the ordinary message queue. Each company sweep bounds
+        // its row count and lock waits and performs no provider I/O.
+        for (const scope of scopes) {
+          if (shuttingDown) break;
+          await protocol.expireAndRecover(scope.companyId, 100);
+        }
+      } catch {
+        // Selection errors are closed here too; private transfer envelopes and
+        // SQL parameters must not escape through the generic background logger.
+        logger.warn(
+          "Teams file maintenance will retry after a temporary failure",
+        );
+      } finally {
+        teamsMaintenancePending = false;
+      }
+    });
   }
 
   async function publicationFiles(
@@ -27377,14 +29095,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           input.endpoint.provider === "github" ||
           input.endpoint.provider === "microsoft-teams"
         ) {
-          // These providers have no safe binary-upload contract in Paperclip's
-          // durable adapter path. Replace only our generated `Shared ….` file
-          // caption; preserve any future custom text before the limitation.
+          // GitHub lacks a bot upload contract. Teams reaches this fallback
+          // only without an admissible personal-consent destination. Replace
+          // our generated caption, preserving any future custom text.
           const generatedFileLabel = /^Shared (.+)\.$/s.exec(text)?.[1] ?? null;
           const limitation =
             input.endpoint.provider === "github"
               ? "This GitHub App connection cannot upload file bytes into comments."
-              : "This Microsoft Teams connection cannot upload file bytes into chats.";
+              : "Direct file delivery isn't available for this Teams conversation.";
           if (generatedFileLabel) {
             const saved = taskUrl
               ? `File saved on the Paperclip task: ${generatedFileLabel}.`
@@ -30591,6 +32309,29 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       eq(chatEndpointLeases.token, token),
     );
     const claimed = await db.transaction(async (tx) => {
+      // Transfer issuance locks this same publication. Check after acquiring
+      // that lock, not through a pre-lock snapshot that could miss a new lane.
+      const current = await tx
+        .select({ id: chatPublications.id })
+        .from(chatPublications)
+        .where(and(
+          eq(chatPublications.companyId, publication.companyId),
+          eq(chatPublications.id, publication.id),
+          eq(chatPublications.state, publication.state),
+          eq(chatPublications.attempts, publication.attempts),
+        ))
+        .for("update")
+        .then((rows) => rows[0]);
+      if (!current) return false;
+      const transfer = await tx
+        .select({ id: chatTeamsFileTransfers.id })
+        .from(chatTeamsFileTransfers)
+        .where(and(
+          eq(chatTeamsFileTransfers.companyId, publication.companyId),
+          eq(chatTeamsFileTransfers.publicationId, current.id),
+        ))
+        .then((rows) => rows[0]);
+      if (transfer) return false;
       const [row] = await tx
         .update(chatPublications)
         .set({
@@ -30730,6 +32471,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       .limit(1)
       .then((result) => result[0] ?? null);
     if (earlierOpenPublication) return;
+    if (await tryProcessTeamsFilePublication(publication)) return;
     await withPublicationAttemptLease(publication, async (publicationLease) => {
       let providerAccepted = false;
       let publicationRuntimeContext: RuntimeContext | null = null;
@@ -31296,6 +33038,22 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         and(
           eq(chatPublications.state, "streaming"),
           lte(chatPublications.updatedAt, staleBefore),
+          // Teams owns separate staged I/O intents and a longer attempt lease.
+          // Only that protocol may recover/quarantine its in-flight stages.
+          notExists(
+            db
+              .select({ id: chatTeamsFileTransfers.id })
+              .from(chatTeamsFileTransfers)
+              .where(
+                and(
+                  eq(
+                    chatTeamsFileTransfers.companyId,
+                    chatPublications.companyId,
+                  ),
+                  eq(chatTeamsFileTransfers.publicationId, chatPublications.id),
+                ),
+              ),
+          ),
           notExists(
             db
               .select({ id: chatEndpointLeases.id })
@@ -31355,6 +33113,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           continue;
         }
         const busyEndpointIds = [...publicationEndpointTasks.keys()];
+        for (const [id, retryAfter] of teamsFileRetryAfter)
+          if (retryAfter <= Date.now()) teamsFileRetryAfter.delete(id);
+        const coolingTeamsPublicationIds = [...teamsFileRetryAfter.keys()];
         // Select only each conversation's current head before applying the
         // global limit. Re-query after every batch so one invocation can still
         // drain a conversation's newly unblocked milestones in FIFO order.
@@ -31363,9 +33124,84 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           .from(chatPublications)
           .where(
             and(
-              inArray(chatPublications.state, ["pending", "retry"]),
+              or(
+                and(
+                  inArray(chatPublications.state, ["pending", "retry"]),
+                  notExists(
+                    db
+                      .select({ id: chatTeamsFileTransfers.id })
+                      .from(chatTeamsFileTransfers)
+                      .where(
+                        and(
+                          eq(
+                            chatTeamsFileTransfers.companyId,
+                            chatPublications.companyId,
+                          ),
+                          eq(
+                            chatTeamsFileTransfers.publicationId,
+                            chatPublications.id,
+                          ),
+                        ),
+                      ),
+                  ),
+                ),
+                // Dedicated protocol work shares the endpoint concurrency cap,
+                // never the ordinary publication claim or resend implementation.
+                sql`exists (${db
+                  .select({ id: chatTeamsFileTransfers.id })
+                  .from(chatTeamsFileTransfers)
+                  .where(
+                    and(
+                      eq(
+                        chatTeamsFileTransfers.companyId,
+                        chatPublications.companyId,
+                      ),
+                      eq(
+                        chatTeamsFileTransfers.endpointId,
+                        chatPublications.endpointId,
+                      ),
+                      eq(
+                        chatTeamsFileTransfers.conversationId,
+                        chatPublications.conversationId,
+                      ),
+                      eq(
+                        chatTeamsFileTransfers.publicationId,
+                        chatPublications.id,
+                      ),
+                      sql`exists (${db
+                        .select({ id: chatEndpoints.id })
+                        .from(chatEndpoints)
+                        .where(
+                          and(
+                            eq(chatEndpoints.id, chatPublications.endpointId),
+                            eq(
+                              chatEndpoints.companyId,
+                              chatPublications.companyId,
+                            ),
+                            eq(chatEndpoints.provider, "microsoft-teams"),
+                            eq(chatEndpoints.status, "active"),
+                          ),
+                        )})`,
+                      or(
+                        inArray(chatTeamsFileTransfers.phase, [
+                          "consent_pending",
+                          "upload_pending",
+                          "file_info_pending",
+                        ]),
+                        and(
+                          eq(chatTeamsFileTransfers.phase, "consent_unknown"),
+                          isNotNull(chatTeamsFileTransfers.responseActivityId),
+                          sql`${chatTeamsFileTransfers.privateState}->'response' is not null`,
+                        ),
+                      ),
+                    ),
+                  )})`,
+              ),
               busyEndpointIds.length > 0
                 ? notInArray(chatPublications.endpointId, busyEndpointIds)
+                : undefined,
+              coolingTeamsPublicationIds.length > 0
+                ? notInArray(chatPublications.id, coolingTeamsPublicationIds)
                 : undefined,
               // Inactive endpoints must not consume the eligibility page or
               // acquire an artificial retry deadline. When an operator resumes
@@ -31497,6 +33333,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   // Cron refills free endpoint slots from the durable outbox each second.
   // Work remains tracked by this service and is joined before runtime shutdown.
   async function schedulePendingPublications(limit = 25) {
+    scheduleTeamsFileMaintenance();
     return processPendingPublications(limit, { waitForCompletion: false });
   }
 

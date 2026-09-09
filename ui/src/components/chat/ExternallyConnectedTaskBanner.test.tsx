@@ -480,6 +480,12 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
         publication: { id: "file-part", state: finalState, attempts: 1 },
         total: 2,
         published: finalState === "published" ? 2 : 1,
+        awaitingConsent: 0,
+        declined: 0,
+        expired: 0,
+        cancelled: finalState === "cancelled" ? 1 : 0,
+        settled: 2,
+        canDismiss: true,
       });
       await restoredClient.invalidateQueries({
         queryKey: ["chat-publication-batch"],
@@ -488,7 +494,9 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
       await act(() =>
         findButton(
           container,
-          finalState === "published" ? "Send to channel" : "Start a new send",
+          finalState === "published"
+            ? "Send to channel"
+            : "Dismiss delivery receipt",
         ).click(),
       );
       expect(container.textContent).not.toContain("selected.txt");
@@ -582,50 +590,62 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("explains GitHub's link-only file boundary before publication", async () => {
-    mockChatEndpointsApi.getIssueBinding.mockResolvedValue({
-      endpointId: "endpoint-github",
-      provider: "github",
-      botLabel: "Maya",
-      externalLabel: "paperclipai/paperclip#42",
-      externalUrl: "https://github.com/paperclipai/paperclip/issues/42",
-      conversationId: "conversation-github",
-      publicationState: null,
-      assignedAgentLocked: true,
-    });
-    const attachment = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId: "company-1",
-      issueId: "issue-1",
-      issueCommentId: null,
-      assetId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-      provider: "local_disk",
-      objectKey: "issues/issue-1/result.txt",
-      contentType: "text/plain",
-      byteSize: 12,
-      sha256: "a".repeat(64),
-      originalFilename: "result.txt",
-      createdByAgentId: "agent-1",
-      createdByUserId: null,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      contentPath:
-        "/api/attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/content",
-    } satisfies IssueAttachment;
+  it.each(["github", "microsoft-teams"] as const)(
+    "explains %s file delivery boundaries before publication",
+    async (provider) => {
+      mockChatEndpointsApi.getIssueBinding.mockResolvedValue({
+        endpointId: "endpoint-github",
+        provider,
+        botLabel: "Maya",
+        externalLabel: "paperclipai/paperclip#42",
+        externalUrl: "https://github.com/paperclipai/paperclip/issues/42",
+        conversationId: "conversation-github",
+        publicationState: null,
+        assignedAgentLocked: true,
+      });
+      const attachment = {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        issueId: "issue-1",
+        issueCommentId: null,
+        assetId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        provider: "local_disk",
+        objectKey: "issues/issue-1/result.txt",
+        contentType: "text/plain",
+        byteSize: 12,
+        sha256: "a".repeat(64),
+        originalFilename: "result.txt",
+        createdByAgentId: "agent-1",
+        createdByUserId: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        contentPath:
+          "/api/attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/content",
+      } satisfies IssueAttachment;
 
-    await renderBanner([attachment]);
-    await act(() => findButton(container, "Send to channel").click());
+      await renderBanner([attachment]);
+      await act(() => findButton(container, "Send to channel").click());
 
-    expect(container.textContent).toContain(
-      "GitHub Apps cannot upload file bytes in comments.",
-    );
-    expect(container.textContent).toContain(
-      "GitHub receives an authenticated task link when this Board has a public URL, or a private-task notice otherwise.",
-    );
-    expect(container.textContent).not.toContain(
-      "Only checked files will be published to the external conversation.",
-    );
-  });
+      if (provider === "github") {
+        expect(container.textContent).toContain(
+          "GitHub Apps cannot upload file bytes in comments.",
+        );
+        expect(container.textContent).toContain(
+          "GitHub receives an authenticated task link when this Board has a public URL, or a private-task notice otherwise.",
+        );
+      } else {
+        expect(container.textContent).toContain(
+          "Teams asks the recipient to accept each file before upload.",
+        );
+        expect(container.textContent).toContain(
+          "Teams receives a task link or a private-task notice.",
+        );
+      }
+      expect(container.textContent).not.toContain(
+        "Only checked files will be published to the external conversation.",
+      );
+    },
+  );
 
   it.each([
     ["pending", "Queued for channel"],
@@ -711,12 +731,167 @@ describe("ExternallyConnectedTaskBanner publication truth", () => {
     expect(retainedDraft?.value).toBe("Visible board update");
     expect(retainedDraft?.disabled).toBe(true);
 
-    await act(() => findButton(container, "Start a new send").click());
+    expect(container.textContent).not.toContain("Start a new send");
+    expect(container.textContent).not.toContain("Dismiss delivery receipt");
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
+  });
 
-    expect(container.querySelector("textarea")?.value).toBe(
-      "Visible board update",
+  it("retains a Teams consent wait across reload without another send", async () => {
+    const part = {
+      id: "consent-file",
+      state: "awaiting_consent",
+      attempts: 1,
+      fileTransfer: {
+        provider: "microsoft-teams",
+        phase: "awaiting_consent",
+        filename: "report.txt",
+        version: 2,
+      },
+    };
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValue(part);
+    mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+      publication: part,
+      total: 2,
+      published: 1,
+      parts: [{ id: "text", state: "published", attempts: 1 }, part],
+      awaitingConsent: 1,
+      declined: 0,
+      expired: 0,
+      cancelled: 0,
+      settled: 1,
+      canDismiss: false,
+    });
+    await renderBanner();
+    await composeAndSubmit();
+    expect(container.textContent).toContain("Waiting for file consent");
+    expect(container.textContent).toContain("report.txt");
+    expect(container.textContent).not.toContain("Dismiss delivery receipt");
+    expect(container.querySelector("textarea")?.disabled).toBe(true);
+    await act(() => root.unmount());
+    root = createRoot(container);
+    await renderBanner();
+    expect(container.textContent).toContain("Waiting for file consent");
+    expect(
+      mockChatEndpointsApi.getPublicationBatchStatus,
+    ).toHaveBeenLastCalledWith("endpoint-1", "conversation-1", "consent-file");
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])(
+    "dismisses a mixed terminal receipt only on explicit whole-batch permission (storage failure %s)",
+    async (storageFailure) => {
+      const part = {
+        id: "declined-file",
+        state: "cancelled",
+        attempts: 1,
+        fileTransfer: {
+          provider: "microsoft-teams",
+          phase: "declined",
+          filename: "declined.txt",
+          version: 3,
+        },
+      };
+      mockChatEndpointsApi.publishBoardMessage.mockResolvedValue(part);
+      mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+        publication: part,
+        total: 3,
+        published: 1,
+        awaitingConsent: 0,
+        declined: 1,
+        expired: 1,
+        cancelled: 0,
+        settled: 3,
+        canDismiss: true,
+        parts: [
+          { id: "text", state: "published", attempts: 1 },
+          part,
+          {
+            ...part,
+            id: "expired-file",
+            fileTransfer: {
+              ...part.fileTransfer,
+              phase: "expired",
+              filename: "expired.txt",
+            },
+          },
+        ],
+      });
+      await renderBanner();
+      await composeAndSubmit();
+      expect(container.textContent).toContain(
+        "1 published · 1 declined · 1 expired",
+      );
+      expect(container.textContent).toContain("expired.txt");
+      const removeItemSpy = storageFailure
+        ? vi
+            .spyOn(Object.getPrototypeOf(sessionStorage), "removeItem")
+            .mockImplementation(() => {
+              throw new Error("storage denied");
+            })
+        : null;
+      await act(() =>
+        findButton(container, "Dismiss delivery receipt").click(),
+      );
+      expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
+      if (storageFailure) {
+        expect(container.querySelector("textarea")?.disabled).toBe(true);
+        expect(container.textContent).toContain("could not be cleared");
+        removeItemSpy!.mockRestore();
+        await act(() =>
+          findButton(container, "Dismiss delivery receipt").click(),
+        );
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+        expect(container.querySelector("textarea")?.value).toBe("");
+        expect(container.textContent).not.toContain("could not be cleared");
+        expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(
+          1,
+        );
+      } else {
+        expect(container.querySelector("textarea")?.value).toBe("");
+        expect(container.querySelector("textarea")?.disabled).toBe(false);
+        expect(
+          readBoardSendDraft(
+            boardSendDraftKey(
+              "company-1",
+              "issue-1",
+              "endpoint-1",
+              "conversation-1",
+            ),
+          ),
+        ).toBeNull();
+        expect(
+          pushToastMock.mock.calls.some(
+            ([toast]) => toast.title === "Sent to channel",
+          ),
+        ).toBe(false);
+      }
+    },
+  );
+
+  it("does not release a cancelled head while another file still waits", async () => {
+    const part = { id: "cancelled-head", state: "cancelled", attempts: 1 };
+    mockChatEndpointsApi.publishBoardMessage.mockResolvedValue(part);
+    mockChatEndpointsApi.getPublicationBatchStatus.mockResolvedValue({
+      publication: part,
+      total: 2,
+      published: 0,
+      awaitingConsent: 1,
+      declined: 0,
+      expired: 0,
+      cancelled: 1,
+      settled: 1,
+      canDismiss: false,
+    });
+    await renderBanner();
+    await composeAndSubmit();
+    expect(container.textContent).toContain(
+      "Waiting for remaining file consent",
     );
-    expect(container.querySelector("textarea")?.disabled).toBe(false);
+    expect(container.textContent).not.toContain("Channel delivery cancelled");
+    expect(container.textContent).not.toContain("Dismiss delivery receipt");
+    expect(container.textContent).not.toContain("Start a new send");
+    expect(container.querySelector("textarea")?.disabled).toBe(true);
+    expect(mockChatEndpointsApi.publishBoardMessage).toHaveBeenCalledTimes(1);
   });
 
   it("restores a pending batch after reload without another POST", async () => {

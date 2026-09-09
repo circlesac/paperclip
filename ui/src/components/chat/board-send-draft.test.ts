@@ -5,9 +5,53 @@ import {
   clearBoardSendDraft,
   readBoardSendDraft,
   writeBoardSendDraft,
+  canDismissBoardSendBatch,
 } from "./board-send-draft";
 
 describe("session-scoped Board send identity", () => {
+  it("round-trips the awaiting-consent anchor without storing transfer capabilities", () => {
+    const draft = {
+      body: "File for review",
+      attachmentIds: ["file-1"],
+      idempotencyKey: "stable-request-key-1",
+      publication: {
+        id: "file-part",
+        state: "awaiting_consent" as const,
+        attempts: 1,
+      },
+    };
+    writeBoardSendDraft("waiting", draft);
+    expect(readBoardSendDraft("waiting")).toEqual(draft);
+  });
+  it("requires consistent whole-batch terminal proof to release a retained anchor", () => {
+    const batch = {
+      publication: {
+        id: "file-part",
+        state: "cancelled" as const,
+        attempts: 1,
+      },
+      total: 3,
+      published: 1,
+      awaitingConsent: 0,
+      declined: 1,
+      expired: 1,
+      cancelled: 0,
+      settled: 3,
+      canDismiss: true,
+    };
+    expect(canDismissBoardSendBatch(batch)).toBe(true);
+    for (const change of [
+      { canDismiss: undefined },
+      { settled: 2 },
+      { awaitingConsent: 1 },
+      { cancelled: 1 },
+      { declined: -1 },
+      { expired: undefined },
+      { parts: [{ id: "waiting", state: "pending" as const, attempts: 0 }] },
+    ]) {
+      expect(canDismissBoardSendBatch({ ...batch, ...change })).toBe(false);
+    }
+  });
   afterEach(() => {
     sessionStorage.clear();
     vi.restoreAllMocks();

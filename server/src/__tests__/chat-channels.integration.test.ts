@@ -49,6 +49,7 @@ import {
   chatMessageLinks,
   chatPublications,
   chatSdkState,
+  chatTeamsFileTransfers,
   completionContracts,
   companySecretBindings,
   companySecrets,
@@ -97,6 +98,13 @@ import type {
 } from "../services/chat-sdk-runtime.js";
 import { createChatSdkEndpointRuntime } from "../services/chat-sdk-runtime.js";
 import { createDiscordAdapter } from "@chat-adapter/discord";
+import { createTeamsAdapter } from "@chat-adapter/teams";
+import {
+  bindTeamsPersonalRecipient,
+  parseTeamsPersonalRecipient,
+  parseTeamsPersonalRecipientBinding,
+  type TeamsPersonalRecipientAdmission,
+} from "../services/chat-teams-personal-recipient.js";
 import * as discordQuestionForms from "../services/chat-discord-question-forms.js";
 import { issueService } from "../services/issues.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
@@ -15062,7 +15070,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ),
     );
     expect(channelAttachmentPost?.text).toContain(
-      "This Microsoft Teams connection cannot upload file bytes into chats.",
+      "Direct file delivery isn't available for this Teams conversation.",
     );
     expect(channelAttachmentPost?.text).toContain(
       `/issues/${channelConversation.issueId}`,
@@ -15074,7 +15082,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       ),
     );
     expect(personalAttachmentPost?.text).toContain(
-      "This Microsoft Teams connection cannot upload file bytes into chats.",
+      "Direct file delivery isn't available for this Teams conversation.",
     );
     expect(personalAttachmentPost?.text).toContain(
       `/issues/${personalConversation.issueId}`,
@@ -34066,6 +34074,806 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       { id: blocked.id, state: "delivery_unknown" },
       { id: expect.any(String), state: "pending" },
     ]);
+  });
+
+  describe("Teams file receipt API projection", () => {
+    type Part = {
+      state?: typeof chatPublications.$inferInsert.state;
+      transfer?: Partial<typeof chatTeamsFileTransfers.$inferInsert>;
+    };
+
+    async function projectionFixture(active = false) {
+      const company = await seedCompany();
+      const providerFetch = vi.fn(async () => {
+        throw new Error("Projection GET must not contact a provider");
+      });
+      const configured = active ? await configuredTeamsEndpoint(company) : null;
+      const context =
+        configured ?? createService(new FakeChatSdkRuntime(), providerFetch);
+      const endpoint =
+        configured?.endpoint ??
+        (await context.service.create(
+          company.companyId,
+          {
+            provider: "microsoft-teams",
+            assignedAgentId: company.assignedAgentId,
+            name: "Read-only Teams file receipt fixture",
+          },
+          "owner-user",
+        ));
+      let issue: typeof issues.$inferSelect | undefined;
+      let conversation: typeof chatConversations.$inferSelect | undefined;
+      if (!configured) {
+        [issue] = await db
+          .insert(issues)
+          .values({
+            companyId: company.companyId,
+            title: "Seeded file receipt projection",
+            status: "backlog",
+          })
+          .returning();
+        [conversation] = await db
+          .insert(chatConversations)
+          .values({
+            companyId: company.companyId,
+            endpointId: endpoint.id,
+            issueId: issue!.id,
+            externalConversationId: `teams:projection:${randomUUID()}`,
+            externalLabel: "Synthetic personal conversation",
+            isDirectMessage: true,
+          })
+          .returning();
+      }
+      if (configured) {
+        const providerConversationId = `19:projection-${randomUUID()}@thread.tacv2`;
+        const serviceUrl = "https://smba.trafficmanager.net/amer/";
+        const rootMessageId = "1740000000991";
+        const channel = makeThread({
+          channelId: `teams:${Buffer.from(providerConversationId).toString("base64url")}:${Buffer.from(serviceUrl).toString("base64url")}`,
+          id: `teams:${Buffer.from(`${providerConversationId};messageid=${rootMessageId}`).toString("base64url")}:${Buffer.from(serviceUrl).toString("base64url")}`,
+          name: "Active projection fixture",
+        });
+        await deliverMessage({
+          callbacks: configured.callbacks,
+          endpointId: endpoint.id,
+          provider: "microsoft-teams",
+          thread: channel.thread,
+          message: makeMessage({
+            id: rootMessageId,
+            text: "@maya verify this active publication fixture",
+            mentioned: true,
+          }),
+          trigger: "mention",
+        });
+        await qualifySetupRoundTrip(context.service, endpoint.id);
+        await context.service.test(endpoint.id, "owner-user");
+        [conversation] = await db
+          .select()
+          .from(chatConversations)
+          .where(
+            and(
+              eq(chatConversations.endpointId, endpoint.id),
+              eq(chatConversations.externalThreadId, channel.thread.id),
+            ),
+          );
+        if (!conversation)
+          throw new Error("Expected admitted active Teams conversation");
+        [issue] = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, conversation.issueId));
+        await expect(context.service.get(endpoint.id)).resolves.toMatchObject({
+          status: "active",
+        });
+      }
+      const [principal] = await db
+        .insert(chatExternalPrincipals)
+        .values({
+          companyId: company.companyId,
+          provider: "microsoft-teams",
+          providerAccountId: randomUUID(),
+          externalId: `projection-user-${randomUUID()}`,
+        })
+        .returning();
+      const batch = async (parts: Part[]) => {
+        const [comment] = await db
+          .insert(issueComments)
+          .values({
+            companyId: company.companyId,
+            issueId: issue!.id,
+            authorUserId: "owner-user",
+            body: "PRIVATE-COMMENT-PROJECTION-CANARY",
+          })
+          .returning();
+        const publications: Array<typeof chatPublications.$inferSelect> = [];
+        for (const [index, part] of parts.entries()) {
+          const [publication] = await db
+            .insert(chatPublications)
+            .values({
+              companyId: company.companyId,
+              endpointId: endpoint.id,
+              conversationId: conversation!.id,
+              issueId: issue!.id,
+              commentId: comment!.id,
+              idempotencyKey: `projection:${randomUUID()}:${index}`,
+              payload: { text: "PRIVATE-PAYLOAD-PROJECTION-CANARY" },
+              state: part.state ?? "published",
+              providerMessageId: `PRIVATE-CARD-PROJECTION-CANARY-${index}`,
+              attempts: 1,
+              createdAt: new Date(Date.now() + index),
+            })
+            .returning();
+          publications.push(publication!);
+          if (part.transfer) {
+            await db.insert(chatTeamsFileTransfers).values({
+              companyId: company.companyId,
+              endpointId: endpoint.id,
+              conversationId: conversation!.id,
+              publicationId: publication!.id,
+              issueId: issue!.id,
+              commentId: comment!.id,
+              attachmentId: randomUUID(),
+              principalId: principal!.id,
+              authorizedUserId: "owner-user",
+              runtimeGeneration: 1,
+              credentialFingerprint: "PRIVATE-FINGERPRINT-PROJECTION-CANARY",
+              conversationGeneration: 1,
+              sourceDigest: "1".repeat(64),
+              authorityDigest: "2".repeat(64),
+              tenantId: randomUUID(),
+              botAppId: randomUUID(),
+              aadObjectId: randomUUID(),
+              providerConversationId: "PRIVATE-CONVERSATION-PROJECTION-CANARY",
+              providerUserId: "PRIVATE-USER-PROJECTION-CANARY",
+              sha256: "3".repeat(64),
+              byteSize: 12,
+              filename: `report-${index}.txt`,
+              tokenSha256: createHash("sha256")
+                .update(randomUUID())
+                .digest("hex"),
+              phase: "awaiting_consent",
+              version: 2,
+              consentMessageId: `PRIVATE-CARD-PROJECTION-CANARY-${index}`,
+              expiresAt: new Date(
+                Date.now() +
+                  (part.transfer.phase === "expired" ? -60_000 : 600_000),
+              ),
+              privateState: {
+                schema: "synthetic-private-state",
+                ciphertext: "PRIVATE-CIPHERTEXT-PROJECTION-CANARY",
+                uploadUrl:
+                  "https://private.invalid/upload?token=PRIVATE-TOKEN-PROJECTION-CANARY",
+                contentUrl:
+                  "https://private.invalid/PRIVATE-CONTENT-PROJECTION-CANARY",
+              },
+              ...part.transfer,
+            });
+          }
+        }
+        return publications;
+      };
+      const snapshot = async () => ({
+        publications: await db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.companyId, company.companyId))
+          .orderBy(asc(chatPublications.id)),
+        transfers: await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.companyId, company.companyId))
+          .orderBy(asc(chatTeamsFileTransfers.id)),
+        comments: await db
+          .select()
+          .from(issueComments)
+          .where(eq(issueComments.companyId, company.companyId))
+          .orderBy(asc(issueComments.id)),
+        actions: await db
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.companyId, company.companyId))
+          .orderBy(asc(chatActions.id)),
+        deliveries: await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.companyId, company.companyId))
+          .orderBy(asc(chatDeliveries.id)),
+        links: await db
+          .select()
+          .from(chatMessageLinks)
+          .where(eq(chatMessageLinks.companyId, company.companyId))
+          .orderBy(asc(chatMessageLinks.id)),
+        wakes: await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.companyId, company.companyId))
+          .orderBy(asc(agentWakeupRequests.id)),
+        audit: await db
+          .select()
+          .from(activityLog)
+          .where(eq(activityLog.companyId, company.companyId))
+          .orderBy(asc(activityLog.id)),
+      });
+      const statusPath = (publicationId: string) =>
+        `/api/chat-endpoints/${endpoint.id}/conversations/${conversation!.id}/publications/${publicationId}/status`;
+      const read = async (publicationId: string) => {
+        const before = await snapshot();
+        const app = routesApp(db, company.companyId, context.service);
+        const status = await request(app)
+          .get(statusPath(publicationId))
+          .expect(200);
+        const activity = await request(app)
+          .get(`/api/chat-endpoints/${endpoint.id}/activity`)
+          .expect(200);
+        expect(status.body).toEqual(
+          await context.service.getPublicationBatchStatus(
+            endpoint.id,
+            conversation!.id,
+            publicationId,
+          ),
+        );
+        expect(activity.body).toEqual(
+          await context.service.listActivity(endpoint.id),
+        );
+        const serialized = JSON.stringify([status.body, activity.body]);
+        expect(serialized).not.toMatch(
+          /PROJECTION-CANARY|https?:|ciphertext|privateState|uploadUrl|contentUrl|tokenSha256|consentMessageId|fileInfoMessageId|responseActivityId|providerMessageId/,
+        );
+        expect(await snapshot()).toEqual(before);
+        expect(providerFetch).not.toHaveBeenCalled();
+        expect(context.wakeup).not.toHaveBeenCalled();
+        expect(context.cancelRun).not.toHaveBeenCalled();
+        expect(context.runtime.endpoints.size).toBe(0);
+        return {
+          status: status.body,
+          activity: activity.body as Array<Record<string, unknown>>,
+        };
+      };
+      return {
+        ...company,
+        ...context,
+        endpoint,
+        conversation: conversation!,
+        principal: principal!,
+        issue: issue!,
+        batch,
+        snapshot,
+        read,
+        statusPath,
+      };
+    }
+
+    // These are persisted-state/API proofs, not provider upload or tenant-auth
+    // proofs. No worker is started; every GET must preserve all seeded rows.
+    it("projects mixed delivered, declined, expired and cancelled file outcomes without making GET effects", async () => {
+      const fixture = await projectionFixture();
+      try {
+        const parts = await fixture.batch([
+          {},
+          {
+            transfer: {
+              phase: "delivered",
+              fileInfoMessageId: "PRIVATE-FILE-RECEIPT-PROJECTION-CANARY",
+            },
+          },
+          {
+            transfer: {
+              phase: "declined",
+              responseActivityId: "PRIVATE-DECLINE-PROJECTION-CANARY",
+            },
+          },
+          { transfer: { phase: "expired" } },
+          {
+            transfer: { phase: "cancelled", reason: "cancelled_after_upload" },
+          },
+        ]);
+        const { status, activity } = await fixture.read(parts[0]!.id);
+        expect(status).toMatchObject({
+          total: 5,
+          published: 2,
+          declined: 1,
+          expired: 1,
+          cancelled: 1,
+          settled: 5,
+          awaitingConsent: 0,
+          canDismiss: true,
+          publication: { id: parts[2]!.id, state: "cancelled" },
+        });
+        expect(
+          status.parts.map((part: { id: string; state: string }) => [
+            part.id,
+            part.state,
+          ]),
+        ).toEqual(
+          parts.map((part, index) => [
+            part.id,
+            index < 2 ? "published" : "cancelled",
+          ]),
+        );
+        expect(
+          activity
+            .filter((item) => parts.some((part) => part.id === item.id))
+            .map((item) => item.status)
+            .sort(),
+        ).toEqual([
+          "cancelled",
+          "cancelled",
+          "cancelled",
+          "published",
+          "published",
+        ]);
+        for (const item of activity) {
+          expect(item.replayable).toBe(false);
+          expect(item.resolutionActions).toEqual([]);
+        }
+      } finally {
+        await fixture.service.shutdown();
+      }
+    });
+
+    it("keeps a cancelled head locked while a consent-card receipt waits for the file tail", async () => {
+      const fixture = await projectionFixture();
+      try {
+        const [head, tail] = await fixture.batch([
+          { state: "cancelled" },
+          { transfer: {} },
+        ]);
+        const { status, activity } = await fixture.read(head!.id);
+        expect(status).toMatchObject({
+          total: 2,
+          published: 0,
+          declined: 0,
+          expired: 0,
+          cancelled: 1,
+          settled: 1,
+          awaitingConsent: 1,
+          canDismiss: false,
+          publication: { id: tail!.id, state: "awaiting_consent" },
+        });
+        expect(activity.find((item) => item.id === tail!.id)).toMatchObject({
+          status: "awaiting_consent",
+          replayable: false,
+          resolutionActions: [],
+          fileTransfer: {
+            phase: "awaiting_consent",
+            version: 2,
+            filename: "report-1.txt",
+          },
+        });
+      } finally {
+        await fixture.service.shutdown();
+      }
+    });
+
+    it("preserves all-published legacy batches without transfer metadata and excludes other comments", async () => {
+      const fixture = await projectionFixture();
+      try {
+        const parts = await fixture.batch([{}, {}]);
+        await fixture.batch([{ state: "pending" }]);
+        const { status } = await fixture.read(parts[0]!.id);
+        expect(status).toMatchObject({
+          total: 2,
+          published: 2,
+          declined: 0,
+          expired: 0,
+          cancelled: 0,
+          settled: 2,
+          awaitingConsent: 0,
+          canDismiss: true,
+          publication: { id: parts[1]!.id, state: "published" },
+        });
+        expect(status.parts.map((part: { id: string }) => part.id)).toEqual(
+          parts.map((part) => part.id),
+        );
+        for (const part of status.parts)
+          expect(part).not.toHaveProperty("fileTransfer");
+      } finally {
+        await fixture.service.shutdown();
+      }
+    });
+
+    it.each([
+      ["delivered without file receipt", { phase: "delivered" }],
+      [
+        "waiting without card receipt",
+        { phase: "awaiting_consent", consentMessageId: null },
+      ],
+      ["declined without response receipt", { phase: "declined" }],
+      [
+        "malformed filename",
+        {
+          phase: "delivered",
+          filename: "",
+          fileInfoMessageId: "PRIVATE-FILE-PROJECTION-CANARY",
+        },
+      ],
+      [
+        "wrong-stage operator receipt",
+        {
+          phase: "delivered",
+          privateState: {
+            resolution: {
+              schema: "paperclip.teams.file-resolution.v1",
+              action: "mark_delivered",
+              fromPhase: "upload_unknown",
+            },
+          },
+        },
+      ],
+    ] satisfies Array<
+      [string, Partial<typeof chatTeamsFileTransfers.$inferInsert>]
+    >)(
+      "refuses terminal success or actions for %s",
+      async (_label, transfer) => {
+        const fixture = await projectionFixture();
+        try {
+          const [part] = await fixture.batch([{ transfer }]);
+          const { status, activity } = await fixture.read(part!.id);
+          expect(status).toMatchObject({
+            total: 1,
+            published: 0,
+            settled: 0,
+            awaitingConsent: 0,
+            canDismiss: false,
+            publication: { id: part!.id, state: "delivery_unknown" },
+          });
+          expect(activity).toEqual([
+            expect.objectContaining({
+              id: part!.id,
+              status: "delivery_unknown",
+              replayable: false,
+              resolutionActions: [],
+            }),
+          ]);
+        } finally {
+          await fixture.service.shutdown();
+        }
+      },
+    );
+
+    it.each([
+      ["consent_unknown", ["cancel"]],
+      ["upload_unknown", ["cancel"]],
+      ["file_info_unknown", ["mark_delivered", "retry_anyway", "cancel"]],
+      ["conflict", []],
+    ] as const)(
+      "offers only the exact %s stage actions",
+      async (phase, actions) => {
+        const fixture = await projectionFixture();
+        try {
+          const [part] = await fixture.batch([{ transfer: { phase } }]);
+          const { status, activity } = await fixture.read(part!.id);
+          expect(status).toMatchObject({
+            published: 0,
+            settled: 0,
+            canDismiss: false,
+            publication: { state: "delivery_unknown" },
+          });
+          expect(activity).toEqual([
+            expect.objectContaining({
+              id: part!.id,
+              replayable: false,
+              resolutionActions: actions,
+              fileTransfer: {
+                provider: "microsoft-teams",
+                phase,
+                version: 2,
+                filename: "report-0.txt",
+                expiresAt: expect.any(String),
+              },
+            }),
+          ]);
+        } finally {
+          await fixture.service.shutdown();
+        }
+      },
+    );
+
+    it("requires exact endpoint, conversation, publication and Board company scope", async () => {
+      const fixture = await projectionFixture();
+      const other = await projectionFixture();
+      try {
+        const [part] = await fixture.batch([{ transfer: {} }]);
+        const [foreign] = await other.batch([{ transfer: {} }]);
+        const app = routesApp(db, fixture.companyId, fixture.service);
+        const before = await fixture.snapshot();
+        await request(app).get(fixture.statusPath(foreign!.id)).expect(404);
+        await request(app)
+          .get(
+            fixture
+              .statusPath(part!.id)
+              .replace(fixture.conversation.id, other.conversation.id),
+          )
+          .expect(404);
+        // Cross-company resources are deliberately concealed as not found.
+        await request(app).get(other.statusPath(part!.id)).expect(404);
+        await request(app)
+          .get(`/api/chat-endpoints/${other.endpoint.id}/activity`)
+          .expect(404);
+        expect(await fixture.snapshot()).toEqual(before);
+        const { status, activity } = await fixture.read(part!.id);
+        expect(status.total).toBe(1);
+        expect(activity.map((item) => item.id)).toEqual([part!.id]);
+        expect(JSON.stringify([status, activity])).not.toContain(foreign!.id);
+      } finally {
+        try {
+          await fixture.service.shutdown();
+        } finally {
+          await other.service.shutdown();
+        }
+      }
+    });
+
+    it("never projects a transfer from another conversation into Activity", async () => {
+      const fixture = await projectionFixture();
+      try {
+        const [otherConversation] = await db
+          .insert(chatConversations)
+          .values({
+            companyId: fixture.companyId,
+            endpointId: fixture.endpoint.id,
+            issueId: fixture.issue.id,
+            externalConversationId: `teams:other:${randomUUID()}`,
+            externalLabel: "Different conversation",
+          })
+          .returning();
+        const [part] = await fixture.batch([
+          {
+            state: "pending",
+            transfer: {
+              conversationId: otherConversation!.id,
+              phase: "file_info_unknown",
+              filename: "WRONG-CONVERSATION-FILE.txt",
+            },
+          },
+        ]);
+        const { status, activity } = await fixture.read(part!.id);
+        expect(status).toMatchObject({
+          publication: { state: "pending" },
+          canDismiss: false,
+        });
+        expect(status.publication).not.toHaveProperty("fileTransfer");
+        expect(activity).toEqual([
+          expect.objectContaining({
+            id: part!.id,
+            status: "pending",
+            replayable: false,
+            resolutionActions: [],
+          }),
+        ]);
+        expect(activity[0]).not.toHaveProperty("fileTransfer");
+      } finally {
+        await fixture.service.shutdown();
+      }
+    });
+
+    it.each([
+      ["missing", undefined],
+      ["wrong phase", { phase: "upload_unknown", version: 2 }],
+      ["stale version", { phase: "file_info_unknown", version: 1 }],
+    ] as const)(
+      "refuses generic resolution with %s transfer preconditions without changing receipts",
+      async (_label, fileTransfer) => {
+        const fixture = await projectionFixture();
+        try {
+          const [part] = await fixture.batch([
+            {
+              state: "delivery_unknown",
+              transfer: { phase: "file_info_unknown" },
+            },
+          ]);
+          const before = await fixture.snapshot();
+          const app = routesApp(db, fixture.companyId, fixture.service);
+          // A missing or stale transfer hint must never fall through to ordinary
+          // message retry, mark-delivered, or cancellation.
+          for (const action of [
+            "mark_delivered",
+            "retry_anyway",
+            "cancel",
+          ] as const) {
+            const response = await request(app)
+              .post(
+                `/api/chat-endpoints/${fixture.endpoint.id}/publications/${part!.id}/resolve`,
+              )
+              .send({ action, ...(fileTransfer ? { fileTransfer } : {}) })
+              .expect(409);
+            expect(response.body).toMatchObject({
+              code: "chat_file_transfer_resolution_required",
+            });
+            await expect(
+              fixture.service.resolvePublication(
+                fixture.endpoint.id,
+                part!.id,
+                action,
+                "owner-user",
+                fileTransfer,
+              ),
+            ).rejects.toMatchObject({
+              status: 409,
+              details: { code: "chat_file_transfer_resolution_required" },
+            });
+            expect(await fixture.snapshot()).toEqual(before);
+          }
+          await fixture.read(part!.id);
+        } finally {
+          await fixture.service.shutdown();
+        }
+      },
+    );
+
+    it("refuses generic replay of a failed transfer without another provider attempt", async () => {
+      const fixture = await projectionFixture();
+      try {
+        const [part] = await fixture.batch([
+          { state: "failed", transfer: { phase: "consent_pending" } },
+        ]);
+        const before = await fixture.snapshot();
+        const response = await request(
+          routesApp(db, fixture.companyId, fixture.service),
+        )
+          .post(
+            `/api/chat-endpoints/${fixture.endpoint.id}/publications/${part!.id}/replay`,
+          )
+          .expect(409);
+        expect(response.body).toMatchObject({
+          code: "chat_file_transfer_resolution_required",
+        });
+        await expect(
+          fixture.service.replayPublication(fixture.endpoint.id, part!.id),
+        ).rejects.toMatchObject({
+          status: 409,
+          details: { code: "chat_file_transfer_resolution_required" },
+        });
+        expect(await fixture.snapshot()).toEqual(before);
+        const { activity } = await fixture.read(part!.id);
+        expect(activity).toEqual([
+          expect.objectContaining({
+            id: part!.id,
+            replayable: false,
+            resolutionActions: [],
+          }),
+        ]);
+      } finally {
+        await fixture.service.shutdown();
+      }
+    });
+
+    it("does not treat a caller-only transfer hint as ordinary delivery authority", async () => {
+      const fixture = await projectionFixture();
+      try {
+        const [part] = await fixture.batch([{ state: "delivery_unknown" }]);
+        const before = await fixture.snapshot();
+        const response = await request(
+          routesApp(db, fixture.companyId, fixture.service),
+        )
+          .post(
+            `/api/chat-endpoints/${fixture.endpoint.id}/publications/${part!.id}/resolve`,
+          )
+          .send({
+            action: "mark_delivered",
+            fileTransfer: { phase: "file_info_unknown", version: 2 },
+          })
+          .expect(409);
+        expect(response.body).toMatchObject({
+          code: "chat_file_transfer_resolution_required",
+        });
+        expect(await fixture.snapshot()).toEqual(before);
+        await fixture.read(part!.id);
+      } finally {
+        await fixture.service.shutdown();
+      }
+    });
+
+    it.each(["draft", "verifying", "paused", "attention", "archived"] as const)(
+      "does not consume a worker slot for a pending Teams transfer on a %s endpoint",
+      async (status) => {
+        const fixture = await projectionFixture();
+        try {
+          // Settle unrelated fixture work before arming this exact inactive
+          // candidate. The transfer must not enter either publication worker.
+          await fixture.service.processPendingPublications();
+          await db
+            .update(chatEndpoints)
+            .set({ status })
+            .where(eq(chatEndpoints.id, fixture.endpoint.id));
+          const [part] = await fixture.batch([
+            { state: "pending", transfer: { phase: "consent_pending" } },
+          ]);
+          const [endpointBefore] = await db
+            .select()
+            .from(chatEndpoints)
+            .where(eq(chatEndpoints.id, fixture.endpoint.id));
+          expect(endpointBefore?.status).toBe(status);
+          const before = await fixture.snapshot();
+          await expect(
+            fixture.service.processPendingPublications(1),
+          ).resolves.toBe(0);
+          await expect(
+            fixture.service.processPendingPublications(1),
+          ).resolves.toBe(0);
+          expect(await fixture.snapshot()).toEqual(before);
+          await expect(
+            db
+              .select()
+              .from(chatEndpoints)
+              .where(eq(chatEndpoints.id, fixture.endpoint.id)),
+          ).resolves.toEqual([endpointBefore]);
+          expect(fixture.runtime.replaceCount).toBe(0);
+          // Also checks zero provider requests, runtime creation, wakeups, and
+          // cancellation calls, with no projection/read-side mutations.
+          await fixture.read(part!.id);
+        } finally {
+          await fixture.service.shutdown();
+        }
+      },
+    );
+
+    it.each(["pending", "streaming"] as const)(
+      "generic publication worker ignores an existing %s Teams transfer on an active endpoint",
+      async (state) => {
+        const fixture = await projectionFixture(true);
+        try {
+          // Finish setup's ordinary outbox work before arming the transfer.
+          await fixture.service.processPendingPublications();
+          const ordinaryControl = await fixture.service.publishBoardMessage(
+            fixture.endpoint.id,
+            fixture.conversation.id,
+            "Ordinary publication control before transfer ownership",
+            `teams-worker-control-${randomUUID()}`,
+            "owner-user",
+          );
+          expect(ordinaryControl.state).toBe("published");
+          const [part] = await fixture.batch([
+            {
+              state,
+              transfer: {
+                phase:
+                  state === "pending" ? "consent_pending" : "consent_sending",
+                ...(state === "streaming"
+                  ? {
+                      attemptId: randomUUID(),
+                      attemptExpiresAt: new Date(Date.now() + 90_000),
+                    }
+                  : {}),
+              },
+            },
+          ]);
+          if (state === "streaming")
+            await db
+              .update(chatPublications)
+              .set({ updatedAt: new Date(Date.now() - 61_000) })
+              .where(eq(chatPublications.id, part!.id));
+          await expect(
+            fixture.service.get(fixture.endpoint.id),
+          ).resolves.toMatchObject({
+            status: "active",
+            setup: { step: "complete" },
+          });
+          const [connection] = await db
+            .select()
+            .from(toolConnections)
+            .where(eq(toolConnections.id, fixture.endpoint.connectionId));
+          expect(connection).toMatchObject({
+            status: "active",
+            enabled: true,
+          });
+          const providerRuntime = fixture.runtime.endpoints.get(
+            fixture.endpoint.id,
+          );
+          expect(providerRuntime).toBeDefined();
+          // An actual ordinary provider post succeeded before the transfer was
+          // seeded. An inactive fixture cannot satisfy this proof.
+          expect(providerRuntime!.posts.length).toBeGreaterThan(0);
+          const postsBefore = [...providerRuntime!.posts];
+          const before = await fixture.snapshot();
+          await fixture.service.processPendingPublications();
+          expect(await fixture.snapshot()).toEqual(before);
+          expect(providerRuntime!.posts).toEqual(postsBefore);
+        } finally {
+          await retirePublicationFixture(fixture.service, fixture.endpoint.id);
+        }
+      },
+    );
   });
 
   it.each(["slack", "discord"] as const)(
@@ -55112,5 +55920,1707 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await holder;
       await context.service.shutdown();
     }
+  });
+
+  describe("Teams personal-recipient admission and durable restart", () => {
+    async function recipientFixture() {
+      const fixture = await seedCompany();
+      const context = await configuredTeamsEndpoint(fixture, {
+        deferWebhookProcessing: true,
+        scheduleDeferredWork: () => undefined,
+      });
+      const configuration = context.runtime.configurations.get(
+        context.endpoint.id,
+      )!;
+      if (configuration.providerConfig.provider !== "microsoft-teams") {
+        throw new Error("Expected Teams provider configuration");
+      }
+      const credentials = configuration.providerConfig.credentials;
+      const tenantId = String(credentials.appTenantId);
+      const botAppId = String(credentials.appId);
+      const aadObjectId = randomUUID();
+      const providerUserId = `29:personal-${randomUUID()}`;
+      const providerConversationId = `a:personal-${randomUUID()}`;
+      const adapter = createTeamsAdapter({
+        appId: botAppId,
+        appPassword: "synthetic-unused-parser-secret",
+        appTenantId: tenantId,
+        appType: "SingleTenant",
+      });
+      const raw = {
+        id: `recipient-${randomUUID()}`,
+        type: "message",
+        channelId: "msteams",
+        timestamp: new Date().toISOString(),
+        serviceUrl: "https://smba.trafficmanager.net/amer/",
+        from: { id: providerUserId, aadObjectId, name: "Recipient Fixture" },
+        recipient: { id: `28:${botAppId}` },
+        conversation: {
+          id: providerConversationId,
+          conversationType: "personal",
+          tenantId,
+        },
+        channelData: { tenant: { id: tenantId } },
+        text: "Keep this exact personal request",
+        token: "SYNTHETIC-RECIPIENT-TOKEN-NEVER-PERSIST",
+      };
+      // Real installed normalization; the service runtime, provider transport
+      // and scheduler below are fake. This is not a JWT/live Teams send proof.
+      const message = adapter.parseMessage(raw);
+      const sourceThread = makeThread({
+        id: message.threadId,
+        channelId: message.threadId,
+        isDM: true,
+        name: "Personal recipient fixture",
+      });
+      const restart = () => {
+        const runtime = new FakeChatSdkRuntime();
+        const replace = runtime.replaceEndpoint.bind(runtime);
+        vi.spyOn(runtime, "replaceEndpoint").mockImplementation(
+          async (options) => {
+            const endpointRuntime = await replace(options);
+            const thread = endpointRuntime.thread.bind(endpointRuntime);
+            vi.spyOn(endpointRuntime, "thread").mockImplementation((id) => ({
+              ...thread(id),
+              isDM: adapter.isDM(id),
+            }));
+            return endpointRuntime;
+          },
+        );
+        return createService(runtime, undefined, {
+          scheduleDeferredWork: () => undefined,
+        });
+      };
+      return {
+        ...context,
+        fixture,
+        adapter,
+        raw,
+        message,
+        sourceThread,
+        tenantId,
+        botAppId,
+        aadObjectId,
+        providerUserId,
+        providerConversationId,
+        restart,
+      };
+    }
+
+    it("preserves actual-parser personal recipient proof across database admission and reconstructed restart", async () => {
+      const context = await recipientFixture();
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        await deliverMessage({
+          callbacks: context.callbacks,
+          endpointId: context.endpoint.id,
+          provider: "microsoft-teams",
+          thread: context.sourceThread.thread,
+          message: context.message,
+          trigger: "direct_message",
+        });
+        const [received] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, context.endpoint.id));
+        expect(received).toMatchObject({
+          state: "received",
+          attempts: 0,
+          conversationId: null,
+        });
+        const origin = received!.normalizedEvent.runtimeContext as {
+          generation: number;
+          credentialFingerprint: string;
+        };
+        const admission: TeamsPersonalRecipientAdmission = {
+          companyId: context.fixture.companyId,
+          endpointId: context.endpoint.id,
+          runtimeGeneration: origin.generation,
+          credentialFingerprint: origin.credentialFingerprint,
+          tenantId: context.tenantId,
+          botAppId: context.botAppId,
+          providerEventId: received!.providerEventId,
+          threadId: context.message.threadId,
+          isDirectMessage: true,
+        };
+        const proof = received!.normalizedEvent.teamsPersonalRecipient;
+        expect(proof).toEqual({
+          schema: "paperclip.teams.personal-recipient.v1",
+          companyId: context.fixture.companyId,
+          endpointId: context.endpoint.id,
+          runtimeGeneration: origin.generation,
+          credentialFingerprint: origin.credentialFingerprint,
+          tenantId: context.tenantId,
+          botAppId: context.botAppId,
+          aadObjectId: context.aadObjectId,
+          providerUserId: context.providerUserId,
+          providerConversationId: context.providerConversationId,
+          providerActivityId: context.raw.id,
+          providerEventId: received!.providerEventId,
+        });
+        expect(parseTeamsPersonalRecipient(proof, admission)).toEqual(proof);
+        expect(JSON.stringify(proof)).not.toMatch(
+          /SYNTHETIC-RECIPIENT|trafficmanager|Recipient Fixture|Keep this/,
+        );
+        expect(JSON.stringify(received!.normalizedEvent)).not.toContain(
+          "SYNTHETIC-RECIPIENT-TOKEN",
+        );
+        expect(context.wakeup).not.toHaveBeenCalled();
+        await context.service.shutdown();
+        await db
+          .update(chatDeliveries)
+          .set({ nextAttemptAt: new Date(0) })
+          .where(eq(chatDeliveries.id, received!.id));
+        restarted = context.restart();
+        await restarted.service.processPendingDeliveries(1, received!.id);
+        const [processed] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.id, received!.id));
+        expect(processed).toMatchObject({ state: "processed" });
+        expect(processed!.normalizedEvent).toEqual(received!.normalizedEvent);
+        const [conversation] = await db
+          .select()
+          .from(chatConversations)
+          .where(eq(chatConversations.id, processed!.conversationId!));
+        const [principal] = await db
+          .select()
+          .from(chatExternalPrincipals)
+          .where(
+            and(
+              eq(chatExternalPrincipals.companyId, context.fixture.companyId),
+              eq(chatExternalPrincipals.externalId, context.aadObjectId),
+            ),
+          );
+        expect(principal).toBeDefined();
+        const scope = {
+          admission,
+          deliveryId: processed!.id,
+          principalId: principal!.id,
+          externalPrincipalId: principal!.externalId,
+          conversationId: conversation!.id,
+          conversationGeneration: conversation!.sessionGeneration,
+        };
+        const bound = bindTeamsPersonalRecipient(
+          processed!.normalizedEvent.teamsPersonalRecipient,
+          scope,
+        );
+        expect(bound).not.toBeNull();
+        expect(
+          parseTeamsPersonalRecipientBinding(
+            JSON.parse(JSON.stringify(bound)),
+            scope,
+          ),
+        ).toEqual(bound);
+        expect(
+          parseTeamsPersonalRecipientBinding(bound, {
+            ...scope,
+            conversationGeneration: scope.conversationGeneration + 1,
+          }),
+        ).toBeNull();
+        expect(restarted.wakeup).toHaveBeenCalledTimes(1);
+        await restarted.service.processPendingDeliveries(1, received!.id);
+        expect(restarted.wakeup).toHaveBeenCalledTimes(1);
+        expect(
+          (
+            await db
+              .select()
+              .from(chatDeliveries)
+              .where(eq(chatDeliveries.id, received!.id))
+          )[0]!.normalizedEvent,
+        ).toEqual(received!.normalizedEvent);
+      } finally {
+        try {
+          await context.service.shutdown();
+        } finally {
+          await retirePublicationFixture(
+            restarted?.service ?? context.service,
+            context.endpoint.id,
+          );
+        }
+      }
+    });
+
+    it("does not invent personal recipient proof when an AAD-only legacy delivery resumes without original runtime evidence", async () => {
+      const context = await recipientFixture();
+      let restarted: ReturnType<typeof createService> | undefined;
+      try {
+        const providerEventId = `teams:${Buffer.from(context.providerConversationId).toString("base64url")}:${context.message.id}`;
+        // A separate synthetic legacy receipt, not a stripped modern proof.
+        // Its AAD principal and personal route cannot reconstruct BF from.id.
+        const normalizedEvent = {
+          providerEventId,
+          kind: "direct_message",
+          trigger: "direct_message",
+          principal: {
+            externalId: context.aadObjectId,
+            displayName: "Legacy person",
+            handle: "legacy",
+          },
+          conversation: {
+            externalConversationId: context.message.threadId,
+            externalThreadId: context.message.threadId,
+            label: "Legacy personal",
+            isDirectMessage: true,
+            providerUrl: null,
+          },
+          message: {
+            providerMessageId: context.message.id,
+            text: "Legacy receipt",
+            mentionedBot: false,
+            attachments: [],
+          },
+        };
+        const [received] = await db
+          .insert(chatDeliveries)
+          .values({
+            companyId: context.fixture.companyId,
+            endpointId: context.endpoint.id,
+            providerEventId,
+            deduplicationKey: createHash("sha256")
+              .update(providerEventId)
+              .digest("hex"),
+            eventKind: "direct_message",
+            normalizedEvent,
+            state: "received",
+            nextAttemptAt: new Date(0),
+          })
+          .returning();
+        await context.service.shutdown();
+        restarted = context.restart();
+        await restarted.service.processPendingDeliveries(1, received!.id);
+        const [processed] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.id, received!.id));
+        expect(processed).toMatchObject({
+          state: "failed",
+          redactedError:
+            "This accepted chat message is no longer authorized to start work",
+        });
+        expect(processed!.normalizedEvent).toEqual(normalizedEvent);
+        expect(
+          processed!.normalizedEvent.teamsPersonalRecipient,
+        ).toBeUndefined();
+        expect(restarted.wakeup).not.toHaveBeenCalled();
+        expect(JSON.stringify(processed!.normalizedEvent)).not.toContain(
+          context.providerUserId,
+        );
+      } finally {
+        try {
+          await context.service.shutdown();
+        } finally {
+          await retirePublicationFixture(
+            restarted?.service ?? context.service,
+            context.endpoint.id,
+          );
+        }
+      }
+    });
+
+    it("redacts a rejected personal destination instead of persisting its derived recipient proof", async () => {
+      const context = await recipientFixture();
+      try {
+        await context.service.update(
+          context.endpoint.id,
+          { allowDirectMessages: false },
+          "owner-user",
+        );
+        const callbacks = context.runtime.configurations.get(
+          context.endpoint.id,
+        )!.callbacks;
+        await deliverMessage({
+          callbacks,
+          endpointId: context.endpoint.id,
+          provider: "microsoft-teams",
+          thread: context.sourceThread.thread,
+          message: context.message,
+          trigger: "direct_message",
+        });
+        const [delivery] = await db
+          .select()
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, context.endpoint.id));
+        expect(delivery).toMatchObject({
+          state: "filtered",
+          conversationId: null,
+          normalizedEvent: { filtering: { contentRetained: false } },
+        });
+        expect(
+          delivery!.normalizedEvent.teamsPersonalRecipient,
+        ).toBeUndefined();
+        expect(JSON.stringify(delivery!.normalizedEvent)).not.toContain(
+          context.providerUserId,
+        );
+        expect(JSON.stringify(delivery!.normalizedEvent)).not.toContain(
+          context.aadObjectId,
+        );
+        expect(context.wakeup).not.toHaveBeenCalled();
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+  });
+
+  async function teamsFileAuthorityFixture(
+    settings: { linkedRecipient?: boolean; separateSponsor?: boolean } = {},
+  ) {
+    const { installTeamsFileConsentHook } =
+      await import("../services/chat-teams-file-consent.js");
+    type ConsentCard = ReturnType<
+      typeof import("../services/chat-teams-file-consent.js").buildTeamsFileConsentCard
+    >;
+    type FileCard = ReturnType<
+      typeof import("../services/chat-teams-file-consent.js").buildTeamsUploadedFileCard
+    >;
+    const fixture = await seedCompany();
+    const storage = createStorageService();
+    const bytes = Buffer.from("Exact original Teams file bytes.\n", "utf8");
+    const consentCards: Array<{ threadId: string; card: ConsentCard }> = [];
+    const fileCards: Array<{ threadId: string; card: FileCard }> = [];
+    const controls: {
+      beforeConsentReceipt?: () => Promise<void>;
+      beforeFileInfoReceipt?: () => Promise<void>;
+    } = {};
+    const handlers = new Map<
+      string,
+      (context: { activity: unknown }) => Promise<{ status: number }>
+    >();
+    const runtime = new FakeChatSdkRuntime();
+    const replace = runtime.replaceEndpoint.bind(runtime);
+    vi.spyOn(runtime, "replaceEndpoint").mockImplementation(async (options) => {
+      const instance = await replace(options);
+      const thread = instance.thread.bind(instance);
+      vi.spyOn(instance, "thread").mockImplementation((id) => ({
+        ...thread(id),
+        isDM: true,
+      }));
+      Object.assign(instance, {
+        sendTeamsFileConsentCard: async (
+          threadId: string,
+          card: ConsentCard,
+        ) => {
+          consentCards.push({ threadId, card });
+          await controls.beforeConsentReceipt?.();
+          return { id: `native-consent-${consentCards.length}` };
+        },
+        sendTeamsUploadedFileCard: async (threadId: string, card: FileCard) => {
+          fileCards.push({ threadId, card });
+          await controls.beforeFileInfoReceipt?.();
+          return { id: `native-file-${fileCards.length}` };
+        },
+      });
+      if (
+        options.providerConfig.provider === "microsoft-teams" &&
+        options.callbacks.onTeamsFileConsent
+      ) {
+        handlers.clear();
+        installTeamsFileConsentHook(
+          { on: (name, callback) => handlers.set(name, callback) },
+          {
+            companyId: options.companyId,
+            endpointId: options.endpointId,
+            tenantId: String(options.providerConfig.credentials.appTenantId),
+            botAppId: String(options.providerConfig.credentials.appId),
+            onConsent: async (event) =>
+              options.callbacks.onTeamsFileConsent!({
+                endpointId: options.endpointId,
+                provider: "microsoft-teams",
+                event,
+              }),
+          },
+        );
+      }
+      return instance;
+    });
+    const uploadRequest = vi.fn<
+      NonNullable<ChatChannelServiceOptions["teamsFileUploadRequest"]>
+    >(async () =>
+      Response.json(
+        {
+          id: "teams-drive-item-1",
+          name: "authority-report.txt",
+          size: bytes.length,
+        },
+        { status: 201 },
+      ),
+    );
+    const wakeup = vi.fn<ChatChannelServiceOptions["heartbeat"]["wakeup"]>(
+      async () => ({ accepted: true }),
+    );
+    const cancelRun = vi.fn(async () => ({ status: "cancelled" }));
+    const service = chatChannelService(db, {
+      fetch: async () =>
+        Response.json({ access_token: "synthetic-teams-access" }),
+      runtime: runtime as unknown as ChatSdkRuntime,
+      heartbeat: { wakeup: receiptBackedWakeup(wakeup), cancelRun },
+      storage: storage.storage,
+      publicBaseUrl: "https://paperclip.example",
+      teamsFileUploadRequest: uploadRequest,
+      scheduleDeferredWork: () => undefined,
+    });
+    const endpoint = await service.create(
+      fixture.companyId,
+      {
+        provider: "microsoft-teams",
+        assignedAgentId: fixture.assignedAgentId,
+        name: "Teams native file authority",
+      },
+      "owner-user",
+    );
+    const tenantId = randomUUID();
+    const botAppId = randomUUID();
+    await service.configure(
+      endpoint.id,
+      {
+        action: "configure",
+        credentials: {
+          clientId: botAppId,
+          tenantId,
+          clientSecret: "synthetic-file-secret",
+        },
+      },
+      "owner-user",
+    );
+    const aadObjectId = randomUUID();
+    const recipientUserId = `teams-linked-${randomUUID()}`;
+    const sponsorUserId = settings.separateSponsor
+      ? `teams-sponsor-${randomUUID()}`
+      : "owner-user";
+    for (const userId of [
+      settings.linkedRecipient ? recipientUserId : null,
+      settings.separateSponsor ? sponsorUserId : null,
+    ]) {
+      if (!userId) continue;
+      await db
+        .insert(authUsers)
+        .values({
+          id: userId,
+          name: "Teams authority member",
+          email: `${userId}@example.com`,
+          emailVerified: true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+      await db
+        .insert(companyMemberships)
+        .values({
+          companyId: fixture.companyId,
+          principalType: "user",
+          principalId: userId,
+          status: "active",
+          membershipRole: "operator",
+        });
+    }
+    if (settings.separateSponsor)
+      await db
+        .update(chatEndpoints)
+        .set({ sponsorUserId })
+        .where(eq(chatEndpoints.id, endpoint.id));
+    if (settings.linkedRecipient) {
+      const [principal] = await db
+        .insert(chatExternalPrincipals)
+        .values({
+          companyId: fixture.companyId,
+          provider: "microsoft-teams",
+          providerAccountId: tenantId,
+          externalId: aadObjectId,
+          kind: "user",
+          isBot: false,
+        })
+        .returning();
+      await db
+        .insert(chatIdentityLinks)
+        .values({
+          companyId: fixture.companyId,
+          endpointId: endpoint.id,
+          principalId: principal!.id,
+          paperclipUserId: recipientUserId,
+          status: "linked",
+          confirmedAt: new Date(),
+        });
+    }
+    const providerUserId = `29:file-author-${randomUUID()}`;
+    const providerConversationId = `a:file-authority-${randomUUID()}`;
+    const adapter = createTeamsAdapter({
+      appId: botAppId,
+      appPassword: "unused-parser-only",
+      appTenantId: tenantId,
+      appType: "SingleTenant",
+    });
+    const raw = {
+      id: `file-source-${randomUUID()}`,
+      type: "message",
+      channelId: "msteams",
+      timestamp: new Date().toISOString(),
+      serviceUrl: "https://smba.trafficmanager.net/amer/",
+      from: { id: providerUserId, aadObjectId, name: "File recipient" },
+      recipient: { id: `28:${botAppId}` },
+      conversation: {
+        id: providerConversationId,
+        conversationType: "personal",
+        tenantId,
+      },
+      channelData: { tenant: { id: tenantId } },
+      text: "Use only my exact original personal conversation.",
+    };
+    const message = adapter.parseMessage(raw);
+    const sourceThread = makeThread({
+      id: message.threadId,
+      channelId: message.threadId,
+      isDM: true,
+      name: "Native personal file",
+    });
+    const deliver = async (activity = raw) => {
+      const callbacks = runtime.configurations.get(endpoint.id)!.callbacks;
+      await deliverMessage({
+        callbacks,
+        endpointId: endpoint.id,
+        provider: "microsoft-teams",
+        thread: sourceThread.thread,
+        message: adapter.parseMessage(activity),
+        trigger: "direct_message",
+      });
+    };
+    await deliver();
+    await qualifySetupRoundTrip(service, endpoint.id, aadObjectId);
+    await service.test(endpoint.id, "owner-user");
+    await service.processPendingPublications();
+    const [sourceDelivery] = await db
+      .select()
+      .from(chatDeliveries)
+      .where(
+        and(
+          eq(chatDeliveries.endpointId, endpoint.id),
+          sql`${chatDeliveries.normalizedEvent}->'message'->>'providerMessageId' = ${raw.id}`,
+        ),
+      );
+    const [conversation] = await db
+      .select()
+      .from(chatConversations)
+      .where(eq(chatConversations.id, sourceDelivery!.conversationId!));
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, conversation!.issueId));
+    const [sourceAction] = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.deliveryId, sourceDelivery!.id),
+          eq(chatActions.kind, "inbound_wakeup"),
+        ),
+      );
+    expect(sourceDelivery).toMatchObject({
+      state: "processed",
+      normalizedEvent: {
+        teamsPersonalRecipient: {
+          aadObjectId,
+          providerUserId,
+          providerConversationId,
+        },
+      },
+    });
+    expect(sourceAction).toMatchObject({ status: "processed" });
+    await expect(service.get(endpoint.id)).resolves.toMatchObject({
+      status: "active",
+    });
+    const createFile = async () => {
+      const stored = await storage.storage.putFile({
+        companyId: fixture.companyId,
+        namespace: `issues/${issue!.id}`,
+        originalFilename: "authority-report.txt",
+        contentType: "text/plain",
+        body: bytes,
+      });
+      return issueService(db).createAttachment({
+        issueId: issue!.id,
+        ...stored,
+        createdByUserId: "owner-user",
+      });
+    };
+    const dispatchConsent = async (
+      action: "accept" | "decline" = "accept",
+      patch: Record<string, unknown> = {},
+      retainedHandler?: (context: {
+        activity: unknown;
+      }) => Promise<{ status: number }>,
+    ) => {
+      const card = consentCards.at(-1)?.card;
+      if (!card)
+        throw new Error("Expected real service consent card before callback");
+      const activity = {
+        id: `consent-response-${randomUUID()}`,
+        type: "invoke",
+        name: "fileConsent/invoke",
+        channelId: "msteams",
+        from: raw.from,
+        recipient: raw.recipient,
+        conversation: raw.conversation,
+        channelData: raw.channelData,
+        replyToId: `native-consent-${consentCards.length}`,
+        value: {
+          type: "fileUpload",
+          action,
+          context:
+            action === "accept"
+              ? card.content.acceptContext
+              : card.content.declineContext,
+          ...(action === "accept"
+            ? {
+                uploadInfo: {
+                  name: card.name,
+                  fileType: "txt",
+                  uniqueId: "teams-drive-item-1",
+                  uploadUrl:
+                    "https://fixture.sharepoint.com/upload?secret=PRIVATE-UPLOAD-CANARY",
+                  contentUrl:
+                    "https://fixture.sharepoint.com/personal/authority-report.txt",
+                },
+              }
+            : {}),
+        },
+        ...patch,
+      };
+      const handler = retainedHandler ?? handlers.get(`file.consent.${action}`);
+      if (!handler)
+        throw new Error("Expected registered service consent callback");
+      return handler({ activity });
+    };
+    return {
+      fixture,
+      storage,
+      bytes,
+      runtime,
+      service,
+      endpoint,
+      tenantId,
+      botAppId,
+      aadObjectId,
+      providerUserId,
+      providerConversationId,
+      adapter,
+      raw,
+      message,
+      sourceThread,
+      sourceDelivery: sourceDelivery!,
+      sourceAction: sourceAction!,
+      conversation: conversation!,
+      issue: issue!,
+      consentCards,
+      fileCards,
+      uploadRequest,
+      wakeup,
+      cancelRun,
+      createFile,
+      deliver,
+      dispatchConsent,
+      controls,
+      handlers,
+      recipientUserId,
+      sponsorUserId,
+    };
+  }
+
+  describe("Teams exact self-unknown source continuation", () => {
+    async function nativeFileFixture() {
+      const context = await teamsFileAuthorityFixture();
+      const runId = randomUUID();
+      const contractId = randomUUID();
+      const sessionId = randomUUID();
+      const runnerId = randomUUID();
+      const contractSha256 = createHash("sha256")
+        .update(contractId)
+        .digest("hex");
+      await db.insert(completionContracts).values({
+        id: contractId,
+        companyId: context.fixture.companyId,
+        issueId: context.issue.id,
+        revision: 1,
+        schemaVersion: "paperclip.completion-contract.v1",
+        policyVersion: "phase6-v3",
+        risk: "low",
+        completionAuthority: "agent_claim_policy",
+        incompleteCriteriaPolicy: "preserve_non_terminal",
+        contractJson: {
+          revision: "teams-native-v1",
+          objective: "Return the requested file",
+          criteria: [
+            { id: "response", requirement: "Return the exact selected file" },
+          ],
+        },
+        canonicalSha256: contractSha256,
+        createdByActorType: "system",
+        createdByActorId: "test",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: context.fixture.companyId,
+        agentId: context.fixture.assignedAgentId,
+        status: "running",
+        wakeupRequestId: context.sourceAction.id,
+        runtimeMode: "native",
+        nativeIssueId: context.issue.id,
+        nativeSessionId: sessionId,
+        runnerInstanceId: runnerId,
+        completionContractId: contractId,
+        completionContractSha256: contractSha256,
+        contextSnapshot: {
+          issueId: context.issue.id,
+          taskKey: context.issue.identifier,
+          source: "chat:microsoft-teams",
+          wakeCommentId: context.sourceAction.payload.commentId,
+          wakeCommentIds: [context.sourceAction.payload.commentId],
+        },
+      });
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "completed", runId })
+        .where(eq(agentWakeupRequests.id, context.sourceAction.id));
+      const stored = await context.storage.storage.putFile({
+        companyId: context.fixture.companyId,
+        namespace: `issues/${context.issue.id}`,
+        originalFilename: "authority-report.txt",
+        contentType: "text/plain",
+        body: context.bytes,
+      });
+      const attachment = await issueService(db).createAttachment({
+        issueId: context.issue.id,
+        ...stored,
+        createdByAgentId: context.fixture.assignedAgentId,
+        createdByRunId: runId,
+      });
+      await issueService(db).addComment(
+        context.issue.id,
+        "Selected the exact requested file.",
+        { agentId: context.fixture.assignedAgentId, runId },
+        {
+          attachmentIds: [attachment.id],
+          authorType: "agent",
+          authorizationReason: "allow_self",
+        },
+      );
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          errorCode: "adapter_failed",
+          finishedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      await db
+        .update(issues)
+        .set({ status: "in_review", executionRunId: null })
+        .where(eq(issues.id, context.issue.id));
+      const result: PrpStructuredRunResult = {
+        schema: "paperclip.run_result.v1",
+        reportedWorkDisposition: "yielded",
+        summary:
+          "Here is the exact requested file. I will wait for your next message.",
+        completionClaim: {
+          contractRevision: "teams-native-v1",
+          objectiveSatisfied: true,
+          criteria: [
+            { criterionId: "response", status: "satisfied", evidenceRefs: [] },
+          ],
+          remainingWork: [],
+        },
+        evidence: [],
+        verification: [],
+        attentionRequests: [],
+        artifacts: [],
+        continuation: {
+          kind: "response_wake",
+          summary: "Wait for the next authorized message.",
+          idempotencyKey: `wait:${runId}`,
+        },
+      };
+      const terminal: PrpTerminalState = {
+        schema: "paperclip.prp.terminal.v1",
+        turnTerminalState: "completed",
+        runTerminalState: "succeeded",
+        reportedWorkDisposition: "yielded",
+        workAssessmentId: randomUUID(),
+        statusDecisionId: randomUUID(),
+      };
+      await new NativeRunCoordinatorStore(db, {
+        companyId: context.fixture.companyId,
+        issueId: context.issue.id,
+        runId,
+        agentId: context.fixture.assignedAgentId,
+        normalizedSessionId: sessionId,
+        runnerSourceInstanceId: runnerId,
+        completionContractId: contractId,
+        completionContractSha256: contractSha256,
+        completionContractRevision: "teams-native-v1",
+        completionContractCriterionIds: ["response"],
+      }).completeRun({ result, terminal, turnId: `turn-${runId}` });
+      await finalizeNativeRun({
+        db,
+        runId,
+        workspaceFinalizeStatus: "succeeded",
+      });
+      await repairCommittedNativeChatResponse(db, {
+        companyId: context.fixture.companyId,
+        issueId: context.issue.id,
+        runId,
+      });
+      const [run] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(run).toMatchObject({
+        status: "succeeded",
+        resultJson: {
+          nativeCommittedChatResponse: {
+            schema: "paperclip.native_committed_chat_response.v1",
+          },
+        },
+      });
+      return { ...context, runId, attachment };
+    }
+
+    // Actual parser/admission and accepted native-result composition. Provider
+    // sends and authenticated App routing are controlled, not live tenant proof.
+    it("accepts the exact native file after a lost consent-card receipt without reposting", async () => {
+      const context = await nativeFileFixture();
+      try {
+        const instance = context.runtime.endpoints.get(
+          context.endpoint.id,
+        )! as unknown as {
+          sendTeamsFileConsentCard: (
+            threadId: string,
+            card: unknown,
+          ) => Promise<{ id: string }>;
+        };
+        const send = instance.sendTeamsFileConsentCard.bind(instance);
+        vi.spyOn(instance, "sendTeamsFileConsentCard").mockImplementation(
+          async (threadId, card) => {
+            await send(threadId, card);
+            throw new Error("controlled lost card POST receipt");
+          },
+        );
+        await context.service.processPendingPublications();
+        const [unknown] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.endpointId, context.endpoint.id));
+        expect(unknown).toMatchObject({
+          phase: "consent_unknown",
+          consentMessageId: null,
+          attemptId: null,
+        });
+        expect(context.consentCards).toHaveLength(1);
+        const wakeCount = context.wakeup.mock.calls.length;
+        await expect(context.dispatchConsent()).resolves.toEqual({
+          status: 200,
+        });
+        await context.service.processPendingPublications();
+        const [done] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, unknown!.id));
+        expect(done).toMatchObject({
+          phase: "delivered",
+          consentMessageId: null,
+          fileInfoMessageId: "native-file-1",
+        });
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.fileCards).toHaveLength(1);
+        expect(context.wakeup).toHaveBeenCalledTimes(wakeCount);
+        await expect(
+          db.transaction((tx) =>
+            context.service.prepareFailedChatRunRetry(tx, {
+              companyId: context.fixture.companyId,
+              issueId: context.issue.id,
+              agentId: context.fixture.assignedAgentId,
+              failedRunId: context.runId,
+              initiatedByUserId: "owner-user",
+            }),
+          ),
+        ).rejects.toMatchObject({
+          details: { code: "chat_failed_run_retry_not_authorized" },
+        });
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+    it.each([
+      "sibling_unknown",
+      "foreign_comment_run",
+      "unowned_attachment",
+      "source_edited",
+      "upload_unknown",
+      "active_attempt",
+    ] as const)(
+      "does not exempt other unknown effects or changed native authority: %s",
+      async (variant) => {
+        const context = await nativeFileFixture();
+        try {
+          context.controls.beforeConsentReceipt = async () => {
+            throw new Error("controlled lost card POST receipt");
+          };
+          await context.service.processPendingPublications();
+          const [unknown] = await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.endpointId, context.endpoint.id));
+          expect(unknown).toMatchObject({
+            phase: "consent_unknown",
+            attemptId: null,
+          });
+          if (variant === "sibling_unknown") {
+            await db.insert(chatPublications).values({
+              companyId: unknown!.companyId,
+              endpointId: unknown!.endpointId,
+              conversationId: unknown!.conversationId,
+              issueId: unknown!.issueId,
+              commentId: unknown!.commentId,
+              state: "delivery_unknown",
+              idempotencyKey: `run:${context.runId}:other-unknown`,
+              payload: { text: "Other uncertain effect" },
+            });
+          } else if (variant === "foreign_comment_run") {
+            await db
+              .update(issueComments)
+              .set({ createdByRunId: null })
+              .where(eq(issueComments.id, unknown!.commentId));
+          } else if (variant === "unowned_attachment") {
+            await db
+              .update(issueAttachments)
+              .set({ originatingRunId: null })
+              .where(eq(issueAttachments.id, context.attachment.id));
+          } else if (variant === "source_edited") {
+            await db
+              .update(issueComments)
+              .set({ updatedAt: new Date(Date.now() + 1) })
+              .where(
+                eq(
+                  issueComments.id,
+                  String(context.sourceAction.payload.commentId),
+                ),
+              );
+          } else if (variant === "upload_unknown") {
+            await db
+              .update(chatTeamsFileTransfers)
+              .set({ phase: "upload_unknown", version: unknown!.version + 1 })
+              .where(eq(chatTeamsFileTransfers.id, unknown!.id));
+          } else {
+            await db
+              .update(chatTeamsFileTransfers)
+              .set({
+                attemptId: randomUUID(),
+                attemptExpiresAt: new Date(Date.now() + 90_000),
+              })
+              .where(eq(chatTeamsFileTransfers.id, unknown!.id));
+          }
+          const [before] = await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.id, unknown!.id));
+          await expect(context.dispatchConsent()).resolves.toEqual({
+            status: 403,
+          });
+          const [after] = await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.id, unknown!.id));
+          expect(after).toEqual(before);
+          expect(context.consentCards).toHaveLength(1);
+          expect(context.uploadRequest).not.toHaveBeenCalled();
+          expect(context.fileCards).toEqual([]);
+        } finally {
+          await retirePublicationFixture(context.service, context.endpoint.id);
+        }
+      },
+    );
+
+    it("retries only the confirmed native file-info stage with an exact audited phase/version, never its PUT", async () => {
+      const context = await nativeFileFixture();
+      try {
+        await context.service.processPendingPublications();
+        context.controls.beforeFileInfoReceipt = async () => {
+          throw new Error("controlled lost file-info POST receipt");
+        };
+        await expect(context.dispatchConsent()).resolves.toEqual({
+          status: 200,
+        });
+        await context.service.processPendingPublications();
+        const [unknown] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.endpointId, context.endpoint.id));
+        expect(unknown).toMatchObject({
+          phase: "file_info_unknown",
+          attemptId: null,
+          fileInfoMessageId: null,
+        });
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.fileCards).toHaveLength(1);
+        for (const requested of [
+          undefined,
+          { phase: "consent_unknown" as const, version: unknown!.version },
+          {
+            phase: "file_info_unknown" as const,
+            version: unknown!.version - 1,
+          },
+        ]) {
+          await expect(
+            context.service.resolvePublication(
+              context.endpoint.id,
+              unknown!.publicationId,
+              "retry_anyway",
+              "owner-user",
+              requested,
+            ),
+          ).rejects.toMatchObject({
+            status: 409,
+            details: { code: "chat_file_transfer_resolution_required" },
+          });
+        }
+        const [unchanged] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, unknown!.id));
+        expect(unchanged).toEqual(unknown);
+        context.controls.beforeFileInfoReceipt = undefined;
+        await context.service.resolvePublication(
+          context.endpoint.id,
+          unknown!.publicationId,
+          "retry_anyway",
+          "owner-user",
+          { phase: "file_info_unknown", version: unknown!.version },
+        );
+        await context.service.processPendingPublications();
+        const [done] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, unknown!.id));
+        expect(done).toMatchObject({
+          phase: "delivered",
+          fileInfoMessageId: "native-file-2",
+        });
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.fileCards).toHaveLength(2);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+  });
+
+  describe("Teams current file authority and composed Board transfer", () => {
+    // Actual installed inbound parser + real admission, intent, transfer,
+    // projection and callback service. Runtime sends/PUT and the authenticated
+    // App hook ingress are controlled here; this is not tenant/JWT/live proof.
+    it("freezes the original recipient at Board Send and publishes only after consent and exact-byte PUT", async () => {
+      const context = await teamsFileAuthorityFixture();
+      try {
+        const attachment = await context.createFile();
+        const publication = await context.service.publishBoardMessage(
+          context.endpoint.id,
+          context.conversation.id,
+          "One original file for the current task recipient",
+          `teams-board-file-${randomUUID()}`,
+          "owner-user",
+          [attachment.id],
+        );
+        const [intent] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, context.endpoint.id),
+              eq(chatActions.kind, "teams_board_file_intent"),
+            ),
+          );
+        expect(intent).toMatchObject({
+          status: "processed",
+          deliveryId: context.sourceDelivery.id,
+          principalId: context.sourceAction.principalId,
+          payload: {
+            publicationId: publication.id,
+            attachmentId: attachment.id,
+            sourceActionId: context.sourceAction.id,
+            userId: "owner-user",
+          },
+        });
+        const [transfer] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.publicationId, publication.id));
+        expect(transfer).toMatchObject({
+          phase: "awaiting_consent",
+          providerUserId: context.providerUserId,
+          aadObjectId: context.aadObjectId,
+          providerConversationId: context.providerConversationId,
+          sha256: createHash("sha256").update(context.bytes).digest("hex"),
+          byteSize: context.bytes.length,
+          consentMessageId: "native-consent-1",
+          fileInfoMessageId: null,
+        });
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.fileCards).toEqual([]);
+        expect(context.uploadRequest).not.toHaveBeenCalled();
+        const before = await context.service.getPublicationBatchStatus(
+          context.endpoint.id,
+          context.conversation.id,
+          publication.id,
+        );
+        expect(before).toMatchObject({
+          published: 1,
+          awaitingConsent: 1,
+          canDismiss: false,
+        });
+        const wakeCount = context.wakeup.mock.calls.length;
+        await expect(context.dispatchConsent()).resolves.toEqual({
+          status: 200,
+        });
+        await context.service.processPendingPublications();
+        const [done] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, transfer!.id));
+        expect(done).toMatchObject({
+          phase: "delivered",
+          consentMessageId: "native-consent-1",
+          fileInfoMessageId: "native-file-1",
+        });
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.uploadRequest.mock.calls[0]![1]).toMatchObject({
+          method: "PUT",
+          redirect: "manual",
+          body: context.bytes,
+        });
+        expect(context.fileCards).toHaveLength(1);
+        const status = await context.service.getPublicationBatchStatus(
+          context.endpoint.id,
+          context.conversation.id,
+          publication.id,
+        );
+        expect(status).toMatchObject({
+          published: 2,
+          awaitingConsent: 0,
+          settled: 2,
+          canDismiss: true,
+        });
+        expect(
+          JSON.stringify([
+            status,
+            await context.service.listActivity(context.endpoint.id),
+          ]),
+        ).not.toMatch(
+          /PRIVATE-UPLOAD-CANARY|pcfc_|ciphertext|fixture\.sharepoint/,
+        );
+        await context.service.processPendingPublications();
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.fileCards).toHaveLength(1);
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.wakeup).toHaveBeenCalledTimes(wakeCount);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+
+    it("stages native Board file consent on the first send from a cold reconstructed service", async () => {
+      const context = await teamsFileAuthorityFixture();
+      const coldRuntime = new FakeChatSdkRuntime();
+      const replace = coldRuntime.replaceEndpoint.bind(coldRuntime);
+      const consentPost = vi.fn(async (_threadId: string, _card: unknown) => ({
+        id: "cold-consent-1",
+      }));
+      vi.spyOn(coldRuntime, "replaceEndpoint").mockImplementation(
+        async (options) => {
+          const instance = await replace(options);
+          const thread = instance.thread.bind(instance);
+          vi.spyOn(instance, "thread").mockImplementation((id) => ({
+            ...thread(id),
+            isDM: true,
+          }));
+          Object.assign(instance, {
+            sendTeamsFileConsentCard: consentPost,
+            sendTeamsUploadedFileCard: async () => {
+              throw new Error("No upload is authorized before consent");
+            },
+          });
+          return instance;
+        },
+      );
+      const coldWakeup = vi.fn<
+        ChatChannelServiceOptions["heartbeat"]["wakeup"]
+      >(async () => ({ accepted: true }));
+      let coldService: ChatChannelService | undefined;
+      try {
+        const attachment = await context.createFile();
+        await context.service.shutdown();
+        coldService = chatChannelService(db, {
+          fetch: async () =>
+            Response.json({ access_token: "synthetic-cold-access" }),
+          runtime: coldRuntime as unknown as ChatSdkRuntime,
+          heartbeat: {
+            wakeup: receiptBackedWakeup(coldWakeup),
+            cancelRun: vi.fn(async () => ({ status: "cancelled" })),
+          },
+          storage: context.storage.storage,
+          publicBaseUrl: "https://paperclip.example",
+          teamsFileUploadRequest: context.uploadRequest,
+          scheduleDeferredWork: () => undefined,
+        });
+        expect(coldRuntime.endpoints.size).toBe(0);
+        expect(coldRuntime.replaceCount).toBe(0);
+        await expect(
+          coldService.get(context.endpoint.id),
+        ).resolves.toMatchObject({ status: "active" });
+        const publication = await coldService.publishBoardMessage(
+          context.endpoint.id,
+          context.conversation.id,
+          "First Board send after service reconstruction",
+          `teams-cold-${randomUUID()}`,
+          "owner-user",
+          [attachment.id],
+        );
+        const [intent] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, context.endpoint.id),
+              eq(chatActions.kind, "teams_board_file_intent"),
+            ),
+          );
+        expect(intent).toMatchObject({
+          deliveryId: context.sourceDelivery.id,
+          principalId: context.sourceAction.principalId,
+          payload: {
+            publicationId: publication.id,
+            sourceActionId: context.sourceAction.id,
+            attachmentId: attachment.id,
+          },
+        });
+        expect(
+          await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.publicationId, publication.id)),
+        ).toEqual([
+          expect.objectContaining({
+            phase: "awaiting_consent",
+            consentMessageId: "cold-consent-1",
+            fileInfoMessageId: null,
+            providerUserId: context.providerUserId,
+            aadObjectId: context.aadObjectId,
+            sha256: createHash("sha256").update(context.bytes).digest("hex"),
+          }),
+        ]);
+        expect(consentPost).toHaveBeenCalledTimes(1);
+        expect(coldWakeup).not.toHaveBeenCalled();
+        expect(context.uploadRequest).not.toHaveBeenCalled();
+        expect(
+          await coldService.getPublicationBatchStatus(
+            context.endpoint.id,
+            context.conversation.id,
+            publication.id,
+          ),
+        ).toMatchObject({
+          published: 1,
+          awaitingConsent: 1,
+          canDismiss: false,
+        });
+      } finally {
+        try {
+          await context.service.shutdown();
+        } finally {
+          await retirePublicationFixture(
+            coldService ?? context.service,
+            context.endpoint.id,
+          );
+        }
+      }
+    });
+
+    async function beginTeamsBoardTransfer(
+      context: Awaited<ReturnType<typeof teamsFileAuthorityFixture>>,
+    ) {
+      const attachment = await context.createFile();
+      const publication = await context.service.publishBoardMessage(
+        context.endpoint.id,
+        context.conversation.id,
+        "The exact current original file",
+        `teams-authority-race-${randomUUID()}`,
+        "owner-user",
+        [attachment.id],
+      );
+      const [transfer] = await db
+        .select()
+        .from(chatTeamsFileTransfers)
+        .where(eq(chatTeamsFileTransfers.publicationId, publication.id));
+      expect(transfer).toMatchObject({
+        phase: "awaiting_consent",
+        consentMessageId: "native-consent-1",
+      });
+      expect(context.consentCards).toHaveLength(1);
+      expect(context.uploadRequest).not.toHaveBeenCalled();
+      return { publication, transfer: transfer! };
+    }
+
+    it.each(["linked_recipient", "sponsor", "board_author"] as const)(
+      "rechecks revoked %s authority before acceptance and before PUT",
+      async (role) => {
+        for (const boundary of ["accept", "put"] as const) {
+          const context = await teamsFileAuthorityFixture({
+            linkedRecipient: role === "linked_recipient",
+            separateSponsor: true,
+          });
+          try {
+            const { transfer } = await beginTeamsBoardTransfer(context);
+            if (boundary === "put")
+              await expect(context.dispatchConsent()).resolves.toEqual({
+                status: 200,
+              });
+            if (role === "linked_recipient")
+              await db
+                .update(chatIdentityLinks)
+                .set({ status: "revoked", revokedAt: new Date() })
+                .where(
+                  and(
+                    eq(chatIdentityLinks.companyId, context.fixture.companyId),
+                    eq(chatIdentityLinks.endpointId, context.endpoint.id),
+                    eq(
+                      chatIdentityLinks.principalId,
+                      context.sourceAction.principalId!,
+                    ),
+                  ),
+                );
+            else
+              await db
+                .update(companyMemberships)
+                .set({ membershipRole: "viewer" })
+                .where(
+                  and(
+                    eq(companyMemberships.companyId, context.fixture.companyId),
+                    eq(companyMemberships.principalType, "user"),
+                    eq(
+                      companyMemberships.principalId,
+                      role === "sponsor" ? context.sponsorUserId : "owner-user",
+                    ),
+                  ),
+                );
+            const [before] = await db
+              .select()
+              .from(chatTeamsFileTransfers)
+              .where(eq(chatTeamsFileTransfers.id, transfer.id));
+            if (boundary === "accept") {
+              const outcome = await context.dispatchConsent();
+              // No success ACK for a revoked principal. The current callback
+              // contract distinguishes explicit denial from closed transient failure.
+              expect([403, 503]).toContain(outcome.status);
+            }
+            await context.service.processPendingPublications();
+            expect(
+              await db
+                .select()
+                .from(chatTeamsFileTransfers)
+                .where(eq(chatTeamsFileTransfers.id, transfer.id)),
+            ).toEqual([before]);
+            expect(context.uploadRequest).not.toHaveBeenCalled();
+            expect(context.fileCards).toEqual([]);
+            expect(context.consentCards).toHaveLength(1);
+          } finally {
+            await retirePublicationFixture(
+              context.service,
+              context.endpoint.id,
+            );
+          }
+        }
+      },
+    );
+
+    it("rejects a retained old-runtime consent callback after normal pause and resume", async () => {
+      const context = await teamsFileAuthorityFixture();
+      try {
+        const { transfer } = await beginTeamsBoardTransfer(context);
+        const oldRuntime = context.runtime.endpoints.get(context.endpoint.id);
+        const oldHandler = context.handlers.get("file.consent.accept")!;
+        await context.service.configure(
+          context.endpoint.id,
+          { action: "pause" },
+          "owner-user",
+        );
+        await context.service.configure(
+          context.endpoint.id,
+          { action: "resume" },
+          "owner-user",
+        );
+        expect(context.runtime.endpoints.get(context.endpoint.id)).not.toBe(
+          oldRuntime,
+        );
+        const [before] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, transfer.id));
+        await expect(
+          context.dispatchConsent("accept", {}, oldHandler),
+        ).resolves.toEqual({ status: 403 });
+        expect(
+          await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.id, transfer.id)),
+        ).toEqual([before]);
+        expect(context.uploadRequest).not.toHaveBeenCalled();
+        expect(context.fileCards).toEqual([]);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+
+    it("deduplicates the same actual acceptance activity before and after file delivery", async () => {
+      const context = await teamsFileAuthorityFixture();
+      try {
+        const { transfer } = await beginTeamsBoardTransfer(context);
+        const activity = { id: `same-accept-${randomUUID()}` };
+        await expect(
+          context.dispatchConsent("accept", activity),
+        ).resolves.toEqual({ status: 200 });
+        await expect(
+          context.dispatchConsent("accept", activity),
+        ).resolves.toEqual({ status: 200 });
+        await context.service.processPendingPublications();
+        const [before] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, transfer.id));
+        expect(before?.phase).toBe("delivered");
+        await expect(
+          context.dispatchConsent("accept", activity),
+        ).resolves.toEqual({ status: 200 });
+        await context.service.processPendingPublications();
+        expect(
+          await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.id, transfer.id)),
+        ).toEqual([before]);
+        expect(
+          await db
+            .select()
+            .from(chatActions)
+            .where(
+              and(
+                eq(chatActions.endpointId, context.endpoint.id),
+                eq(chatActions.kind, "teams_file_consent"),
+              ),
+            ),
+        ).toHaveLength(1);
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.fileCards).toHaveLength(1);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+
+    it("durably accepts a callback inside the consent POST before the native receipt returns", async () => {
+      const context = await teamsFileAuthorityFixture();
+      try {
+        let duringPost: typeof chatTeamsFileTransfers.$inferSelect | undefined;
+        context.controls.beforeConsentReceipt = async () => {
+          await expect(context.dispatchConsent()).resolves.toEqual({
+            status: 200,
+          });
+          [duringPost] = await db
+            .select()
+            .from(chatTeamsFileTransfers)
+            .where(eq(chatTeamsFileTransfers.endpointId, context.endpoint.id));
+          expect(duringPost).toMatchObject({
+            phase: "consent_sending",
+            consentMessageId: null,
+            responseActivityId: expect.any(String),
+          });
+          expect(JSON.stringify(duringPost)).not.toContain(
+            "PRIVATE-UPLOAD-CANARY",
+          );
+          expect(context.uploadRequest).not.toHaveBeenCalled();
+        };
+        const attachment = await context.createFile();
+        await context.service.publishBoardMessage(
+          context.endpoint.id,
+          context.conversation.id,
+          "Early callback exact file",
+          `teams-early-${randomUUID()}`,
+          "owner-user",
+          [attachment.id],
+        );
+        expect(duringPost).toBeDefined();
+        const [finished] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, duringPost!.id));
+        expect(finished).toMatchObject({
+          phase: "delivered",
+          consentMessageId: "native-consent-1",
+          fileInfoMessageId: "native-file-1",
+        });
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.fileCards).toHaveLength(1);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+
+    it("retries only fileInfo after a confirmed PUT and an explicitly resolved missing fileInfo receipt", async () => {
+      const context = await teamsFileAuthorityFixture();
+      try {
+        const { transfer, publication } =
+          await beginTeamsBoardTransfer(context);
+        context.controls.beforeFileInfoReceipt = async () => {
+          throw new Error(
+            "Synthetic provider ACK timeout after attempted fileInfo POST",
+          );
+        };
+        await expect(context.dispatchConsent()).resolves.toEqual({
+          status: 200,
+        });
+        await context.service.processPendingPublications();
+        const [unknown] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, transfer.id));
+        expect(unknown).toMatchObject({
+          phase: "file_info_unknown",
+          consentMessageId: "native-consent-1",
+          fileInfoMessageId: null,
+        });
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.fileCards).toHaveLength(1);
+        await context.service.processPendingPublications();
+        expect(context.fileCards).toHaveLength(1);
+        context.controls.beforeFileInfoReceipt = undefined;
+        await context.service.resolvePublication(
+          context.endpoint.id,
+          publication.id,
+          "retry_anyway",
+          "owner-user",
+          { phase: "file_info_unknown", version: unknown!.version },
+        );
+        const [finished] = await db
+          .select()
+          .from(chatTeamsFileTransfers)
+          .where(eq(chatTeamsFileTransfers.id, transfer.id));
+        expect(finished).toMatchObject({
+          phase: "delivered",
+          fileInfoMessageId: "native-file-2",
+        });
+        expect(context.consentCards).toHaveLength(1);
+        expect(context.uploadRequest).toHaveBeenCalledTimes(1);
+        expect(context.uploadRequest.mock.calls[0]![1]).toMatchObject({
+          body: context.bytes,
+        });
+        expect(context.fileCards).toHaveLength(2);
+        expect(
+          await db
+            .select()
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.companyId, context.fixture.companyId),
+                eq(activityLog.entityId, publication.id),
+                eq(activityLog.action, "chat.publication_retry_anyway"),
+              ),
+            ),
+        ).toEqual([
+          expect.objectContaining({
+            details: expect.objectContaining({
+              previousPhase: "file_info_unknown",
+              duplicateRiskAcknowledged: true,
+            }),
+          }),
+        ]);
+      } finally {
+        await retirePublicationFixture(context.service, context.endpoint.id);
+      }
+    });
+
+    it.each([
+      "missing_original_proof",
+      "mismatched_original_aad",
+      "different_admitted_recipient",
+    ] as const)(
+      "keeps the task-link fallback with no native file intent for %s",
+      async (variant) => {
+        const context = await teamsFileAuthorityFixture();
+        try {
+          if (variant === "different_admitted_recipient") {
+            await context.deliver({
+              ...context.raw,
+              id: `other-source-${randomUUID()}`,
+              from: {
+                ...context.raw.from,
+                id: `29:other-${randomUUID()}`,
+                aadObjectId: randomUUID(),
+              },
+            });
+          } else {
+            const normalized = { ...context.sourceDelivery.normalizedEvent };
+            if (variant === "missing_original_proof")
+              delete normalized.teamsPersonalRecipient;
+            else
+              normalized.teamsPersonalRecipient = {
+                ...(normalized.teamsPersonalRecipient as Record<
+                  string,
+                  unknown
+                >),
+                aadObjectId: randomUUID(),
+              };
+            await db
+              .update(chatDeliveries)
+              .set({ normalizedEvent: normalized })
+              .where(eq(chatDeliveries.id, context.sourceDelivery.id));
+          }
+          const attachment = await context.createFile();
+          const publication = await context.service.publishBoardMessage(
+            context.endpoint.id,
+            context.conversation.id,
+            "Share the authorized original file",
+            `teams-safe-fallback-${randomUUID()}`,
+            "owner-user",
+            [attachment.id],
+          );
+          expect(
+            await db
+              .select()
+              .from(chatActions)
+              .where(
+                and(
+                  eq(chatActions.endpointId, context.endpoint.id),
+                  eq(chatActions.kind, "teams_board_file_intent"),
+                ),
+              ),
+          ).toEqual([]);
+          expect(
+            await db
+              .select()
+              .from(chatTeamsFileTransfers)
+              .where(
+                eq(chatTeamsFileTransfers.endpointId, context.endpoint.id),
+              ),
+          ).toEqual([]);
+          expect(context.consentCards).toEqual([]);
+          expect(context.fileCards).toEqual([]);
+          expect(context.uploadRequest).not.toHaveBeenCalled();
+          expect(publication.state).toBe("published");
+          expect(
+            context.runtime.endpoints
+              .get(context.endpoint.id)!
+              .posts.some((post) => post.text.includes(context.issue.id)),
+          ).toBe(true);
+        } finally {
+          await retirePublicationFixture(context.service, context.endpoint.id);
+        }
+      },
+    );
   });
 });

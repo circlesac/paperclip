@@ -83,11 +83,15 @@ suite(
     });
     afterEach(() => vi.restoreAllMocks());
 
-    async function fixture(consentLifetimeMs = 60_000) {
+    async function fixture(
+      consentLifetimeMs = 60_000,
+      originalFilename: string | null = "file.txt",
+    ) {
       const companyId = randomUUID();
       const agentId = randomUUID();
       const applicationId = randomUUID();
       const connectionId = randomUUID();
+      const attachmentId = randomUUID();
       const a: TeamsFileTransferAuthority = {
         companyId,
         endpointId: randomUUID(),
@@ -95,7 +99,7 @@ suite(
         issueId: randomUUID(),
         publicationId: randomUUID(),
         commentId: randomUUID(),
-        attachmentId: randomUUID(),
+        attachmentId,
         principalId: randomUUID(),
         authorizedUserId: "board-user",
         runtimeGeneration: 3,
@@ -109,7 +113,7 @@ suite(
         providerUserId: "29:exact-recipient",
         sha256: hash(bytes),
         byteSize: bytes.length,
-        filename: "file.txt",
+        filename: originalFilename ?? `attachment-${attachmentId}`,
       };
       await db.insert(companies).values({
         id: companyId,
@@ -182,7 +186,7 @@ suite(
         contentType: "text/plain",
         byteSize: bytes.length,
         sha256: a.sha256,
-        originalFilename: a.filename,
+        originalFilename,
       });
       await db.insert(issueAttachments).values({
         id: a.attachmentId,
@@ -324,6 +328,64 @@ suite(
         },
       };
     }
+
+    it("uses the exact attachment-derived filename for an unnamed source across issuance and restart", async () => {
+      const f = await fixture(60_000, null);
+      const expected = `attachment-${f.a.attachmentId}`;
+      expect(f.created).toMatchObject({
+        phase: "consent_pending",
+        filename: expected,
+      });
+      expect(
+        await f.service().process(f.a.companyId, f.created.id),
+      ).toMatchObject({
+        phase: "awaiting_consent",
+        filename: expected,
+      });
+      expect(f.opts.postConsent).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(f.opts.postConsent).mock.calls[0]![0].card.name).toBe(
+        expected,
+      );
+      // Each service() is a new instance; no normalized name is cached or
+      // written back to the immutable source asset during recovery.
+      expect(
+        await f.service().process(f.a.companyId, f.created.id),
+      ).toMatchObject({
+        phase: "awaiting_consent",
+        filename: expected,
+      });
+      const [asset] = await db
+        .select()
+        .from(assets)
+        .where(eq(assets.id, f.assetId));
+      expect(asset).toMatchObject({
+        originalFilename: null,
+        sha256: f.a.sha256,
+        byteSize: bytes.length,
+      });
+      expect(f.opts.postConsent).toHaveBeenCalledTimes(1);
+      expect(f.opts.uploadRequest).not.toHaveBeenCalled();
+      expect(f.opts.postFileInfo).not.toHaveBeenCalled();
+    });
+
+    it.each(["", "../unsafe.txt", "unsafe?.txt", " report.txt", "report."])(
+      "does not normalize an unsafe stored filename to the unnamed-file fallback: %j",
+      async (filename) => {
+        const f = await fixture(60_000, null);
+        await db
+          .update(assets)
+          .set({ originalFilename: filename })
+          .where(eq(assets.id, f.assetId));
+        const before = await f.read();
+        await expect(
+          f.service().process(f.a.companyId, f.created.id),
+        ).rejects.toThrow("Teams file transfer authority or state changed");
+        expect(await f.read()).toEqual(before);
+        expect(f.opts.postConsent).not.toHaveBeenCalled();
+        expect(f.opts.uploadRequest).not.toHaveBeenCalled();
+        expect(f.opts.postFileInfo).not.toHaveBeenCalled();
+      },
+    );
 
     it("persists one exact encrypted issuance, never consent as delivered", async () => {
       const f = await fixture();
@@ -1086,17 +1148,15 @@ suite(
         .select()
         .from(toolConnections)
         .where(eq(toolConnections.id, originalEndpoint!.connectionId));
-      await db
-        .insert(toolConnections)
-        .values({
-          id: connectionId,
-          companyId: f.a.companyId,
-          applicationId: originalConnection!.applicationId,
-          uid: randomUUID(),
-          name: "Other Teams fixture",
-          transport: "chat_sdk",
-          connectionPurpose: "channel",
-        });
+      await db.insert(toolConnections).values({
+        id: connectionId,
+        companyId: f.a.companyId,
+        applicationId: originalConnection!.applicationId,
+        uid: randomUUID(),
+        name: "Other Teams fixture",
+        transport: "chat_sdk",
+        connectionPurpose: "channel",
+      });
       await db.insert(chatEndpoints).values({
         id: endpointId,
         companyId: f.a.companyId,

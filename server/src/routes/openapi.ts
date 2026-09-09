@@ -251,6 +251,7 @@ import {
   chatEndpointStatusSchema,
   chatIdentityLinkStatusSchema,
   chatProviderSchema,
+  CHAT_FILE_TRANSFER_PHASES,
   chatPublicationStateSchema,
   chatResourceAvailabilitySchema,
   configureChatEndpointSchema,
@@ -888,6 +889,16 @@ const chatConversationResponseSchema = z
   })
   .strict();
 
+const chatFileTransferResponseSchema = z
+  .object({
+    provider: z.literal("microsoft-teams"),
+    phase: z.enum(CHAT_FILE_TRANSFER_PHASES),
+    filename: z.string().min(1).max(255),
+    expiresAt: z.string().datetime().nullable().optional(),
+    version: z.number().int().positive(),
+  })
+  .strict();
+
 const chatActivityResponseSchema = z
   .object({
     id: z.string().uuid(),
@@ -913,6 +924,7 @@ const chatActivityResponseSchema = z
     resolutionActions: z.array(
       z.enum(["mark_delivered", "retry_anyway", "cancel"]),
     ),
+    fileTransfer: chatFileTransferResponseSchema.optional(),
   })
   .strict();
 
@@ -976,6 +988,7 @@ const chatPublicationResponseSchema = z
     idempotencyKey: z.string(),
     payload: safeChatPublicationPayloadResponseSchema,
     state: chatPublicationStateSchema,
+    fileTransfer: chatFileTransferResponseSchema.optional(),
     providerMessageId: z.string().nullable(),
     providerUrl: z.string().nullable(),
     attempts: z.number().int().nonnegative(),
@@ -2411,7 +2424,7 @@ registry.registerPath({
   tags: ["chat-channels"],
   summary: "Read authoritative delivery status for a Board publication batch",
   description:
-    "Returns the first blocking text/file part, or the final published part only when every part is published. This read-only endpoint never retries or sends provider messages. The original publication ID remains a stable batch anchor.",
+    "Returns the complete ordered batch, its first unresolved part and separate delivered, waiting, declined, expired and cancelled counts. Dismissal is allowed only when every part is settled; a consent card or upload receipt is not final file delivery. This read-only endpoint never retries or sends provider messages. The original publication ID remains a stable batch anchor.",
   request: {
     params: z.object({
       endpointId: z.string().uuid(),
@@ -2431,9 +2444,28 @@ registry.registerPath({
             redactedError: true,
             nextAttemptAt: true,
             publishedAt: true,
+            fileTransfer: true,
           }),
           total: z.number().int().positive(),
           published: z.number().int().nonnegative(),
+          parts: z.array(
+            chatPublicationResponseSchema.pick({
+              id: true,
+              state: true,
+              providerUrl: true,
+              attempts: true,
+              redactedError: true,
+              nextAttemptAt: true,
+              publishedAt: true,
+              fileTransfer: true,
+            }),
+          ),
+          awaitingConsent: z.number().int().nonnegative(),
+          declined: z.number().int().nonnegative(),
+          expired: z.number().int().nonnegative(),
+          cancelled: z.number().int().nonnegative(),
+          settled: z.number().int().nonnegative(),
+          canDismiss: z.boolean(),
         })
         .strict(),
     ),

@@ -342,7 +342,7 @@ export function teamsFileTransferService(
       source.publicationCommentId !== a.commentId ||
       source.sha256 !== a.sha256 ||
       source.byteSize !== a.byteSize ||
-      source.filename !== a.filename ||
+      (source.filename ?? `attachment-${a.attachmentId}`) !== a.filename ||
       source.payload.attachmentIds?.length !== 1 ||
       source.payload.attachmentIds[0] !== a.attachmentId
     )

@@ -5,6 +5,8 @@ import {
   isIndividuallyToggleableResource,
   isReplayEligible,
   isResolutionEligible,
+  activityResolutionActions,
+  activityResolutionDescription,
 } from "./ChatEndpointDetail";
 
 describe("chat endpoint lifecycle health presentation", () => {
@@ -36,7 +38,10 @@ describe("chat endpoint lifecycle health presentation", () => {
     "labels retained errors as historical while %s",
     (status) => {
       expect(
-        connectionHealthPresentation({ status, lastError: "Gateway timed out" }),
+        connectionHealthPresentation({
+          status,
+          lastError: "Gateway timed out",
+        }),
       ).toMatchObject({
         error: "Gateway timed out",
         errorLabel: "Last reported error",
@@ -102,6 +107,67 @@ describe("chat endpoint activity replay eligibility", () => {
 });
 
 describe("chat endpoint ambiguous-delivery resolution eligibility", () => {
+  it("uses server-offered stage-aware file notification actions only", () => {
+    const item = activity({
+      kind: "publication",
+      status: "delivery_unknown",
+      fileTransfer: {
+        provider: "microsoft-teams",
+        phase: "file_info_unknown",
+        filename: "report.txt",
+        version: 3,
+      },
+      resolutionActions: ["retry_anyway"],
+    });
+    expect(activityResolutionActions(item)).toEqual(["retry_anyway"]);
+    expect(activityResolutionDescription(item)).toContain("not the file bytes");
+    expect(
+      activityResolutionActions({ ...item, resolutionActions: [] }),
+    ).toEqual([]);
+    expect(
+      activityResolutionActions({
+        ...item,
+        fileTransfer: { ...item.fileTransfer!, version: 0 },
+      }),
+    ).toEqual([]);
+    expect(isResolutionEligible({ ...item, status: "awaiting_consent" })).toBe(
+      false,
+    );
+  });
+  it.each(["consent_unknown", "upload_unknown", "conflict"] as const)(
+    "suppresses generic delivery/retry resolution for Teams %s",
+    (phase) => {
+      const fileTransfer = {
+        provider: "microsoft-teams" as const,
+        phase,
+        filename: "report.txt",
+        version: 2,
+      };
+      expect(
+        isResolutionEligible(
+          activity({
+            kind: "publication",
+            status: "delivery_unknown",
+            fileTransfer,
+            resolutionActions: ["mark_delivered", "retry_anyway"],
+          }),
+        ),
+      ).toBe(false);
+      expect(
+        isResolutionEligible(
+          activity({
+            kind: "publication",
+            status: "delivery_unknown",
+            fileTransfer,
+            resolutionActions: ["cancel"],
+          }),
+        ),
+      ).toBe(true);
+      expect(
+        isReplayEligible(activity({ kind: "publication", fileTransfer })),
+      ).toBe(false);
+    },
+  );
   it.each([
     activity({
       kind: "publication",

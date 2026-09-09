@@ -3782,3 +3782,55 @@ are not automatically retried. The bounded process-local interaction-ID cache
 is not a replacement for durable service admission. The hook remains inactive
 until the service has a verified command registration and durable authorization;
 no Discord capability was enabled or provider command created in this step.
+
+### September 9: Teams file service composition and full-suite regressions
+
+The service now stages an atomic content-free Board file intent for an exact
+admitted personal recipient, or derives native output authority from the exact
+accepted committed response and its causal inputs. Every effect rechecks the
+current source, actor, reach, task generation, endpoint and credential fence.
+The callback records encrypted consent without taking the sender's credential
+lease, allowing genuine acceptance during the original card POST. A dedicated
+worker shares the endpoint concurrency limit but never uses generic replay.
+Versioned operator resolution, publication state and audit commit together.
+Only a confirmed final file message, or explicit operator confirmation of that
+final stage, settles delivery; card/PUT receipts cannot masquerade as delivery.
+
+The Board composition/race cohort passes **12/12** on a fresh database. It
+includes cold service reconstruction, exact bytes, independent Board-author,
+sponsor and linked-user revocation, old runtime callbacks, duplicate/early
+acceptance, and final-card-only retry after one confirmed PUT. The native
+composition passes **8/8**: the exact file's own unknown card/final stage may
+re-prove its source, but sibling unknown effects, changed origin, live attempts
+and generic run retry remain denied. An actual coordinator result exposed a
+`sha256:` prefix mismatch in the new guard, and cold Board Send exposed missing
+runtime initialization; both were reproduced before repair.
+
+Root's first full run was **658 passed / 27 failed**, not a passing gate.
+Two scheduling mistakes caused the failures: maintenance was entering the
+general message scheduler on direct drains, and draft transfer fixtures were
+eligible for the dedicated worker and consumed a slot on every later service.
+Maintenance is now scheduled only by the periodic drain; transfer selection
+requires an exact active Teams endpoint. Five new inactive-state cases plus
+the existing projection suite pass **26/26**, preserving every scoped row and
+zero provider calls/worker slots. The corrected full run passes **690/690** on
+fresh database `chat_teams_activation_full_20260909_root02`, with no skips,
+in 134.68 seconds. Its log is `teams-activation-full-green-root-0909.log`;
+the original failure log remains `teams-activation-full-root-0909.log`.
+The loaded service SHA256 was `db3725aac8ebc1ec485ea3a8549c4df3cdb54e0bd112358b30a3c6da50e7bcdd`
+and integration-test SHA256 was `6ead09e090d777f9ee6741018e1243f8d051b94878ed358a900e8f9e67ebf0de`.
+
+A separate genuine test reproduced unnamed assets failing before consent:
+the service chose `attachment-<attachmentId>` but the protocol compared it to
+the nullable filename column. Null-only normalization now matches; empty or
+unsafe stored names still fail. The fresh protocol/projection/foundation cohort
+passes **157/157**, including six new filename cases.
+
+Root's browser suite passes **31/31** (2.8 minutes), followed by **2/2** consent
+journeys (14.1 seconds) after shortening repeated copy on retained receipts.
+The screenshots show accurate waiting/mixed outcomes, retained files and
+explicit batch dismissal. These use real Board/task/upload UI with mocked
+provider/model/transfer responses, not native Teams UI. Focused UI tests pass
+**96/96**, OpenAPI/batch tests **44/44**; shared/server/UI types and token gates
+pass. Existing broad workspace harness failures are not reclassified as passed.
+Server 72, its live database and its qualified runner were not changed.

@@ -542,6 +542,64 @@ describe("openapi routes", () => {
       "slack_session_sync",
       "slack_session_stop",
     ]);
+    const fileTransfer = activity.properties.fileTransfer;
+    expect(fileTransfer).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["provider", "phase", "filename", "version"],
+      properties: {
+        provider: { type: "string", enum: ["microsoft-teams"] },
+        version: { type: "integer", minimum: 0, exclusiveMinimum: true },
+      },
+    });
+    expect(Object.keys(fileTransfer.properties).sort()).toEqual([
+      "expiresAt",
+      "filename",
+      "phase",
+      "provider",
+      "version",
+    ]);
+    expect(fileTransfer.properties.phase.enum).toHaveLength(15);
+    const batchStatus =
+      spec.paths[
+        "/api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications/{publicationId}/status"
+      ].get.responses["200"].content["application/json"].schema;
+    expect(batchStatus.required).toEqual(
+      expect.arrayContaining([
+        "publication",
+        "parts",
+        "total",
+        "published",
+        "awaitingConsent",
+        "declined",
+        "expired",
+        "cancelled",
+        "settled",
+        "canDismiss",
+      ]),
+    );
+    expect(batchStatus.properties.parts.items.properties.fileTransfer).toEqual(
+      fileTransfer,
+    );
+    expect(batchStatus.properties.publication.properties.state.enum).toContain(
+      "awaiting_consent",
+    );
+    const resolvePublication =
+      spec.paths[
+        "/api/chat-endpoints/{endpointId}/publications/{publicationId}/resolve"
+      ].post.requestBody.content["application/json"].schema;
+    expect(resolvePublication.properties.fileTransfer).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["phase", "version"],
+      properties: {
+        phase: { enum: fileTransfer.properties.phase.enum },
+        version: { type: "integer", minimum: 0, exclusiveMinimum: true },
+      },
+    });
+    expect(JSON.stringify(batchStatus)).not.toMatch(
+      /uploadUrl|privateState|tokenSha256|credentialFingerprint/,
+    );
 
     const replaceResources =
       spec.paths["/api/chat-endpoints/{endpointId}/resources"].put;
