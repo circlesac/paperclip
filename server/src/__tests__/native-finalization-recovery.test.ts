@@ -26,6 +26,7 @@ import {
   reconcileRetainedNativeSessionCleanups,
 } from "../services/native-runtime/native-finalization-reconciler.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
+import { assertRetainedNativeSourceArchiveSettled } from "../services/native-runtime/native-session-executor.js";
 
 describe("P6-16/P6-25/P6-28 native finalization recovery", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -389,12 +390,14 @@ describe("retained native cleanup discovery", () => {
       run?: Partial<typeof heartbeatRuns.$inferInsert>;
       coordinator?: Partial<typeof nativeRunFinalizations.$inferInsert>;
       schemaStatus?: string;
+      issueId?: string;
+      revision?: number;
     } = {},
   ) {
     const runId = randomUUID();
-    const issueId = randomUUID();
+    const issueId = options.issueId ?? randomUUID();
     const contractId = randomUUID();
-    await db
+    if (!options.issueId) await db
       .insert(issues)
       .values({
         id: issueId,
@@ -406,7 +409,7 @@ describe("retained native cleanup discovery", () => {
       id: contractId,
       companyId,
       issueId,
-      revision: 1,
+      revision: options.revision ?? 1,
       schemaVersion: "paperclip.completion-contract.v1",
       policyVersion: "phase6-v3",
       risk: "standard",
@@ -470,7 +473,7 @@ describe("retained native cleanup discovery", () => {
         issueId,
         runId,
         assessmentId: assessment!.id,
-        decisionVersion: 1,
+        decisionVersion: options.revision ?? 1,
         policyVersion: "phase6-v3",
         fromStatus: "in_progress",
         toStatus: "in_review",
@@ -563,6 +566,11 @@ describe("retained native cleanup discovery", () => {
         recoveryHistory: [{ kind: "native_cleanup_maintenance", phase }],
       },
     })),
+    { coordinator: { recoveryHistory: [{ kind: "native_cleanup_source_archive", phase: "operator_required" }] } },
+    { coordinator: { recoveryHistory: [
+      { kind: "native_cleanup_source_archive", phase: "prepared" },
+      { kind: "native_cleanup_runner_epoch", phase: "spawned", epoch: 1, pid: 88736 },
+    ] } },
   ])(
     "excludes ineligible or previously attempted cleanup: %j",
     async (options) => {
@@ -595,6 +603,67 @@ describe("retained native cleanup discovery", () => {
         .from(nativeRunFinalizations)
         .where(eq(nativeRunFinalizations.runId, runId)),
     ).toEqual(before);
+  });
+
+  it.each(["prepared", "archived"])("discovers prelaunch source archival at %s without changing authority", async (phase) => {
+    const runId = await candidate();
+    const prepared = {
+      kind: "native_cleanup_source_archive", version: 1, phase: "prepared",
+      requestId: "native-cleanup:source-archive", companyId, agentId, runId,
+      nativeSessionId: runId, runnerInstanceId: randomUUID(), stateKey: "a".repeat(64),
+      archiveName: `${"a".repeat(64)}.identity_indeterminate.cleanup.fixture`,
+      rootIdentity: { device: 1, inode: 2, mode: 0o40700 },
+      sourceFingerprint: "b".repeat(64), providerHomeFingerprint: "c".repeat(64),
+    };
+    const history = [prepared, ...(phase === "archived" ? [{ ...prepared, phase }] : [])];
+    await db.update(nativeRunFinalizations).set({ recoveryHistory: history })
+      .where(eq(nativeRunFinalizations.runId, runId));
+    const cleanup = vi.fn(async () => ({ runId, status: "not_eligible" as const }));
+    await reconcileRetainedNativeSessionCleanups(db, { cleanup });
+    expect(cleanup).toHaveBeenCalledExactlyOnceWith({ companyId, runId });
+    const [after] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+    expect(after?.recoveryHistory).toEqual(history);
+    expect(after?.phase).toBe("committed");
+  });
+
+  it("fences actual scoped admission until every archived owner has its matching latest settlement", async () => {
+    const first = await candidate();
+    const [owner] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, first));
+    const issueId = owner!.issueId;
+    const scope = { companyId, issueId, stateKey: "d".repeat(64) };
+    const prepared = { kind: "native_cleanup_source_archive", version: 1, phase: "prepared",
+      stateKey: scope.stateKey, requestId: "native-cleanup:archive", sourceFingerprint: "a".repeat(64) };
+    const settled = { kind: "native_cleanup_maintenance", phase: "settled",
+      sourceArchiveRequestId: prepared.requestId, sourceFingerprint: prepared.sourceFingerprint };
+    const setHistory = async (runId: string, history: Record<string, unknown>[]) =>
+      db.update(nativeRunFinalizations).set({ recoveryHistory: history }).where(eq(nativeRunFinalizations.runId, runId));
+    await assertRetainedNativeSourceArchiveSettled(db, scope);
+    await setHistory(first, [prepared]);
+    await expect(assertRetainedNativeSourceArchiveSettled(db, scope)).rejects.toMatchObject({ code: "native_session_cleanup_quarantined" });
+    await assertRetainedNativeSourceArchiveSettled(db, { ...scope, stateKey: "e".repeat(64) });
+    await assertRetainedNativeSourceArchiveSettled(db, { ...scope, companyId: randomUUID() });
+    await assertRetainedNativeSourceArchiveSettled(db, { ...scope, issueId: randomUUID() });
+    await setHistory(first, [prepared, { ...settled, sourceFingerprint: "b".repeat(64) }]);
+    await expect(assertRetainedNativeSourceArchiveSettled(db, scope)).rejects.toMatchObject({ code: "native_session_cleanup_quarantined" });
+    await setHistory(first, [prepared, settled]);
+    await assertRetainedNativeSourceArchiveSettled(db, scope);
+    await setHistory(first, [prepared, { ...prepared }, settled]);
+    await expect(assertRetainedNativeSourceArchiveSettled(db, scope)).rejects.toMatchObject({ code: "native_session_cleanup_quarantined" });
+    await setHistory(first, [{ ...prepared, version: null }, settled]);
+    await expect(assertRetainedNativeSourceArchiveSettled(db, scope)).rejects.toMatchObject({ code: "native_session_cleanup_quarantined" });
+    await setHistory(first, [{ ...prepared, requestId: null }, { kind: "native_cleanup_maintenance", phase: "settled", sourceFingerprint: prepared.sourceFingerprint }]);
+    await expect(assertRetainedNativeSourceArchiveSettled(db, scope)).rejects.toMatchObject({ code: "native_session_cleanup_quarantined" });
+    await setHistory(first, [prepared, settled]);
+    const second = await candidate({ issueId, revision: 2 });
+    await setHistory(second, [prepared, settled]);
+    await assertRetainedNativeSourceArchiveSettled(db, scope);
+    const third = await candidate({ issueId, revision: 3 });
+    await setHistory(third, [prepared]);
+    await expect(assertRetainedNativeSourceArchiveSettled(db, scope)).rejects.toMatchObject({ code: "native_session_cleanup_quarantined" });
+    await setHistory(third, [prepared, settled]);
+    await assertRetainedNativeSourceArchiveSettled(db, scope);
+    await setHistory(first, [prepared, settled, { ...settled, phase: "operator_required" }]);
+    await expect(assertRetainedNativeSourceArchiveSettled(db, scope)).rejects.toMatchObject({ code: "native_session_cleanup_quarantined" });
   });
 
   it.each([

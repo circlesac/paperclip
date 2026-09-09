@@ -253,6 +253,7 @@ export function reconcileRetainedNativeSessionCleanups(
             sql`coalesce(${heartbeatRuns.errorCode}, ${heartbeatRuns.resultJson}->'recoveredExecutionFailure'->>'errorCode') = 'adapter_failed'`,
             sql`coalesce(${heartbeatRuns.error}, ${heartbeatRuns.resultJson}->'recoveredExecutionFailure'->>'error') = 'provider_transport_failed: runner did not durably suspend before checkpoint'`,
             sql`not (${nativeRunFinalizations.recoveryHistory} @> '[{"kind":"native_cleanup_runner_epoch"}]'::jsonb)`,
+            sql`not (${nativeRunFinalizations.recoveryHistory} @> '[{"kind":"native_cleanup_source_archive","phase":"operator_required"}]'::jsonb)`,
             // One legacy pre-ownership attempt may be inspected by the closed,
             // artifact-pinned no-launch verifier. Discovery grants no authority
             // to reuse its directory or start a provider. New recorded epochs,

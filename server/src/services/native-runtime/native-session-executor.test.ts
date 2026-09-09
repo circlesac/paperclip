@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   access,
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
@@ -2110,6 +2111,27 @@ const execution = {
 describe("retained native cleanup activation", () => {
   it.each([
     "settled",
+    "canonical_source",
+    "canonical_live_owner",
+    "canonical_foreign_owner",
+    "canonical_existing_quarantine",
+    "canonical_prior_epoch",
+    "canonical_prior_maintenance",
+    "canonical_lease_loss",
+    "canonical_source_changed",
+    "canonical_home_changed",
+    "canonical_inode_changed",
+    "canonical_archive_occupied",
+    "canonical_claim_commit_failure",
+    "canonical_archive_commit_failure",
+    "canonical_claim_commit_stalled",
+    "canonical_archive_commit_stalled",
+    "canonical_after_archive_replacement",
+    "canonical_prepared_original",
+    "canonical_prepared_archived",
+    "canonical_archived_recorded",
+    "canonical_prepared_bad_hash",
+    "canonical_prepared_bad_inode",
     "provider_home",
     "home_symlink",
     "home_oversized",
@@ -2189,13 +2211,14 @@ describe("retained native cleanup activation", () => {
       )
       .digest("hex");
     const root = join(directory, key);
-    const quarantine = join(
+    let quarantine = join(
       directory,
       "quarantine",
       `${key}.identity_indeterminate.fixture`,
     );
     const legacyDirectory = join(directory, `${key}.cleanup-prior`);
     const legacy = mode.startsWith("legacy_");
+    const canonicalSource = mode.startsWith("canonical_");
     const proofSpy = vi.spyOn(
       noLaunchProofModule,
       "verifyRetainedMaintenanceNoLaunch",
@@ -2385,8 +2408,8 @@ describe("retained native cleanup activation", () => {
       nativeSessionId: identity.normalizedSessionId,
       runnerInstanceId: identity.runnerInstanceId,
       finishedAt: new Date(),
-      processPid: mode === "live_owner" ? process.pid : 99_999_999,
-      processGroupId: mode === "live_owner" ? process.pid : 99_999_999,
+      processPid: mode.endsWith("live_owner") ? process.pid : 99_999_999,
+      processGroupId: mode.endsWith("live_owner") ? process.pid : 99_999_999,
       completionContractId: "contract",
       completionContractSha256: "sha",
       errorCode: "adapter_failed",
@@ -2421,7 +2444,7 @@ describe("retained native cleanup activation", () => {
             table === heartbeatRuns
               ? [run]
               : table === nativeRunFinalizations
-                ? [coordinator]
+                ? mode === "canonical_lease_loss" && coordinator.leaseOwner === "another-owner" ? [] : [coordinator]
                 : table === nativeRunResults
                   ? [accepted]
                   : table === heartbeatRunEvents
@@ -2455,6 +2478,33 @@ describe("retained native cleanup activation", () => {
         const before = structuredClone(coordinator);
         try {
           const result = await operation(db as unknown as Db);
+          const latest = (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(-1);
+          if (latest?.kind === "native_cleanup_source_archive" && latest.phase === "prepared") {
+            if (mode === "canonical_lease_loss") coordinator.leaseOwner = "another-owner";
+            if (mode === "canonical_source_changed") await writeFile(join(root, "runner/runner-state.json"), "{}");
+            if (mode === "canonical_home_changed") await writeFile(join(root, "codex-home/sessions/rollout-exact-thread.jsonl"), "changed\n");
+            if (mode === "canonical_inode_changed") {
+              await rename(root, `${root}.replaced`);
+              quarantine = `${root}.replaced`;
+              await mkdir(root);
+              await writeFile(join(root, "foreign-owner"), "preserved");
+            }
+            if (mode === "canonical_archive_occupied") {
+              const occupied = join(directory, "quarantine", String(latest.archiveName));
+              await mkdir(occupied);
+              await writeFile(join(occupied, "foreign-owner"), "preserved");
+            }
+            if (mode === "canonical_claim_commit_failure") throw new Error("injected source claim commit failure");
+            if (mode === "canonical_claim_commit_stalled") await commitGate;
+          }
+          if (latest?.kind === "native_cleanup_source_archive" && latest.phase === "archived") {
+            if (mode === "canonical_archive_commit_failure") throw new Error("injected archive commit failure");
+            if (mode === "canonical_after_archive_replacement") {
+              await mkdir(root);
+              await writeFile(join(root, "foreign-owner"), "preserved");
+            }
+            if (mode === "canonical_archive_commit_stalled") await commitGate;
+          }
           if (mode === "home_changed_during_commit" &&
               (coordinator.recoveryHistory as Array<Record<string, unknown>>).at(-1)?.phase === "settled")
             await writeFile(join(root, "codex-home/sessions/rollout-exact-thread.jsonl"), "changed-after-activation\n");
@@ -2713,12 +2763,74 @@ describe("retained native cleanup activation", () => {
               },
         );
       }
+      if (mode === "canonical_foreign_owner")
+        await writeFile(join(quarantine, source[0][0]), JSON.stringify({
+          ...source[0][1], identity: { ...identity, runId: "foreign-run" },
+        }));
       const original = await Promise.all(
         source.map(([file]) => readFile(join(quarantine, file), "utf8")),
       );
+      if (canonicalSource) {
+        await rename(quarantine, root);
+        quarantine = root;
+        if (mode === "canonical_existing_quarantine")
+          await mkdir(join(directory, "quarantine", `${key}.identity_indeterminate.foreign`));
+        if (mode === "canonical_prior_epoch") coordinator.recoveryHistory = [
+          { kind: "native_cleanup_runner_epoch", phase: "spawned", epoch: 1, pid: 88736 },
+        ];
+        if (mode === "canonical_prior_maintenance") coordinator.recoveryHistory = [
+          { kind: "native_cleanup_maintenance", phase: "started" },
+          { kind: "native_cleanup_maintenance", phase: "operator_required" },
+        ];
+        if (mode.startsWith("canonical_prepared_") || mode === "canonical_archived_recorded") {
+          const metadata = await lstat(root);
+          const entries: Array<Record<string, unknown>> = [];
+          const home = join(root, "codex-home");
+          const visit = async (relative: string) => {
+            const path = join(home, relative), stat = await lstat(path);
+            entries.push({ path: relative, directory: stat.isDirectory(), size: stat.isDirectory() ? 0 : stat.size,
+              ...(!stat.isDirectory() ? { sha256: createHash("sha256").update(await readFile(path)).digest("hex") } : {}) });
+            if (stat.isDirectory()) for (const name of (await readdir(path)).sort()) {
+              if (!relative && ["tmp", ".tmp", "auth.json", "config.toml"].includes(name)) continue;
+              await visit(relative ? `${relative}/${name}` : name);
+            }
+          };
+          await visit("");
+          const prepared = {
+            kind: "native_cleanup_source_archive", version: 1, phase: "prepared",
+            requestId: "native-cleanup:prepared-fixture", companyId: run.companyId, agentId: run.agentId,
+            runId: run.id, nativeSessionId: run.nativeSessionId, runnerInstanceId: run.runnerInstanceId,
+            stateKey: key, archiveName: `${key}.identity_indeterminate.cleanup.prepared-fixture`,
+            rootIdentity: { device: metadata.dev, inode: mode === "canonical_prepared_bad_inode" ? 1 : metadata.ino, mode: metadata.mode },
+            sourceFingerprint: mode === "canonical_prepared_bad_hash" ? "a".repeat(64) : createHash("sha256")
+              .update(JSON.stringify(original.map((bytes) => createHash("sha256").update(bytes).digest("hex")))).digest("hex"),
+            providerHomeFingerprint: nativeSha256(entries),
+          };
+          coordinator.recoveryHistory = [prepared];
+          if (["canonical_prepared_archived", "canonical_archived_recorded"].includes(mode)) {
+            quarantine = join(directory, "quarantine", prepared.archiveName);
+            await rename(root, quarantine);
+          }
+          if (mode === "canonical_archived_recorded")
+            (coordinator.recoveryHistory as unknown[]).push({ ...prepared, phase: "archived" });
+          // A fresh process must not interpret either side of the rename as
+          // permission to create another provider before archival settles.
+          await expect(createRunnerdBackend({ db: db as unknown as Db, execution, runnerInstanceId: "successor-runner" }))
+            .rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
+        }
+      }
       state.cleanup.mockReset();
       state.retireCleanup.mockReset();
       state.cleanup.mockImplementation(async (input) => {
+        if (canonicalSource) {
+          const archived = (coordinator.recoveryHistory as Array<Record<string, unknown>>)
+            .find((entry) => entry.kind === "native_cleanup_source_archive" && entry.phase === "archived")!;
+          expect(archived).toBeDefined();
+          quarantine = join(directory, "quarantine", String(archived.archiveName));
+          await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
+          expect(await Promise.all(source.map(([file]) => readFile(join(quarantine, file), "utf8"))))
+            .toEqual(original);
+        }
         await input.authorize();
         if (mode === "home_changed_source") {
           await writeFile(
@@ -2836,6 +2948,14 @@ describe("retained native cleanup activation", () => {
         db as unknown as Db,
         { companyId: run.companyId, runId: run.id },
       );
+      if (["canonical_claim_commit_stalled", "canonical_archive_commit_stalled"].includes(mode)) {
+        await vi.waitFor(() => expect((coordinator.recoveryHistory as Array<Record<string, unknown>>).at(-1)?.phase)
+          .toBe(mode === "canonical_claim_commit_stalled" ? "prepared" : "archived"));
+        expect(state.cleanup).not.toHaveBeenCalled();
+        await expect(createRunnerdBackend({ db: db as unknown as Db, execution, runnerInstanceId: "successor-runner" }))
+          .rejects.toThrow("native_session_supervisor_busy");
+        releaseCommit();
+      }
       if (mode === "activation_commit_stalled") {
         await vi.waitFor(() =>
           expect(
@@ -2855,6 +2975,14 @@ describe("retained native cleanup activation", () => {
         releaseCommit();
       }
       const outcome = await pendingOutcome;
+      if (canonicalSource) {
+        const prepared = (coordinator.recoveryHistory as Array<Record<string, unknown>>)
+          .find((entry) => entry.kind === "native_cleanup_source_archive" && entry.phase === "prepared");
+        if (prepared) {
+          const archived = join(directory, "quarantine", String(prepared.archiveName));
+          if (await access(join(archived, source[0][0])).then(() => true, () => false)) quarantine = archived;
+        }
+      }
       if (mode === "settled") {
         const cleanupEnvironment = state.cleanup.mock.calls[0]![0].environment;
         expect(cleanupEnvironment).toEqual(
@@ -2868,6 +2996,9 @@ describe("retained native cleanup activation", () => {
         expect(cleanupEnvironment).not.toHaveProperty("CODEX_API_KEY");
       }
       const ineligible = [
+        "canonical_live_owner", "canonical_foreign_owner", "canonical_existing_quarantine",
+        "canonical_prior_epoch", "canonical_prior_maintenance", "canonical_claim_commit_failure",
+        "canonical_prepared_bad_hash", "canonical_prepared_bad_inode",
         "home_symlink",
         "home_oversized",
         "legacy_busy_copy",
@@ -2887,6 +3018,9 @@ describe("retained native cleanup activation", () => {
         "wrong_provider_account",
       ].includes(mode);
       const succeeds = [
+        "canonical_source",
+        "canonical_claim_commit_stalled", "canonical_archive_commit_stalled",
+        "canonical_prepared_original", "canonical_prepared_archived", "canonical_archived_recorded",
         "provider_home",
         "legacy_copy",
         "settled",
@@ -2905,7 +3039,7 @@ describe("retained native cleanup activation", () => {
         await Promise.all(
           source.map(([file]) => readFile(join(quarantine, file), "utf8")),
         ),
-      ).toEqual(original);
+      ).toEqual(mode === "canonical_source_changed" ? [original[0], "{}", original[2]] : original);
       if (preservedHomeBytes)
         expect(
           await Promise.all(
@@ -2915,6 +3049,8 @@ describe("retained native cleanup activation", () => {
           ),
         ).toEqual(preservedHomeBytes);
       const deniedBeforeLaunch = [
+        "canonical_lease_loss", "canonical_source_changed", "canonical_home_changed", "canonical_inode_changed",
+        "canonical_archive_occupied", "canonical_archive_commit_failure", "canonical_after_archive_replacement",
         "home_foreign_path",
         "home_stale_foreign_path",
         "home_wrong_thread",
@@ -2927,6 +3063,24 @@ describe("retained native cleanup activation", () => {
       expect(state.retireCleanup).toHaveBeenCalledTimes(succeeds ? 1 : 0);
       expect(coordinator.phase).toBe("committed");
       expect(coordinator.resultId).toBe("result");
+      if (mode === "canonical_lease_loss") {
+        await access(join(root, source[0][0]));
+        expect(await readdir(join(directory, "quarantine"))).toEqual([]);
+      }
+      if (["canonical_inode_changed", "canonical_after_archive_replacement"].includes(mode))
+        expect(await readFile(join(root, "foreign-owner"), "utf8")).toBe("preserved");
+      if (mode === "canonical_archive_occupied") {
+        const prepared = (coordinator.recoveryHistory as Array<Record<string, unknown>>)[0]!;
+        expect(await readFile(join(directory, "quarantine", String(prepared.archiveName), "foreign-owner"), "utf8"))
+          .toBe("preserved");
+      }
+      if (mode === "canonical_prior_epoch")
+        expect(coordinator.recoveryHistory).toEqual([{ kind: "native_cleanup_runner_epoch", phase: "spawned", epoch: 1, pid: 88736 }]);
+      if (canonicalSource && !succeeds && mode !== "canonical_lease_loss" &&
+          (coordinator.recoveryHistory as Array<Record<string, unknown>>).some((entry) =>
+            entry.kind === "native_cleanup_source_archive" && entry.phase === "prepared"))
+        await expect(createRunnerdBackend({ db: db as unknown as Db, execution, runnerInstanceId: "successor-runner" }))
+          .rejects.toBeInstanceOf(NativeSessionCleanupQuarantinedError);
       if (mode === "empty_root") {
         const prepared = (
           coordinator.recoveryHistory as Array<Record<string, unknown>>
@@ -2979,6 +3133,7 @@ describe("retained native cleanup activation", () => {
         }
         expect(
           (coordinator.recoveryHistory as Array<Record<string, unknown>>)
+            .filter((entry) => entry.kind !== "native_cleanup_source_archive")
             .slice(legacy ? 2 : 0)
             .map((entry) => entry.phase),
         ).toEqual([

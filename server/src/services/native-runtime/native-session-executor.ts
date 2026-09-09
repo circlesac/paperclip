@@ -1608,6 +1608,13 @@ function cleanupCanonicalVacancy(root: string) {
   };
 }
 
+function cleanupArchiveRootIdentity(root: string) {
+  if (!isSafeNativeStateDirectory(root))
+    throw new Error("native_cleanup_maintenance_unproven");
+  const stat = lstatSync(root);
+  return { device: stat.dev, inode: stat.ino, mode: stat.mode };
+}
+
 /** Raw runner events and normalized driver events are distinct streams. Bind
  * the retained raw journal to the server-accepted result, not a guessed shared
  * event identifier. This is read-only and never interprets a tool as a request. */
@@ -2125,6 +2132,11 @@ export async function reconcileRetainedNativeSessionCleanup(
     emptyRoot: ReturnType<typeof cleanupCanonicalVacancy>;
     source: ReturnType<typeof cleanupStateSnapshot>;
     providerHome: ReturnType<typeof cleanupProviderHomeSnapshot>;
+    sourceArchive: {
+      intent: Record<string, unknown>;
+      fromCanonical: boolean;
+      completed: boolean;
+    } | null;
     copySource: {
       directory: string;
       snapshot: ReturnType<typeof cleanupStateSnapshot>;
@@ -2255,19 +2267,113 @@ export async function reconcileRetainedNativeSessionCleanup(
         .limit(1);
       if (environment.length) return null;
       const root = scopedRunnerdStateRoot(execution);
-      // A refused successor may create only the directory before admission
-      // fails. Inventory that exact empty inode, never an existing checkpoint.
-      const emptyRoot = cleanupCanonicalVacancy(root);
+      const maintenanceHistory = coordinator.recoveryHistory.filter(
+        (event) => event.kind === "native_cleanup_maintenance",
+      );
+      const archiveHistory = coordinator.recoveryHistory.filter(
+        (event) => event.kind === "native_cleanup_source_archive",
+      );
       const parent = resolve(runnerdStateBase(), "quarantine");
-      if (!isSafeNativeStateDirectory(parent)) return null;
-      const entries = readdirSync(parent);
+      if (existsSync(parent) && !isSafeNativeStateDirectory(parent))
+        return null;
+      const entries = existsSync(parent) ? readdirSync(parent) : [];
       if (entries.length > 4096) return null;
       const candidates = entries.filter((name) =>
         name.startsWith(`${basename(root)}.identity_indeterminate.`),
       );
-      if (candidates.length !== 1) return null;
-      const quarantine = resolve(parent, candidates[0]!);
-      const source = cleanupStateSnapshot(quarantine);
+      let emptyRoot: ReturnType<typeof cleanupCanonicalVacancy> = null;
+      let sourceDirectory: string;
+      let quarantine: string;
+      let sourceArchive: NonNullable<typeof claim>["sourceArchive"] = null;
+      const rootExists = !!lstatSync(root, { throwIfNoEntry: false });
+      if (rootExists && !isSafeNativeStateDirectory(root)) return null;
+      if (archiveHistory.length) {
+        const prepared = archiveHistory[0]!;
+        const archived = archiveHistory[1];
+        if (
+          maintenanceHistory.length ||
+          archiveHistory.length > 2 ||
+          prepared.version !== 1 ||
+          prepared.phase !== "prepared" ||
+          prepared.companyId !== run.companyId ||
+          prepared.agentId !== run.agentId ||
+          prepared.runId !== run.id ||
+          prepared.nativeSessionId !== run.nativeSessionId ||
+          prepared.runnerInstanceId !== run.runnerInstanceId ||
+          prepared.stateKey !== basename(root) ||
+          typeof prepared.requestId !== "string" ||
+          !prepared.requestId.startsWith("native-cleanup:") ||
+          typeof prepared.archiveName !== "string" ||
+          prepared.archiveName.length > 192 ||
+          basename(prepared.archiveName) !== prepared.archiveName ||
+          !prepared.archiveName.startsWith(
+            `${basename(root)}.identity_indeterminate.cleanup.`,
+          ) ||
+          typeof prepared.sourceFingerprint !== "string" ||
+          !/^[0-9a-f]{64}$/.test(prepared.sourceFingerprint) ||
+          typeof prepared.providerHomeFingerprint !== "string" ||
+          !/^[0-9a-f]{64}$/.test(prepared.providerHomeFingerprint) ||
+          (archived &&
+            (archived.phase !== "archived" ||
+              Object.entries(prepared).some(
+                ([key, value]) =>
+                  key !== "phase" &&
+                  canonicalJson(archived[key]) !== canonicalJson(value),
+              )))
+        )
+          return null;
+        quarantine = resolve(parent, prepared.archiveName);
+        if (rootExists) {
+          if (archived || candidates.length || existsSync(quarantine))
+            return null;
+          sourceDirectory = root;
+        } else {
+          if (
+            candidates.length !== 1 ||
+            candidates[0] !== prepared.archiveName
+          )
+            return null;
+          sourceDirectory = quarantine;
+        }
+        sourceArchive = {
+          intent: prepared,
+          fromCanonical: rootExists,
+          completed: !!archived,
+        };
+      } else if (rootExists && readdirSync(root).length) {
+        if (maintenanceHistory.length || candidates.length) return null;
+        sourceDirectory = root;
+        quarantine = resolve(
+          parent,
+          `${basename(root)}.identity_indeterminate.cleanup.${randomUUID()}`,
+        );
+        sourceArchive = {
+          intent: {},
+          fromCanonical: true,
+          completed: false,
+        };
+      } else {
+        // A refused successor may create only the directory before admission
+        // fails. Inventory that exact empty inode, never replace another owner.
+        emptyRoot = cleanupCanonicalVacancy(root);
+        if (candidates.length !== 1) return null;
+        quarantine = resolve(parent, candidates[0]!);
+        sourceDirectory = quarantine;
+      }
+      const archiveRootIdentity = sourceArchive
+        ? cleanupArchiveRootIdentity(sourceDirectory)
+        : null;
+      if (sourceArchive) {
+        const scopeEntries = readdirSync(runnerdStateBase());
+        if (
+          scopeEntries.length > 4096 ||
+          scopeEntries.some((name) =>
+            name.startsWith(`${basename(root)}.cleanup-`),
+          )
+        )
+          return null;
+      }
+      const source = cleanupStateSnapshot(sourceDirectory);
       const identity = record(source.control.identity);
       if (
         !durableIdentityMatchesExecution(identity, execution) ||
@@ -2355,12 +2461,38 @@ export async function reconcileRetainedNativeSessionCleanup(
         requestId: string;
       } | null = null;
       const providerHome = cleanupProviderHomeSnapshot(
-        resolve(quarantine, "codex-home"),
+        resolve(sourceDirectory, "codex-home"),
         true,
       );
-      const maintenanceHistory = coordinator.recoveryHistory.filter(
-        (event) => event.kind === "native_cleanup_maintenance",
-      );
+      if (sourceArchive) {
+        if (archiveHistory.length) {
+          if (
+            sourceArchive.intent.sourceFingerprint !== source.fingerprint ||
+            sourceArchive.intent.providerHomeFingerprint !==
+              providerHome.fingerprint ||
+            canonicalJson(sourceArchive.intent.rootIdentity) !==
+              canonicalJson(archiveRootIdentity)
+          )
+            return null;
+        } else {
+          sourceArchive.intent = {
+            kind: "native_cleanup_source_archive",
+            version: 1,
+            phase: "prepared",
+            requestId: leaseOwner,
+            companyId: run.companyId,
+            agentId: run.agentId,
+            runId: run.id,
+            nativeSessionId: run.nativeSessionId,
+            runnerInstanceId: run.runnerInstanceId,
+            stateKey: basename(root),
+            archiveName: basename(quarantine),
+            rootIdentity: archiveRootIdentity,
+            sourceFingerprint: source.fingerprint,
+            providerHomeFingerprint: providerHome.fingerprint,
+          };
+        }
+      }
       if (maintenanceHistory.length) {
         if (
           maintenanceHistory.length !== 2 ||
@@ -2428,7 +2560,7 @@ export async function reconcileRetainedNativeSessionCleanup(
       }
       const history = [
         ...coordinator.recoveryHistory,
-        {
+        ...(sourceArchive ? (archiveHistory.length ? [] : [sourceArchive.intent]) : [{
           kind: "native_cleanup_maintenance",
           version: 1,
           phase: "started",
@@ -2443,7 +2575,7 @@ export async function reconcileRetainedNativeSessionCleanup(
               }
             : {}),
           startedAt: new Date().toISOString(),
-        },
+        }]),
       ];
       await tx
         .update(nativeRunFinalizations)
@@ -2462,6 +2594,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         emptyRoot,
         source,
         providerHome,
+        sourceArchive,
         copySource,
         providerPid: provider.processId,
         providerSessionId: provider.providerSessionId,
@@ -2486,7 +2619,11 @@ export async function reconcileRetainedNativeSessionCleanup(
   }
   const owned = claim;
   let stagingDirectory: string | null = null;
-  const authorize = async () => {
+  let maintenanceStarted = !owned.sourceArchive;
+  const archiveReference = owned.sourceArchive
+    ? { sourceArchiveRequestId: owned.sourceArchive.intent.requestId }
+    : {};
+  const assertLease = async () => {
     const lease = await db
       .select({ runId: nativeRunFinalizations.runId })
       .from(nativeRunFinalizations)
@@ -2504,6 +2641,14 @@ export async function reconcileRetainedNativeSessionCleanup(
       !lease.length ||
       !reservedScope ||
       executingRunnerdSessionScopes.get(reservedScope) !== leaseOwner ||
+      !cleanupProcessAbsent(owned.run.processPid) ||
+      !cleanupProcessAbsent(owned.providerPid)
+    )
+      throw denied();
+  };
+  const authorize = async () => {
+    await assertLease();
+    if (
       cleanupStateSnapshot(owned.quarantine).fingerprint !==
         owned.source.fingerprint ||
       cleanupProviderHomeSnapshot(
@@ -2519,9 +2664,7 @@ export async function reconcileRetainedNativeSessionCleanup(
             { throwIfNoEntry: false },
           ))) ||
       canonicalJson(cleanupCanonicalVacancy(owned.root)) !==
-        canonicalJson(owned.emptyRoot) ||
-      !cleanupProcessAbsent(owned.run.processPid) ||
-      !cleanupProcessAbsent(owned.providerPid)
+        canonicalJson(owned.emptyRoot)
     )
       throw denied();
   };
@@ -2543,7 +2686,10 @@ export async function reconcileRetainedNativeSessionCleanup(
         .limit(1)
         .then((rows) => rows[0]);
       if (!current || current.leaseOwner !== leaseOwner) throw denied();
-      const next = [...current.recoveryHistory, entry];
+      const next = [...current.recoveryHistory, {
+        ...entry,
+        ...(entry.kind === "native_cleanup_source_archive" ? {} : archiveReference),
+      }];
       await tx
         .update(nativeRunFinalizations)
         .set({ recoveryHistory: next, updatedAt: new Date() })
@@ -2553,6 +2699,67 @@ export async function reconcileRetainedNativeSessionCleanup(
     owned.history = history;
   };
   try {
+    if (owned.sourceArchive) {
+      const archive = owned.sourceArchive;
+      await assertLease();
+      const sourceDirectory = archive.fromCanonical
+        ? owned.root
+        : owned.quarantine;
+      if (
+        canonicalJson(cleanupArchiveRootIdentity(sourceDirectory)) !==
+          canonicalJson(archive.intent.rootIdentity) ||
+        cleanupStateSnapshot(sourceDirectory).fingerprint !==
+          owned.source.fingerprint ||
+        cleanupProviderHomeSnapshot(
+          resolve(sourceDirectory, "codex-home"),
+          true,
+        ).fingerprint !== owned.providerHome.fingerprint ||
+        (archive.fromCanonical
+          ? existsSync(owned.quarantine)
+          : existsSync(owned.root))
+      )
+        throw denied();
+      if (archive.fromCanonical) {
+        const parent = dirname(owned.quarantine);
+        mkdirSync(parent, { recursive: true, mode: 0o700 });
+        if (!isSafeNativeStateDirectory(parent)) throw denied();
+        // Preserve the original inode and every byte. In particular, do not
+        // invoke ordinary quarantine scrubbing on this evidence-only archive.
+        renameSync(owned.root, owned.quarantine);
+        archive.fromCanonical = false;
+      }
+      const archivedHome = cleanupProviderHomeSnapshot(
+        resolve(owned.quarantine, "codex-home"),
+        true,
+      );
+      if (
+        cleanupStateSnapshot(owned.quarantine).fingerprint !==
+          owned.source.fingerprint ||
+        archivedHome.fingerprint !== owned.providerHome.fingerprint ||
+        canonicalJson(cleanupArchiveRootIdentity(owned.quarantine)) !==
+          canonicalJson(archive.intent.rootIdentity) ||
+        existsSync(owned.root)
+      )
+        throw denied();
+      owned.providerHome = archivedHome;
+      if (!archive.completed) {
+        await appendMaintenanceHistory({
+          ...archive.intent,
+          phase: "archived",
+        });
+        archive.completed = true;
+      }
+      await authorize();
+      await appendMaintenanceHistory({
+        kind: "native_cleanup_maintenance",
+        version: 1,
+        phase: "started",
+        requestId: leaseOwner,
+        sourceFingerprint: owned.source.fingerprint,
+        startedAt: new Date().toISOString(),
+      });
+      maintenanceStarted = true;
+    }
     await authorize();
     const copy = mkdtempSync(
       resolve(runnerdStateBase(), `${basename(owned.root)}.cleanup-`),
@@ -2665,6 +2872,7 @@ export async function reconcileRetainedNativeSessionCleanup(
         kind: "native_cleanup_maintenance",
         version: 1,
         phase: "activation_prepared",
+        ...archiveReference,
         requestId: leaseOwner,
         sourceFingerprint: proof.sourceFingerprint,
         settledFingerprint: proof.settledFingerprint,
@@ -2745,6 +2953,7 @@ export async function reconcileRetainedNativeSessionCleanup(
               kind: "native_cleanup_maintenance",
               version: 1,
               phase: "settled",
+              ...archiveReference,
               requestId: leaseOwner,
               sourceFingerprint: proof.sourceFingerprint,
               settledFingerprint: proof.settledFingerprint,
@@ -2800,10 +3009,11 @@ export async function reconcileRetainedNativeSessionCleanup(
           recoveryHistory: [
             ...current.recoveryHistory,
             {
-              kind: "native_cleanup_maintenance",
+              kind: maintenanceStarted ? "native_cleanup_maintenance" : "native_cleanup_source_archive",
               version: 1,
               phase: "operator_required",
               requestId: leaseOwner,
+              ...archiveReference,
               code: "native_cleanup_maintenance_unproven",
             },
           ],
@@ -2822,6 +3032,82 @@ export async function reconcileRetainedNativeSessionCleanup(
   }
 }
 
+/** Read-only scoped admission fence; never grants provider or recovery authority. */
+export async function assertRetainedNativeSourceArchiveSettled(
+  db: Db,
+  input: { companyId: string; issueId: string; stateKey: string },
+): Promise<void> {
+  if (!/^[a-f0-9]{64}$/.test(input.stateKey))
+    throw new NativeSessionCleanupQuarantinedError();
+  const owners = await db
+    .select()
+    .from(nativeRunFinalizations)
+    .where(
+      and(
+        eq(nativeRunFinalizations.companyId, input.companyId),
+        eq(nativeRunFinalizations.issueId, input.issueId),
+        sql`exists (
+      select 1 from jsonb_array_elements(${nativeRunFinalizations.recoveryHistory}) prepared
+      where prepared->>'kind' = 'native_cleanup_source_archive'
+        and prepared->>'phase' = 'prepared'
+        and jsonb_typeof(prepared->'stateKey') = 'string'
+        and prepared->>'stateKey' = ${input.stateKey}
+        and not coalesce(${nativeRunFinalizations.phase} = 'committed'
+          and (select count(*) from jsonb_array_elements(${nativeRunFinalizations.recoveryHistory}) duplicate
+            where duplicate->>'kind' = 'native_cleanup_source_archive'
+              and duplicate->>'phase' = 'prepared'
+              and duplicate->'stateKey' = prepared->'stateKey') = 1
+          and prepared->'version' = '1'::jsonb
+          and jsonb_typeof(prepared->'requestId') = 'string'
+          and prepared->>'requestId' like 'native-cleanup:%'
+          and jsonb_typeof(prepared->'sourceFingerprint') = 'string'
+          and prepared->>'sourceFingerprint' ~ '^[a-f0-9]{64}$'
+          and (
+          select settled.value->>'phase' = 'settled'
+            and jsonb_typeof(settled.value->'sourceArchiveRequestId') = 'string'
+            and jsonb_typeof(settled.value->'sourceFingerprint') = 'string'
+            and settled.value->>'sourceFingerprint' = prepared->>'sourceFingerprint'
+          from jsonb_array_elements(${nativeRunFinalizations.recoveryHistory})
+            with ordinality as settled(value, position)
+          where settled.value->>'kind' = 'native_cleanup_maintenance'
+            and settled.value->>'sourceArchiveRequestId' = prepared->>'requestId'
+          order by settled.position desc limit 1
+        ), false)
+    )`,
+      ),
+    )
+    .limit(1);
+  for (const owner of owners) {
+    const history = Array.isArray(owner.recoveryHistory)
+      ? owner.recoveryHistory
+      : [];
+    const intents = history.filter(
+      (entry) =>
+        entry.kind === "native_cleanup_source_archive" &&
+        entry.phase === "prepared" &&
+        entry.stateKey === input.stateKey,
+    );
+    if (!intents.length) continue;
+    const intent = intents[0]!;
+    const settlement = history.findLast(
+      (entry) =>
+        entry.kind === "native_cleanup_maintenance" &&
+        entry.sourceArchiveRequestId === intent.requestId,
+    );
+    if (
+      intents.length !== 1 ||
+      owner.phase !== "committed" ||
+      intent.version !== 1 ||
+      typeof intent.requestId !== "string" ||
+      !intent.requestId.startsWith("native-cleanup:") ||
+      typeof intent.sourceFingerprint !== "string" ||
+      !/^[a-f0-9]{64}$/.test(intent.sourceFingerprint) ||
+      settlement?.phase !== "settled" ||
+      settlement.sourceFingerprint !== intent.sourceFingerprint
+    )
+      throw new NativeSessionCleanupQuarantinedError();
+  }
+}
 async function assertCleanupActivationCommitted(
   db: Db,
   root: string,
@@ -3199,6 +3485,14 @@ async function migrateRunnerdStateRootForExecution(input: {
   restartRecovery?: NativeRestartRecoveryClaim;
 }): Promise<void> {
   const scoped = scopedRunnerdStateRoot(input.execution);
+  // A crash can leave a source archive intent before/after its rename. Until
+  // that exact maintenance is settled, absence of a canonical root is not
+  // permission to bootstrap a replacement provider session.
+  await assertRetainedNativeSourceArchiveSettled(input.db, {
+    companyId: input.execution.binding.companyId,
+    issueId: input.execution.binding.issueId,
+    stateKey: basename(scoped),
+  });
   if (existsSync(scoped)) {
     if (!isSafeNativeStateDirectory(scoped)) {
       throw new Error("runner_state_directory_unsafe");

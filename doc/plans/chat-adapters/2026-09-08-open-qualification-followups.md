@@ -7,6 +7,34 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 00:48 UTC: server **64** (PID 61627, port **3137**) is running
+`58de1c105`, including the normally staged runner below. Fresh Discord CHA-32
+and Slack CHA-33 completed checklists and separate follow-ups. Genuine overlapping
+pairs then passed on Discord, Slack, and GitHub QA PR 3: the second source arrived
+while the first run was active, and the second run began 53–61ms after the first
+finished. Each pair retained its own task/native session, both results were
+accepted/committed, and provider UI showed the requested distinct answers once.
+Discord C/D ran 26.72/11.59s, Slack C/D 38.31/12.19s, GitHub A/B 28.21/12.95s
+(execution durations, not end-to-end latency; queued requests waited for their
+predecessor). Maya uses `paperclip_runner`, `codex_app_server`, `gpt-5.6-luna`.
+No false Discord edit events were generated for the fresh thread. Native agent
+image/document inspection and exact-file return are now running in both fresh
+Discord and Slack threads; direct Board uploads already passed, but do not
+conflate those two paths.
+
+James is implementing canonical source archival with an evidence-preserving
+prepared-intent ledger before rename, including a durable normal-admission guard.
+Executor tests pass 244/244 and types pass; real-database discovery verification
+and independent fail-closed review are still in progress. Do not deploy this
+moving slice or mutate old sources manually. Boole reproduced a separate Board
+rendering defect: accepted `response_wake` answers are complete but blanket
+`yielded` filtering hides them. He is fixing a narrowly authoritative same-run
+accepted-result marker; ordinary waiting/attention/proposed results must stay
+hidden. Telegram's old epoch-1 receipt remains missing; Teams live qualification
+still requires a Microsoft 365 bot/tenant setup, not merely personal Teams login.
+
+The following entries are historical checkpoints, not the current deployment.
+
 September 9, 00:38 UTC: the composed chat integration suite passes **578/578**
 on fresh `chat_adapters_discord_upload_20260909_full01` (121.61 seconds), zero
 skips. Discord's pinned Gateway repair suppresses metadata-only updates only

@@ -2690,3 +2690,68 @@ Experience: file selection and pending/success behavior are usable, but the
 historical failed agent notices remain visible. This is not a pass for agent
 recovery, inbound media, or every provider. The attachment previews do not prove
 remote byte hashes; exact-byte checks here are deterministic local API tests.
+
+### September 9: repaired native queues and agent media round trips
+
+Server 64 runs `58de1c105` on loopback 3137 with the normally built runner
+`4acf2d1dbe99a6202d07b6d0be73b469ebf153103cda2bbd097e5e4233fcd57a`.
+Maya uses Paperclip Runner / Codex app-server / `gpt-5.6-luna`, not a legacy
+adapter. Signed-in provider UI created Discord thread `1547043763581358111`
+(CHA-32) and Slack thread `1788914422.188869` (CHA-33). Initial checklist and
+short follow-up turns succeeded; these first pairs were sequential, not a
+claim of overlapping queue coverage.
+
+The next pairs deliberately sent a separate follow-up while the first run was
+active. All six accepted results committed successfully, retaining one task
+and native session per provider conversation. There were no new edit lifecycle
+events in the Discord thread, no extra task, and one provider answer per source
+message; progress updates edited that same answer message. UI snapshots and
+database timing agree on FIFO order:
+
+| Provider / pair | First execution | Follow-up received before first finished | Second execution | Dispatch gap |
+| --- | ---: | ---: | ---: | ---: |
+| Discord C/D | 26.716s | 17.489s | 11.586s | 61ms |
+| Slack C/D | 38.312s | 21.035s | 12.193s | 53ms |
+| GitHub A/B | 28.207s | 11.382s | 12.947s | 57ms |
+
+These are execution durations, not user-visible latency; the second source
+waited for its predecessor. Discord runs are `0bb4e127-8219-4ae3-add3-01a4ea14525c`
+and `2a2fe013-c6cb-437c-b30d-fbbb49b5f20d`; Slack runs are
+`cfe6271b-cc81-4141-be07-c5ee18bb397d` and
+`cf1bf23e-54ae-49da-9cbc-a09f3e773ae4`; GitHub runs are
+`ce257827-0d3e-455a-9027-10c51b682826` and
+`fdaae0f8-b9bb-43dd-9b4e-0afeb7d08f70`. GitHub used only the disposable QA
+repository's PR 3 discussion, not the implementation PR or its reviews.
+
+The next user journeys uploaded both the synthetic cat PNG and 152-byte text
+document through each provider's own thread composer. Each agent described the
+image, correctly extracted lighthouse / amber / 63 from the new document, and
+returned actual image and text attachments in the same thread. Both provider
+image renders and text previews were visually inspected; no local-path-only
+substitute or Board send was used. Native runs
+`8ffe415c-4baa-45a2-8912-f4e0bf2d0a06` (Discord, 67.925s) and
+`73d19fdf-2ff0-4251-a43f-494be5182225` (Slack, 67.801s) succeeded and committed.
+Discord's final answer and two attachment messages are `1547045730311737424`,
+`1547046019735355442`, and `1547046024667857037`; Slack's are
+`1788914872.444639`, `1788914945.916419`, and `1788914947.702919`. Every publication
+part completed on its first attempt. Final attachment delivery finished about
+3.6 seconds after Discord's run and 8.5 seconds after Slack's. Provider previews
+establish real delivery, not remote byte-hash equality.
+
+Functional outcome: the fresh overlapping queues and these image/document
+round trips passed. Experience: concise turns are materially faster than the
+old multi-minute failures; attachment inspection/return still takes roughly
+one minute and deserves further latency work. Generic progress messages were
+visible before the final answer, and no failure notice appeared in these fresh
+journeys. Historical failed conversations, Telegram's unproved retirement
+receipt, Teams tenant qualification, other media formats and broader fault
+coverage remain separate gaps. Do not call all five channels production-ready.
+
+Canonical-source recovery now preserves an original completed owner's directory
+under a durably recorded archival intent before rename. Normal admission stays
+blocked across a crash until the exact archive's maintenance settles. It does
+not invent retirement receipts or change historical Telegram eligibility.
+Verification passed 244 executor cases and 32 real-database recovery/admission
+cases, server types, and independent review; the review's duplicate-history
+finding was fixed with a real-database negative. This is pre-deployment evidence,
+not a live recovery claim.
