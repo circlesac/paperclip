@@ -39,17 +39,18 @@ permissions and audit. Do not narrow completion to whichever tests pass.
 
 ## Current deployment
 
-Implementation `cfbda24be` is pushed and deployed, adding lossless long replies
-and scoped Teams pictures to automatic Discord commands, Teams personal-file
-consent and the previous native recovery/forms/video-note repairs.
-Server **74** is running:
+Implementation `33b2be903` is pushed and deployed, adding bounded Slack receipt
+transport/cleanup and source-bound Telegram media to the earlier long-reply,
+Teams-picture, Discord-command and native recovery repairs. Teams pre-send
+guidance is corrected in `bc232f2b0`.
+Server **75** is running:
 
 | Field                    | Verified value                                                       |
 | ------------------------ | -------------------------------------------------------------------- |
-| PID / tool handle        | `7070` / `34451`                                                     |
+| PID / tool handle        | `23408` / `4206`                                                     |
 | Listener                 | `127.0.0.1:3137`                                                     |
-| Loaded server version    | `2026.831.0+609.git.cfbda24be`                                         |
-| Started / recovery ready | `07:07:32.964` / `07:07:39.382 UTC`, September 9                        |
+| Loaded server version    | `2026.831.0+612.git.33b2be903`                                         |
+| Started / recovery ready | `07:38:05.805` / `07:38:09.706 UTC`, September 9                        |
 | Native runner SHA256     | `6279d39ac731e4565a638b64c93673b8ca23e6dfbc0870e24d48422497f1826d`     |
 | Live DB                  | `chat_adapters_live_3103` on local PostgreSQL `55439`, role `paperclip` |
 | Last checked runs        | 290 terminal: 262 succeeded, 26 failed, 2 cancelled; zero active       |
@@ -64,13 +65,13 @@ proves live provider registration, not invocation or private-response UX.
 The health response's Git commit is dynamic; use loaded version and process
 start to identify deployed code.
 
-Server 73 exited cleanly after a fresh zero-active-run check at
-`07:06:44.529 UTC`. Its stopped database was backed up to private
-`pre-74-backup.MYm5xK/pre-server-74-20260909-020706.sql.gz`
-(8,035,012 bytes; directory 0700/file 0600; gzip integrity passed; restore not
+Server 74 exited cleanly after a fresh zero-active-run check at
+`07:37:35.378 UTC`. Its stopped database was backed up to private
+`pre-75-backup.PHjeDm/pre-server-75-20260909-023746.sql.gz`
+(8,246,249 bytes; directory 0700/file 0600; gzip integrity passed; restore not
 tested; no backup pruned). No migration was needed: journal count 257, up to
 date. No credentials or historical recovery records were rewritten.
-At `07:08:52.041 UTC`, the run inventory remained 290 terminal, zero active.
+At `07:38:31.515 UTC`, the run inventory remained 290 terminal, zero active.
 The qualified runner and lockfile SHA256 values are unchanged.
 
 Private Board: `https://dottas-macbook-pro.tail29c1aa.ts.net`.
@@ -90,8 +91,8 @@ All local runtime material is under ignored
 `.paperclip-runtime/chat-adapters-live/`, including:
 
 - `start-server.sh`: configured isolated startup, no embedded credentials.
-- `server-experimental-landing-74.log`: current server log.
-- `pre-server-74-backup-0909.log`: private backup/schema metadata.
+- `server-experimental-landing-75.log`: current server log.
+- `pre-server-75-backup-0909.log`: private backup/schema metadata.
 - `qualified-runnerd-2400740c`: preserved old qualified runner backup.
 - `home/instances/chat-adapters-live/runtime/paperclip-runner/durable-sessions`:
   live native roots; do not manipulate historical evidence.
@@ -105,7 +106,7 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Immediate next actions
 
-1. **Resume real browser qualification on server 74.** Latest actual browser
+1. **Resume real browser qualification on server 75.** Latest actual browser
    inventory reports **Mac locked**; the user has been asked to unlock it.
    Discord login was restored before the lock. Do not request Discord login
    again unless the actual provider page requires it.
@@ -134,7 +135,7 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 **Current follow-up:** the restored Discord login is not the current gate:
 the in-app browser tool still reports that the Mac is locked. Read-only health
-confirms server 74 is ready and the original four configured endpoints remain
+confirms server 75 is ready and the original four configured endpoints remain
 active; that is not a new live conversation. Slack receipt contention/cleanup
 and Telegram optional-MIME/Live Photo repairs are now frozen and independently
 reviewed. Slack's final joined repeat passes 10/10, and Telegram's repaired
@@ -142,7 +143,7 @@ configured-2-MiB cohort passes 22/22. After diagnosing three test-only failures,
 root's fresh combined regression passes **770/770** integration tests in
 149.26 seconds, **31/31** deterministic browser tests and **127/127** final
 helper/runtime checks. Shared/server/UI plain types and targeted formatting
-pass. These repairs are ready for deployment but are not live-provider proof.
+pass. These repairs are deployed on server 75 but are not live-provider proof.
 
 Root corrected stale Teams file guidance: personal chats ask for file consent,
 while channels/groups can receive supported images directly. The old universal
@@ -469,7 +470,7 @@ approvalPolicy: never}`. Injecting an effort field is rejected; resolving
 
 The latest user reports Discord login restored; root's subsequent browser probe
 still reports **Mac locked**. Only the OS unlock is being requested. Root
-rechecked server 74 health and its 3137 listener; no new live provider turn
+rechecked server 75 health and its 3137 listener; no new live provider turn
 has been sent during this code-only audit.
 
 ## Latest provider evidence — scope matters
@@ -482,7 +483,7 @@ low field is outside the native v4 contract. Do not claim it is running low effo
 
 | Provider | Latest useful real evidence                                                                                                           | Still missing                                                                     |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Discord  | Server 68 same-thread image/TXT return on CHA-32; both previews and full TXT inspected, one attempt per output; bot reconnected on 74 | Live repeat on current deployment, remaining runbook cases, second-process takeover |
+| Discord  | Server 68 same-thread image/TXT return on CHA-32; both previews and full TXT inspected, one attempt per output; bot reconnected on 75 | Live repeat on current deployment, remaining runbook cases, second-process takeover |
 | Slack    | Server 68 same-thread image/TXT return on CHA-33; exact received bytes retained; live edited-source reuse denied                      | Live repeat on current deployment, remaining lifecycle/governance/failure permutations |
 | GitHub   | Server 68 honest unavailable-private-file reply, followed by correct pasted-text answer on the same session                           | New safe task-link → task-upload live journey and remaining runbook cases         |
 | Telegram | Earlier real text/media/reaction/backlog cases; accepted CHA-26 image answer later delivered without another model run                | Exact failed document-B recovery and remaining file/interaction/performance cases |

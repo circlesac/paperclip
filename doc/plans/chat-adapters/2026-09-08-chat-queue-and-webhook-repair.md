@@ -4231,3 +4231,31 @@ A read-only live inventory at `07:36:42.375 UTC` still showed the original
 290 terminal runs, zero active; the latest start remained `02:15:47.812 UTC`.
 Deployment follows a separate fresh quiescence check. No provider result or
 historical recovery was manufactured to obtain this verification.
+
+### September 9: server 75 deployed after the corrected full pass
+
+Committed and pushed `33b2be903`; the earlier Teams copy fix is `bc232f2b0`.
+The listener identity, loaded version and live run inventory were rechecked
+at `07:37:35.378 UTC`: server 74, PID 7070, had zero active runs. SIGTERM
+completed with exit 0. Its stopped database was backed up to private
+`pre-75-backup.PHjeDm/pre-server-75-20260909-023746.sql.gz`, 8,246,249 bytes,
+directory 0700/file 0600. Gzip integrity passed; restore remains untested.
+No backup was pruned. Migrations were already current with 257 journal entries.
+
+Server **75**, PID **23408**, handle **4206**, started at `07:38:05.805 UTC`
+with loaded version `2026.831.0+612.git.33b2be903` and reached recovery-ready
+at `07:38:09.706 UTC`. Loopback and private Tailscale health returned 200;
+public Funnel Board-health remained 404. Discord Gateway reconnected the
+existing bot. All four original configured endpoints remained active.
+
+At `07:38:31.515 UTC`, the database still showed 290 terminal runs and zero
+active, with latest start `02:15:47.812 UTC`. The qualified runner and CI-owned
+lockfile hashes are unchanged. The proxy and other checkout on port 3103
+were not touched. Runtime and backup metadata logs are
+`server-experimental-landing-75.log` and `pre-server-75-backup-0909.log`.
+
+No new live provider conversation was possible: the in-app browser continued
+to report a locked Mac, although Discord login had been restored. This is
+deployment/configuration evidence, not proof of provider UX or completion.
+The current handoff also records the bounded read-only Telegram 10.3 audit's
+separate rich-input, ephemeral-identity and draft-stop qualification gaps.

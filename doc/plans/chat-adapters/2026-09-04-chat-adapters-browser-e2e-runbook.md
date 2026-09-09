@@ -52,13 +52,14 @@ The [reach audit](./2026-09-07-native-chat-reach-audit.md) records subsequent
 model-independent live checks. These are scenario-specific evidence, not a
 complete final-source qualification of every provider and feature.
 
-Server 74 deployed implementation `cfbda24be` with qualified runner
-`6279d39a…`; health and Discord Gateway reconnection passed. It adds lossless
-long text and scoped Teams pictures, verified by 749 integration tests and 31
-deterministic browser tests. Command ID `1547131713472430131` was durably
+Server 75 deployed implementation `33b2be903` with qualified runner
+`6279d39a…`; health and Discord Gateway reconnection passed. It adds bounded
+Slack receipts and source-bound Telegram media to the earlier lossless text
+and Teams pictures, verified by 770 integration tests and 31 deterministic
+browser tests. Command ID `1547131713472430131` was durably
 registered on server 73; this is not live command-invocation proof. Latest real
 Slack/Discord native PNG+TXT and GitHub private-file/pasted-text evidence is on
-server 68, not this deployment. Server 74 conversation, command, modal and
+server 68, not this deployment. Server 75 conversation, command, modal and
 photo-boundary retests remain pending because the browser reports the Mac locked. Discord
 login has been restored; do not treat an OS lock as a new provider login gate.
 The [current handoff](./2026-09-08-open-qualification-followups.md) names exact
