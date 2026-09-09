@@ -3,6 +3,13 @@
 For the September 7 private-attachment limitation and live outbound task-notice
 check, see [media qualification](2026-09-07-media-live-qualification.md).
 
+For September 8–9 native Luna conversations, private-file omission/pasted-text
+proof and deployment, use the
+[current qualification ledger](2026-09-08-chat-queue-and-webhook-repair.md).
+Historical rows below keep their original scopes. Server 70's new task-link →
+correct-task upload journey and remaining provider permutations are not yet
+qualified live.
+
 > **Status: current App connection, signed Tailscale ingress, exact agent replies, ordered burst handling, and keep-open idle recovery are proven; full production qualification remains open.** The September 7 checkpoints below supersede the older login/credential gates and the intermediate unsolicited-recovery blocker.
 
 ## 2026-09-07 current live checkpoint
@@ -223,9 +230,9 @@ The committed fix distinguishes first-time setup from live credential rotation:
 5. Every generation is audited as `chat_endpoint.setup_secret_generated` with safe metadata indicating whether the operation was a live rotation; no plaintext secret enters the activity record.
 6. The UI opens GitHub's new-App form for first setup, requires App ID and private key rather than pretending a secret-only endpoint is reusable, and explains the consequence before a real rotation.
 
-The signed setup-ping path also accepts a correctly signed GitHub `ping` before App API credentials exist, records `chat_endpoint.webhook_verified` with only the safe provider delivery ID, and returns 401 for a missing or invalid signature. These are code and local-test results; the current GitHub App has not been created to send that ping.
+The signed setup-ping path also accepts a correctly signed GitHub `ping` before App API credentials exist, records `chat_endpoint.webhook_verified` with only the safe provider delivery ID, and returns 401 for a missing or invalid signature. These were code and local-test results at the September 6 checkpoint; that App had not yet been created to send the ping.
 
-## Current hardening
+## September 6 hardening checkpoint
 
 The branch includes the following GitHub safety and concurrency behavior. These are code and local-test observations, not live GitHub qualification:
 
@@ -252,7 +259,7 @@ On merge revision `da8f83d6c9befe7bf958f6d9cf12a95fc7e59e88`, the full chat-chan
 
 The final combined working tree passed 193/193 chat-channel integration tests on fresh migrated database `chat_adapters_test_final_20260906_1257`, 111/111 focused runtime/error/privacy tests, all package typechecks, token gates, and the deterministic five-provider browser suite. This remains local evidence only for GitHub.
 
-Actual GitHub App registration and current-build provider delivery remain unexecuted. The signed-in GitHub session is stopped at GitHub's six-digit sudo-mode verification prompt. Until that account challenge is completed, no current App credentials, installation, signed ping, issue/PR/review event, reaction, edit, file fallback, or outbound publication can be qualified live.
+At the September 6 checkpoint, App registration and current-build provider delivery remained unexecuted because the signed-in session was stopped at GitHub's six-digit sudo-mode prompt. The later connected-App evidence above supersedes that setup gate without retroactively qualifying the unexecuted scenarios on the older revision.
 
 ## Historical-run scope
 

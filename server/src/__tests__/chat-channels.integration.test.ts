@@ -25274,15 +25274,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
-  it("settles a Discord question card and returns its exact continuation to the same thread", async () => {
+  it("composes a parsed Discord question answer with one same-thread continuation publication", async () => {
     const fixture = await seedCompany();
     const continuationRunId = randomUUID();
+    let continuationWakeCount = 0;
     const { callbacks, endpoint, runtime, service } =
       await configuredDiscordEndpoint(fixture, {
         wakeup: async (agentId, options) => {
           if (options.contextSnapshot?.source !== "issue.interaction.respond") {
             return { accepted: true };
           }
+          continuationWakeCount += 1;
+          // The runner is outside this provider/control-plane composition.
+          // Seed only its synthetic result, never claim a real model turn.
           const [created] = await db
             .insert(heartbeatRuns)
             .values({
@@ -25304,6 +25308,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           );
         },
       });
+    let pinned: ReturnType<typeof createChatSdkEndpointRuntime> | undefined;
+    let threadSpy: ReturnType<typeof vi.spyOn> | undefined;
     try {
       const guildId = "1457808928258658549";
       const channelId = "333333333333333333";
@@ -25402,6 +25408,39 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       if (!linkToken) throw new Error("Discord identity token was absent");
       await service.confirmIdentityLink(linkToken, linkedUserId);
 
+      const configuration = runtime.configurations.get(endpoint.id)!;
+      const onAction = vi.fn(callbacks.onAction);
+      pinned = createChatSdkEndpointRuntime({
+        ...configuration,
+        callbacks: { onMessage() {}, onAction },
+        enableDiscordGateway: false,
+        logger: "silent",
+      });
+      await pinned.initialize();
+      const parsedAdapter = pinned.getProviderAdapter() as unknown as {
+        buildMessagePayload(message: unknown): {
+          payload: Record<string, unknown>;
+        };
+        handleGatewayInteraction(event: unknown): Promise<void>;
+      };
+      const providerRuntime = runtime.endpoints.get(endpoint.id)!;
+      const renderedPayloads: Record<string, unknown>[] = [];
+      const originalThread = providerRuntime.thread.bind(providerRuntime);
+      threadSpy = vi
+        .spyOn(providerRuntime, "thread")
+        .mockImplementation((id) => {
+          const original = originalThread(id);
+          return {
+            ...original,
+            post: async (message: Parameters<typeof original.post>[0]) => {
+              renderedPayloads.push(
+                parsedAdapter.buildMessagePayload(message).payload,
+              );
+              return original.post(message);
+            },
+          };
+        });
+
       const sourceRunId = randomUUID();
       await db.insert(heartbeatRuns).values({
         id: sourceRunId,
@@ -25465,33 +25504,70 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         throw new Error("Discord question callback was not projected");
       }
 
-      await expect(
-        callbacks.onAction({
-          endpointId: endpoint.id,
-          provider: "discord",
-          event: {
-            actionId: highAction.actionId,
-            adapter: {} as never,
-            messageId: questionPublication.providerMessageId,
-            openModal: async () => undefined,
-            raw: {
-              deferUpdate: vi.fn(),
-              isMessageComponent: () => true,
-            },
-            thread: channel.thread,
-            threadId,
-            user: {
-              userId: externalUserId,
-              userName: "discord-user",
-              fullName: "Discord User",
-              isBot: false,
-              isMe: false,
-              isSystem: false,
-            },
-            value: interaction.id,
-          },
-        }),
-      ).resolves.toBeUndefined();
+      const findHighButton = (value: unknown): string[] => {
+        if (Array.isArray(value)) return value.flatMap(findHighButton);
+        if (!value || typeof value !== "object") return [];
+        const object = value as Record<string, unknown>;
+        return [
+          ...(object.label === "High" && typeof object.custom_id === "string"
+            ? [object.custom_id]
+            : []),
+          ...Object.values(object).flatMap(findHighButton),
+        ];
+      };
+      const customIds = renderedPayloads.flatMap(findHighButton);
+      expect(customIds).toEqual([`${highAction.actionId}\n${interaction.id}`]);
+      const applicationId =
+        configuration.providerConfig.provider === "discord"
+          ? configuration.providerConfig.credentials.applicationId
+          : undefined;
+      const click = (id: string) => ({
+        applicationId,
+        channel: { id: rootMessageId, parentId: channelId, type: 11 },
+        channelId: rootMessageId,
+        componentType: 2,
+        customId: customIds[0],
+        deferUpdate: vi.fn().mockResolvedValue(undefined),
+        guildId,
+        id,
+        isChatInputCommand: () => false,
+        isMessageComponent: () => true,
+        message: { id: questionPublication.providerMessageId },
+        reply: vi.fn().mockResolvedValue(undefined),
+        token: "synthetic-interaction-token",
+        type: 3,
+        user: {
+          id: externalUserId,
+          username: "discord-user",
+          globalName: "Discord User",
+          bot: false,
+        },
+        version: 1,
+      });
+      const first = click("777777777777777711");
+      const concurrent = click("777777777777777712");
+      await Promise.all([
+        parsedAdapter.handleGatewayInteraction(first),
+        parsedAdapter.handleGatewayInteraction(concurrent),
+      ]);
+      expect(onAction).toHaveBeenCalledTimes(2);
+      expect(onAction.mock.calls[0]![0]).toMatchObject({
+        endpointId: endpoint.id,
+        provider: "discord",
+        transport: "discord_gateway",
+        event: {
+          actionId: highAction.actionId,
+          value: interaction.id,
+          threadId,
+        },
+      });
+      expect(onAction.mock.calls[0]![0].event.raw).not.toHaveProperty(
+        "deferUpdate",
+      );
+      expect(first.deferUpdate).toHaveBeenCalledOnce();
+      expect(concurrent.deferUpdate).toHaveBeenCalledOnce();
+      expect(first.reply).not.toHaveBeenCalled();
+      expect(concurrent.reply).not.toHaveBeenCalled();
       await service.processPendingPublications(1_000);
 
       const [storedInteraction] = await db
@@ -25538,7 +25614,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         },
       });
       expect(resolutionPublication?.payload.card?.actions).toBeUndefined();
-      const providerRuntime = runtime.endpoints.get(endpoint.id);
       expect(providerRuntime?.edits).toEqual([
         expect.objectContaining({
           threadId,
@@ -25555,6 +25630,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             .where(eq(heartbeatRuns.id, continuationRunId)),
         ).resolves.toHaveLength(1);
       });
+      expect(continuationWakeCount).toBe(1);
       const presentationAuthorization =
         await resolveChatRunPresentationAuthorizationReason(db, {
           companyId: fixture.companyId,
@@ -25591,7 +25667,20 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           expect.objectContaining({ threadId, text: exactMarker }),
         ]),
       );
+      // A late delivery of this resolved action is idempotent at the service
+      // boundary; it must not create a second continuation or final reply.
+      const late = click("777777777777777713");
+      await parsedAdapter.handleGatewayInteraction(late);
+      await service.processPendingPublications(1_000);
+      expect(late.deferUpdate).toHaveBeenCalledOnce();
+      expect(late.reply).not.toHaveBeenCalled();
+      expect(continuationWakeCount).toBe(1);
+      expect(
+        providerRuntime.posts.filter((post) => post.text === exactMarker),
+      ).toHaveLength(1);
     } finally {
+      threadSpy?.mockRestore();
+      await pinned?.shutdown();
       await service.shutdown();
     }
   });

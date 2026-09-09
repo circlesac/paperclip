@@ -3382,3 +3382,32 @@ Loopback and private Tailscale health both pass, and Discord Gateway reconnected
 bot `1546330979860221952`. The final actual browser probe still reports the Mac
 locked. User Discord login is not being requested again; OS unlock is needed
 for live conversations and interaction/file retesting.
+
+### September 9: joined question and modal coverage
+
+Discord's existing question/continuation integration now builds the actual
+service-generated card with the pinned adapter and takes its emitted button
+custom ID through the real Gateway normalizer, Chat SDK and runtime. Two
+concurrent synthetic clicks produce one canonical answer, one continuation
+wake and one same-thread final publication. A late click does not add another
+wake or final. Root's focused fresh-database run passes **2/2**, including the
+parsed denial case, in **5.31 seconds** on
+`chat_discord_question_bridge_20260909_root02`. The wake/result and provider
+socket remain simulated; this is not a native model turn or live click proof.
+This coverage addition did not reproduce another product defect.
+
+The new Slack modal bridge uses real Paperclip form construction, signed
+synthetic envelopes, the installed adapter/Chat SDK and runtime, with a local
+fake Web API. It verifies opaque field IDs and wrapped private metadata,
+canonical answer validation, inline field errors, corrected retries after
+SDK context consumption, callback-failure 503/no false acknowledgment and
+endpoint isolation. **10/10** new cases and an adjacent **116/116** cohort pass.
+The final application callback is a pure validator/observer or an injected
+failure, not the actual database authorization/continuation service. No
+production Slack change or live-modal qualification is claimed.
+
+The runbook now points at the current ledger and the repository's CI-owned
+lockfile workflow. Unscoped “current” labels in dated provider results have
+been explicitly tied to their original checkpoints. Historical September 6
+setup failures and case rows remain intact, rather than being relabeled as
+current success.

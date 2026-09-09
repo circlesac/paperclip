@@ -32,7 +32,7 @@ Direct verified webhooks are the required transport for Slack, GitHub, Teams, an
 
 A webhook provider is not deployment-qualified merely because it passed through a temporary tunnel. Live development may use an ephemeral HTTPS tunnel to find product defects, but stable release evidence requires a durable public ingress origin whose callback URLs survive process restarts and whose Paperclip secrets master key is preserved with the instance.
 
-### Current setup gates — 2026-09-08 UTC
+### Current setup gates — 2026-09-09 UTC
 
 Slack, GitHub, Discord, and Telegram are configured and active in the isolated
 live instance. The GitHub PEM, Discord bot installation/token, and replacement
@@ -42,7 +42,7 @@ The public proxy exposes verified webhook routes, not the private Board or files
 
 Maya E2E uses native Paperclip Runner with Codex `gpt-5.6-luna`; actual native
 turn records confirm the model, with no Terra substitution. The
-[current native qualification ledger](./2026-09-07-upstream-runner-integration.md)
+[current qualification ledger](./2026-09-08-chat-queue-and-webhook-repair.md)
 records resumed model capacity, successful text replies on all four connected
 providers, native files on Slack/Discord/Telegram, honest GitHub file fallbacks,
 and the remaining defects. Earlier quota and GitHub/Discord login gates are
@@ -52,10 +52,22 @@ The [reach audit](./2026-09-07-native-chat-reach-audit.md) records subsequent
 model-independent live checks. These are scenario-specific evidence, not a
 complete final-source qualification of every provider and feature.
 
-Release installation is also unqualified: the preserved lockfile currently
-fails the frozen, offline configuration check. The [deployment follow-up](./2026-09-07-native-board-files-and-webhook-recovery.md#frozen-install-release-gate)
-records the exact failure and the no-lockfile-edit constraint. Successful tests
-against the existing installed modules do not qualify a clean installation.
+Server 70 deployed implementation `d5ec721f2` with qualified runner
+`6279d39a…`; health and Discord Gateway reconnection passed. Latest real
+Slack/Discord native PNG+TXT and GitHub private-file/pasted-text evidence is on
+server 68, not this deployment. Server 70 conversation, button and photo-boundary
+retests remain pending because the browser reports the Mac locked. Discord
+login has been restored; do not treat an OS lock as a new provider login gate.
+The [current handoff](./2026-09-08-open-qualification-followups.md) names exact
+remaining journeys and protected historical recovery failures.
+
+Current-head release installation remains unqualified. The
+[CI-owned lockfile correction](./2026-09-08-chat-queue-and-webhook-repair.md#ci-owned-lockfile-correction)
+distinguishes the successful local generated-copy install from the preserved
+checked-in lockfile and the CI-generated artifact required by repository policy.
+Do not manually change the lockfile or treat installed-module tests as clean
+installation proof. The earlier failed frozen/offline check remains historical
+evidence; it is not the whole current install workflow.
 
 ### Historical qualification snapshot — 2026-09-06
 

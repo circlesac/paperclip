@@ -3,6 +3,13 @@
 For the reported missing-image failure and its successful September 7 retake,
 see [media qualification](2026-09-07-media-live-qualification.md).
 
+For subsequent native Luna PNG+TXT returns and the latest deployment, use the
+[September 8–9 qualification ledger](2026-09-08-chat-queue-and-webhook-repair.md).
+The older gap list below is checkpoint-specific: files are no longer wholly
+untested, but remaining media boundaries and server 70's normalized-button
+denial still need live qualification. Gateway reconnection alone is not a
+provider conversation pass.
+
 > **Status: core Discord transport, ordered follow-up bursts, receipt cleanup, and keep-open idle recovery have live proof, but the full DC1–DC7 matrix remains unqualified.** Paperclip has verified the dedicated bot identity, Message Content intent, Clawd membership, and a permission-complete text channel against Discord. The later clean-source checkpoint supersedes the intermediate unsolicited-recovery blocker.
 
 ## Resumed live setup — 2026-09-07 UTC
@@ -196,7 +203,7 @@ linked identity, exact final reply, and receipt cleanup now also have live
 proof. It does not replace the remaining Gateway-reconnect, rate-limit,
 restart, file, action, negative-reach, token-rotation, and cleanup cases.
 
-## Qualification gap
+## Qualification gap at the September 7 checkpoint
 
 Provider credential validation, Message Content intent, Clawd membership,
 `#general` enablement, root-thread creation, a linked unmentioned follow-up,

@@ -116,6 +116,14 @@ describe the normal binary as continuously unchanged across that earlier check.
 
 ## Current parallel work and audit conclusions
 
+The next bounded pass is in progress: actual Slack modal `view_submission`
+and Teams `task/fetch`/`task/submit` adapter-to-runtime tests, plus Discord's
+generated question card → parsed concurrent clicks → real service/DB → one
+continuation publication. Existing direct-callback tests do not establish
+these joined boundaries. Real provider I/O and model execution are explicitly
+outside the synthetic composition tests. Server 70 remains unchanged until
+any new production repair is frozen and verified; no new live browser pass.
+
 - **Telegram photo eligibility (complete):** bounded PNG/JPEG metadata selects
   photo within supported geometry and a conservative 10,000,000-byte budget.
   Other images retain original document bytes. Header screening never decodes

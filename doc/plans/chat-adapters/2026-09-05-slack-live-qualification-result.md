@@ -3,6 +3,11 @@
 For the later September 7 image/file handoff retake, see
 [media qualification](2026-09-07-media-live-qualification.md).
 
+For the September 8–9 native Luna media, queue and deployment evidence, use the
+[current qualification ledger](2026-09-08-chat-queue-and-webhook-repair.md).
+The checkpoint rows below retain their original tested revisions; they do not
+qualify server 70 or the remaining live modal/Stop/governance permutations.
+
 > **Status: broad current-branch live evidence plus historical core-smoke evidence, not full release qualification.** The current runs cover channel roots, DMs, FIFO follow-ups, reactions, edits, pause/resume, the registered Slack command, a command-created thread, native inbound and outbound files, disabled-resource enforcement and recovery, an interleaved command/status/final race, a complete native question-to-continuation round trip, and one revocation/relink sequence. Slack is still missing the rest of the governance, failure-injection, reinstall, and cleanup matrix.
 
 ## 2026-09-07 fresh-connection setup edge and recovery
@@ -110,14 +115,14 @@ The active endpoint `2782e758-8e1e-47e3-a5aa-6a8359b1c23c` added the following c
 
 The outbound-file and tested rich-interaction gaps are now closed. Broader modal/form behavior still needs live coverage. Earlier low-trust failures were governance isolation, and two old synthetic-command receipt warnings are preserved pre-fix evidence; neither is a current Slack account gate.
 
-## Current source and evidence boundary
+## September 5–6 source and evidence boundary
 
 - Pre-merge source revision for the historical breadth checks below: `77ad5383e3a8badf7b1b0933a7e9c66469186d55`
-- Most recently live-rerun Slack source revision: `da8f83d6c9befe7bf958f6d9cf12a95fc7e59e88`
+- Most recently live-rerun Slack source revision at that checkpoint: `da8f83d6c9befe7bf958f6d9cf12a95fc7e59e88`
 - Later implementation revision (Discord log redaction and documentation/setup-copy follow-up only): `83018c688`
 - The synthetic-command receipt, native thread binding, ordered task-control, coherent progress/status/final lane, explicit attachment binding, native-action lifecycle, final-presentation lineage, and top-level DM reaction-generation fixes are present in the final merge revision. The historical breadth checks exercised the pre-merge revision above; the merged-build section records the final live rerun.
 - Live checkpoint: 2026-09-05 through 2026-09-06
-- Current live endpoint: `2782e758-8e1e-47e3-a5aa-6a8359b1c23c`
+- Live endpoint at that checkpoint: `2782e758-8e1e-47e3-a5aa-6a8359b1c23c`
 - Paperclip issue: `d7f718da-a8da-468e-99a7-79dc337d5cbc`
 
 No bot token, signing secret, webhook URL, cookie, password, or one-time identity-link URL is recorded here.
