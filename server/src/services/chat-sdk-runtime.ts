@@ -345,9 +345,14 @@ export interface ChatSdkCallbackEvent<T> {
   endpointId: string;
   event: T;
   provider: ChatSdkProvider;
-  /** Runtime-assigned action ingress context; never read from provider payloads. */
+  /** Runtime-assigned ingress context; never read from provider payloads. */
   transport?: "discord_gateway";
 }
+
+/** Private command completion only; task publications use the ordinary FIFO. */
+export type DiscordNativeCommandResponse =
+  | { kind: "accepted"; content: string }
+  | { kind: "denied" };
 
 export interface DiscordRootMentionAdmissionEvent {
   channelId: string;
@@ -432,7 +437,10 @@ export interface ChatSdkRuntimeCallbacks {
   onReaction?(event: ChatSdkCallbackEvent<ReactionEvent>): Promise<void> | void;
   onSlashCommand?(
     event: ChatSdkCallbackEvent<SlashCommandEvent>,
-  ): Promise<void> | void;
+  ):
+    | Promise<DiscordNativeCommandResponse | void>
+    | DiscordNativeCommandResponse
+    | void;
 }
 
 export interface CreateChatSdkEndpointRuntimeOptions {
@@ -564,6 +572,235 @@ interface DiscordChatInternals {
   handleReactionEvent?: unknown;
   processMessageDeleted?: unknown;
   processMessageUpdated?: unknown;
+}
+
+interface DiscordCommandDispatch {
+  raw: unknown;
+  response?: unknown;
+}
+
+interface DiscordCommandInteraction {
+  id: string;
+  applicationId: string;
+  commandId: string;
+  commandName: string;
+  commandType: number;
+  type: number;
+  context: number | null;
+  guildId: string | null;
+  channelId: string | null;
+  channel: { id: string; type: number; parentId?: string } | null;
+  authorizingIntegrationOwners: {
+    guildId: string | null;
+    userId: string | null;
+  };
+  user: { id: string; bot?: boolean };
+  options: {
+    data: Array<{
+      name: string;
+      type: number;
+      options?: unknown[];
+      value?: unknown;
+    }>;
+  };
+  createdTimestamp: number;
+  replied: boolean;
+  deferred: boolean;
+  isChatInputCommand(): boolean;
+  deferReply(options: { flags: number }): Promise<unknown>;
+  editReply(options: {
+    content: string;
+    allowedMentions: { parse: never[] };
+  }): Promise<unknown>;
+}
+
+interface DiscordCommandAdapter {
+  handleGatewayInteraction(
+    interaction: DiscordCommandInteraction,
+  ): Promise<void>;
+  normalizeGatewaySlashCommandInteraction(
+    interaction: DiscordCommandInteraction,
+  ): Record<string, unknown>;
+  getApplicationCommandContext(raw: Record<string, unknown>): {
+    channelId: string;
+    user: { id: string; username: string; global_name?: string; bot?: boolean };
+  } | null;
+}
+
+/**
+ * The pinned adapter's slash path is fire-and-forget and redirects postMessage
+ * into interaction webhooks. Keep this opt-in path outside that requestContext,
+ * while still using its channel normalization and Chat's real awaited dispatch.
+ */
+function installDiscordNativeCommands(
+  adapter: Adapter,
+  chat: Chat,
+  applicationId: string,
+  guildId: string,
+  dispatchContext: AsyncLocalStorage<DiscordCommandDispatch>,
+): void {
+  const discord = adapter as unknown as DiscordCommandAdapter;
+  const sdk = chat as unknown as {
+    handleSlashCommandEvent(event: Record<string, unknown>): Promise<void>;
+  };
+  if (
+    typeof discord.handleGatewayInteraction !== "function" ||
+    typeof discord.normalizeGatewaySlashCommandInteraction !== "function" ||
+    typeof discord.getApplicationCommandContext !== "function" ||
+    typeof sdk.handleSlashCommandEvent !== "function"
+  ) {
+    throw new DiscordAdapterCompatibilityError(
+      "awaited native command dispatch is unavailable",
+    );
+  }
+  const original = discord.handleGatewayInteraction.bind(discord);
+  // Only IDs/timestamps are retained, never interaction objects or their tokens.
+  // This suppresses same-process redelivery; service receipt dedupe is still
+  // required across restarts. Expired snowflakes are never acknowledged anew.
+  const attempted = new Map<string, number>();
+  const snowflake = (value: unknown): value is string =>
+    typeof value === "string" && /^[1-9][0-9]{16,19}$/.test(value);
+  const denied =
+    "This command is not available here. Open the Paperclip task or ask an operator to link this account.";
+  const unconfirmed =
+    "This command could not be confirmed. Check the Paperclip task before trying again.";
+  discord.handleGatewayInteraction = async (interaction) => {
+    if (!interaction.isChatInputCommand()) return await original(interaction);
+    const startedAt = Date.now();
+    for (const [id, expiresAt] of attempted)
+      if (expiresAt <= startedAt) attempted.delete(id);
+    if (
+      !snowflake(interaction.id) ||
+      attempted.has(interaction.id) ||
+      attempted.size >= 1024
+    )
+      return;
+    // Reserve 500ms for the initial REST response. No database work precedes it.
+    if (
+      !Number.isFinite(interaction.createdTimestamp) ||
+      startedAt >= interaction.createdTimestamp + 2500 ||
+      interaction.createdTimestamp > startedAt + 1000
+    )
+      return;
+    attempted.set(interaction.id, interaction.createdTimestamp + 15 * 60_000);
+    if (interaction.deferred || interaction.replied) return;
+    try {
+      await interaction.deferReply({ flags: 64 });
+    } catch {
+      // The initial write may have succeeded. Never retry it, call the service,
+      // send a second initial response, or expose provider error/token details.
+      return;
+    }
+    let content = denied;
+    const options = interaction.options?.data;
+    const option =
+      Array.isArray(options) && options.length === 1 ? options[0] : undefined;
+    const isGuild =
+      interaction.context === 0 &&
+      interaction.guildId === guildId &&
+      interaction.authorizingIntegrationOwners?.guildId === guildId;
+    const isDm =
+      interaction.context === 1 &&
+      interaction.guildId === null &&
+      interaction.authorizingIntegrationOwners?.guildId === "0" &&
+      interaction.channel?.type === 1;
+    const channel = interaction.channel;
+    const thread = channel?.type === 11 || channel?.type === 12;
+    const valid =
+      interaction.type === 2 &&
+      interaction.commandType === 1 &&
+      interaction.applicationId === applicationId &&
+      interaction.commandName === "paperclip" &&
+      snowflake(interaction.commandId) &&
+      snowflake(interaction.user?.id) &&
+      !interaction.user.bot &&
+      interaction.user.id !== applicationId &&
+      !interaction.authorizingIntegrationOwners?.userId &&
+      (isGuild || isDm) &&
+      snowflake(interaction.channelId) &&
+      channel?.id === interaction.channelId &&
+      (!thread || snowflake(channel?.parentId)) &&
+      option?.type === 1 &&
+      ["status", "new", "close"].includes(option.name) &&
+      option.value === undefined &&
+      (option.options === undefined ||
+        (Array.isArray(option.options) && option.options.length === 0));
+    if (valid && option) {
+      const normalized =
+        discord.normalizeGatewaySlashCommandInteraction(interaction);
+      // Explicit allowlist: the adapter's normalized raw currently has a token.
+      // Do not pass it (or the discord.js interaction object) to Chat or storage.
+      const raw = {
+        id: interaction.id,
+        application_id: applicationId,
+        type: 2,
+        version: 1,
+        channel: normalized.channel,
+        channel_id: interaction.channelId,
+        guild_id: interaction.guildId ?? "@me",
+        user: normalized.user,
+        context: interaction.context,
+        authorizing_integration_owners: { "0": isGuild ? guildId : "0" },
+        data: {
+          id: interaction.commandId,
+          type: 1,
+          name: "paperclip",
+          options: [{ type: 1, name: option.name }],
+        },
+      };
+      const context = discord.getApplicationCommandContext(raw);
+      if (context) {
+        const dispatch: DiscordCommandDispatch = { raw };
+        content = unconfirmed;
+        try {
+          await dispatchContext.run(dispatch, () =>
+            sdk.handleSlashCommandEvent({
+              command: `/paperclip ${option.name}`,
+              text: "",
+              adapter,
+              raw,
+              channelId: context.channelId,
+              user: {
+                userId: context.user.id,
+                userName: context.user.username,
+                fullName: context.user.global_name || context.user.username,
+                isBot: false,
+                isMe: false,
+              },
+            }),
+          );
+          const response = dispatch.response;
+          if (
+            response &&
+            typeof response === "object" &&
+            !Array.isArray(response)
+          ) {
+            const record = response as Record<string, unknown>;
+            if (record.kind === "denied" && Object.keys(record).length === 1)
+              content = denied;
+            else if (
+              record.kind === "accepted" &&
+              Object.keys(record).length === 2 &&
+              typeof record.content === "string" &&
+              record.content.trim().length > 0 &&
+              record.content.length <= 2000 &&
+              !record.content.includes("\0")
+            )
+              content = record.content;
+          }
+        } catch {
+          // The application may already have committed. No synthetic success or
+          // raw exception text, and no replay of the command in this adapter.
+        }
+      }
+    }
+    if (Date.now() >= interaction.createdTimestamp + 14 * 60_000) return;
+    try {
+      await interaction.editReply({ content, allowedMentions: { parse: [] } });
+    } catch {
+      /* Outcome unknown; no second response or callback replay. */
+    }
+  };
 }
 
 function assertDiscordAdapterCompatibility(adapter: Adapter, chat: Chat): void {
@@ -1477,6 +1714,7 @@ function registerCallbacks(
   acceptsProviderScope: (raw: unknown) => boolean,
   providerUpdateId: () => number | undefined,
   actionTransport: () => ChatSdkCallbackEvent<ActionEvent>["transport"],
+  discordCommandDispatch: () => DiscordCommandDispatch | undefined,
 ): void {
   const messageCallback =
     (trigger: ChatSdkMessageTrigger) =>
@@ -1607,11 +1845,20 @@ function registerCallbacks(
   }
   if (callbacks.onSlashCommand) {
     chat.onSlashCommand(async (event) => {
+      const dispatch = discordCommandDispatch();
+      if (provider === "discord" && (!dispatch || dispatch.raw !== event.raw))
+        return;
       if (!acceptsProviderScope(event.raw)) return;
-      await trackCallback(
+      const response = await trackCallback(
         async () =>
-          await callbacks.onSlashCommand?.({ endpointId, provider, event }),
+          await callbacks.onSlashCommand?.({
+            endpointId,
+            provider,
+            event,
+            ...(dispatch ? { transport: "discord_gateway" as const } : {}),
+          }),
       );
+      if (dispatch) dispatch.response = response;
     });
   }
 }
@@ -1626,6 +1873,8 @@ export class ChatSdkEndpointRuntime {
   private readonly chat: Chat;
   private readonly webhookIngress =
     new AsyncLocalStorage<WebhookIngressAttempt>();
+  private readonly discordCommandDispatch =
+    new AsyncLocalStorage<DiscordCommandDispatch>();
   private readonly webhookIngressTimeoutMs: number;
   private readonly microsoftTeamsTenantId: string | null;
   private readonly discordGuildId: string | null;
@@ -1726,7 +1975,20 @@ export class ChatSdkEndpointRuntime {
         this.provider === "discord" && !this.webhookIngress.getStore()
           ? "discord_gateway"
           : undefined,
+      () => this.discordCommandDispatch.getStore(),
     );
+    if (
+      options.providerConfig.provider === "discord" &&
+      options.callbacks.onSlashCommand
+    ) {
+      installDiscordNativeCommands(
+        this.adapter,
+        this.chat,
+        options.providerConfig.credentials.applicationId,
+        options.providerConfig.credentials.guildId,
+        this.discordCommandDispatch,
+      );
+    }
     if (this.teamsFileConsentEnabled) {
       const app = (this.adapter as unknown as TeamsAdapterInternals).app;
       if (

@@ -3763,3 +3763,22 @@ parsing, real database admission/consent/projection, and controlled provider
 ports. It verifies one exact-byte PUT and one final card after acceptance plus
 three missing/ambiguous-recipient fallbacks. This is not tenant/JWT/live proof.
 The browser inventory still reports the Mac locked, not a Discord login error.
+
+### September 9: awaited Discord command boundary, still opt-in
+
+Three genuine failing tests reproduced the installed SDK returning before a
+held slash-command handler, swallowing handler failure, and routing an ordinary
+publication through the private slash response context. The instance-local
+Discord command hook now awaits the explicit closed handler result. Its initial
+private acknowledgement means processing only; void/error results never claim
+acceptance. Public publications keep their normal bot route. Exact application,
+guild/install context and no-argument subcommand identities are checked, and
+interaction tokens never enter the normalized event or persisted channel state.
+
+The owner's final actual-discord.js/SDK cohort passes **189/189**, including
+30 new command cases. Root independently passes **125/125** across the native
+command, runtime and Teams file-consent suites. Duplicate/uncertain responses
+are not automatically retried. The bounded process-local interaction-ID cache
+is not a replacement for durable service admission. The hook remains inactive
+until the service has a verified command registration and durable authorization;
+no Discord capability was enabled or provider command created in this step.
