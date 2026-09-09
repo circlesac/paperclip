@@ -2820,3 +2820,49 @@ safe omission and offer direct Paperclip attachment or pasted text; never
 borrow browser cookies or send App credentials to upload/CDN URLs. The focused
 attachment suite passed 96/96. This is evidence for these fixtures and the
 supported App-read route, not a claim that GitHub can never add another route.
+
+### September 9: exact paginated rollout relocation
+
+The previous filesystem-fallback assumption was wrong for Codex 0.153.4's
+paginated threads: its outer resolver deliberately trusts the SQLite-selected
+rollout and refuses an absent path, avoiding an older history after a revert.
+Recovery now rebases only that already-proven selected path in the new private
+copy, with exact thread/history metadata checks. After proved stop it rebases
+the path back to the future canonical home before hashing and activation.
+Original and failed-copy SQLite files are never opened or changed.
+
+Independent review reproduced two unknown-schema side effects: mixed-case table
+names bypassed trigger inspection, and foreign-key update cascades could alter
+another row. Case-insensitive trigger lookup and a fail-closed mutating-FK guard
+now reject both before launch. Full executor verification passed **252/252**,
+server types passed, and independent review found no remaining blocker.
+
+The opt-in actual-provider regression is now reproducible:
+
+```sh
+node --import ./server/node_modules/tsx/dist/loader.mjs scripts/tests/native-cleanup-paginated-codex.mjs
+```
+
+It requires exact Codex CLI 0.153.4 (`PAPERCLIP_TEST_CODEX_BINARY` may select it),
+uses only fresh synthetic homes, and makes no `turn/start` or model request.
+It proves the real stale-path failure, successful same-thread paginated resume
+after staging relocation, and successful resume after canonical activation.
+The complete original fixture fingerprint remains unchanged. Root reran the
+portable check twice; final thread was `01a083b4-e368-7b03-be85-d81b0eb0e12f`.
+Fixture directories remain available for inspection. This is actual Codex
+protocol qualification, not live recovery of the earlier failed chat sessions.
+
+Slack's separate delayed restart request arrived with retry number 2 and
+`http_error`. Source-to-durable-ingress took 61.530s; ingress-to-run took 0.792s,
+execution 13.062s and final publication another 0.306s: **75.690s user latency**.
+The eventual webhook returned HTTP 200 in 23ms. No request/connection reached
+the local proxy around the original send; the original upstream status and
+component remain unproved. Exactly one run and one final reply were produced.
+Do not attribute this pre-ingress minute to the model or claim it was fixed.
+
+Browser qualification then paused because the Mac locked. Code/tests continued,
+but no further live browser action or batching A/B pass is claimed. The old
+Discord maintenance runner has an exact exit-1 receipt; its failed provider
+initialization does not have authenticated renewed-provider exit evidence.
+Telegram additionally lacks its maintenance runner's retirement. Both remain
+conservatively denied, and no historical retry eligibility was widened.

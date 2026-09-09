@@ -2133,6 +2133,14 @@ describe("retained native cleanup activation", () => {
     "canonical_prepared_bad_hash",
     "canonical_prepared_bad_inode",
     "provider_home",
+    "home_paginated",
+    "home_history_mismatch",
+    "home_unknown_history",
+    "home_index_trigger",
+    "home_mixed_case_index_trigger",
+    "home_cascading_foreign_key",
+    "home_selected_reverted_rollout",
+    "home_changed_index",
     "home_symlink",
     "home_oversized",
     "home_foreign_path",
@@ -2625,21 +2633,43 @@ describe("retained native cleanup activation", () => {
         join(quarantine, "codex-home/sessions/rollout-exact-thread.jsonl"),
         JSON.stringify({
           type: "session_meta",
-          payload: { id: "exact-thread" },
+          payload: { id: "exact-thread", history_mode: mode === "home_paginated" ? "paginated" : "legacy" },
         }) + "\n",
       );
       providerHomeDatabase = new DatabaseSync(
         join(quarantine, "codex-home/state_5.sqlite"),
       );
       providerHomeDatabase.exec(
-        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+        `PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE ${mode === "home_mixed_case_index_trigger" ? "Threads" : "threads"} (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, history_mode TEXT NOT NULL)`,
       );
       providerHomeDatabase
-        .prepare("INSERT INTO threads VALUES (?, ?)")
+        .prepare("INSERT INTO threads VALUES (?, ?, ?)")
         .run(
           "exact-thread",
           join(root, "codex-home/sessions/rollout-exact-thread.jsonl"),
+          mode === "home_paginated" ? "paginated" : "legacy",
         );
+      providerHomeDatabase.prepare("INSERT INTO threads VALUES (?, ?, ?)")
+        .run("unrelated-thread", "/unrelated/immutable-rollout.jsonl", "paginated");
+      if (mode === "home_history_mismatch")
+        providerHomeDatabase.prepare("UPDATE threads SET history_mode = 'paginated' WHERE id = 'exact-thread'").run();
+      if (mode === "home_unknown_history")
+        providerHomeDatabase.prepare("UPDATE threads SET history_mode = 'future-mode' WHERE id = 'exact-thread'").run();
+      if (mode === "home_index_trigger")
+        providerHomeDatabase.exec("CREATE TRIGGER unexpected_relocation AFTER UPDATE ON threads BEGIN UPDATE threads SET history_mode = 'changed' WHERE id = 'unrelated-thread'; END");
+      if (mode === "home_mixed_case_index_trigger")
+        providerHomeDatabase.exec("CREATE TRIGGER unexpected_relocation AFTER UPDATE ON Threads BEGIN UPDATE threads SET history_mode = 'changed' WHERE id = 'unrelated-thread'; END");
+      if (mode === "home_cascading_foreign_key") {
+        providerHomeDatabase.exec("CREATE UNIQUE INDEX selected_rollout ON threads(rollout_path); CREATE TABLE related_selection (selected_path TEXT REFERENCES Threads(rollout_path) ON UPDATE CASCADE)");
+        providerHomeDatabase.prepare("INSERT INTO related_selection VALUES (?)")
+          .run(join(root, "codex-home/sessions/rollout-exact-thread.jsonl"));
+      }
+      if (mode === "home_selected_reverted_rollout") {
+        await writeFile(join(quarantine, "codex-home/sessions/rollout-different-rollout-id.jsonl"),
+          JSON.stringify({ type: "session_meta", payload: { id: "exact-thread", history_mode: "legacy" } }) + "\n");
+        providerHomeDatabase.prepare("UPDATE threads SET rollout_path = ? WHERE id = 'exact-thread'")
+          .run(join(root, "codex-home/sessions/rollout-different-rollout-id.jsonl"));
+      }
       if (mode === "home_symlink")
         await symlink(
           join(directory, "outside-home"),
@@ -2832,6 +2862,22 @@ describe("retained native cleanup activation", () => {
             .toEqual(original);
         }
         await input.authorize();
+        if (mode === "home_paginated") {
+          // Codex 0.153.4's thread-store resolver deliberately does not scan
+          // for a paginated thread when its selected SQLite path is absent.
+          const copied = new DatabaseSync(join(input.stateDirectory, "codex-home/state_5.sqlite"), { readOnly: true });
+          try {
+            const selected = copied.prepare("SELECT rollout_path, history_mode FROM threads WHERE id = ?").get("exact-thread")!;
+            expect(selected.history_mode).toBe("paginated");
+            expect(selected.rollout_path).toBe(join(input.stateDirectory, "codex-home/sessions/rollout-exact-thread.jsonl"));
+            await access(String(selected.rollout_path));
+          } finally { copied.close(); }
+        }
+        if (mode === "home_changed_index") {
+          const copied = new DatabaseSync(join(input.stateDirectory, "codex-home/state_5.sqlite"));
+          try { copied.prepare("UPDATE threads SET rollout_path = '/foreign/selected.jsonl' WHERE id = 'exact-thread'").run(); }
+          finally { copied.close(); }
+        }
         if (mode === "home_changed_source") {
           await writeFile(
             join(
@@ -2845,8 +2891,6 @@ describe("retained native cleanup activation", () => {
         if (mode === "provider_home") {
           for (const file of [
             "sessions/rollout-exact-thread.jsonl",
-            "state_5.sqlite",
-            "state_5.sqlite-wal",
             "traces/provider.log",
           ])
             expect(
@@ -3018,6 +3062,7 @@ describe("retained native cleanup activation", () => {
         "wrong_provider_account",
       ].includes(mode);
       const succeeds = [
+        "home_paginated",
         "canonical_source",
         "canonical_claim_commit_stalled", "canonical_archive_commit_stalled",
         "canonical_prepared_original", "canonical_prepared_archived", "canonical_archived_recorded",
@@ -3056,6 +3101,7 @@ describe("retained native cleanup activation", () => {
         "home_wrong_thread",
         "home_unknown_db",
         "home_duplicate_rollout",
+        "home_history_mismatch", "home_unknown_history", "home_index_trigger", "home_mixed_case_index_trigger", "home_cascading_foreign_key", "home_selected_reverted_rollout",
       ].includes(mode);
       expect(state.cleanup).toHaveBeenCalledTimes(
         ineligible || deniedBeforeLaunch ? 0 : 1,
@@ -3104,6 +3150,16 @@ describe("retained native cleanup activation", () => {
       }
       if (succeeds) {
         await access(root);
+        const activatedIndex = new DatabaseSync(join(root, "codex-home/state_5.sqlite"), { readOnly: true });
+        try {
+          expect(activatedIndex.prepare("SELECT * FROM threads WHERE id = ?").get("exact-thread")).toEqual({
+            id: "exact-thread", rollout_path: join(root, "codex-home/sessions/rollout-exact-thread.jsonl"),
+            history_mode: mode === "home_paginated" ? "paginated" : "legacy",
+          });
+          expect(activatedIndex.prepare("SELECT * FROM threads WHERE id = ?").get("unrelated-thread")).toEqual({
+            id: "unrelated-thread", rollout_path: "/unrelated/immutable-rollout.jsonl", history_mode: "paginated",
+          });
+        } finally { activatedIndex.close(); }
         const history = coordinator.recoveryHistory as Array<
           Record<string, unknown>
         >;

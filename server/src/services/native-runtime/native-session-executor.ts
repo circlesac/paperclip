@@ -2037,11 +2037,14 @@ function copyCleanupProviderHome(
     throw new Error("native_cleanup_maintenance_unproven");
 }
 
-function assertCleanupProviderHomePaths(
+export function rebaseRetainedNativeCleanupProviderHome(
   home: string,
   canonicalHome: string,
   threadId: string,
+  destination: "staging" | "canonical",
 ) {
+  if (resolve(home) === resolve(canonicalHome))
+    throw new Error("native_cleanup_maintenance_unproven");
   const snapshot = cleanupProviderHomeSnapshot(home, true);
   const rollouts = snapshot.entries.filter(
     (entry) =>
@@ -2068,9 +2071,10 @@ function assertCleanupProviderHomePaths(
     record(first.payload).id !== threadId
   )
     throw new Error("native_cleanup_maintenance_unproven");
-  // Only inspect the NEW private copy. SQLite may consult its copied WAL/SHM.
-  // The pinned provider repairs a stale canonical path by finding this local
-  // rollout. An existing quarantine/foreign path must never be resumed.
+  // Only open the NEW private copy. Codex 0.153.4 deliberately does not fall
+  // back to a filesystem scan for paginated threads: SQLite selects the exact
+  // immutable rollout, which can differ after thread/revert. Relocate only
+  // that already-proven path, never choose another rollout or change its mode.
   const sqlite = resolve(home, "state_5.sqlite");
   if (
     snapshot.entries.some(
@@ -2081,10 +2085,41 @@ function assertCleanupProviderHomePaths(
   )
     throw new Error("native_cleanup_maintenance_unproven");
   if (!existsSync(sqlite)) return;
-  const database = new DatabaseSync(sqlite, { readOnly: true });
+  const database = new DatabaseSync(sqlite);
   try {
+    database.exec("BEGIN IMMEDIATE");
+    // The pinned schema has insert and timestamp-only triggers. None fire
+    // for this column-only update; unknown/general update triggers deny it.
+    if (
+      database
+        .prepare(
+          "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name COLLATE NOCASE = 'threads'",
+        )
+        .all()
+        .some(
+          (trigger) =>
+            typeof trigger.sql !== "string" ||
+            !/^CREATE\s+TRIGGER\s+[a-z_][a-z0-9_]*\s+AFTER\s+(?:INSERT|UPDATE\s+OF\s+(?:created_at|updated_at))\s+ON\s+threads\s/i.test(
+              trigger.sql,
+            ),
+        )
+    )
+      throw new Error("native_cleanup_maintenance_unproven");
+    // Foreign-key actions can also mutate other tables without an explicit
+    // trigger. Unknown cascading topology is not an exact path relocation.
+    if (
+      database
+        .prepare(
+          `SELECT 1 FROM sqlite_schema AS s
+           JOIN pragma_foreign_key_list(s.name) AS f
+           WHERE s.type = 'table' AND f."table" COLLATE NOCASE = 'threads'
+             AND f.on_update NOT IN ('NO ACTION', 'RESTRICT') LIMIT 1`,
+        )
+        .get()
+    )
+      throw new Error("native_cleanup_maintenance_unproven");
     const row = database
-      .prepare("SELECT rollout_path FROM threads WHERE id = ?")
+      .prepare("SELECT * FROM threads WHERE id = ?")
       .get(threadId);
     if (
       !row ||
@@ -2092,9 +2127,35 @@ function assertCleanupProviderHomePaths(
       ![
         resolve(home, rollout.path),
         resolve(canonicalHome, rollout.path),
-      ].includes(row.rollout_path)
+      ].includes(row.rollout_path) ||
+      !["legacy", "paginated"].includes(String(row.history_mode)) ||
+      (record(first.payload).history_mode ?? "legacy") !== row.history_mode
     )
       throw new Error("native_cleanup_maintenance_unproven");
+    const target = resolve(
+      destination === "staging" ? home : canonicalHome,
+      rollout.path,
+    );
+    if (row.rollout_path !== target) {
+      const changed = database
+        .prepare(
+          "UPDATE threads SET rollout_path = ? WHERE id = ? AND rollout_path = ? AND history_mode = ?",
+        )
+        .run(target, threadId, row.rollout_path, row.history_mode);
+      if (changed.changes !== 1)
+        throw new Error("native_cleanup_maintenance_unproven");
+    }
+    const after = database
+      .prepare("SELECT * FROM threads WHERE id = ?")
+      .get(threadId);
+    if (
+      nativeSha256(after) !== nativeSha256({ ...row, rollout_path: target })
+    )
+      throw new Error("native_cleanup_maintenance_unproven");
+    database.exec("COMMIT");
+  } catch (error) {
+    if (database.isTransaction) database.exec("ROLLBACK");
+    throw error;
   } finally {
     database.close();
   }
@@ -2781,10 +2842,11 @@ export async function reconcileRetainedNativeSessionCleanup(
       resolve(copy, "codex-home"),
       owned.providerHome,
     );
-    assertCleanupProviderHomePaths(
+    rebaseRetainedNativeCleanupProviderHome(
       resolve(copy, "codex-home"),
       resolve(owned.root, "codex-home"),
       owned.providerSessionId,
+      "staging",
     );
     await authorize();
     await appendMaintenanceHistory({
@@ -2797,6 +2859,10 @@ export async function reconcileRetainedNativeSessionCleanup(
       stagingName: basename(copy),
       providerHomeFingerprint: owned.providerHome.fingerprint,
       providerHomeBytes: owned.providerHome.bytes,
+      stagedProviderHomeFingerprint: cleanupProviderHomeSnapshot(
+        resolve(copy, "codex-home"),
+        true,
+      ).fingerprint,
     });
     const proof = await settleRetainedRunnerdSession({
       requestId: leaseOwner,
@@ -2854,10 +2920,11 @@ export async function reconcileRetainedNativeSessionCleanup(
       ).fingerprint !== owned.providerHome.fingerprint
     )
       throw denied();
-    assertCleanupProviderHomePaths(
+    rebaseRetainedNativeCleanupProviderHome(
       resolve(copy, "codex-home"),
       resolve(owned.root, "codex-home"),
       owned.providerSessionId,
+      "canonical",
     );
     const settledHome = cleanupProviderHomeSnapshot(
       resolve(copy, "codex-home"),

@@ -7,6 +7,32 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 01:08 UTC: the paginated SQLite path repair is frozen and
+independently reviewed. Two genuine additional regressions covered mixed-case
+table trigger lookup and foreign-key update cascades; both now deny before
+launch. **252/252** executor cases and server types pass. The actual pinned
+Codex 0.153.4 canary proves exact stale-path failure, then same-thread paginated
+resume in staging and after canonical activation, without any model turn or
+original fixture mutation. Root reproduced it twice and promoted the portable
+opt-in canary to `scripts/tests/native-cleanup-paginated-codex.mjs` with an exact
+version pin, fresh-home path validation and bounded child shutdown.
+
+The Mac locked during browser inventory; no further browser actions were
+attempted. The user has been asked to unlock it. Automated/code work continued;
+live batching A/B and remaining provider qualification are paused, not passed.
+The latest GitHub fallback guidance passed the composed 36-case instruction
+cohort and is pushed as `53e039149`; batching is `18068c865`.
+
+Slack's delayed restart check is conclusively provider retry #2 / `http_error`:
+61.530s before durable ingestion, 0.792s to run admission, 13.062s execution and
+0.306s final publication, **75.690s total**. The retry received HTTP 200 in 23ms;
+no original request reached the local proxy. Initial upstream failure remains
+unknown. Historical Discord `mZx1xU` and Telegram still lack sufficient ownership
+evidence. A forward-only receipt design needs separate authenticated spawn and
+failed-initialization cleanup facts before durable command failure; leader exit
+alone must not be called whole-provider retirement. No such eligibility change
+has been implemented or authorized by later process absence.
+
 September 9, 00:58 UTC: `e0494d8d8` is pushed; root's full deterministic
 chat browser suite also passed **22/22** (2.5 minutes) after the Board repair.
 Post-restart exact replies succeeded in all three existing Discord/Slack/GitHub
