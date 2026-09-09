@@ -164,12 +164,34 @@ describe("buildPaperclipTaskMarkdown", () => {
       );
       expect(markdown).toContain("workspace-relative staged attachment descriptors");
       expect(markdown).toContain("clearly state that you could not inspect it");
+      expect(markdown).toContain("batch independent reads/inspection with the appropriate available tools");
+      expect(markdown).toContain("Compute exact sizes and SHA-256 hashes in the same preparation step");
+      expect(markdown).toContain("batch independent per-file registrations into as few tool calls as practical");
+      expect(markdown).toContain("one registration and a distinct stable idempotencyKey per file");
+      expect(markdown).toContain("wait for each receipt before the final-response protocol");
+      expect(markdown).toContain("retry only a failed or ambiguous step with its original key");
+      expect(markdown).toContain("current source/generation authorization, exact-byte reuse, or approval gates");
+      expect(markdown).toContain("skip a separate preamble and narration before each step");
+      expect(markdown).toContain("Keep useful wait, blocker, permission, and failure updates");
+      expect(markdown).toContain("do not suppress transport-managed progress");
       expect(markdown).toContain('"id":"native-attachment"');
       expect(markdown).not.toContain("paperclip-upload-artifact.sh");
       expect(markdown).not.toContain("PAPERCLIP_API_KEY");
       expect(markdown).not.toContain("/api/attachments/");
     },
   );
+
+  it.each([
+    { nativeRunner: false, externalChatProvider: "slack" },
+    { nativeRunner: true, externalChatProvider: null },
+  ])("keeps native media batching out of unrelated instruction paths: %j", (mode) => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: { id: "other-workflow", identifier: null, title: "Other work" },
+      ...mode,
+    });
+    expect(markdown).not.toContain("batch independent per-file registrations");
+    expect(markdown).not.toContain("skip a separate preamble and narration before each step");
+  });
 
   it("does not imply that GitHub chat grants attachment or repository-tool access", () => {
     const markdown = buildPaperclipTaskMarkdown({

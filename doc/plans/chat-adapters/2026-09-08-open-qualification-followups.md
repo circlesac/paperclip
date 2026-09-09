@@ -7,6 +7,30 @@ in [the permanent qualification log](2026-09-08-chat-queue-and-webhook-repair.md
 
 ## Current work: exact chat retry, accepted answers and session recovery
 
+September 9, 00:58 UTC: `e0494d8d8` is pushed; root's full deterministic
+chat browser suite also passed **22/22** (2.5 minutes) after the Board repair.
+Post-restart exact replies succeeded in all three existing Discord/Slack/GitHub
+tasks and native sessions. However Slack's provider timestamp preceded local
+delivery ingestion by about 62 seconds; its run itself took 13 seconds. Boole
+is tracing that pre-ingest delay; do not report execution time as user latency.
+
+James proved the historical Discord failure in pinned Codex's actual paginated
+thread resolver: it refuses the absent canonical SQLite rollout path rather
+than scanning the copied sessions tree. The narrow repair is rebasing only the
+exact selected path in a new private snapshot, then back to the canonical path
+after proved stop and before activation. Its failed `mZx1xU` runner has an exact
+exit-1 receipt, but failed provider initialization has no new authenticated
+provider-exit proof. Keep that historical attempt and Telegram closed to retry.
+
+Media timing attributes roughly 56–60 of the 68 seconds to provider/model work
+across 6–7 sequential tool cycles, not file IO or the inbound queue. Native-only
+batching guidance passed 36 focused tests and server types; deployment and
+same-input A/B measurement remain pending. Do not shorten shutdown safeguards.
+Exact App REST reads also confirmed GitHub's current private generic-file
+fixture has no signed download target, while the image fixture does. Retain the
+safe omission; no cookie or credential forwarding workaround is authorized by
+that evidence. Provider/file coverage and actionable fallback remain explicit.
+
 September 9, 00:52 UTC: server **65**, PID **68642**, runs `d47f2099f` on
 loopback 3137. Server 64 drained with zero interrupted runs and closed cleanly.
 The new canonical lane automatically preserved and archived Discord CHA-29's

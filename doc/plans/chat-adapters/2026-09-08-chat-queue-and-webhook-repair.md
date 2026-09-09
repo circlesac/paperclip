@@ -2785,3 +2785,38 @@ the full bounded provider home, but control-only maintenance still ended
 `operator_required` (`cleanup-mZx1xU`). That failure is under read-only diagnosis;
 this display fix and the fresh-thread successes do not prove historical
 physical cleanup or failed-follow-up retry.
+
+### September 9: latency attribution and provider limits
+
+The final composed deterministic chat browser suite passed **22/22** in
+2.5 minutes after the accepted-answer repair. Post-restart Discord, Slack and
+GitHub replies also succeeded in the same tasks/native sessions. Execution
+durations were 14.36, 13.06 and 15.92 seconds respectively. Slack's source-to-
+local-ingestion delay was nevertheless about 62 seconds, under investigation;
+those execution numbers must not be presented as end-to-end response times.
+
+The preceding media runs spent 60.149s (Discord) and 55.701s (Slack) between
+turn acceptance and result proposal, across 6–7 sequential tool/model cycles.
+Startup was 1.954/2.933s, result acceptance 5.555/5.168s, and finalization/close
+0.267/3.999s. Actual tool execution took roughly two seconds; tool-duration
+measurements overlap and are not additive. Slack's close encountered a warm
+teardown timeout followed by proved successful physical stop. The five-second
+post-result grace waits for provider final/terminal evidence and is not being
+reduced. Native media instructions now encourage batching independent reads,
+preparation and registrations, preserving exact per-file receipts, distinct
+stable retry identities, source authorization, approvals and helpful progress.
+This instruction-only change passed 36 focused tests and server types. No
+measured savings are claimed before its same-input live A/B test.
+
+The GitHub private-document limit was verified using the existing App's exact
+installation and a read token restricted to the disposable QA repository.
+Comment `5589017671` returned HTTP 200 with the admitted body hash intact; its
+full rendered representation contains only the original unsigned generic-file
+anchor, no signed download target. Anonymous retrieval returned 404 without a
+redirect; the body was not consumed. The image comparison `5589001728` exposes
+an exact same-asset signed image target through the equivalent App read.
+Removing the generic-file guard alone cannot fix this fixture. Preserve the
+safe omission and offer direct Paperclip attachment or pasted text; never
+borrow browser cookies or send App credentials to upload/CDN URLs. The focused
+attachment suite passed 96/96. This is evidence for these fixtures and the
+supported App-read route, not a claim that GitHub can never add another route.
