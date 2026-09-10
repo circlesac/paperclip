@@ -1,7 +1,7 @@
 import type { Context, MiddlewareHandler } from "hono";
 import type { Db } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
-import type { Actor, ActorRequestSource } from "../src/auth/actor.js";
+import type { Actor, ActorRequestSource } from "../src/types/actor.js";
 import { resolveActor } from "../src/middleware/auth.js";
 import { HttpError } from "../src/errors.js";
 

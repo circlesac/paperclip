@@ -1,6 +1,6 @@
 export {};
 
-import type { Actor } from "../auth/actor.js";
+import type { Actor } from "./actor.js";
 
 declare global {
   namespace Express {

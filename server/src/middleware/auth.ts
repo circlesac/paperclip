@@ -55,7 +55,7 @@ function pruneCloudTenantWriteDebounce(
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
-import type { Actor, ActorRequestSource, CloudActorHeaderSource } from "../auth/actor.js";
+import type { Actor, ActorRequestSource, CloudActorHeaderSource } from "../types/actor.js";
 import { logger } from "./base-logger.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
@@ -515,7 +515,7 @@ async function resolveOwnerInstanceAdmin(
  * trusted-header authentication must work identically for upgrades — a
  * cloud-proxied browser has no local Better Auth session to fall back on.
  */
-export type { CloudActorHeaderSource } from "../auth/actor.js";
+export type { CloudActorHeaderSource } from "../types/actor.js";
 
 /** Adapts a raw header map (e.g. `IncomingMessage.headers`) to {@link CloudActorHeaderSource}. */
 export function cloudActorHeaderSourceFromHeaders(
