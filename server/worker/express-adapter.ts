@@ -192,10 +192,10 @@ function buildRequest<E extends { Variables: { actor: unknown } }>(c: Context<E>
   // handles flat string/array values.
   return {
     method: c.req.method,
-    path,
+    path: path as string,
     originalUrl: url.pathname + url.search,
     url: path + url.search,
-    baseUrl: prefix,
+    baseUrl: prefix as string,
     params: {},
     query,
     body: undefined as unknown,
@@ -251,9 +251,12 @@ function runHandler(handler: ShimHandler, req: Record<string, unknown>, res: Res
   });
 }
 
+/** A router mounted at a sub-path, like Express `api.use("/companies", router)`. */
+export type MountedRouter = ShimRouter | { mount: string; router: ShimRouter };
+
 export function mountExpressRouters<E extends { Variables: { actor: unknown } }>(
   app: Hono<E>,
-  opts: { prefix: string; routers: (c: Context<E>) => ShimRouter[] },
+  opts: { prefix: string; routers: (c: Context<E>) => MountedRouter[] },
 ): void {
   app.all(`${opts.prefix}/*`, async (c) => {
     const url = new URL(c.req.url);
@@ -268,7 +271,19 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
       // Inside the try: a route factory that throws while constructing its
       // services must produce the same JSON error mapping as a handler error.
       const routers = opts.routers(c);
-      for (const router of routers) {
+      for (const entry of routers) {
+        const mount = "mount" in entry ? entry.mount : "";
+        const router = "mount" in entry ? entry.router : entry;
+        // Express strips the mount path before matching the router's own paths
+        // and exposes it as req.baseUrl.
+        let routerPath = requestPath;
+        if (mount) {
+          if (!usePathPrefixMatches(mount, requestPath)) continue;
+          routerPath = requestPath.slice(mount.length) || "/";
+          if (!routerPath.startsWith("/")) routerPath = "/" + routerPath;
+        }
+        req.baseUrl = opts.prefix + mount;
+        req.path = routerPath;
         for (const layer of router.layers as ShimLayer[]) {
           const nextParams: Record<string, string> = {};
 
@@ -277,11 +292,11 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
           }
 
           if (layer.method === "USE") {
-            if (!usePathPrefixMatches(layer.path ?? "/", requestPath)) {
+            if (!usePathPrefixMatches(layer.path ?? "/", routerPath)) {
               continue;
             }
           } else {
-            if (!routeMatches(layer.path ?? "", requestPath, nextParams)) {
+            if (!routeMatches(layer.path ?? "", routerPath, nextParams)) {
               continue;
             }
           }

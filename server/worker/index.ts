@@ -4,7 +4,7 @@ import { DEPLOYMENT_MODES, type DeploymentMode } from "@paperclipai/shared";
 import { createWorkerDb } from "./db.js";
 import type { Env } from "./env.js";
 import { actorMiddleware, type ActorVariables } from "./actor.js";
-import { mountExpressRouters } from "./express-adapter.js";
+import { mountExpressRouters, type MountedRouter } from "./express-adapter.js";
 import { companies } from "./shims/paperclip-db.js";
 import { dashboardRoutes } from "../src/routes/dashboard.js";
 import { sidebarBadgeRoutes } from "../src/routes/sidebar-badges.js";
@@ -19,6 +19,12 @@ import { decisionTrainingRoutes } from "../src/routes/decision-training.js";
 import { issueTreeControlRoutes } from "../src/routes/issue-tree-control.js";
 import { activityRoutes } from "../src/routes/activity.js";
 import { instanceSettingsRoutes } from "../src/routes/instance-settings.js";
+import { costRoutes } from "../src/routes/costs.js";
+import { attentionRoutes } from "../src/routes/attention.js";
+import { decisionRoutes } from "../src/routes/decisions.js";
+import { companyRoutes } from "../src/routes/companies.js";
+import { accessRoutes } from "../src/routes/access.js";
+import { createDecisionWakeOriginAgent } from "../src/services/decision-wakeup.js";
 import { boardMutationGuard } from "../src/middleware/board-mutation-guard.js";
 import type { ShimRouter } from "./shims/express.js";
 import { Router } from "./shims/express.js";
@@ -112,7 +118,21 @@ mountExpressRouters(app, {
       issueTreeControlRoutes(c.get("db")),
       activityRoutes(c.get("db")),
       instanceSettingsRoutes(c.get("db")),
-    ] as unknown as ShimRouter[];
+      costRoutes(c.get("db")),
+      attentionRoutes(c.get("db")),
+      // No heartbeat scheduler on the Worker: the same no-op wake Node uses
+      // when HEARTBEAT_SCHEDULER_ENABLED=false.
+      decisionRoutes(c.get("db"), { wakeOriginAgent: createDecisionWakeOriginAgent(null) }),
+      // Express mounts this router at /api/companies (app.ts); no storage
+      // service yet, so logo/import paths answer 501 via the multer shim.
+      { mount: "/companies", router: companyRoutes(c.get("db")) as unknown as ShimRouter },
+      accessRoutes(c.get("db"), {
+        deploymentMode: deploymentMode(c.env),
+        deploymentExposure: "private",
+        bindHost: "127.0.0.1",
+        allowedHostnames: [],
+      }),
+    ] as unknown as MountedRouter[];
   },
 });
 

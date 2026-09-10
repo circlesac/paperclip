@@ -20,19 +20,19 @@ If a change seems to need an edit under `server/src`, the answer is a shim or an
 
 `worker/build.mjs` (esbuild) runs first, then wrangler bundles its output:
 
-- Package aliases: `express` → recording `Router` shim; `multer` → 501 middleware; `pino-http` → no-op; `@paperclipai/db` → schema + `type Db` only (the real barrel drags in `embedded-postgres`).
-- Source-path redirects (an `onResolve` plugin; only imports made from inside `server/src` are affected): `services/index.ts` → curated barrel; the execution-plane hubs and the service modules whose graphs reach them → lazy throwing stubs under `shims/hubs/`; `instrumentation.ts`, `version.ts`, `build-commit.ts`, `build-version.ts` → benign values (the real ones run OpenTelemetry, `@cursor/sdk`, `createRequire(import.meta.url)` and `git describe` at module load).
+- Package aliases: `express` → recording `Router` shim (plus `express.json` pass-through and 501 `raw`/`text`/`urlencoded`/`static` factories); `multer` → 501 middleware; `pino-http` → no-op; `@paperclipai/db` → schema + `type Db` only (the real barrel drags in `embedded-postgres`).
+- Source-path redirects (an `onResolve` plugin; only imports made from inside `server/src` are affected): `services/index.ts` → curated barrel (names derived from the routes mounted in `index.ts`); the execution-plane hubs, the service modules whose graphs reach them, and the disk catalogs (`skills-catalog`, `built-in-agents`) → lazy stubs under `shims/hubs/`; `instrumentation.ts`, `version.ts`, `build-commit.ts`, `build-version.ts` → benign values (the real ones run OpenTelemetry, `@cursor/sdk`, `createRequire(import.meta.url)` and `git describe` at module load).
 - `define`: `process.env.NODE_ENV` = `"production"` so `middleware/logger.ts` never calls `pino.transport` (absent in the pino build the bundler selects; a runtime var is not visible at module load).
 - `external`: `node:*`, `cloudflare:*`, and bare builtin specifiers reached through third-party packages; workerd's `nodejs_compat` provides them.
 
-Stubs are lazy: `fooService(db)` returns a proxy and only the first property access throws. Route factories build their services eagerly, so an eager throw would take every route down. When a request reaches a stub, the adapter answers `501 { "error": "<name> is not available on the Cloudflare Worker yet" }`.
+Stubs are lazy in two steps: `fooService(db)` and property reads (`svc.wakeup`) return proxies, because route factories do both at construction; the first call, `await`, string conversion, or JSON serialization of the result throws. When a request reaches a stub, the adapter answers `501 { "error": "<name> is not available on the Cloudflare Worker yet" }`.
 
 Check with `pnpm --filter @paperclipai/server exec wrangler deploy --dry-run --outdir /tmp/b` and grep the pre-bundle (`worker/dist/index.mjs`) for `node_modules/express/`, `pino-http`, `embedded-postgres`, `services/heartbeat.ts` (all must be absent).
 
 ## Adding a route module
 
-1. Import its factory in `index.ts` and append it to the `routers` array (constructed per request with `c.get("db")`).
-2. If it imports names from `../services/index.js`, add them to `NEEDED` in `scripts/gen-services-index.mjs` and re-run it. A name whose module is Workers-safe is re-exported; a Node-bound one becomes a lazy stub.
+1. Import its factory in `index.ts` and append it to the `routers` array (constructed per request with `c.get("db")`). If `app.ts` mounts it under a sub-path (`api.use("/companies", …)`), use `{ mount: "/companies", router }`.
+2. Re-run `node worker/scripts/gen-services-index.mjs`; it reads the routes mounted in `index.ts` and exports what they import from the services barrel. A name whose module is Workers-safe is re-exported; a Node-bound one becomes a lazy stub.
 3. `node worker/build.mjs` — a build error names the next Node-only module; add a redirect or stop.
 4. `wrangler dev`, then compare against the Node server on the same database (see Verification contract). A `501 … not available` answer means the route reached a stub; decide whether that endpoint is acceptable as "not yet".
 
@@ -51,9 +51,9 @@ Hyperdrive uses `localConnectionString` in `wrangler.jsonc`; the `id` is a place
 
 Measured on the route modules under `server/src/routes` (54 `Router()` modules) by walking each module's static import graph and counting reachable modules that import a Node-only builtin (`node:fs`, `node:child_process`, `node:net`, `node:os`, …). "Reach" is a bundling proxy, not proof of runtime behavior; the runtime check is `wrangler dev` plus a byte comparison against the Node server on the same database.
 
-### Mounted today (13 route modules)
+### Mounted today (18 route modules)
 
-`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`. Byte-identical to Node on 28 of 34 compared GET requests; the other 6 answer 501 because they call `issueService` or `heartbeatService` (issue tree-control state/holds, issue activity/runs, heartbeat-runs issues, instance task-drain). Mutations go through `boardMutationGuard` and the same validators: a goal created through the Worker is visible from Node and deletable through the Worker; invalid bodies produce the same Zod 400.
+`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (mounted at `/api/companies`, like `app.ts`), `access`. Byte-identical to Node on 47 of 55 compared GET requests. The other 8 answer `501 … is not available on the Cloudflare Worker yet` because they call the stubbed `issueService` or `heartbeatService`: issue tree-control state/holds, issue activity/runs, heartbeat-runs issues, instance task-drain, issue cost-summary, company attention. Mutations go through the unchanged `boardMutationGuard` and validators: a goal created through the Worker is visible from Node and deletable through the Worker; invalid bodies produce the same Zod 400. `services/companies.ts` and `services/agents.ts` run for real now that the hubs under them are stubbed.
 
 ### Tier 0 — runs with the M3 mechanism alone (12 routes)
 

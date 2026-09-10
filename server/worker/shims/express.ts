@@ -98,6 +98,32 @@ export function Router(): ShimRouter {
   return createRouter();
 }
 
-export default function express(): never {
-  throw new Error("express() is not available in the Worker bundle; only Router() is shimmed");
+// Body-parser factories that route modules call at module load
+// (`express.raw({ limit })`, `express.json()`). JSON bodies are already parsed
+// by the adapter, so `json()` passes through; the others answer 501 until a
+// route needs them.
+type Middleware = (req: any, res: any, next: (err?: unknown) => void) => void;
+const passthrough: Middleware = (_req, _res, next) => next();
+function notAvailable(what: string): Middleware {
+  return (_req, _res, next) => {
+    const err = new Error(`express.${what} is not available on the Cloudflare Worker yet`);
+    (err as Error & { status?: number }).status = 501;
+    next(err);
+  };
 }
+
+function express(): never {
+  throw new Error("express() is not available in the Worker bundle; only Router() and the body-parser factories are shimmed");
+}
+express.Router = Router;
+express.json = (_opts?: unknown) => passthrough;
+express.raw = (_opts?: unknown) => notAvailable("raw");
+express.text = (_opts?: unknown) => notAvailable("text");
+express.urlencoded = (_opts?: unknown) => notAvailable("urlencoded");
+express.static = (_root?: unknown, _opts?: unknown) => notAvailable("static");
+
+export const json = express.json;
+export const raw = express.raw;
+export const text = express.text;
+export const urlencoded = express.urlencoded;
+export default express;
