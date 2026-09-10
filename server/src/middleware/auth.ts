@@ -23,7 +23,6 @@ import {
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
-import { logger } from "./logger.js";
 import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
 
@@ -56,6 +55,8 @@ function pruneCloudTenantWriteDebounce(
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
+import type { Actor, ActorRequestSource, CloudActorHeaderSource } from "../auth/actor.js";
+import { logger } from "./base-logger.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
 
@@ -214,266 +215,271 @@ interface ActorMiddlewareOptions {
 
 const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
-export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
-  const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
-    req.actor =
-      opts.deploymentMode === "local_trusted"
-        ? {
-            type: "board",
-            userId: "local-board",
-            userName: "Local Board",
-            userEmail: null,
-            isInstanceAdmin: true,
-            source: "local_implicit",
-          }
-        : { type: "none", source: "none" };
+export interface ResolveActorOptions {
+  deploymentMode: DeploymentMode;
+  /** Bound by the caller. Express binds `() => opts.resolveSession(req)`. */
+  resolveSession?: () => Promise<BetterAuthSessionResult | null>;
+}
 
-    const runIdHeader = req.header("x-paperclip-run-id");
-
-    const authHeader = req.header("authorization");
-    const hasBearerCredentials = /^bearer(?:\s|$)/i.test(authHeader ?? "");
-
-    // Public MCP gateway protocol requests carry a pcgw_* bearer that is
-    // validated by the gateway service itself. Do not interpret that bearer as
-    // a board key or agent JWT here: doing so rejects the MCP handshake before
-    // the protocol route can verify its run-scoped credential. Keep this bypass
-    // restricted to the unguessable public gateway path; all /api routes retain
-    // the normal actor authentication path below.
-    if (hasBearerCredentials && publicMcpGatewayProtocolPath.test(req.path)) {
-      if (runIdHeader) req.actor.runId = runIdHeader;
-      next();
-      return;
-    }
-
-    if (!hasBearerCredentials) {
-      if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
-        const cloudTenantActor = await resolveCloudTenantActor(db, req);
-        if (cloudTenantActor) {
-          req.actor = {
-            ...cloudTenantActor,
-            runId: runIdHeader ?? undefined,
-          };
-          next();
-          return;
-        }
-
-        let session: BetterAuthSessionResult | null = null;
-        try {
-          session = await opts.resolveSession(req);
-        } catch (err) {
-          logger.warn(
-            { err, method: req.method, url: req.originalUrl },
-            "Failed to resolve auth session from request headers",
-          );
-        }
-        if (session?.user?.id && session.session?.id) {
-          const userId = session.user.id;
-          const [roleRow, memberships] = await Promise.all([
-            db
-              .select({ id: instanceUserRoles.id })
-              .from(instanceUserRoles)
-              .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-              .then((rows) => rows[0] ?? null),
-            loadActiveUserCompanyMemberships(db, userId),
-          ]);
-          req.actor = {
-            type: "board",
-            userId,
-            sessionId: session.session.id,
-            userName: session.user.name ?? null,
-            userEmail: session.user.email ?? null,
-            companyIds: memberships.map((row) => row.companyId),
-            memberships,
-            isInstanceAdmin: Boolean(roleRow),
-            runId: runIdHeader ?? undefined,
-            source: "session",
-          };
-          next();
-          return;
-        }
-      }
-      if (runIdHeader) req.actor.runId = runIdHeader;
-      next();
-      return;
-    }
-
-    const token = authHeader!.slice("bearer".length).trim();
-    if (!token) {
-      next(unauthorized("Empty bearer token; provide valid agent credentials and retry"));
-      return;
-    }
-
-    const boardKey = await boardAuth.findBoardApiKeyByToken(token);
-    if (boardKey) {
-      const access = await boardAuth.resolveBoardAccess(boardKey.userId);
-      if (access.user) {
-        await boardAuth.touchBoardApiKey(boardKey.id);
-        req.actor = {
+export async function resolveActor(
+  db: Db,
+  source: ActorRequestSource,
+  opts: ResolveActorOptions,
+  deps?: { boardAuth?: ReturnType<typeof boardAuthService> },
+): Promise<Actor> {
+  const boardAuth = deps?.boardAuth ?? boardAuthService(db);
+  let actor: Actor =
+    opts.deploymentMode === "local_trusted"
+      ? {
           type: "board",
-          userId: boardKey.userId,
-          userName: access.user?.name ?? null,
-          userEmail: access.user?.email ?? null,
-          companyIds: access.companyIds,
-          memberships: access.memberships,
-          isInstanceAdmin: access.isInstanceAdmin,
-          keyId: boardKey.id,
-          runId: runIdHeader || undefined,
-          source: "board_key",
+          userId: "local-board",
+          userName: "Local Board",
+          userEmail: null,
+          isInstanceAdmin: true,
+          source: "local_implicit",
+        }
+      : { type: "none", source: "none" };
+
+  const runIdHeader = source.header("x-paperclip-run-id");
+
+  const authHeader = source.header("authorization");
+  const hasBearerCredentials = /^bearer(?:\s|$)/i.test(authHeader ?? "");
+
+  // Public MCP gateway protocol requests carry a pcgw_* bearer that is
+  // validated by the gateway service itself. Do not interpret that bearer as
+  // a board key or agent JWT here: doing so rejects the MCP handshake before
+  // the protocol route can verify its run-scoped credential. Keep this bypass
+  // restricted to the unguessable public gateway path; all /api routes retain
+  // the normal actor authentication path below.
+  if (hasBearerCredentials && publicMcpGatewayProtocolPath.test(source.path)) {
+    if (runIdHeader) actor.runId = runIdHeader;
+    return actor;
+  }
+
+  if (!hasBearerCredentials) {
+    if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
+      const cloudTenantActor = await resolveCloudTenantActor(db, source);
+      if (cloudTenantActor) {
+        actor = {
+          ...cloudTenantActor,
+          runId: runIdHeader ?? undefined,
         };
-        next();
-        return;
-      }
-    }
-
-    const tokenHash = hashToken(token);
-    const key = await db
-      .select()
-      .from(agentApiKeys)
-      .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
-      .then((rows) => rows[0] ?? null);
-
-    if (!key) {
-      const claims = verifyLocalAgentJwt(token);
-      if (!claims) {
-        next(unauthorized(invalidAgentTokenMessage(token)));
-        return;
+        return actor;
       }
 
-      const agentRecord = await db
-        .select()
-        .from(agents)
-        .where(eq(agents.id, claims.sub))
-        .then((rows) => rows[0] ?? null);
-
-      if (!agentRecord || agentRecord.companyId !== claims.company_id) {
-        next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
-        return;
-      }
-
-      if (agentRecord.status === "terminated") {
-        next(unauthorized("Agent is terminated and cannot authenticate"));
-        return;
-      }
-      if (agentRecord.status === "pending_approval") {
-        next(unauthorized("Agent is pending approval and cannot authenticate"));
-        return;
-      }
-
-      const normalizedRunIdHeader = normalizeOptionalString(runIdHeader);
-      if (normalizedRunIdHeader && normalizedRunIdHeader !== claims.run_id) {
-        await auditAgentJwtRunHeaderMismatch(db, {
-          companyId: claims.company_id,
-          agentId: claims.sub,
-          claimRunId: claims.run_id,
-          headerRunId: normalizedRunIdHeader,
-          method: req.method,
-          url: req.originalUrl,
-        });
-        next(
-          unprocessable("X-Paperclip-Run-Id does not match signed agent JWT run_id", {
-            code: "agent_jwt_run_id_mismatch",
-            claimRunId: claims.run_id,
-            headerRunId: normalizedRunIdHeader,
-          }),
+      let session: BetterAuthSessionResult | null = null;
+      try {
+        session = await opts.resolveSession();
+      } catch (err) {
+        logger.warn(
+          { err, method: source.method, url: source.originalUrl },
+          "Failed to resolve auth session from request headers",
         );
-        return;
       }
-
-      const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
-        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
-        ));
-      if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
-        const captured = await captureRunIdentity(db, { companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id });
-        identityRun.activeIdentityContextId = captured.context?.id ?? null;
-        identityRun.responsibleUserId = captured.context?.responsibleUserId ?? null;
+      if (session?.user?.id && session.session?.id) {
+        const userId = session.user.id;
+        const [roleRow, memberships] = await Promise.all([
+          db
+            .select({ id: instanceUserRoles.id })
+            .from(instanceUserRoles)
+            .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
+            .then((rows) => rows[0] ?? null),
+          loadActiveUserCompanyMemberships(db, userId),
+        ]);
+        actor = {
+          type: "board",
+          userId,
+          sessionId: session.session.id,
+          userName: session.user.name ?? null,
+          userEmail: session.user.email ?? null,
+          companyIds: memberships.map((row) => row.companyId),
+          memberships,
+          isInstanceAdmin: Boolean(roleRow),
+          runId: runIdHeader ?? undefined,
+          source: "session",
+        };
+        return actor;
       }
-      const onBehalfOfUserId = identityRun?.activeIdentityContextId
-        ? identityRun.responsibleUserId
-        : claims.responsible_user_id !== undefined
-        ? normalizeOptionalString(claims.responsible_user_id)
-        : await resolveLegacyRunResponsibleUserId(db, {
-            companyId: claims.company_id,
-            agentId: claims.sub,
-            runId: claims.run_id,
-          });
-      const onBehalfOfMemberships = await loadResponsibleUserMemberships(db, {
-        companyId: claims.company_id,
-        userId: onBehalfOfUserId,
-      });
-
-      req.actor = {
-        type: "agent",
-        agentId: claims.sub,
-        companyId: claims.company_id,
-        keyId: undefined,
-        keyScope: normalizeAgentApiKeyScope(claims.key_scope),
-        runId: claims.run_id,
-        onBehalfOfUserId,
-        identityContextId: identityRun?.activeIdentityContextId ?? null,
-        onBehalfOfMemberships,
-        source: "agent_jwt",
-      };
-      next();
-      return;
     }
+    if (runIdHeader) actor.runId = runIdHeader;
+    return actor;
+  }
 
-    await db
-      .update(agentApiKeys)
-      .set({ lastUsedAt: new Date() })
-      .where(eq(agentApiKeys.id, key.id));
+  const token = authHeader!.slice("bearer".length).trim();
+  if (!token) {
+    throw unauthorized("Empty bearer token; provide valid agent credentials and retry");
+  }
+
+  const boardKey = await boardAuth.findBoardApiKeyByToken(token);
+  if (boardKey) {
+    const access = await boardAuth.resolveBoardAccess(boardKey.userId);
+    if (access.user) {
+      await boardAuth.touchBoardApiKey(boardKey.id);
+      actor = {
+        type: "board",
+        userId: boardKey.userId,
+        userName: access.user?.name ?? null,
+        userEmail: access.user?.email ?? null,
+        companyIds: access.companyIds,
+        memberships: access.memberships,
+        isInstanceAdmin: access.isInstanceAdmin,
+        keyId: boardKey.id,
+        runId: runIdHeader || undefined,
+        source: "board_key",
+      };
+      return actor;
+    }
+  }
+
+  const tokenHash = hashToken(token);
+  const key = await db
+    .select()
+    .from(agentApiKeys)
+    .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
+    .then((rows) => rows[0] ?? null);
+
+  if (!key) {
+    const claims = verifyLocalAgentJwt(token);
+    if (!claims) {
+      throw unauthorized(invalidAgentTokenMessage(token));
+    }
 
     const agentRecord = await db
       .select()
       .from(agents)
-      .where(eq(agents.id, key.agentId))
+      .where(eq(agents.id, claims.sub))
       .then((rows) => rows[0] ?? null);
 
-    if (!agentRecord || agentRecord.companyId !== key.companyId) {
-      next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
-      return;
+    if (!agentRecord || agentRecord.companyId !== claims.company_id) {
+      throw unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry");
     }
+
     if (agentRecord.status === "terminated") {
-      next(unauthorized("Agent is terminated and cannot authenticate"));
-      return;
+      throw unauthorized("Agent is terminated and cannot authenticate");
     }
     if (agentRecord.status === "pending_approval") {
-      next(unauthorized("Agent is pending approval and cannot authenticate"));
-      return;
+      throw unauthorized("Agent is pending approval and cannot authenticate");
     }
 
-    const responsibleUserId = normalizeOptionalString(key.responsibleUserId);
-    if (!responsibleUserId) {
-      await auditAgentKeyMissingResponsibleUser(db, {
-        companyId: key.companyId,
-        agentId: key.agentId,
-        keyId: key.id,
-        method: req.method,
-        url: req.originalUrl,
+    const normalizedRunIdHeader = normalizeOptionalString(runIdHeader);
+    if (normalizedRunIdHeader && normalizedRunIdHeader !== claims.run_id) {
+      await auditAgentJwtRunHeaderMismatch(db, {
+        companyId: claims.company_id,
+        agentId: claims.sub,
+        claimRunId: claims.run_id,
+        headerRunId: normalizedRunIdHeader,
+        method: source.method,
+        url: source.originalUrl,
       });
-      next(forbidden("Responsible user is unavailable for this agent key", {
-        code: "RESPONSIBLE_USER_UNAVAILABLE",
-      }));
-      return;
+      throw unprocessable("X-Paperclip-Run-Id does not match signed agent JWT run_id", {
+        code: "agent_jwt_run_id_mismatch",
+        claimRunId: claims.run_id,
+        headerRunId: normalizedRunIdHeader,
+      });
     }
 
-    req.actor = {
-      type: "agent",
-      agentId: key.agentId,
-      companyId: key.companyId,
-      keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
-      onBehalfOfUserId: responsibleUserId,
-      onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
-        companyId: key.companyId,
-        userId: responsibleUserId,
-      }),
-      runId: runIdHeader || undefined,
-      source: "agent_key",
-    };
+    const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
+      responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
+      ));
+    if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
+      const captured = await captureRunIdentity(db, { companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id });
+      identityRun.activeIdentityContextId = captured.context?.id ?? null;
+      identityRun.responsibleUserId = captured.context?.responsibleUserId ?? null;
+    }
+    const onBehalfOfUserId = identityRun?.activeIdentityContextId
+      ? identityRun.responsibleUserId
+      : claims.responsible_user_id !== undefined
+      ? normalizeOptionalString(claims.responsible_user_id)
+      : await resolveLegacyRunResponsibleUserId(db, {
+          companyId: claims.company_id,
+          agentId: claims.sub,
+          runId: claims.run_id,
+        });
+    const onBehalfOfMemberships = await loadResponsibleUserMemberships(db, {
+      companyId: claims.company_id,
+      userId: onBehalfOfUserId,
+    });
 
-    next();
+    actor = {
+      type: "agent",
+      agentId: claims.sub,
+      companyId: claims.company_id,
+      keyId: undefined,
+      keyScope: normalizeAgentApiKeyScope(claims.key_scope),
+      runId: claims.run_id,
+      onBehalfOfUserId,
+      identityContextId: identityRun?.activeIdentityContextId ?? null,
+      onBehalfOfMemberships,
+      source: "agent_jwt",
+    };
+    return actor;
+  }
+
+  await db
+    .update(agentApiKeys)
+    .set({ lastUsedAt: new Date() })
+    .where(eq(agentApiKeys.id, key.id));
+
+  const agentRecord = await db
+    .select()
+    .from(agents)
+    .where(eq(agents.id, key.agentId))
+    .then((rows) => rows[0] ?? null);
+
+  if (!agentRecord || agentRecord.companyId !== key.companyId) {
+    throw unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry");
+  }
+  if (agentRecord.status === "terminated") {
+    throw unauthorized("Agent is terminated and cannot authenticate");
+  }
+  if (agentRecord.status === "pending_approval") {
+    throw unauthorized("Agent is pending approval and cannot authenticate");
+  }
+
+  const responsibleUserId = normalizeOptionalString(key.responsibleUserId);
+  if (!responsibleUserId) {
+    await auditAgentKeyMissingResponsibleUser(db, {
+      companyId: key.companyId,
+      agentId: key.agentId,
+      keyId: key.id,
+      method: source.method,
+      url: source.originalUrl,
+    });
+    throw forbidden("Responsible user is unavailable for this agent key", {
+      code: "RESPONSIBLE_USER_UNAVAILABLE",
+    });
+  }
+
+  actor = {
+    type: "agent",
+    agentId: key.agentId,
+    companyId: key.companyId,
+    keyId: key.id,
+    keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+    onBehalfOfUserId: responsibleUserId,
+    onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
+      companyId: key.companyId,
+      userId: responsibleUserId,
+    }),
+    runId: runIdHeader || undefined,
+    source: "agent_key",
+  };
+  return actor;
+}
+
+export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
+  const boardAuth = boardAuthService(db);
+  return async (req, _res, next) => {
+    try {
+      req.actor = await resolveActor(db, req, {
+        deploymentMode: opts.deploymentMode,
+        resolveSession: opts.resolveSession ? () => opts.resolveSession!(req) : undefined,
+      }, { boardAuth });
+      next();
+    } catch (err) {
+      next(err);
+    }
   };
 }
 
@@ -509,9 +515,7 @@ async function resolveOwnerInstanceAdmin(
  * trusted-header authentication must work identically for upgrades — a
  * cloud-proxied browser has no local Better Auth session to fall back on.
  */
-export interface CloudActorHeaderSource {
-  header(name: string): string | undefined;
-}
+export type { CloudActorHeaderSource } from "../auth/actor.js";
 
 /** Adapts a raw header map (e.g. `IncomingMessage.headers`) to {@link CloudActorHeaderSource}. */
 export function cloudActorHeaderSourceFromHeaders(
@@ -574,14 +578,14 @@ export async function retryOnTransientDbConnectionError<T>(run: () => Promise<T>
 export async function resolveCloudTenantActor(
   db: Db,
   req: CloudActorHeaderSource,
-): Promise<Express.Request["actor"] | null> {
+): Promise<Actor | null> {
   return retryOnTransientDbConnectionError(() => resolveCloudTenantActorOnce(db, req));
 }
 
 async function resolveCloudTenantActorOnce(
   db: Db,
   req: CloudActorHeaderSource,
-): Promise<Express.Request["actor"] | null> {
+): Promise<Actor | null> {
   const expectedToken = process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN?.trim();
   if (!expectedToken) return null;
 

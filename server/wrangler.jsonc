@@ -3,6 +3,11 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-05-09",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    // One of DEPLOYMENT_MODES from @paperclipai/shared. local_trusted gives the
+    // implicit local board actor; authenticated requires credentials.
+    "PAPERCLIP_DEPLOYMENT_MODE": "local_trusted"
+  },
   "hyperdrive": [
     {
       // Placeholder ID for local development. Replace this before wrangler deploy.

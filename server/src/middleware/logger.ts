@@ -1,23 +1,13 @@
-import pino from "pino";
 import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
-import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
+import { logger } from "./base-logger.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
 import { redactSensitive, stripSecretBearingUrlParts } from "./redact-sensitive.js";
 
-const sharedOpts = {
-  translateTime: "SYS:HH:MM:ss",
-  ignore: "pid,hostname",
-  singleLine: true,
-};
-
-const isProduction = process.env.NODE_ENV === "production";
-export const logger = isProduction
-  ? pino({ level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "info", redact: [...HTTP_LOG_REDACT_PATHS] })
-  : pino({ level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || "debug", redact: [...HTTP_LOG_REDACT_PATHS] }, pino.transport({
-      target: "pino-pretty",
-      options: { ...sharedOpts, ignore: "pid,hostname,req,res,responseTime", colorize: true, destination: 1 },
-    }));
+// The base logger lives in ./base-logger.ts so modules that must also bundle
+// for Cloudflare Workers can import it without pulling in pino-http, whose
+// module initialization needs the Node pino build. Same instance either way.
+export { logger };
 
 export function createHttpLogger(baseLogger: Logger) {
   return pinoHttp({
