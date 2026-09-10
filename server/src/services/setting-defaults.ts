@@ -3,7 +3,7 @@ import {
   parseSettingDefaults,
   type OperatorSettingDefaults,
 } from "@paperclipai/shared";
-import { logger } from "../middleware/base-logger.js";
+import { logger } from "../middleware/logger.js";
 
 export { SETTING_DEFAULTS_ENV_KEY };
 

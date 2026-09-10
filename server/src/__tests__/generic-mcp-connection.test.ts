@@ -42,7 +42,7 @@ import { createComposioSessionManager } from "../services/composio-session-manag
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
-import { createHttpLogger } from "../middleware/logger.js";
+import { createHttpLogger } from "../middleware/http-logger.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();

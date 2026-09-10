@@ -56,7 +56,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
 import type { Actor, ActorRequestSource, CloudActorHeaderSource } from "../types/actor.js";
-import { logger } from "./base-logger.js";
+import { logger } from "./logger.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
 
