@@ -208,7 +208,8 @@ function buildRequest<E extends { Variables: { actor: unknown } }>(c: Context<E>
     },
     actor: c.get("actor"),
     socket: {},
-    app: {},
+    // Express exposes app settings here (board-mutation-guard reads "trust proxy fn").
+    app: { get: (_name: string) => undefined },
   };
 }
 

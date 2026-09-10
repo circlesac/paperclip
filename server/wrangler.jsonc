@@ -1,6 +1,13 @@
 {
   "name": "paperclip-server",
-  "main": "worker/index.ts",
+  // Built by worker/build.mjs (esbuild): swaps the services barrel and the
+  // Node-only modules for worker/shims; wrangler then bundles that output.
+  "main": "worker/dist/index.mjs",
+  "build": {
+    "command": "node worker/build.mjs",
+    "cwd": ".",
+    "watch_dir": ["worker", "src"]
+  },
   "compatibility_date": "2026-05-09",
   "compatibility_flags": ["nodejs_compat"],
   // Bundle-time module replacements. server/src stays untouched; only the
