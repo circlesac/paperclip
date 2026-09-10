@@ -43,7 +43,7 @@ const TYPES = new Set(); // filled from the barrel below (export type {...})
 // Source modules whose static import graph reaches Node-only builtins
 // (node:fs, child_process, net, dns, tls, http, readline, ...). Stubbed.
 const NODE_BOUND = new Set([
-  "heartbeat", "issues", "status-cards", "company-portability",
+  "heartbeat", "status-cards", "company-portability",
   "routines", "approvals", "secrets", "feedback", "smoke-lab",
   "skills-catalog", "built-in-agents",
 ]);

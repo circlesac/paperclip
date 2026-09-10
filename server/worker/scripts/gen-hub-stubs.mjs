@@ -27,7 +27,6 @@ export const HUBS = {
   // Service modules whose import graph reaches the execution plane. The curated
   // services barrel already stubs their exports; redirecting the files too makes
   // direct imports (e.g. services/issue-tree-control.ts → ./issues.js) consistent.
-  "services/issues.ts": "services-issues.ts",
   "services/heartbeat.ts": "services-heartbeat.ts",
   "services/status-cards.ts": "services-status-cards.ts",
   "services/routines.ts": "services-routines.ts",

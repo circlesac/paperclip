@@ -25,7 +25,7 @@ export { sidebarPreferenceService } from "../../src/services/sidebar-preferences
 export { resourceMembershipService } from "../../src/services/resource-memberships.js";
 export { decisionTrainingService } from "../../src/services/decision-training.js";
 export const heartbeatService = unavailable("heartbeatService") as unknown as typeof import("../../src/services/heartbeat.js").heartbeatService;
-export const issueService = unavailable("issueService") as unknown as typeof import("../../src/services/issues.js").issueService;
+export { issueService } from "../../src/services/issues.js";
 export { issueTreeControlService } from "../../src/services/issue-tree-control.js";
 export { instanceSettingsService } from "../../src/services/instance-settings.js";
 export { publishActivity } from "../../src/services/activity-log.js";
