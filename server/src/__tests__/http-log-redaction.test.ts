@@ -7,7 +7,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { testAdapterEnvironmentSchema } from "@paperclipai/shared";
-import { createHttpLogger } from "../middleware/http-logger.js";
+import { createHttpLogger } from "../middleware/logger.js";
 
 describe("HTTP logger redaction", () => {
   it("defines the HTTP auth and cookie header paths that must be redacted", () => {

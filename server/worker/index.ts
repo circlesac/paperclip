@@ -4,7 +4,7 @@ import { DEPLOYMENT_MODES, type DeploymentMode } from "@paperclipai/shared";
 import { createWorkerDb } from "./db.js";
 import type { Env } from "./env.js";
 import { actorMiddleware, type ActorVariables } from "./actor.js";
-import { companies } from "@paperclipai/db/schema/index";
+import { companies } from "./shims/paperclip-db.js";
 
 type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb> } };
 

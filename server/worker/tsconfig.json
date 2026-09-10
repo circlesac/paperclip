@@ -2,7 +2,7 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "types": ["node", "@cloudflare/workers-types"],
-    "rootDir": "..",
+    "rootDir": "../..",
     "module": "preserve",
     "moduleResolution": "Bundler",
     "noEmit": true

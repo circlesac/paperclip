@@ -1,6 +1,6 @@
 import type { Context, MiddlewareHandler } from "hono";
 import type { Request as ExpressRequest, RequestHandler } from "express";
-import type { Db } from "@paperclipai/db";
+import type { Db } from "./shims/paperclip-db.js";
 import type { DeploymentMode } from "@paperclipai/shared";
 import { actorMiddleware as expressActorMiddleware } from "../src/middleware/auth.js";
 import { HttpError } from "../src/errors.js";

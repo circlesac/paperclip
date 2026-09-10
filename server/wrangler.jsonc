@@ -3,10 +3,23 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-05-09",
   "compatibility_flags": ["nodejs_compat"],
+  // Bundle-time module replacements. server/src stays untouched; only the
+  // Worker build swaps these two Node-only modules for the shims in worker/shims.
+  "alias": {
+    "pino-http": "./worker/shims/pino-http.ts",
+    "@paperclipai/db": "./worker/shims/paperclip-db.ts"
+  },
   "vars": {
     // One of DEPLOYMENT_MODES from @paperclipai/shared. local_trusted gives the
     // implicit local board actor; authenticated requires credentials.
     "PAPERCLIP_DEPLOYMENT_MODE": "local_trusted"
+  },
+  // Build-time substitution (vars are only visible at request time, but
+  // server/src/middleware/logger.ts reads NODE_ENV at module load). The
+  // production branch does not call pino.transport, which the pino build the
+  // Workers bundler selects does not have.
+  "define": {
+    "process.env.NODE_ENV": "\"production\""
   },
   "hyperdrive": [
     {
