@@ -53,9 +53,9 @@ Hyperdrive uses `localConnectionString` in `wrangler.jsonc`; the `id` is a place
 
 Measured on the route modules under `server/src/routes` (54 `Router()` modules) by walking each module's static import graph and counting reachable modules that import a Node-only builtin (`node:fs`, `node:child_process`, `node:net`, `node:os`, …). "Reach" is a bundling proxy, not proof of runtime behavior; the runtime check is `wrangler dev` plus a byte comparison against the Node server on the same database.
 
-### Mounted today (25 route modules)
+### Mounted today (27 route modules) — the UI runs from the Worker
 
-`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (at `/api/companies`), `access`, `projects`, `pipelines`, `issues`, `approvals`, `routines`, `status-cards`, `agents`, plus `auth` at `/api/auth`. Byte-identical to Node on 79 of 82 compared GET requests; the 3 that differ answer 501 because they call `heartbeatService` (heartbeat-runs issues, instance task-drain) or the adapter registry (adapter model list). Mutations through the Worker (create/edit/delete goals, projects, issues) are visible from Node and identical on read-back. `services/issues.ts`, `companies.ts`, `agents.ts`, `approvals.ts`, `routines.ts` run for real; `heartbeat`, `status-cards`, `secrets`, `tool-gateway`, `execution-workspaces`, the native runtime, and the disk catalogs stay stubbed. Storage is `storage-unavailable.ts` (every operation 501) until an R2 provider exists.
+`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (at `/api/companies`), `access`, `projects`, `pipelines`, `issues`, `approvals`, `routines`, `status-cards`, `agents`, `health` (at `/api/health`), `adapters`, plus `auth` at `/api/auth`. Byte-identical to Node on 79 of 82 compared GET requests; the 3 that differ answer 501 because they call `heartbeatService` (heartbeat-runs issues, instance task-drain) or the adapter registry (adapter model list). Mutations through the Worker (create/edit/delete goals, projects, issues) are visible from Node and identical on read-back. With the UI build served through Workers Assets, `wrangler dev` alone serves the React app: the dashboard shell loads and its ~30 API calls are answered by the Worker; what it still cannot get is the adapter list (501, registry is execution plane), company skills and plugin UI contributions (404, not mounted), heartbeat runs (501), and the live-events WebSocket (Durable Objects later). `services/issues.ts`, `companies.ts`, `agents.ts`, `approvals.ts`, `routines.ts` run for real; `heartbeat`, `status-cards`, `secrets`, `tool-gateway`, `execution-workspaces`, the native runtime, and the disk catalogs stay stubbed. Storage is `storage-unavailable.ts` (every operation 501) until an R2 provider exists.
 
 ### Tier 0 — runs with the M3 mechanism alone (12 routes)
 
@@ -102,6 +102,12 @@ More than three Node-only modules remain even after the stubs, because the route
 | Plugin workers | one child process per plugin | Not on Workers (Workers for Platforms would be the analogue) |
 | Agent execution, git worktrees, terminals | child processes, disk | Not on Workers (Cloudflare Sandbox containers exist upstream; out of scope here) |
 | Embedded Postgres, backups | Node | Not on Workers; Hyperdrive to a managed Postgres |
+
+## UI
+
+`wrangler.jsonc` serves `../ui/dist` (build it with `pnpm --filter @paperclipai/ui build`) through Workers Assets with `not_found_handling: "single-page-application"`; `/api/*` and `/assets/*` run the Worker first. `/assets/*` answers with `Cache-Control: public, max-age=31536000, immutable` like `app.ts`, and a missing asset is a real 404 instead of the SPA fallback. `applyUiBranding` is not applied: it only does anything when `PAPERCLIP_IN_WORKTREE` is set.
+
+`/api/health` is served by the unchanged `healthRoutes`; the Node-only pieces it reports through are shimmed (`server-info`, `dev-server-status`, `workspace-readiness`, and `native-restart-recovery`, whose summary query is reproduced because the real module calls `randomUUID()` at module load). `startup-recovery-state` is set to `ready` at Worker start. The response matches Node on every shared field; `databaseBackup`, `devServer`, and `warnings` are Node-only.
 
 ## Authenticated mode
 

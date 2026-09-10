@@ -34,12 +34,19 @@ import { routineRoutes } from "../src/routes/routines.js";
 import { statusCardRoutes } from "../src/routes/status-cards.js";
 import { storageUnavailable } from "./storage-unavailable.js";
 import { authRoutes } from "../src/routes/auth.js";
+import { healthRoutes } from "../src/routes/health.js";
+import { adapterRoutes } from "../src/routes/adapters.js";
 import { createWorkerAuth, resolveWorkerSession, type WorkerAuth } from "./auth.js";
+import { setStartupRecoveryPhase } from "../src/startup-recovery-state.js";
 import { boardMutationGuard } from "../src/middleware/board-mutation-guard.js";
 import type { ShimRouter } from "./shims/express.js";
 import { Router } from "./shims/express.js";
 
 type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb>; auth: WorkerAuth | null } };
+
+// index.ts flips this to "ready" after startup recovery; the Worker has no
+// startup recovery to run, so health reports ready from the first request.
+setStartupRecoveryPhase("ready");
 
 const app = new Hono<AppEnv>();
 
@@ -122,6 +129,20 @@ mountExpressRouters(app, {
     return [
       guard,
       () => ({ mount: "/auth", router: authRoutes(c.get("db")) as unknown as ShimRouter }),
+      // app.ts mounts health at /api/health. authReady mirrors app.ts (true unless
+      // authenticated mode is still bootstrapping); backups are Node-only.
+      () => ({
+        mount: "/health",
+        router: healthRoutes(c.get("db"), {
+          deploymentMode: deploymentMode(c.env),
+          deploymentExposure: "private",
+          authReady: true,
+          companyDeletionEnabled: true,
+        }) as unknown as ShimRouter,
+      }),
+      // No native runner on the Worker; the adapter registry itself is stubbed,
+      // so listing adapters answers 501 until a Workers-side registry exists.
+      () => adapterRoutes({ getNativeRunnerEnabled: async () => false }),
       () => dashboardRoutes(c.get("db")),
       () => sidebarBadgeRoutes(c.get("db")),
       () => userProfileRoutes(c.get("db")),
@@ -161,6 +182,17 @@ mountExpressRouters(app, {
       () => statusCardRoutes(c.get("db")),
     ] as unknown as RouterEntry[];
   },
+});
+
+// Hashed build assets: immutable cache like app.ts (`maxAge: "1y", immutable`),
+// and a real 404 for a missing file instead of the SPA fallback that
+// `not_found_handling: "single-page-application"` would apply.
+app.get("/assets/*", async (c) => {
+  const res = await c.env.ASSETS.fetch(c.req.raw);
+  if (!res.ok || (res.headers.get("content-type") ?? "").includes("text/html")) return c.notFound();
+  const headers = new Headers(res.headers);
+  headers.set("cache-control", "public, max-age=31536000, immutable");
+  return new Response(res.body, { status: res.status, headers });
 });
 
 // better-auth's own endpoints (sign-in, session, …). app.ts registers this after

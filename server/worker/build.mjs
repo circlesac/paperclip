@@ -38,6 +38,10 @@ const SHIM_FILES = {
   "version.ts": shim("version.ts"),
   "build-commit.ts": shim("build-commit.ts"),
   "build-version.ts": shim("build-version.ts"),
+  "server-info.ts": shim("server-info.ts"),
+  "services/workspace-readiness.ts": shim("workspace-readiness.ts"),
+  "services/native-runtime/native-restart-recovery.ts": shim("native-restart-recovery.ts"),
+  "dev-server-status.ts": shim("dev-server-status.ts"),
 };
 
 /** Modules the Worker must not run even if rule 2/3 would not catch them. */
