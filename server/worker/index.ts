@@ -33,6 +33,8 @@ import { approvalRoutes } from "../src/routes/approvals.js";
 import { routineRoutes } from "../src/routes/routines.js";
 import { statusCardRoutes } from "../src/routes/status-cards.js";
 import { createWorkerStorage } from "./storage-r2.js";
+import { LiveEventsRoom, authorizeLiveEventsUpgrade } from "./live-events.js";
+import { liveEventSink } from "./shims/live-events.js";
 import { assetRoutes } from "../src/routes/assets.js";
 import { caseRoutes } from "../src/routes/cases.js";
 import { authRoutes } from "../src/routes/auth.js";
@@ -69,7 +71,12 @@ app.use("/api/*", async (c, next) => {
   // Session cookies only exist in authenticated mode (app.ts does the same).
   c.set("auth", deploymentMode(c.env) === "authenticated" ? createWorkerAuth(db, c.env, "authenticated", c.req.url) : null);
   try {
-    await next();
+    // Live events published while handling this request go to the company's
+    // room; the delivery outlives the response.
+    await liveEventSink.run((event) => {
+      const room = c.env.LIVE_EVENTS.get(c.env.LIVE_EVENTS.idFromName(event.companyId));
+      c.executionCtx.waitUntil(room.publish(JSON.stringify(event)).catch((err: unknown) => console.error("live event publish failed", err)));
+    }, next);
   } finally {
     c.executionCtx.waitUntil(db.$client.end({ timeout: 5 }));
   }
@@ -123,6 +130,22 @@ app.get("/api/__probe/me", (c) => {
 
 // Route factories are intentionally invoked per request to preserve the db-scoped
 // dependencies they capture today.
+// Live-events WebSocket (src/realtime/live-events-ws.ts on Node). Only the
+// upgrade is handled here; a plain GET falls through to the routers and 404s
+// as on Node.
+app.get("/api/companies/:companyId/events/ws", async (c, next) => {
+  if (c.req.header("upgrade")?.toLowerCase() !== "websocket") return next();
+  const companyId = c.req.param("companyId");
+  const auth = c.get("auth");
+  const context = await authorizeLiveEventsUpgrade(c.get("db"), c, companyId, {
+    deploymentMode: deploymentMode(c.env),
+    resolveSession: auth ? () => resolveWorkerSession(auth, c) : undefined,
+  });
+  if (!context) return c.text("forbidden", 403);
+  const room = c.env.LIVE_EVENTS.get(c.env.LIVE_EVENTS.idFromName(companyId));
+  return room.fetch(c.req.raw);
+});
+
 mountExpressRouters(app, {
   prefix: "/api",
   routers: (c) => {
@@ -208,4 +231,10 @@ app.all("/api/auth/*", async (c) => {
   return auth.handler(c.req.raw);
 });
 
+// app.ts: `app.use("/api", (_req, res) => res.status(404).json({ error: "API route not found" }))`.
+// Non-API paths never reach the Worker except /assets/*, which answers its own 404.
+app.notFound((c) => (c.req.path.startsWith("/api/") ? c.json({ error: "API route not found" }, 404) : c.text("Not found", 404)));
+
 export default app;
+
+export { LiveEventsRoom };

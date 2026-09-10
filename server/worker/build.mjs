@@ -42,6 +42,7 @@ const SHIM_FILES = {
   "services/workspace-readiness.ts": shim("workspace-readiness.ts"),
   "services/native-runtime/native-restart-recovery.ts": shim("native-restart-recovery.ts"),
   "dev-server-status.ts": shim("dev-server-status.ts"),
+  "services/live-events.ts": shim("live-events.ts"), // forwards to the LiveEventsRoom Durable Object
 };
 
 /** Modules the Worker must not run even if rule 2/3 would not catch them. */
