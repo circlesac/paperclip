@@ -251,7 +251,10 @@ function parseBody(c: Context, method: string): Promise<unknown> {
     return Promise.resolve(undefined);
   }
 
-  return c.req.json();
+  // Read from a clone so the original body stays available to handlers that
+  // run after this one when no Express route responds (better-auth reads the
+  // Request itself).
+  return c.req.raw.clone().text().then((text) => (text.length ? JSON.parse(text) : undefined));
 }
 
 function runHandler(handler: ShimHandler, req: Record<string, unknown>, res: ResLike): Promise<boolean> {
@@ -284,12 +287,15 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
   app: Hono<E>,
   opts: { prefix: string; routers: (c: Context<E>) => RouterEntry[] },
 ): void {
-  app.all(`${opts.prefix}/*`, async (c) => {
+  app.all(`${opts.prefix}/*`, async (c, next) => {
     const url = new URL(c.req.url);
     const requestPath = url.pathname.slice(opts.prefix.length) || "/";
     const requestMethod = c.req.method;
     const req = buildRequest(c, opts.prefix);
-    req.body = await parseBody(c, requestMethod);
+    // The body is parsed only once a layer matches: an unmatched request is
+    // passed on (next()) and its body must stay unread for later handlers
+    // such as better-auth.
+    let bodyParsed = false;
 
     const resObj = createResponse();
     const ranParams = new Set<string>();
@@ -340,6 +346,10 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
           }
 
           req.params = nextParams;
+          if (!bodyParsed) {
+            bodyParsed = true;
+            req.body = await parseBody(c, requestMethod);
+          }
           // Express `router.param(name, fn)` handlers run once per request for
           // each captured param, before the route's own handlers.
           for (const [name, value] of Object.entries(nextParams)) {
@@ -381,7 +391,10 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
       }
 
       if (constructionError) throw constructionError;
-      return c.notFound();
+      // Nothing matched: let routes registered after this one (for example the
+      // better-auth handler) see the request; Hono answers 404 at the end.
+      await next();
+      return;
     } catch (error) {
       if (error instanceof HttpError) {
         const details = error.details;

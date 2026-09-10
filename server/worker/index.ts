@@ -26,17 +26,20 @@ import { companyRoutes } from "../src/routes/companies.js";
 import { accessRoutes } from "../src/routes/access.js";
 import { createDecisionWakeOriginAgent } from "../src/services/decision-wakeup.js";
 import { projectRoutes } from "../src/routes/projects.js";
+import { agentRoutes } from "../src/routes/agents.js";
 import { pipelineRoutes } from "../src/routes/pipelines.js";
 import { issueRoutes } from "../src/routes/issues.js";
 import { approvalRoutes } from "../src/routes/approvals.js";
 import { routineRoutes } from "../src/routes/routines.js";
 import { statusCardRoutes } from "../src/routes/status-cards.js";
 import { storageUnavailable } from "./storage-unavailable.js";
+import { authRoutes } from "../src/routes/auth.js";
+import { createWorkerAuth, resolveWorkerSession, type WorkerAuth } from "./auth.js";
 import { boardMutationGuard } from "../src/middleware/board-mutation-guard.js";
 import type { ShimRouter } from "./shims/express.js";
 import { Router } from "./shims/express.js";
 
-type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb> } };
+type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb>; auth: WorkerAuth | null } };
 
 const app = new Hono<AppEnv>();
 
@@ -53,6 +56,8 @@ function deploymentMode(env: Env): DeploymentMode {
 app.use("/api/*", async (c, next) => {
   const db = createWorkerDb(c.env.HYPERDRIVE.connectionString);
   c.set("db", db);
+  // Session cookies only exist in authenticated mode (app.ts does the same).
+  c.set("auth", deploymentMode(c.env) === "authenticated" ? createWorkerAuth(db, c.env, "authenticated", c.req.url) : null);
   try {
     await next();
   } finally {
@@ -65,6 +70,10 @@ app.use(
   actorMiddleware<AppEnv>({
     getDb: (c) => c.get("db"),
     deploymentMode: (c) => deploymentMode(c.env),
+    resolveSession: (c) => {
+      const auth = c.get("auth");
+      return auth ? resolveWorkerSession(auth, c) : Promise.resolve(null);
+    },
   }),
 );
 
@@ -112,6 +121,7 @@ mountExpressRouters(app, {
 
     return [
       guard,
+      () => ({ mount: "/auth", router: authRoutes(c.get("db")) as unknown as ShimRouter }),
       () => dashboardRoutes(c.get("db")),
       () => sidebarBadgeRoutes(c.get("db")),
       () => userProfileRoutes(c.get("db")),
@@ -140,7 +150,8 @@ mountExpressRouters(app, {
         allowedHostnames: [],
       }),
       () => projectRoutes(c.get("db")),
-      // routes/agents.ts is Node-bound at module load (import.meta.url, node:fs); not mounted yet.
+      // node:fs is only used lazily by agents.ts (skill file removal); those paths fail loudly.
+      () => agentRoutes(c.get("db"), { deploymentMode: deploymentMode(c.env) }),
       () => pipelineRoutes(c.get("db")),
       // No plugin workers, feedback export, or tool-gateway callbacks on the
       // Worker; the options are optional and the affected paths fail loudly.
@@ -150,6 +161,15 @@ mountExpressRouters(app, {
       () => statusCardRoutes(c.get("db")),
     ] as unknown as RouterEntry[];
   },
+});
+
+// better-auth's own endpoints (sign-in, session, …). app.ts registers this after
+// authRoutes; here it runs when no Express router matched (the adapter passes
+// through). Web handler instead of the Node one.
+app.all("/api/auth/*", async (c) => {
+  const auth = c.get("auth");
+  if (!auth) return c.notFound();
+  return auth.handler(c.req.raw);
 });
 
 export default app;

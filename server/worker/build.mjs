@@ -28,6 +28,7 @@ import { exportsOf, stubSource } from "./scripts/lib/module-exports.mjs";
 const here = dirname(fileURLToPath(import.meta.url));
 const serverDir = resolve(here, "..");
 const srcDir = resolve(serverDir, "src") + sep;
+const packagesDir = resolve(serverDir, "..", "packages") + sep;
 const shim = (...p) => resolve(here, "shims", ...p);
 
 /** Real source file (relative to server/src) → hand-written replacement. */
@@ -50,8 +51,13 @@ const STUB_FILES = new Set([
 ]);
 /** Modules that import a Node-only builtin but only call it lazily (never at
  *  module load or on the request paths that run on the Worker). Not stubbed. */
-const ALLOW_FILES = new Set(["services/tool-access.ts"]);
+const ALLOW_FILES = new Set(["services/tool-access.ts", "services/provider-trace-store.ts"]);
 const STUB_DIRS = ["services/native-runtime/", "services/runtime-exposure/", "realtime/", "vendor/", "modules/active-run-watchdog/"];
+/** Workspace packages get the same per-file rules (they are imported by server
+ *  code); the execution-plane packages are stubbed wholesale. `shared` and `db`
+ *  are pure and never stubbed. */
+const PACKAGE_STUB_DIRS = ["adapters/", "paperclip-runner/", "adapter-utils/src/acpx-engine/"];
+const PACKAGE_ALLOW_DIRS = ["shared/", "db/"];
 
 const NODE_ONLY_IMPORT = /^import\s+(?!type\s)[^;]*?from\s+"node:(fs|child_process|net|dns|tls|http|http2|readline|worker_threads)(\/[^"]*)?"/m;
 const TOP_LEVEL_NODE_WORK = /^(?:export\s+)?(?:const|let|var)\s[^\n]*(import\.meta\.url|createRequire\(|randomUUID\(|randomBytes\()/m;
@@ -69,6 +75,21 @@ const paperclipStubs = {
     });
     // Generated stubs: keep the path, replace the contents.
     build.onLoad({ filter: /\.ts$/ }, (args) => {
+      if (args.path.startsWith(packagesDir)) {
+        const prel = relative(packagesDir, args.path);
+        if (PACKAGE_ALLOW_DIRS.some((d) => prel.startsWith(d))) return null;
+        let why = null;
+        if (PACKAGE_STUB_DIRS.some((d) => prel.startsWith(d))) why = "execution-plane package";
+        else {
+          const s = readFileSync(args.path, "utf8");
+          if (NODE_ONLY_IMPORT.test(s)) why = "imports a Node-only builtin";
+          else if (TOP_LEVEL_NODE_WORK.test(s)) why = "Node-only work at module load";
+        }
+        if (!why) return null;
+        const { values, hasDefault, literals } = exportsOf(args.path);
+        stubbed.push(`packages/${prel} (${why}, ${values.size} exports, ${literals.size} literal constants kept)`);
+        return { contents: stubSource(`packages/${prel.replace(/\.ts$/, "")}`, [...values.keys()], hasDefault, literals), loader: "ts" };
+      }
       if (!args.path.startsWith(srcDir)) return null;
       const rel = relative(srcDir, args.path);
       if (rel.startsWith("routes" + sep)) {
@@ -122,6 +143,11 @@ await esbuild.build({
     // production branch never calls pino.transport (absent in the pino build
     // selected for Workers). A runtime var is not visible at module load.
     "process.env.NODE_ENV": JSON.stringify("production"),
+    // Some modules (ours and third-party) evaluate `new URL(x, import.meta.url)`
+    // at load; on workerd import.meta.url is empty and that throws before the
+    // first request. A stable file URL keeps module load working; anything
+    // that then touches the file system still fails on use.
+    "import.meta.url": JSON.stringify("file:///paperclip/server/worker/index.ts"),
   },
   plugins: [paperclipStubs],
 });

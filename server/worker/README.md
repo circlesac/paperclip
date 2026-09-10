@@ -53,9 +53,9 @@ Hyperdrive uses `localConnectionString` in `wrangler.jsonc`; the `id` is a place
 
 Measured on the route modules under `server/src/routes` (54 `Router()` modules) by walking each module's static import graph and counting reachable modules that import a Node-only builtin (`node:fs`, `node:child_process`, `node:net`, `node:os`, …). "Reach" is a bundling proxy, not proof of runtime behavior; the runtime check is `wrangler dev` plus a byte comparison against the Node server on the same database.
 
-### Mounted today (24 route modules)
+### Mounted today (25 route modules)
 
-`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (at `/api/companies`), `access`, `projects`, `pipelines`, `issues`, `approvals`, `routines`, `status-cards`. Byte-identical to Node on 72 of 74 compared GET requests; the 2 that differ call `heartbeatService` (heartbeat-runs issues, instance task-drain) and answer 501. `services/issues.ts`, `companies.ts`, `agents.ts`, `approvals.ts`, `routines.ts` run for real; `heartbeat`, `status-cards`, `secrets`, `tool-gateway`, `execution-workspaces`, the native runtime, and the disk catalogs stay stubbed. `routes/agents.ts` is Node-bound at module load (`import.meta.url`, `node:fs`) and is not mounted. Storage is `storage-unavailable.ts` (every operation 501) until an R2 provider exists.
+`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (at `/api/companies`), `access`, `projects`, `pipelines`, `issues`, `approvals`, `routines`, `status-cards`, `agents`, plus `auth` at `/api/auth`. Byte-identical to Node on 79 of 82 compared GET requests; the 3 that differ answer 501 because they call `heartbeatService` (heartbeat-runs issues, instance task-drain) or the adapter registry (adapter model list). Mutations through the Worker (create/edit/delete goals, projects, issues) are visible from Node and identical on read-back. `services/issues.ts`, `companies.ts`, `agents.ts`, `approvals.ts`, `routines.ts` run for real; `heartbeat`, `status-cards`, `secrets`, `tool-gateway`, `execution-workspaces`, the native runtime, and the disk catalogs stay stubbed. Storage is `storage-unavailable.ts` (every operation 501) until an R2 provider exists.
 
 ### Tier 0 — runs with the M3 mechanism alone (12 routes)
 
@@ -94,7 +94,7 @@ More than three Node-only modules remain even after the stubs, because the route
 | Subsystem | Today | On Cloudflare |
 |---|---|---|
 | Actor / bearer auth | Express middleware | Runs unchanged behind the request shim (done) |
-| Session cookies (better-auth) | Node handler | Not wired on Workers yet; better-auth has a Workers path |
+| Session cookies (better-auth) | Node handler | **Done.** `worker/auth.ts` builds the unchanged `createBetterAuthInstance` from bindings; `/api/auth/*` uses better-auth's web handler; the actor middleware resolves sessions from request headers. Only in `authenticated` mode |
 | Live events WebSocket | in-process `EventEmitter` + `ws` | Durable Object + WebSocket Hibernation (later) |
 | Runner PRP WebSocket | `ws` | Durable Object (later) |
 | Heartbeat scheduler | `setInterval` 30 s, DB-driven | Cron Trigger / DO alarm; `HEARTBEAT_SCHEDULER_ENABLED=false` on Node (later) |
@@ -102,6 +102,18 @@ More than three Node-only modules remain even after the stubs, because the route
 | Plugin workers | one child process per plugin | Not on Workers (Workers for Platforms would be the analogue) |
 | Agent execution, git worktrees, terminals | child processes, disk | Not on Workers (Cloudflare Sandbox containers exist upstream; out of scope here) |
 | Embedded Postgres, backups | Node | Not on Workers; Hyperdrive to a managed Postgres |
+
+## Authenticated mode
+
+`PAPERCLIP_DEPLOYMENT_MODE=authenticated` and `BETTER_AUTH_SECRET` (a var or secret) turn on session cookies:
+
+```
+pnpm --filter @paperclipai/server dev:worker -- --port 8789 --var PAPERCLIP_DEPLOYMENT_MODE:authenticated --var BETTER_AUTH_SECRET:paperclip-dev-secret
+curl -c jar -X POST localhost:8789/api/auth/sign-up/email -H 'content-type: application/json' -H 'origin: http://localhost:8789' -d '{"name":"x","email":"x@example.com","password":"…"}'
+curl -b jar localhost:8789/api/__probe/me      # {"type":"board","source":"session",…}
+```
+
+The unchanged `boardMutationGuard` applies: a session actor's mutation without a trusted `origin`/`referer` answers 403. `PAPERCLIP_PUBLIC_URL` sets the explicit auth base URL; `BETTER_AUTH_TRUSTED_ORIGINS` adds origins.
 
 ## Verification contract
 

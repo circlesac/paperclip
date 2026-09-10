@@ -4,6 +4,7 @@ import type { Db } from "./shims/paperclip-db.js";
 import type { DeploymentMode } from "@paperclipai/shared";
 import { actorMiddleware as expressActorMiddleware } from "../src/middleware/auth.js";
 import { HttpError } from "../src/errors.js";
+import type { BetterAuthSessionResult } from "../src/auth/better-auth.js";
 
 export type Actor = ExpressRequest["actor"];
 export type ActorVariables = { actor: Actor };
@@ -43,10 +44,15 @@ function runExpressMiddleware(handler: RequestHandler, req: ExpressRequest): Pro
 export function actorMiddleware<E extends { Variables: ActorVariables }>(input: {
   getDb: (c: Context<E>) => Db;
   deploymentMode: (c: Context<E>) => DeploymentMode;
+  /** Session-cookie resolver (better-auth); absent means bearer/cloud-tenant only. */
+  resolveSession?: (c: Context<E>) => Promise<BetterAuthSessionResult | null>;
 }): MiddlewareHandler<E> {
   return async (c, next) => {
     const handler = expressActorMiddleware(input.getDb(c), {
       deploymentMode: input.deploymentMode(c),
+      // The Express middleware hands its `req` to resolveSession; we resolve
+      // from the real request headers instead.
+      resolveSession: input.resolveSession ? () => input.resolveSession!(c) : undefined,
     });
     const req = expressRequestShim(c);
     try {
