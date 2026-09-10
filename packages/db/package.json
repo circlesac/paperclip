@@ -13,15 +13,29 @@
   },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
+    ".": {
+      "workerd": "./src/index.worker.ts",
+      "worker": "./src/index.worker.ts",
+      "default": "./src/index.ts"
+    },
     "./*": "./src/*.ts"
   },
   "publishConfig": {
     "access": "public",
     "exports": {
       ".": {
-        "types": "./dist/index.d.ts",
-        "import": "./dist/index.js"
+        "workerd": {
+          "types": "./dist/index.worker.d.ts",
+          "import": "./dist/index.worker.js"
+        },
+        "worker": {
+          "types": "./dist/index.worker.d.ts",
+          "import": "./dist/index.worker.js"
+        },
+        "default": {
+          "types": "./dist/index.d.ts",
+          "import": "./dist/index.js"
+        }
       },
       "./*": {
         "types": "./dist/*.d.ts",
