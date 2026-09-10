@@ -263,9 +263,11 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
     req.body = await parseBody(c, requestMethod);
 
     const resObj = createResponse();
-    const routers = opts.routers(c);
 
     try {
+      // Inside the try: a route factory that throws while constructing its
+      // services must produce the same JSON error mapping as a handler error.
+      const routers = opts.routers(c);
       for (const router of routers) {
         for (const layer of router.layers as ShimLayer[]) {
           const nextParams: Record<string, string> = {};
@@ -320,6 +322,13 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
 
       if (error instanceof ZodError) {
         return c.json({ error: "Validation error", details: error.issues }, 400);
+      }
+
+      // A worker/shims stub was reached: the route exists but this part of the
+      // server is not on the Worker yet. 501 with the reason is more useful to
+      // the caller than a generic 500, and the stubs already make it explicit.
+      if (error instanceof Error && error.message.endsWith("is not available on the Cloudflare Worker yet")) {
+        return c.json({ error: error.message }, 501);
       }
 
       console.error(error);

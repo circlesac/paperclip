@@ -6,23 +6,35 @@ This directory is the Cloudflare Workers entry point for the Paperclip server. I
 
 Upstream is active. We do not edit `server/src`. Everything Cloudflare needs lives here:
 
-- `index.ts` — the Worker `fetch` handler (Hono). Probes, per-request DB, actor, and mounted Express routers.
+- `index.ts` — the Worker `fetch` handler (Hono). Probes, per-request DB, actor, `boardMutationGuard`, and the mounted Express routers.
 - `actor.ts` — runs the unchanged Express `actorMiddleware` behind a request shim.
 - `express-adapter.ts` + `shims/express.ts` — runs unchanged Express route modules (`Router()`-based) under Hono.
-- `shims/paperclip-db.ts`, `shims/pino-http.ts` — bundle-time replacements wired through `alias` in `../wrangler.jsonc`.
+- `build.mjs` — esbuild pre-bundle. Redirects, by resolved source path, the modules the Worker cannot run to `shims/` (see below); wrangler then bundles its output.
+- `shims/` — bundle-time replacements: `express`, `multer`, `pino-http`, `paperclip-db` (package aliases); `services-index` (curated barrel, generated); `hubs/*` (execution-plane stubs, generated); `instrumentation`, `version`, `build-commit`, `build-version` (hand-written, benign values).
+- `scripts/gen-services-index.mjs`, `scripts/gen-hub-stubs.mjs` — generators for the two generated shim groups. Re-run after mounting a route that needs new names.
 - `db.ts`, `env.ts`, `tsconfig.json`.
 
 If a change seems to need an edit under `server/src`, the answer is a shim or an alias here, or the route stays on Node for now.
 
 ## How the bundle stays Node-free
 
-`wrangler.jsonc`:
+`worker/build.mjs` (esbuild) runs first, then wrangler bundles its output:
 
-- `alias`: `express` → recording `Router` shim; `pino-http` → no-op; `@paperclipai/db` → schema + `type Db` only (the real barrel drags in `embedded-postgres`).
+- Package aliases: `express` → recording `Router` shim; `multer` → 501 middleware; `pino-http` → no-op; `@paperclipai/db` → schema + `type Db` only (the real barrel drags in `embedded-postgres`).
+- Source-path redirects (an `onResolve` plugin; only imports made from inside `server/src` are affected): `services/index.ts` → curated barrel; the execution-plane hubs and the service modules whose graphs reach them → lazy throwing stubs under `shims/hubs/`; `instrumentation.ts`, `version.ts`, `build-commit.ts`, `build-version.ts` → benign values (the real ones run OpenTelemetry, `@cursor/sdk`, `createRequire(import.meta.url)` and `git describe` at module load).
 - `define`: `process.env.NODE_ENV` = `"production"` so `middleware/logger.ts` never calls `pino.transport` (absent in the pino build the bundler selects; a runtime var is not visible at module load).
-- `nodejs_compat`: `node:crypto`, `node:os`, etc. resolve. Modules that only *import* `node:os` (for example `log-redaction.ts`) bundle fine; they fail only if a Node-only call actually runs.
+- `external`: `node:*`, `cloudflare:*`, and bare builtin specifiers reached through third-party packages; workerd's `nodejs_compat` provides them.
 
-Check with `pnpm --filter @paperclipai/server exec wrangler deploy --dry-run --outdir /tmp/b` and grep the output for `node_modules/.pnpm/express@` (must be absent).
+Stubs are lazy: `fooService(db)` returns a proxy and only the first property access throws. Route factories build their services eagerly, so an eager throw would take every route down. When a request reaches a stub, the adapter answers `501 { "error": "<name> is not available on the Cloudflare Worker yet" }`.
+
+Check with `pnpm --filter @paperclipai/server exec wrangler deploy --dry-run --outdir /tmp/b` and grep the pre-bundle (`worker/dist/index.mjs`) for `node_modules/express/`, `pino-http`, `embedded-postgres`, `services/heartbeat.ts` (all must be absent).
+
+## Adding a route module
+
+1. Import its factory in `index.ts` and append it to the `routers` array (constructed per request with `c.get("db")`).
+2. If it imports names from `../services/index.js`, add them to `NEEDED` in `scripts/gen-services-index.mjs` and re-run it. A name whose module is Workers-safe is re-exported; a Node-bound one becomes a lazy stub.
+3. `node worker/build.mjs` — a build error names the next Node-only module; add a redirect or stop.
+4. `wrangler dev`, then compare against the Node server on the same database (see Verification contract). A `501 … not available` answer means the route reached a stub; decide whether that endpoint is acceptable as "not yet".
 
 ## Local development
 
@@ -39,7 +51,11 @@ Hyperdrive uses `localConnectionString` in `wrangler.jsonc`; the `id` is a place
 
 Measured on the route modules under `server/src/routes` (54 `Router()` modules) by walking each module's static import graph and counting reachable modules that import a Node-only builtin (`node:fs`, `node:child_process`, `node:net`, `node:os`, …). "Reach" is a bundling proxy, not proof of runtime behavior; the runtime check is `wrangler dev` plus a byte comparison against the Node server on the same database.
 
-### Tier 0 — runs now with the M3 mechanism (12 routes)
+### Mounted today (13 route modules)
+
+`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`. Byte-identical to Node on 28 of 34 compared GET requests; the other 6 answer 501 because they call `issueService` or `heartbeatService` (issue tree-control state/holds, issue activity/runs, heartbeat-runs issues, instance task-drain). Mutations go through `boardMutationGuard` and the same validators: a goal created through the Worker is visible from Node and deletable through the Worker; invalid bodies produce the same Zod 400.
+
+### Tier 0 — runs with the M3 mechanism alone (12 routes)
 
 Zero Node-only modules reachable, or only `log-redaction.ts` (`node:os` called inside a function, never on these paths):
 

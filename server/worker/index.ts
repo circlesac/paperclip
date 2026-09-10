@@ -9,7 +9,19 @@ import { companies } from "./shims/paperclip-db.js";
 import { dashboardRoutes } from "../src/routes/dashboard.js";
 import { sidebarBadgeRoutes } from "../src/routes/sidebar-badges.js";
 import { userProfileRoutes } from "../src/routes/user-profiles.js";
+import { folderRoutes } from "../src/routes/folders.js";
+import { goalRoutes } from "../src/routes/goals.js";
+import { inboxDismissalRoutes } from "../src/routes/inbox-dismissals.js";
+import { inboxAgentPolicyRoutes } from "../src/routes/inbox-agent-policy.js";
+import { sidebarPreferenceRoutes } from "../src/routes/sidebar-preferences.js";
+import { resourceMembershipRoutes } from "../src/routes/resource-memberships.js";
+import { decisionTrainingRoutes } from "../src/routes/decision-training.js";
+import { issueTreeControlRoutes } from "../src/routes/issue-tree-control.js";
+import { activityRoutes } from "../src/routes/activity.js";
+import { instanceSettingsRoutes } from "../src/routes/instance-settings.js";
+import { boardMutationGuard } from "../src/middleware/board-mutation-guard.js";
 import type { ShimRouter } from "./shims/express.js";
+import { Router } from "./shims/express.js";
 
 type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb> } };
 
@@ -81,12 +93,27 @@ app.get("/api/__probe/me", (c) => {
 // dependencies they capture today.
 mountExpressRouters(app, {
   prefix: "/api",
-  routers: (c) =>
-    [
+  routers: (c) => {
+    const guard = Router();
+    guard.use(boardMutationGuard() as never);
+
+    return [
+      guard,
       dashboardRoutes(c.get("db")),
       sidebarBadgeRoutes(c.get("db")),
       userProfileRoutes(c.get("db")),
-    ] as unknown as ShimRouter[],
+      folderRoutes(c.get("db")),
+      goalRoutes(c.get("db")),
+      inboxDismissalRoutes(c.get("db")),
+      inboxAgentPolicyRoutes(c.get("db")),
+      sidebarPreferenceRoutes(c.get("db")),
+      resourceMembershipRoutes(c.get("db")),
+      decisionTrainingRoutes(c.get("db")),
+      issueTreeControlRoutes(c.get("db")),
+      activityRoutes(c.get("db")),
+      instanceSettingsRoutes(c.get("db")),
+    ] as unknown as ShimRouter[];
+  },
 });
 
 export default app;
