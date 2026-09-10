@@ -4,7 +4,7 @@ import { DEPLOYMENT_MODES, type DeploymentMode } from "@paperclipai/shared";
 import { createWorkerDb } from "./db.js";
 import type { Env } from "./env.js";
 import { actorMiddleware, type ActorVariables } from "./actor.js";
-import { mountExpressRouters, type MountedRouter } from "./express-adapter.js";
+import { mountExpressRouters, type RouterEntry } from "./express-adapter.js";
 import { companies } from "./shims/paperclip-db.js";
 import { dashboardRoutes } from "../src/routes/dashboard.js";
 import { sidebarBadgeRoutes } from "../src/routes/sidebar-badges.js";
@@ -25,6 +25,13 @@ import { decisionRoutes } from "../src/routes/decisions.js";
 import { companyRoutes } from "../src/routes/companies.js";
 import { accessRoutes } from "../src/routes/access.js";
 import { createDecisionWakeOriginAgent } from "../src/services/decision-wakeup.js";
+import { projectRoutes } from "../src/routes/projects.js";
+import { pipelineRoutes } from "../src/routes/pipelines.js";
+import { issueRoutes } from "../src/routes/issues.js";
+import { approvalRoutes } from "../src/routes/approvals.js";
+import { routineRoutes } from "../src/routes/routines.js";
+import { statusCardRoutes } from "../src/routes/status-cards.js";
+import { storageUnavailable } from "./storage-unavailable.js";
 import { boardMutationGuard } from "../src/middleware/board-mutation-guard.js";
 import type { ShimRouter } from "./shims/express.js";
 import { Router } from "./shims/express.js";
@@ -105,34 +112,43 @@ mountExpressRouters(app, {
 
     return [
       guard,
-      dashboardRoutes(c.get("db")),
-      sidebarBadgeRoutes(c.get("db")),
-      userProfileRoutes(c.get("db")),
-      folderRoutes(c.get("db")),
-      goalRoutes(c.get("db")),
-      inboxDismissalRoutes(c.get("db")),
-      inboxAgentPolicyRoutes(c.get("db")),
-      sidebarPreferenceRoutes(c.get("db")),
-      resourceMembershipRoutes(c.get("db")),
-      decisionTrainingRoutes(c.get("db")),
-      issueTreeControlRoutes(c.get("db")),
-      activityRoutes(c.get("db")),
-      instanceSettingsRoutes(c.get("db")),
-      costRoutes(c.get("db")),
-      attentionRoutes(c.get("db")),
+      () => dashboardRoutes(c.get("db")),
+      () => sidebarBadgeRoutes(c.get("db")),
+      () => userProfileRoutes(c.get("db")),
+      () => folderRoutes(c.get("db")),
+      () => goalRoutes(c.get("db")),
+      () => inboxDismissalRoutes(c.get("db")),
+      () => inboxAgentPolicyRoutes(c.get("db")),
+      () => sidebarPreferenceRoutes(c.get("db")),
+      () => resourceMembershipRoutes(c.get("db")),
+      () => decisionTrainingRoutes(c.get("db")),
+      () => issueTreeControlRoutes(c.get("db")),
+      () => activityRoutes(c.get("db")),
+      () => instanceSettingsRoutes(c.get("db")),
+      () => costRoutes(c.get("db")),
+      () => attentionRoutes(c.get("db")),
       // No heartbeat scheduler on the Worker: the same no-op wake Node uses
       // when HEARTBEAT_SCHEDULER_ENABLED=false.
-      decisionRoutes(c.get("db"), { wakeOriginAgent: createDecisionWakeOriginAgent(null) }),
+      () => decisionRoutes(c.get("db"), { wakeOriginAgent: createDecisionWakeOriginAgent(null) }),
       // Express mounts this router at /api/companies (app.ts); no storage
       // service yet, so logo/import paths answer 501 via the multer shim.
-      { mount: "/companies", router: companyRoutes(c.get("db")) as unknown as ShimRouter },
-      accessRoutes(c.get("db"), {
+      () => ({ mount: "/companies", router: companyRoutes(c.get("db")) as unknown as ShimRouter }),
+      () => accessRoutes(c.get("db"), {
         deploymentMode: deploymentMode(c.env),
         deploymentExposure: "private",
         bindHost: "127.0.0.1",
         allowedHostnames: [],
       }),
-    ] as unknown as MountedRouter[];
+      () => projectRoutes(c.get("db")),
+      // routes/agents.ts is Node-bound at module load (import.meta.url, node:fs); not mounted yet.
+      () => pipelineRoutes(c.get("db")),
+      // No plugin workers, feedback export, or tool-gateway callbacks on the
+      // Worker; the options are optional and the affected paths fail loudly.
+      () => issueRoutes(c.get("db"), storageUnavailable, {}),
+      () => approvalRoutes(c.get("db")),
+      () => routineRoutes(c.get("db")),
+      () => statusCardRoutes(c.get("db")),
+    ] as unknown as RouterEntry[];
   },
 });
 

@@ -4,10 +4,17 @@ import type { ShimLayer, ShimRouter } from "./shims/express.js";
 import { HttpError } from "../src/errors.js";
 
 type ShimHandler = (req: unknown, res: unknown, next: (err?: unknown) => void) => unknown;
+type ShimParamHandler = (req: unknown, res: unknown, next: (err?: unknown) => void, value: string, name: string) => unknown;
 
 type ResLike = {
   statusCode: number;
   headersSent: boolean;
+  writableEnded: boolean;
+  finished: boolean;
+  on(event: string, fn: (...args: unknown[]) => void): ResLike;
+  once(event: string, fn: (...args: unknown[]) => void): ResLike;
+  off(event: string, fn: (...args: unknown[]) => void): ResLike;
+  removeListener(event: string, fn: (...args: unknown[]) => void): ResLike;
   locals: Record<string, unknown>;
   status(code: number): ResLike;
   setHeader(name: string, value: string): void;
@@ -86,6 +93,11 @@ function createResponse(): ShimResponse {
   let finished = false;
   const headers: Record<string, string> = {};
 
+  // Express responses are EventEmitters (http.ServerResponse); routes register
+  // "close"/"finish" listeners for cancellation. Listeners run when the
+  // response is finalized.
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const emit = (event: string) => { for (const fn of listeners.get(event) ?? []) { try { fn(); } catch {} } };
   const finish = (nextStatus?: number, nextBody?: string | Uint8Array) => {
     if (finished) {
       throw new Error("response already finished");
@@ -97,6 +109,8 @@ function createResponse(): ShimResponse {
     if (nextBody !== undefined) {
       body = nextBody;
     }
+    emit("finish");
+    emit("close");
   };
 
   return {
@@ -107,6 +121,16 @@ function createResponse(): ShimResponse {
       get headersSent() {
         return finished;
       },
+      get writableEnded() {
+        return finished;
+      },
+      get finished() {
+        return finished;
+      },
+      on(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, [...(listeners.get(event) ?? []), fn]); return this; },
+      once(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, [...(listeners.get(event) ?? []), fn]); return this; },
+      off(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn)); return this; },
+      removeListener(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn)); return this; },
       locals: {},
       status(code: number) {
         statusCode = code;
@@ -253,10 +277,12 @@ function runHandler(handler: ShimHandler, req: Record<string, unknown>, res: Res
 
 /** A router mounted at a sub-path, like Express `api.use("/companies", router)`. */
 export type MountedRouter = ShimRouter | { mount: string; router: ShimRouter };
+/** Entries may be thunks so one failing route factory does not take the others down. */
+export type RouterEntry = MountedRouter | (() => MountedRouter);
 
 export function mountExpressRouters<E extends { Variables: { actor: unknown } }>(
   app: Hono<E>,
-  opts: { prefix: string; routers: (c: Context<E>) => MountedRouter[] },
+  opts: { prefix: string; routers: (c: Context<E>) => RouterEntry[] },
 ): void {
   app.all(`${opts.prefix}/*`, async (c) => {
     const url = new URL(c.req.url);
@@ -266,11 +292,23 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
     req.body = await parseBody(c, requestMethod);
 
     const resObj = createResponse();
+    const ranParams = new Set<string>();
 
     try {
       // Inside the try: a route factory that throws while constructing its
       // services must produce the same JSON error mapping as a handler error.
-      const routers = opts.routers(c);
+      // Build each router in isolation: a factory that throws (for example
+      // because it touches a stubbed service at construction) only disables
+      // its own routes. If nothing else matches, its error is what we report.
+      const routers: MountedRouter[] = [];
+      let constructionError: unknown = null;
+      for (const item of opts.routers(c)) {
+        try {
+          routers.push(typeof item === "function" ? item() : item);
+        } catch (err) {
+          constructionError ??= err;
+        }
+      }
       for (const entry of routers) {
         const mount = "mount" in entry ? entry.mount : "";
         const router = "mount" in entry ? entry.router : entry;
@@ -302,6 +340,26 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
           }
 
           req.params = nextParams;
+          // Express `router.param(name, fn)` handlers run once per request for
+          // each captured param, before the route's own handlers.
+          for (const [name, value] of Object.entries(nextParams)) {
+            const key = `${name}=${value}`;
+            if (ranParams.has(key)) continue;
+            for (const paramHandler of router.params?.get(name) ?? []) {
+              const nextCalled = await runHandler(
+                (rq: unknown, rs: unknown, nx: (err?: unknown) => void) => paramHandler(rq, rs, nx, value, name),
+                req,
+                resObj.res,
+              );
+              if (resObj.res.headersSent) return resObj.buildResponse();
+              if (!nextCalled) {
+                console.error("No response and no next() call from Express-style param handler", { method: requestMethod, path: requestPath, name });
+                resObj.res.status(500).json({ error: "Internal server error" });
+                return resObj.buildResponse();
+              }
+            }
+            ranParams.add(key);
+          }
           for (const handler of layer.handlers) {
             const nextCalled = await runHandler(handler, req, resObj.res);
 
@@ -322,6 +380,7 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
         }
       }
 
+      if (constructionError) throw constructionError;
       return c.notFound();
     } catch (error) {
       if (error instanceof HttpError) {
@@ -343,6 +402,7 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
       // server is not on the Worker yet. 501 with the reason is more useful to
       // the caller than a generic 500, and the stubs already make it explicit.
       if (error instanceof Error && error.message.endsWith("is not available on the Cloudflare Worker yet")) {
+        console.warn(`[worker] 501 ${requestMethod} ${requestPath}: ${error.message}`);
         return c.json({ error: error.message }, 501);
       }
 

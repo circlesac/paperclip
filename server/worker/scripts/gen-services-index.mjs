@@ -44,8 +44,8 @@ const TYPES = new Set(); // filled from the barrel below (export type {...})
 // (node:fs, child_process, net, dns, tls, http, readline, ...). Stubbed.
 const NODE_BOUND = new Set([
   "heartbeat", "status-cards", "company-portability",
-  "routines", "approvals", "secrets", "feedback", "smoke-lab",
-  "skills-catalog", "built-in-agents",
+  "secrets", "feedback", "smoke-lab",
+  "skills-catalog", "built-in-agents", "workspace-operations", "workspace-runtime", "environment-runtime", "device-login-service",
 ]);
 
 const barrel = readFileSync(join(SRC, "services/index.ts"), "utf8");

@@ -7,8 +7,13 @@ export interface ShimLayer {
   handlers: ShimHandler[];
 }
 
+export type ShimParamHandler = (req: any, res: any, next: (err?: unknown) => void, value: string, name: string) => unknown;
+
 export interface ShimRouter {
   readonly layers: ShimLayer[];
+  /** Express `router.param(name, handler)`: runs before any route that captures `:name`. */
+  readonly params: Map<string, ShimParamHandler[]>;
+  param(name: string, handler: ShimParamHandler): ShimRouter;
   get(path: string, ...handlers: ShimHandler[]): ShimRouter;
   post(path: string, ...handlers: ShimHandler[]): ShimRouter;
   put(path: string, ...handlers: ShimHandler[]): ShimRouter;
@@ -47,6 +52,7 @@ function assertSupportedRoutePattern(path: string): void {
 
 function createRouter(): ShimRouter {
   const layers: ShimLayer[] = [];
+  const params = new Map<string, ShimParamHandler[]>();
 
   function register(method: ShimMethod, path: string | null, handlers: ShimHandler[]): void {
     if (path) {
@@ -57,6 +63,11 @@ function createRouter(): ShimRouter {
 
   const router: ShimRouter = {
     layers,
+    params,
+    param: (name, handler) => {
+      params.set(name, [...(params.get(name) ?? []), handler]);
+      return router;
+    },
     get: (path, ...handlers) => {
       register("GET", path, handlers);
       return router;

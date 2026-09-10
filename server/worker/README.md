@@ -9,9 +9,10 @@ Upstream is active. We do not edit `server/src`. Everything Cloudflare needs liv
 - `index.ts` — the Worker `fetch` handler (Hono). Probes, per-request DB, actor, `boardMutationGuard`, and the mounted Express routers.
 - `actor.ts` — runs the unchanged Express `actorMiddleware` behind a request shim.
 - `express-adapter.ts` + `shims/express.ts` — runs unchanged Express route modules (`Router()`-based) under Hono.
-- `build.mjs` — esbuild pre-bundle. Redirects, by resolved source path, the modules the Worker cannot run to `shims/` (see below); wrangler then bundles its output.
-- `shims/` — bundle-time replacements: `express`, `multer`, `pino-http`, `paperclip-db` (package aliases); `services-index` (curated barrel, generated); `hubs/*` (execution-plane stubs, generated); `instrumentation`, `version`, `build-commit`, `build-version` (hand-written, benign values).
-- `scripts/gen-services-index.mjs`, `scripts/gen-hub-stubs.mjs` — generators for the two generated shim groups. Re-run after mounting a route that needs new names.
+- `build.mjs` — esbuild pre-bundle. Swaps a few modules for hand-written shims and generates lazy stubs for every `server/src` module the Worker cannot run (see below); wrangler then bundles its output.
+- `shims/` — bundle-time replacements: `express` (recording `Router` with `param`, body-parser factories), `multer`, `pino-http`, `paperclip-db` (package aliases); `services-index` (curated barrel, generated); `instrumentation`, `version`, `build-commit`, `build-version` (hand-written, benign values).
+- `scripts/gen-services-index.mjs` — regenerates the curated barrel from the routes mounted in `index.ts`. `scripts/lib/module-exports.mjs` — the export parser shared with `build.mjs`.
+- `storage-unavailable.ts` — a `StorageService` whose operations answer 501.
 - `db.ts`, `env.ts`, `tsconfig.json`.
 
 If a change seems to need an edit under `server/src`, the answer is a shim or an alias here, or the route stays on Node for now.
@@ -21,11 +22,12 @@ If a change seems to need an edit under `server/src`, the answer is a shim or an
 `worker/build.mjs` (esbuild) runs first, then wrangler bundles its output:
 
 - Package aliases: `express` → recording `Router` shim (plus `express.json` pass-through and 501 `raw`/`text`/`urlencoded`/`static` factories); `multer` → 501 middleware; `pino-http` → no-op; `@paperclipai/db` → schema + `type Db` only (the real barrel drags in `embedded-postgres`).
-- Source-path redirects (an `onResolve` plugin; only imports made from inside `server/src` are affected): `services/index.ts` → curated barrel (names derived from the routes mounted in `index.ts`); the execution-plane hubs, the service modules whose graphs reach them, and the disk catalogs (`skills-catalog`, `built-in-agents`) → lazy stubs under `shims/hubs/`; `instrumentation.ts`, `version.ts`, `build-commit.ts`, `build-version.ts` → benign values (the real ones run OpenTelemetry, `@cursor/sdk`, `createRequire(import.meta.url)` and `git describe` at module load).
+- Hand-written shims (`SHIM_FILES`, swapped by path): `services/index.ts` → curated barrel (names derived from the routes mounted in `index.ts`); `instrumentation.ts`, `version.ts`, `build-commit.ts`, `build-version.ts` → benign values (the real ones run OpenTelemetry, `@cursor/sdk`, `createRequire(import.meta.url)` and `git describe` at module load).
+- Generated stubs (an `onLoad` plugin decides per `server/src` module at build time; nothing is pre-generated): a module is replaced when it is listed in `STUB_FILES`, lives under an execution-plane directory (`STUB_DIRS`), imports a Node-only builtin at value level, or does Node-only work in a top-level statement (`import.meta.url`, `createRequire`, `randomUUID()` — workerd forbids random values at global scope). `ALLOW_FILES` exempts modules whose Node imports are only used lazily. Route modules are never stubbed; the build warns if a mounted one is Node-bound. `export const NAME = <literal>` keeps its real value in a stub. Run `WORKER_BUILD_VERBOSE=1 node worker/build.mjs` to list what was stubbed and why.
 - `define`: `process.env.NODE_ENV` = `"production"` so `middleware/logger.ts` never calls `pino.transport` (absent in the pino build the bundler selects; a runtime var is not visible at module load).
 - `external`: `node:*`, `cloudflare:*`, and bare builtin specifiers reached through third-party packages; workerd's `nodejs_compat` provides them.
 
-Stubs are lazy in two steps: `fooService(db)` and property reads (`svc.wakeup`) return proxies, because route factories do both at construction; the first call, `await`, string conversion, or JSON serialization of the result throws. When a request reaches a stub, the adapter answers `501 { "error": "<name> is not available on the Cloudflare Worker yet" }`.
+Stubs are lazy in two steps: `fooService(db)` and property reads (`svc.wakeup`) return proxies, because route factories do both at construction; the first call, `await`, string conversion, or JSON serialization of the result throws. Routers are built per request as isolated thunks, so a factory that throws only disables its own routes. When a request reaches a stub, the adapter answers `501 { "error": "<name> is not available on the Cloudflare Worker yet" }`.
 
 Check with `pnpm --filter @paperclipai/server exec wrangler deploy --dry-run --outdir /tmp/b` and grep the pre-bundle (`worker/dist/index.mjs`) for `node_modules/express/`, `pino-http`, `embedded-postgres`, `services/heartbeat.ts` (all must be absent).
 
@@ -33,7 +35,7 @@ Check with `pnpm --filter @paperclipai/server exec wrangler deploy --dry-run --o
 
 1. Import its factory in `index.ts` and append it to the `routers` array (constructed per request with `c.get("db")`). If `app.ts` mounts it under a sub-path (`api.use("/companies", …)`), use `{ mount: "/companies", router }`.
 2. Re-run `node worker/scripts/gen-services-index.mjs`; it reads the routes mounted in `index.ts` and exports what they import from the services barrel. A name whose module is Workers-safe is re-exported; a Node-bound one becomes a lazy stub.
-3. `node worker/build.mjs` — a build error names the next Node-only module; add a redirect or stop.
+3. `node worker/build.mjs` — the build warns if the route module itself is Node-bound; `WORKER_BUILD_VERBOSE=1` lists what was stubbed. If a needed module was stubbed only because it imports `node:fs` lazily, add it to `ALLOW_FILES`.
 4. `wrangler dev`, then compare against the Node server on the same database (see Verification contract). A `501 … not available` answer means the route reached a stub; decide whether that endpoint is acceptable as "not yet".
 
 ## Local development
@@ -51,9 +53,9 @@ Hyperdrive uses `localConnectionString` in `wrangler.jsonc`; the `id` is a place
 
 Measured on the route modules under `server/src/routes` (54 `Router()` modules) by walking each module's static import graph and counting reachable modules that import a Node-only builtin (`node:fs`, `node:child_process`, `node:net`, `node:os`, …). "Reach" is a bundling proxy, not proof of runtime behavior; the runtime check is `wrangler dev` plus a byte comparison against the Node server on the same database.
 
-### Mounted today (18 route modules)
+### Mounted today (24 route modules)
 
-`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (mounted at `/api/companies`, like `app.ts`), `access`. Byte-identical to Node on 47 of 55 compared GET requests. The other 8 answer `501 … is not available on the Cloudflare Worker yet` because they call the stubbed `issueService` or `heartbeatService`: issue tree-control state/holds, issue activity/runs, heartbeat-runs issues, instance task-drain, issue cost-summary, company attention. Mutations go through the unchanged `boardMutationGuard` and validators: a goal created through the Worker is visible from Node and deletable through the Worker; invalid bodies produce the same Zod 400. `services/companies.ts` and `services/agents.ts` run for real now that the hubs under them are stubbed.
+`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (at `/api/companies`), `access`, `projects`, `pipelines`, `issues`, `approvals`, `routines`, `status-cards`. Byte-identical to Node on 72 of 74 compared GET requests; the 2 that differ call `heartbeatService` (heartbeat-runs issues, instance task-drain) and answer 501. `services/issues.ts`, `companies.ts`, `agents.ts`, `approvals.ts`, `routines.ts` run for real; `heartbeat`, `status-cards`, `secrets`, `tool-gateway`, `execution-workspaces`, the native runtime, and the disk catalogs stay stubbed. `routes/agents.ts` is Node-bound at module load (`import.meta.url`, `node:fs`) and is not mounted. Storage is `storage-unavailable.ts` (every operation 501) until an R2 provider exists.
 
 ### Tier 0 — runs with the M3 mechanism alone (12 routes)
 
