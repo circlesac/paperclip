@@ -7,7 +7,8 @@
   // Worker build swaps these two Node-only modules for the shims in worker/shims.
   "alias": {
     "pino-http": "./worker/shims/pino-http.ts",
-    "@paperclipai/db": "./worker/shims/paperclip-db.ts"
+    "@paperclipai/db": "./worker/shims/paperclip-db.ts",
+    "express": "./worker/shims/express.ts"
   },
   "vars": {
     // One of DEPLOYMENT_MODES from @paperclipai/shared. local_trusted gives the

@@ -4,7 +4,12 @@ import { DEPLOYMENT_MODES, type DeploymentMode } from "@paperclipai/shared";
 import { createWorkerDb } from "./db.js";
 import type { Env } from "./env.js";
 import { actorMiddleware, type ActorVariables } from "./actor.js";
+import { mountExpressRouters } from "./express-adapter.js";
 import { companies } from "./shims/paperclip-db.js";
+import { dashboardRoutes } from "../src/routes/dashboard.js";
+import { sidebarBadgeRoutes } from "../src/routes/sidebar-badges.js";
+import { userProfileRoutes } from "../src/routes/user-profiles.js";
+import type { ShimRouter } from "./shims/express.js";
 
 type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb> } };
 
@@ -70,6 +75,18 @@ app.get("/api/__probe/me", (c) => {
     keyScope: actor.keyScope,
     runId: actor.runId,
   });
+});
+
+// Route factories are intentionally invoked per request to preserve the db-scoped
+// dependencies they capture today.
+mountExpressRouters(app, {
+  prefix: "/api",
+  routers: (c) =>
+    [
+      dashboardRoutes(c.get("db")),
+      sidebarBadgeRoutes(c.get("db")),
+      userProfileRoutes(c.get("db")),
+    ] as unknown as ShimRouter[],
 });
 
 export default app;
