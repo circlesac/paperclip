@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node", "@cloudflare/workers-types"],
+    "rootDir": "../..",
+    "module": "preserve",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": [".", "../src/types/express.d.ts"],
+  "exclude": []
+}

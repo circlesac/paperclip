@@ -1,0 +1,56 @@
+{
+  "name": "paperclip-server",
+  // Built by worker/build.mjs (esbuild): swaps the services barrel and the
+  // Node-only modules for worker/shims; wrangler then bundles that output.
+  "main": "worker/dist/index.mjs",
+  "build": {
+    "command": "node worker/build.mjs",
+    "cwd": ".",
+    "watch_dir": ["worker", "src"]
+  },
+  "compatibility_date": "2026-05-09",
+  "compatibility_flags": ["nodejs_compat"],
+  // Bundle-time module replacements. server/src stays untouched; only the
+  // Worker build swaps these two Node-only modules for the shims in worker/shims.
+  "alias": {
+    "pino-http": "./worker/shims/pino-http.ts",
+    "@paperclipai/db": "./worker/shims/paperclip-db.ts",
+    "express": "./worker/shims/express.ts"
+  },
+  "vars": {
+    // One of DEPLOYMENT_MODES from @paperclipai/shared. local_trusted gives the
+    // implicit local board actor; authenticated requires credentials.
+    "PAPERCLIP_DEPLOYMENT_MODE": "local_trusted"
+  },
+  // Build-time substitution (vars are only visible at request time, but
+  // server/src/middleware/logger.ts reads NODE_ENV at module load). The
+  // production branch does not call pino.transport, which the pino build the
+  // Workers bundler selects does not have.
+  "define": {
+    "process.env.NODE_ENV": "\"production\""
+  },
+  // The React UI (vite build output). /api/* always reaches the Worker; every
+  // other path is served from the build, with index.html for client routes —
+  // the same split app.ts makes with express.static + the catch-all.
+  "assets": {
+    "directory": "../ui/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/assets/*"]
+  },
+  // Live events: one room per company holds the browsers' WebSockets
+  // (worker/live-events.ts). Local in wrangler dev.
+  "durable_objects": { "bindings": [{ "name": "LIVE_EVENTS", "class_name": "LiveEventsRoom" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LiveEventsRoom"] }],
+  // Attachments, logos, case documents. Local in wrangler dev (miniflare).
+  "r2_buckets": [{ "binding": "STORAGE", "bucket_name": "paperclip-storage" }],
+  "hyperdrive": [
+    {
+      // Placeholder ID for local development. Replace this before wrangler deploy.
+      // wrangler dev can run with this local connection string in place.
+      "binding": "HYPERDRIVE",
+      "id": "00000000-0000-0000-0000-000000000000",
+      "localConnectionString": "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip"
+    }
+  ]
+}

@@ -34,6 +34,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "dev:watch": "cross-env PAPERCLIP_MIGRATION_PROMPT=never PAPERCLIP_MIGRATION_AUTO_APPLY=true tsx ./scripts/dev-watch.ts",
+    "dev:worker": "wrangler dev",
     "prepare:ui-dist": "bash ../scripts/prepare-server-ui-dist.sh",
     "build": "pnpm run prepare:runner-vendor && tsc && mkdir -p dist/onboarding-assets dist/built-ins dist/services/scripts dist/vendor/paperclip-runner && cp -R src/onboarding-assets/. dist/onboarding-assets/ && cp -R src/built-ins/. dist/built-ins/ && cp -R src/services/scripts/. dist/services/scripts/ && cp -R ../packages/paperclip-runner/dist/. dist/vendor/paperclip-runner/ && node scripts/write-build-stamp.mjs",
     "prepack": "pnpm run prepare:ui-dist && pnpm run build",
@@ -41,7 +42,8 @@
     "clean": "rm -rf dist",
     "start": "node dist/index.js",
     "prepare:runner-vendor": "pnpm --filter @paperclipai/paperclip-runner build",
-    "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
+    "typecheck": "pnpm run prepare:runner-vendor && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit",
+    "typecheck:worker": "tsc --noEmit -p worker/tsconfig.json"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1122.0",
@@ -74,12 +76,14 @@
     "drizzle-orm": "^0.45.2",
     "embedded-postgres": "^18.1.0-beta.16",
     "express": "^5.1.0",
+    "hono": "^4.13.2",
     "jsdom": "^30.0.1",
     "multer": "^2.2.0",
     "open": "^11.0.1",
     "pino": "^10.0.0",
     "pino-http": "^11.0.0",
     "pino-pretty": "^13.1.3",
+    "postgres": "^3.4.9",
     "sharp": "^0.35.4",
     "ssh2": "^1.17.0",
     "ws": "^8.21.3",
@@ -89,6 +93,7 @@
     "acpx"
   ],
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260501.0",
     "@paperclipai/paperclip-runner": "workspace:*",
     "@types/express": "^5.0.0",
     "@types/express-serve-static-core": "^5.1.3",
@@ -103,7 +108,8 @@
     "tsx": "^4.23.12",
     "typescript": "^7.0.2",
     "vite": "^8.2.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "wrangler": "^4.130.0"
   },
   "peerDependencies": {
     "@opentelemetry/auto-instrumentations-node": "0.79.0",
