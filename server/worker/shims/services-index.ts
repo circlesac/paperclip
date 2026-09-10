@@ -68,3 +68,4 @@ export { routineService } from "../../src/services/routines.js";
 export { workProductService } from "../../src/services/work-products.js";
 export const secretService = unavailable("secretService") as unknown as typeof import("../../src/services/secrets.js").secretService;
 export const statusCardService = unavailable("statusCardService") as unknown as typeof import("../../src/services/status-cards.js").statusCardService;
+export { assetService } from "../../src/services/assets.js";

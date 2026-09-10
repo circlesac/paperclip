@@ -32,7 +32,9 @@ import { issueRoutes } from "../src/routes/issues.js";
 import { approvalRoutes } from "../src/routes/approvals.js";
 import { routineRoutes } from "../src/routes/routines.js";
 import { statusCardRoutes } from "../src/routes/status-cards.js";
-import { storageUnavailable } from "./storage-unavailable.js";
+import { createWorkerStorage } from "./storage-r2.js";
+import { assetRoutes } from "../src/routes/assets.js";
+import { caseRoutes } from "../src/routes/cases.js";
 import { authRoutes } from "../src/routes/auth.js";
 import { healthRoutes } from "../src/routes/health.js";
 import { adapterRoutes } from "../src/routes/adapters.js";
@@ -42,7 +44,7 @@ import { boardMutationGuard } from "../src/middleware/board-mutation-guard.js";
 import type { ShimRouter } from "./shims/express.js";
 import { Router } from "./shims/express.js";
 
-type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb>; auth: WorkerAuth | null } };
+type AppEnv = { Bindings: Env; Variables: ActorVariables & { db: ReturnType<typeof createWorkerDb>; auth: WorkerAuth | null; storage: ReturnType<typeof createWorkerStorage> } };
 
 // index.ts flips this to "ready" after startup recovery; the Worker has no
 // startup recovery to run, so health reports ready from the first request.
@@ -63,6 +65,7 @@ function deploymentMode(env: Env): DeploymentMode {
 app.use("/api/*", async (c, next) => {
   const db = createWorkerDb(c.env.HYPERDRIVE.connectionString);
   c.set("db", db);
+  c.set("storage", createWorkerStorage(c.env.STORAGE));
   // Session cookies only exist in authenticated mode (app.ts does the same).
   c.set("auth", deploymentMode(c.env) === "authenticated" ? createWorkerAuth(db, c.env, "authenticated", c.req.url) : null);
   try {
@@ -161,9 +164,8 @@ mountExpressRouters(app, {
       // No heartbeat scheduler on the Worker: the same no-op wake Node uses
       // when HEARTBEAT_SCHEDULER_ENABLED=false.
       () => decisionRoutes(c.get("db"), { wakeOriginAgent: createDecisionWakeOriginAgent(null) }),
-      // Express mounts this router at /api/companies (app.ts); no storage
-      // service yet, so logo/import paths answer 501 via the multer shim.
-      () => ({ mount: "/companies", router: companyRoutes(c.get("db")) as unknown as ShimRouter }),
+      // Express mounts this router at /api/companies (app.ts).
+      () => ({ mount: "/companies", router: companyRoutes(c.get("db"), c.get("storage")) as unknown as ShimRouter }),
       () => accessRoutes(c.get("db"), {
         deploymentMode: deploymentMode(c.env),
         deploymentExposure: "private",
@@ -176,7 +178,9 @@ mountExpressRouters(app, {
       () => pipelineRoutes(c.get("db")),
       // No plugin workers, feedback export, or tool-gateway callbacks on the
       // Worker; the options are optional and the affected paths fail loudly.
-      () => issueRoutes(c.get("db"), storageUnavailable, {}),
+      () => issueRoutes(c.get("db"), c.get("storage"), {}),
+      () => assetRoutes(c.get("db"), c.get("storage")),
+      () => caseRoutes(c.get("db"), c.get("storage")),
       () => approvalRoutes(c.get("db")),
       () => routineRoutes(c.get("db")),
       () => statusCardRoutes(c.get("db")),

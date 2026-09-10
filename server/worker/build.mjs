@@ -139,6 +139,9 @@ await esbuild.build({
   alias: {
     express: shim("express.ts"),
     multer: shim("multer.ts"),
+    // routes/assets.ts: SVG sanitizing only; the Worker answers 501 for SVG uploads.
+    jsdom: shim("jsdom.ts"),
+    dompurify: shim("dompurify.ts"),
     "pino-http": shim("pino-http.ts"),
     "@paperclipai/db": shim("paperclip-db.ts"),
   },

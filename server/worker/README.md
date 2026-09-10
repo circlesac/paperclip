@@ -10,9 +10,9 @@ Upstream is active. We do not edit `server/src`. Everything Cloudflare needs liv
 - `actor.ts` — runs the unchanged Express `actorMiddleware` behind a request shim.
 - `express-adapter.ts` + `shims/express.ts` — runs unchanged Express route modules (`Router()`-based) under Hono.
 - `build.mjs` — esbuild pre-bundle. Swaps a few modules for hand-written shims and generates lazy stubs for every `server/src` module the Worker cannot run (see below); wrangler then bundles its output.
-- `shims/` — bundle-time replacements: `express` (recording `Router` with `param`, body-parser factories), `multer`, `pino-http`, `paperclip-db` (package aliases); `services-index` (curated barrel, generated); `instrumentation`, `version`, `build-commit`, `build-version` (hand-written, benign values).
+- `shims/` — bundle-time replacements: `express` (recording `Router` with `param`, body-parser factories), `multer` (parses multipart from the Worker `Request`), `jsdom`/`dompurify` (throw → 501; SVG sanitizing only), `pino-http`, `paperclip-db` (package aliases); `services-index` (curated barrel, generated); `instrumentation`, `version`, `build-commit`, `build-version` (hand-written, benign values).
 - `scripts/gen-services-index.mjs` — regenerates the curated barrel from the routes mounted in `index.ts`. `scripts/lib/module-exports.mjs` — the export parser shared with `build.mjs`.
-- `storage-unavailable.ts` — a `StorageService` whose operations answer 501.
+- `storage-r2.ts` — R2 as a `StorageProvider` under the unchanged `src/storage/service.ts` (`STORAGE` binding in `wrangler.jsonc`; local emulation under `wrangler dev`).
 - `db.ts`, `env.ts`, `tsconfig.json`.
 
 If a change seems to need an edit under `server/src`, the answer is a shim or an alias here, or the route stays on Node for now.
@@ -21,7 +21,7 @@ If a change seems to need an edit under `server/src`, the answer is a shim or an
 
 `worker/build.mjs` (esbuild) runs first, then wrangler bundles its output:
 
-- Package aliases: `express` → recording `Router` shim (plus `express.json` pass-through and 501 `raw`/`text`/`urlencoded`/`static` factories); `multer` → 501 middleware; `pino-http` → no-op; `@paperclipai/db` → schema + `type Db` only (the real barrel drags in `embedded-postgres`).
+- Package aliases: `express` → recording `Router` shim (plus `express.json` pass-through and 501 `raw`/`text`/`urlencoded`/`static` factories); `multer` → real multipart parsing via `Request.formData()` (same `req.file`/`req.files` shapes, `MulterError` codes for size/count limits); `jsdom`/`dompurify` → throw on use (only SVG uploads reach them); `pino-http` → no-op; `@paperclipai/db` → schema + `type Db` only (the real barrel drags in `embedded-postgres`).
 - Hand-written shims (`SHIM_FILES`, swapped by path): `services/index.ts` → curated barrel (names derived from the routes mounted in `index.ts`); `instrumentation.ts`, `version.ts`, `build-commit.ts`, `build-version.ts` → benign values (the real ones run OpenTelemetry, `@cursor/sdk`, `createRequire(import.meta.url)` and `git describe` at module load).
 - Generated stubs (an `onLoad` plugin decides per `server/src` module at build time; nothing is pre-generated): a module is replaced when it is listed in `STUB_FILES`, lives under an execution-plane directory (`STUB_DIRS`), imports a Node-only builtin at value level, or does Node-only work in a top-level statement (`import.meta.url`, `createRequire`, `randomUUID()` — workerd forbids random values at global scope). `ALLOW_FILES` exempts modules whose Node imports are only used lazily. Route modules are never stubbed; the build warns if a mounted one is Node-bound. `export const NAME = <literal>` keeps its real value in a stub. Run `WORKER_BUILD_VERBOSE=1 node worker/build.mjs` to list what was stubbed and why.
 - `define`: `process.env.NODE_ENV` = `"production"` so `middleware/logger.ts` never calls `pino.transport` (absent in the pino build the bundler selects; a runtime var is not visible at module load).
@@ -53,9 +53,9 @@ Hyperdrive uses `localConnectionString` in `wrangler.jsonc`; the `id` is a place
 
 Measured on the route modules under `server/src/routes` (54 `Router()` modules) by walking each module's static import graph and counting reachable modules that import a Node-only builtin (`node:fs`, `node:child_process`, `node:net`, `node:os`, …). "Reach" is a bundling proxy, not proof of runtime behavior; the runtime check is `wrangler dev` plus a byte comparison against the Node server on the same database.
 
-### Mounted today (27 route modules) — the UI runs from the Worker
+### Mounted today (29 route modules) — the UI runs from the Worker
 
-`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (at `/api/companies`), `access`, `projects`, `pipelines`, `issues`, `approvals`, `routines`, `status-cards`, `agents`, `health` (at `/api/health`), `adapters`, plus `auth` at `/api/auth`. Byte-identical to Node on 79 of 82 compared GET requests; the 3 that differ answer 501 because they call `heartbeatService` (heartbeat-runs issues, instance task-drain) or the adapter registry (adapter model list). Mutations through the Worker (create/edit/delete goals, projects, issues) are visible from Node and identical on read-back. With the UI build served through Workers Assets, `wrangler dev` alone serves the React app: the dashboard shell loads and its ~30 API calls are answered by the Worker; what it still cannot get is the adapter list (501, registry is execution plane), company skills and plugin UI contributions (404, not mounted), heartbeat runs (501), and the live-events WebSocket (Durable Objects later). `services/issues.ts`, `companies.ts`, `agents.ts`, `approvals.ts`, `routines.ts` run for real; `heartbeat`, `status-cards`, `secrets`, `tool-gateway`, `execution-workspaces`, the native runtime, and the disk catalogs stay stubbed. Storage is `storage-unavailable.ts` (every operation 501) until an R2 provider exists.
+`dashboard`, `sidebar-badges`, `user-profiles`, `folders`, `goals`, `inbox-dismissals`, `inbox-agent-policy`, `sidebar-preferences`, `resource-memberships`, `decision-training`, `issue-tree-control`, `activity`, `instance-settings`, `costs`, `attention`, `decisions`, `companies` (at `/api/companies`), `access`, `projects`, `pipelines`, `issues`, `approvals`, `routines`, `status-cards`, `agents`, `health` (at `/api/health`), `adapters`, `assets`, `cases`, plus `auth` at `/api/auth`. Byte-identical to Node on 79 of 82 compared GET requests; the 3 that differ answer 501 because they call `heartbeatService` (heartbeat-runs issues, instance task-drain) or the adapter registry (adapter model list). Mutations through the Worker (create/edit/delete goals, projects, issues) are visible from Node and identical on read-back. With the UI build served through Workers Assets, `wrangler dev` alone serves the React app: the dashboard shell loads and its ~30 API calls are answered by the Worker; what it still cannot get is the adapter list (501, registry is execution plane), company skills and plugin UI contributions (404, not mounted), heartbeat runs (501), and the live-events WebSocket (Durable Objects later). `services/issues.ts`, `companies.ts`, `agents.ts`, `approvals.ts`, `routines.ts` run for real; `heartbeat`, `status-cards`, `secrets`, `tool-gateway`, `execution-workspaces`, the native runtime, and the disk catalogs stay stubbed. Storage is R2 (`storage-r2.ts`): image/logo/attachment uploads, downloads (`stream.pipe(res)` through the response shim), and the 10 MB limit answer the same as Node; SVG uploads answer 501 because their sanitizer is `jsdom`.
 
 ### Tier 0 — runs with the M3 mechanism alone (12 routes)
 
@@ -71,7 +71,7 @@ Zero Node-only modules reachable, or only `log-redaction.ts` (`node:os` called i
 
 `assets`³, `cases`³, `decision-training`, `folders`, `inbox-agent-policy`, `inbox-dismissals`, `issue-tree-control`, `resource-memberships`, `sidebar-preferences`, `smoke-lab`, `status-cards`, `activity`, `instance-settings`, `companies`³ (2: agent instructions, import transfers).
 
-³ Have `multer` uploads; the upload paths need an R2-backed storage provider before they are complete on Workers.
+³ Have `multer` uploads; served by the multer shim + R2 storage (done).
 
 ### Tier 2 — after stubbing the execution-plane hubs (+11 routes to ≤3)
 
@@ -98,7 +98,7 @@ More than three Node-only modules remain even after the stubs, because the route
 | Live events WebSocket | in-process `EventEmitter` + `ws` | Durable Object + WebSocket Hibernation (later) |
 | Runner PRP WebSocket | `ws` | Durable Object (later) |
 | Heartbeat scheduler | `setInterval` 30 s, DB-driven | Cron Trigger / DO alarm; `HEARTBEAT_SCHEDULER_ENABLED=false` on Node (later) |
-| Storage | S3 / local disk | R2 through the existing provider interface |
+| Storage | S3 / local disk | **Done.** R2 through the existing provider interface (`storage-r2.ts`, provider id `s3`); SVG sanitizing (`jsdom`) not on Workers |
 | Plugin workers | one child process per plugin | Not on Workers (Workers for Platforms would be the analogue) |
 | Agent execution, git worktrees, terminals | child processes, disk | Not on Workers (Cloudflare Sandbox containers exist upstream; out of scope here) |
 | Embedded Postgres, backups | Node | Not on Workers; Hyperdrive to a managed Postgres |

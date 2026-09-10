@@ -2,6 +2,8 @@ import { ZodError } from "zod";
 import type { Context, Hono } from "hono";
 import type { ShimLayer, ShimRouter } from "./shims/express.js";
 import { HttpError } from "../src/errors.js";
+import { RAW_REQUEST } from "./shims/multer.js";
+import { EventEmitter } from "node:events";
 
 type ShimHandler = (req: unknown, res: unknown, next: (err?: unknown) => void) => unknown;
 type ShimParamHandler = (req: unknown, res: unknown, next: (err?: unknown) => void, value: string, name: string) => unknown;
@@ -15,6 +17,9 @@ type ResLike = {
   once(event: string, fn: (...args: unknown[]) => void): ResLike;
   off(event: string, fn: (...args: unknown[]) => void): ResLike;
   removeListener(event: string, fn: (...args: unknown[]) => void): ResLike;
+  prependListener(event: string, fn: (...args: unknown[]) => void): ResLike;
+  prependOnceListener(event: string, fn: (...args: unknown[]) => void): ResLike;
+  removeAllListeners(event?: string): ResLike;
   locals: Record<string, unknown>;
   status(code: number): ResLike;
   setHeader(name: string, value: string): void;
@@ -24,10 +29,17 @@ type ResLike = {
   json(body: unknown): ResLike;
   send(body: string | Uint8Array | unknown): ResLike;
   end(body?: string | Uint8Array): ResLike;
+  write(chunk: string | Uint8Array): boolean;
+  emit(event: string, ...args: unknown[]): boolean;
+  listenerCount(event: string): number;
   redirect(statusOrUrl: number | string, url?: string): ResLike;
 };
 
 type ShimResponse = {
+  /** True once a readable was piped or write() was called. */
+  readonly streaming: boolean;
+  /** Resolves when end() runs. */
+  ended: Promise<void>;
   res: ResLike;
   buildResponse(): Response;
 };
@@ -91,13 +103,20 @@ function createResponse(): ShimResponse {
   let statusCode = 200;
   let body: string | Uint8Array | undefined;
   let finished = false;
+  const chunks: Uint8Array[] = [];
   const headers: Record<string, string> = {};
+  // `readable.pipe(res)` (asset/attachment downloads) emits "pipe" on the
+  // destination synchronously and then writes asynchronously, after the
+  // handler returned. Once a stream is attached the adapter waits for end().
+  let streaming = false;
+  let settle: (() => void) | undefined;
+  const ended = new Promise<void>((r) => { settle = r; });
 
   // Express responses are EventEmitters (http.ServerResponse); routes register
   // "close"/"finish" listeners for cancellation. Listeners run when the
   // response is finalized.
-  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
-  const emit = (event: string) => { for (const fn of listeners.get(event) ?? []) { try { fn(); } catch {} } };
+  const emitter = new EventEmitter();
+  const emit = (event: string) => { try { emitter.emit(event); } catch {} };
   const finish = (nextStatus?: number, nextBody?: string | Uint8Array) => {
     if (finished) {
       throw new Error("response already finished");
@@ -111,9 +130,12 @@ function createResponse(): ShimResponse {
     }
     emit("finish");
     emit("close");
+    settle?.();
   };
 
   return {
+    get streaming() { return streaming; },
+    ended,
     res: {
       get statusCode() {
         return statusCode;
@@ -127,10 +149,13 @@ function createResponse(): ShimResponse {
       get finished() {
         return finished;
       },
-      on(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, [...(listeners.get(event) ?? []), fn]); return this; },
-      once(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, [...(listeners.get(event) ?? []), fn]); return this; },
-      off(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn)); return this; },
-      removeListener(event: string, fn: (...args: unknown[]) => void) { listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn)); return this; },
+      on(event: string, fn: (...args: unknown[]) => void) { emitter.on(event, fn); return this; },
+      once(event: string, fn: (...args: unknown[]) => void) { emitter.once(event, fn); return this; },
+      prependListener(event: string, fn: (...args: unknown[]) => void) { emitter.prependListener(event, fn); return this; },
+      prependOnceListener(event: string, fn: (...args: unknown[]) => void) { emitter.prependOnceListener(event, fn); return this; },
+      removeAllListeners(event?: string) { emitter.removeAllListeners(event); return this; },
+      off(event: string, fn: (...args: unknown[]) => void) { emitter.off(event, fn); return this; },
+      removeListener(event: string, fn: (...args: unknown[]) => void) { emitter.removeListener(event, fn); return this; },
       locals: {},
       status(code: number) {
         statusCode = code;
@@ -170,8 +195,31 @@ function createResponse(): ShimResponse {
         }
         return this;
       },
+      // Node streams pipe into the response (`object.stream.pipe(res)`):
+      // Readable.pipe needs write/end/emit and the listener methods above.
+      write(chunk: string | Uint8Array) {
+        streaming = true;
+        chunks.push(typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk);
+        return true;
+      },
+      emit(event: string, ...args: unknown[]) {
+        if (event === "pipe") streaming = true;
+        return emitter.emit(event, ...args);
+      },
+      listenerCount(event: string) {
+        return emitter.listenerCount(event);
+      },
       end(payload?: string | Uint8Array) {
-        finish(undefined, payload == null ? "" : payload);
+        if (payload != null) chunks.push(typeof payload === "string" ? new TextEncoder().encode(payload) : payload);
+        if (chunks.length > 0) {
+          const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+          const joined = new Uint8Array(total);
+          let offset = 0;
+          for (const c of chunks) { joined.set(c, offset); offset += c.byteLength; }
+          finish(undefined, joined);
+        } else {
+          finish(undefined, "");
+        }
         return this;
       },
       redirect(statusOrUrl: number | string, url?: string) {
@@ -231,6 +279,8 @@ function buildRequest<E extends { Variables: { actor: unknown } }>(c: Context<E>
       return lowerHeaders[name.toLowerCase()];
     },
     actor: c.get("actor"),
+    // The Worker Request, for shims that must read the body themselves (multer).
+    [RAW_REQUEST]: c.req.raw,
     socket: {},
     // Express exposes app settings here (board-mutation-guard reads "trust proxy fn").
     app: { get: (_name: string) => undefined },
@@ -372,6 +422,10 @@ export function mountExpressRouters<E extends { Variables: { actor: unknown } }>
           }
           for (const handler of layer.handlers) {
             const nextCalled = await runHandler(handler, req, resObj.res);
+
+            if (!nextCalled && !resObj.res.headersSent && resObj.streaming) {
+              await resObj.ended;
+            }
 
             if (resObj.res.headersSent) {
               return resObj.buildResponse();

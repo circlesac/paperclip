@@ -4,6 +4,8 @@ export interface Env {
   HYPERDRIVE: Hyperdrive;
   /** Static UI (ui/dist) — see `assets` in wrangler.jsonc. */
   ASSETS: Fetcher;
+  /** Object storage for attachments (see `r2_buckets` in wrangler.jsonc). */
+  STORAGE: R2Bucket;
   /** One of `DEPLOYMENT_MODES` from `@paperclipai/shared`. Defaults to `local_trusted`. */
   PAPERCLIP_DEPLOYMENT_MODE?: string;
   /** better-auth (authenticated mode). */
