@@ -20,7 +20,7 @@
 //
 // Usage (from server/): node worker/build.mjs
 import * as esbuild from "esbuild";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, relative, resolve, sep } from "node:path";
 import { exportsOf, stubSource } from "./scripts/lib/module-exports.mjs";
@@ -43,11 +43,16 @@ const SHIM_FILES = {
   "services/native-runtime/native-restart-recovery.ts": shim("native-restart-recovery.ts"),
   "dev-server-status.ts": shim("dev-server-status.ts"),
   "services/live-events.ts": shim("live-events.ts"), // forwards to the LiveEventsRoom Durable Object
+  "services/adapter-plugin-store.ts": shim("adapter-plugin-store.ts"), // JSON file on disk → no external adapters
+  "services/skills-catalog.ts": shim("skills-catalog.ts"), // manifest bundled from packages/skills-catalog/generated
+  "adapters/plugin-loader.ts": shim("adapter-plugin-loader.ts"), // external adapters live on disk → none
 };
 
-/** Modules the Worker must not run even if rule 2/3 would not catch them. */
+/** Modules the Worker must not run even if rule 2/3 would not catch them.
+ *  (adapters/registry.ts runs: it only assembles adapter metadata at load; the
+ *  execution parts it references resolve to lazy stubs.) */
 const STUB_FILES = new Set([
-  "adapters/registry.ts", "adapters/index.ts", "storage/index.ts", "secrets/provider-registry.ts",
+  "storage/index.ts", "secrets/provider-registry.ts",
   "services/execution-workspaces.ts", "services/tool-gateway.ts", "services/heartbeat.ts",
   "services/status-cards.ts", "services/secrets.ts",
   "services/feedback.ts", "services/smoke-lab.ts", "services/company-portability.ts",
@@ -56,15 +61,25 @@ const STUB_FILES = new Set([
 ]);
 /** Modules that import a Node-only builtin but only call it lazily (never at
  *  module load or on the request paths that run on the Worker). Not stubbed. */
-const ALLOW_FILES = new Set(["services/tool-access.ts", "services/provider-trace-store.ts"]);
+const ALLOW_FILES = new Set(["services/tool-access.ts", "services/provider-trace-store.ts", "services/company-skills.ts"]);
+/** Mounted route modules whose Node imports are only used on paths that answer
+ *  501 (agent ssh/terminal, adapter install, plugin install, access proxy). */
+const LAZY_ROUTES = new Set(["routes/agents.ts", "routes/adapters.ts", "routes/access.ts", "routes/plugins.ts"]);
 const STUB_DIRS = ["services/native-runtime/", "services/runtime-exposure/", "realtime/", "vendor/", "modules/active-run-watchdog/"];
 /** Workspace packages get the same per-file rules (they are imported by server
  *  code); the execution-plane packages are stubbed wholesale. `shared` and `db`
  *  are pure and never stubbed. */
-const PACKAGE_STUB_DIRS = ["adapters/", "paperclip-runner/", "adapter-utils/src/acpx-engine/"];
+// The adapter packages themselves follow the per-file rules: their server
+// entries build the ServerAdapterModule objects (type, models, capabilities)
+// the registry lists, while execute/login/skills files import child_process
+// and are stubbed lazily.
+const PACKAGE_STUB_DIRS = ["paperclip-runner/", "adapter-utils/src/acpx-engine/"];
 const PACKAGE_ALLOW_DIRS = ["shared/", "db/"];
 
 const NODE_ONLY_IMPORT = /^import\s+(?!type\s)[^;]*?from\s+"node:(fs|child_process|net|dns|tls|http|http2|readline|worker_threads)(\/[^"]*)?"/m;
+/** Third-party packages that only run on Node (and cannot even be bundled for
+ *  workerd); a module importing one at value level is stubbed like rule 2. */
+const NODE_ONLY_PACKAGE_IMPORT = /^import\s+(?!type\s)[^;]*?from\s+"(@cursor\/sdk|bun:sqlite|better-sqlite3|node-pty)(\/[^"]*)?"/m;
 const TOP_LEVEL_NODE_WORK = /^(?:export\s+)?(?:const|let|var)\s[^\n]*(import\.meta\.url|createRequire\(|randomUUID\(|randomBytes\()/m;
 
 const stubbed = [];
@@ -88,6 +103,7 @@ const paperclipStubs = {
         else {
           const s = readFileSync(args.path, "utf8");
           if (NODE_ONLY_IMPORT.test(s)) why = "imports a Node-only builtin";
+          else if (NODE_ONLY_PACKAGE_IMPORT.test(s)) why = "imports a Node-only package";
           else if (TOP_LEVEL_NODE_WORK.test(s)) why = "Node-only work at module load";
         }
         if (!why) return null;
@@ -99,7 +115,7 @@ const paperclipStubs = {
       const rel = relative(srcDir, args.path);
       if (rel.startsWith("routes" + sep)) {
         const s = readFileSync(args.path, "utf8");
-        if (NODE_ONLY_IMPORT.test(s) || TOP_LEVEL_NODE_WORK.test(s)) console.warn(`[worker/build] route module is Node-bound and should not be mounted: src/${rel}`);
+        if (!LAZY_ROUTES.has(rel) && (NODE_ONLY_IMPORT.test(s) || TOP_LEVEL_NODE_WORK.test(s))) console.warn(`[worker/build] route module is Node-bound and should not be mounted: src/${rel}`);
         return null;
       }
       let why = null;
@@ -109,6 +125,7 @@ const paperclipStubs = {
       else {
         const s = readFileSync(args.path, "utf8");
         if (NODE_ONLY_IMPORT.test(s)) why = "imports a Node-only builtin";
+        else if (NODE_ONLY_PACKAGE_IMPORT.test(s)) why = "imports a Node-only package";
         else if (TOP_LEVEL_NODE_WORK.test(s)) why = "Node-only work at module load";
       }
       if (!why) return null;
@@ -118,6 +135,25 @@ const paperclipStubs = {
     });
   },
 };
+
+// Skill files for the bundled skills catalog (shims/skills-catalog.ts): the
+// manifest lists every file with its sha256; pack the text/entrypoint files
+// (assets are never previewed) so catalog reads answer from the bundle.
+{
+  const catalogRoot = resolve(packagesDir, "skills-catalog");
+  const manifest = JSON.parse(readFileSync(resolve(catalogRoot, "generated", "catalog.json"), "utf8"));
+  const packed = {};
+  for (const skill of manifest.skills) {
+    if (skill.source) continue; // fetched from GitHub at request time
+    for (const file of skill.files) {
+      if (file.kind === "asset") continue;
+      packed[`${skill.path}/${file.path}`] = readFileSync(resolve(catalogRoot, skill.path, file.path)).toString("base64");
+    }
+  }
+  mkdirSync(resolve(here, "dist"), { recursive: true });
+  writeFileSync(resolve(here, "dist", "skills-catalog-files.json"), JSON.stringify(packed));
+  console.log(`[worker/build] packed ${Object.keys(packed).length} skills-catalog files`);
+}
 
 await esbuild.build({
   entryPoints: [resolve(here, "index.ts")],

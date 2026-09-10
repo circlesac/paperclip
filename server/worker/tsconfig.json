@@ -5,6 +5,7 @@
     "rootDir": "../..",
     "module": "preserve",
     "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
     "noEmit": true
   },
   "include": [".", "../src/types/express.d.ts"],

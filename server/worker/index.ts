@@ -19,6 +19,7 @@ import { decisionTrainingRoutes } from "../src/routes/decision-training.js";
 import { issueTreeControlRoutes } from "../src/routes/issue-tree-control.js";
 import { activityRoutes } from "../src/routes/activity.js";
 import { instanceSettingsRoutes } from "../src/routes/instance-settings.js";
+import { instanceSettingsService } from "../src/services/instance-settings.js";
 import { costRoutes } from "../src/routes/costs.js";
 import { attentionRoutes } from "../src/routes/attention.js";
 import { decisionRoutes } from "../src/routes/decisions.js";
@@ -37,6 +38,11 @@ import { LiveEventsRoom, authorizeLiveEventsUpgrade } from "./live-events.js";
 import { liveEventSink } from "./shims/live-events.js";
 import { assetRoutes } from "../src/routes/assets.js";
 import { caseRoutes } from "../src/routes/cases.js";
+import { companySkillRoutes } from "../src/routes/company-skills.js";
+import { companySkillPolicyRoutes } from "../src/routes/company-skill-policy.js";
+import { pluginRoutes } from "../src/routes/plugins.js";
+import type { pluginLoader } from "../src/services/plugin-loader.js";
+import { unavailable } from "./unavailable.js";
 import { authRoutes } from "../src/routes/auth.js";
 import { healthRoutes } from "../src/routes/health.js";
 import { adapterRoutes } from "../src/routes/adapters.js";
@@ -152,6 +158,9 @@ mountExpressRouters(app, {
     const guard = Router();
     guard.use(boardMutationGuard() as never);
 
+    // Same order as app.ts: Express tries routers in mount order, and some
+    // patterns overlap (access.ts has GET /skills/:skillName, company-skills.ts
+    // has GET /skills/catalog).
     return [
       guard,
       () => ({ mount: "/auth", router: authRoutes(c.get("db")) as unknown as ShimRouter }),
@@ -166,47 +175,53 @@ mountExpressRouters(app, {
           companyDeletionEnabled: true,
         }) as unknown as ShimRouter,
       }),
-      // No native runner on the Worker; the adapter registry itself is stubbed,
-      // so listing adapters answers 501 until a Workers-side registry exists.
-      () => adapterRoutes({ getNativeRunnerEnabled: async () => false }),
-      () => dashboardRoutes(c.get("db")),
-      () => sidebarBadgeRoutes(c.get("db")),
-      () => userProfileRoutes(c.get("db")),
+      // Express mounts this router at /api/companies (app.ts).
+      () => ({ mount: "/companies", router: companyRoutes(c.get("db"), c.get("storage")) as unknown as ShimRouter }),
       () => folderRoutes(c.get("db")),
-      () => goalRoutes(c.get("db")),
-      () => inboxDismissalRoutes(c.get("db")),
+      () => companySkillRoutes(c.get("db")),
+      () => companySkillPolicyRoutes(c.get("db")),
       () => inboxAgentPolicyRoutes(c.get("db")),
-      () => sidebarPreferenceRoutes(c.get("db")),
-      () => resourceMembershipRoutes(c.get("db")),
-      () => decisionTrainingRoutes(c.get("db")),
+      () => statusCardRoutes(c.get("db")),
+      // node:fs is only used lazily by agents.ts (skill file removal); those paths fail loudly.
+      () => agentRoutes(c.get("db"), { deploymentMode: deploymentMode(c.env) }),
+      () => assetRoutes(c.get("db"), c.get("storage")),
+      () => projectRoutes(c.get("db")),
+      () => caseRoutes(c.get("db"), c.get("storage")),
       () => issueTreeControlRoutes(c.get("db")),
-      () => activityRoutes(c.get("db")),
-      () => instanceSettingsRoutes(c.get("db")),
+      () => routineRoutes(c.get("db")),
+      () => pipelineRoutes(c.get("db")),
+      () => goalRoutes(c.get("db")),
+      () => approvalRoutes(c.get("db")),
       () => costRoutes(c.get("db")),
+      () => activityRoutes(c.get("db")),
+      () => dashboardRoutes(c.get("db")),
       () => attentionRoutes(c.get("db")),
+      () => decisionTrainingRoutes(c.get("db")),
       // No heartbeat scheduler on the Worker: the same no-op wake Node uses
       // when HEARTBEAT_SCHEDULER_ENABLED=false.
       () => decisionRoutes(c.get("db"), { wakeOriginAgent: createDecisionWakeOriginAgent(null) }),
-      // Express mounts this router at /api/companies (app.ts).
-      () => ({ mount: "/companies", router: companyRoutes(c.get("db"), c.get("storage")) as unknown as ShimRouter }),
+      () => userProfileRoutes(c.get("db")),
+      () => sidebarBadgeRoutes(c.get("db")),
+      () => sidebarPreferenceRoutes(c.get("db")),
+      () => resourceMembershipRoutes(c.get("db")),
+      () => inboxDismissalRoutes(c.get("db")),
+      () => instanceSettingsRoutes(c.get("db")),
+      // No plugin workers, feedback export, or tool-gateway callbacks on the
+      // Worker; the options are optional and the affected paths fail loudly.
+      () => issueRoutes(c.get("db"), c.get("storage"), {}),
+      // Plugin registry reads (list, ui-contributions, detail) come from the
+      // database; the loader, worker manager, job scheduler and tool
+      // dispatcher are child processes on Node, so those paths answer 501.
+      () => pluginRoutes(c.get("db"), unavailable<ReturnType<typeof pluginLoader>>("pluginLoader")),
+      // The registry runs on the Worker (built-in adapters' metadata; execution
+      // parts are lazy stubs); the runner flag is the same instance setting app.ts reads.
+      () => adapterRoutes({ getNativeRunnerEnabled: async () => (await instanceSettingsService(c.get("db")).getExperimental()).enableNativeRunner === true }),
       () => accessRoutes(c.get("db"), {
         deploymentMode: deploymentMode(c.env),
         deploymentExposure: "private",
         bindHost: "127.0.0.1",
         allowedHostnames: [],
       }),
-      () => projectRoutes(c.get("db")),
-      // node:fs is only used lazily by agents.ts (skill file removal); those paths fail loudly.
-      () => agentRoutes(c.get("db"), { deploymentMode: deploymentMode(c.env) }),
-      () => pipelineRoutes(c.get("db")),
-      // No plugin workers, feedback export, or tool-gateway callbacks on the
-      // Worker; the options are optional and the affected paths fail loudly.
-      () => issueRoutes(c.get("db"), c.get("storage"), {}),
-      () => assetRoutes(c.get("db"), c.get("storage")),
-      () => caseRoutes(c.get("db"), c.get("storage")),
-      () => approvalRoutes(c.get("db")),
-      () => routineRoutes(c.get("db")),
-      () => statusCardRoutes(c.get("db")),
     ] as unknown as RouterEntry[];
   },
 });

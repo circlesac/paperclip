@@ -15,6 +15,7 @@ function unavailable(name: string): any {
   return new Proxy(fail, { apply: () => child, construct: () => child, get: (_t, prop) => (prop === "then" ? undefined : child) });
 }
 
+export { taskWatchdogService } from "../../src/services/task-watchdogs.js";
 export { folderService } from "../../src/services/folders.js";
 export { logActivity } from "../../src/services/activity-log.js";
 export { goalService } from "../../src/services/goals.js";

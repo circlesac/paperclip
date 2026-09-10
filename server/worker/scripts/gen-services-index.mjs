@@ -20,7 +20,9 @@ const OUT = new URL("../shims/services-index.ts", import.meta.url).pathname;
 // imports from "../services/index.js". EXTRA_NEEDED covers names reached some
 // other way (for example a middleware that imports the barrel).
 const INDEX = new URL("../index.ts", import.meta.url).pathname;
-const EXTRA_NEEDED = [];
+// routes/issues.ts reads `serviceIndex.taskWatchdogService` through a namespace
+// import, which the regex below does not see.
+const EXTRA_NEEDED = ["taskWatchdogService"];
 function neededNames() {
   const index = readFileSync(INDEX, "utf8");
   const routeFiles = [...index.matchAll(/from\s+"\.\.\/src\/routes\/([^"]+)\.js"/g)].map((m) => join(SRC, "routes", m[1] + ".ts"));
@@ -45,7 +47,7 @@ const TYPES = new Set(); // filled from the barrel below (export type {...})
 const NODE_BOUND = new Set([
   "heartbeat", "status-cards", "company-portability",
   "secrets", "feedback", "smoke-lab",
-  "skills-catalog", "built-in-agents", "workspace-operations", "workspace-runtime", "environment-runtime", "device-login-service",
+  "built-in-agents", "workspace-operations", "workspace-runtime", "environment-runtime", "device-login-service",
 ]);
 
 const barrel = readFileSync(join(SRC, "services/index.ts"), "utf8");
